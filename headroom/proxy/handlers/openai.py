@@ -3103,11 +3103,18 @@ class OpenAIHandlerMixin:
                 )
 
         # Direct OpenAI API (no backend configured)
-        url = build_copilot_upstream_url(
-            upstream_base_url or self.OPENAI_API_URL,
-            handler_path,
-        )
-        url = _append_request_query(url, request.url.query)
+        if upstream_base_url:
+            url = build_copilot_upstream_url(
+                upstream_base_url or self.OPENAI_API_URL,
+                handler_path,
+            )
+            url = _append_request_query(url, request.url.query)
+        else:
+            base_url, headers = self.resolve_upstream(
+                protocol="openai", model=model, headers=headers
+            )
+            url = build_copilot_upstream_url(base_url, handler_path)
+            url = _append_request_query(url, request.url.query)
 
         try:
             if stream:
@@ -3946,15 +3953,19 @@ class OpenAIHandlerMixin:
             url = "https://chatgpt.com/backend-api/codex/responses"
         else:
             upstream_base_url = _resolve_openai_upstream_base(request.headers)
-            handler_path = (
-                _resolve_openai_handler_path(request.headers, handler_path=_OPENAI_RESPONSES_PATH)
-                if upstream_base_url is not None
-                else "/v1/responses"
-            )
-            url = build_copilot_upstream_url(
-                upstream_base_url or self.OPENAI_API_URL,
-                handler_path,
-            )
+            if upstream_base_url is not None:
+                handler_path = _resolve_openai_handler_path(
+                    request.headers, handler_path=_OPENAI_RESPONSES_PATH
+                )
+                url = build_copilot_upstream_url(
+                    upstream_base_url or self.OPENAI_API_URL,
+                    handler_path,
+                )
+            else:
+                base_url, headers = self.resolve_upstream(
+                    protocol="openai", model=model, headers=headers
+                )
+                url = build_copilot_upstream_url(base_url, "/v1/responses")
             url = _append_request_query(url, request.url.query)
 
         # The standalone Rust proxy has native /v1/responses item handling,
@@ -6898,7 +6909,12 @@ class OpenAIHandlerMixin:
         if "chatgpt-account-id" in _lower:
             http_url = "https://chatgpt.com/backend-api/codex/responses"
         else:
-            http_url = build_copilot_upstream_url(self.OPENAI_API_URL, "/v1/responses")
+            ws_model = body.get("model") if isinstance(body, dict) else None
+            base_url, resolved_headers = self.resolve_upstream(
+                protocol="openai", model=ws_model, headers=upstream_headers
+            )
+            http_url = build_copilot_upstream_url(base_url, "/v1/responses")
+            upstream_headers = resolved_headers
 
         # Build HTTP body from the WS response.create payload.
         # WS messages use {"type": "response.create", "response": {...}} wrapper.

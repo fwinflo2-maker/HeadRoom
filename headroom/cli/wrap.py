@@ -5560,7 +5560,7 @@ def opencode(
         _inject_memory_agents_md(agents_md)
 
     if prepare_only:
-        inject_opencode_provider_config(port)
+        inject_opencode_provider_config(port, include_mcp=not no_mcp)
         return
 
     opencode_bin = shutil.which("opencode")
@@ -5574,7 +5574,7 @@ def opencode(
     )
 
     # Inject Headroom provider into OpenCode config so traffic routes through proxy.
-    inject_opencode_provider_config(port)
+    inject_opencode_provider_config(port, include_mcp=not no_mcp)
     if memory:
         mem_dir = Path.cwd() / ".headroom"
         _inject_memory_mcp_config(

@@ -3086,6 +3086,13 @@ class OpenAIHandlerMixin:
                 },
             )
 
+        _bypass = self._headroom_bypass_enabled(request.headers)
+        if _bypass:
+            logger.info(
+                "[%s] Responses passthrough reason=bypass_header mutation=disabled",
+                request_id,
+            )
+
         model = body.get("model", "unknown")
         stream = body.get("stream", False)
         body_mutation_tracker = BodyMutationTracker()
@@ -3576,6 +3583,7 @@ class OpenAIHandlerMixin:
                     "attempted_input_tokens": attempted_input_tokens,
                     "transforms_applied": transforms_applied,
                 },
+                bypass=_bypass,
             )
 
         body, headers, _ = self._emit_openai_responses_payload_stage(
@@ -3590,6 +3598,7 @@ class OpenAIHandlerMixin:
                 "tokens_saved": tokens_saved,
                 "transforms_applied": transforms_applied,
             },
+            bypass=_bypass,
         )
         headers = headers or {}
 
@@ -4434,6 +4443,7 @@ class OpenAIHandlerMixin:
                             stream=True,
                             frame_index=1,
                             frame_type=str(body.get("type") or "response.create"),
+                            bypass=_ws_bypass,
                         )
                     )
                     if _first_pipeline_changed:

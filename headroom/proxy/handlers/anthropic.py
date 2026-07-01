@@ -2790,11 +2790,20 @@ class AnthropicHandlerMixin:
                         body,
                         session_header=explicit_session_header,
                     )
-                    # Only opt-in (header-bearing) callers participate in
-                    # mid-turn steering; see StreamingMixin._should_queue_mid_turn
-                    # for why the coarse md5 fallback must not queue concurrent
-                    # independent streams (it wrongly 202s a streaming caller).
-                    if self._should_queue_mid_turn(session_key, explicit_session_header):
+                    # Coalesce mid-turn messages only for Claude Code, the sole
+                    # client that understands the 202 `headroom_queued` reply and
+                    # the `headroom_pending_messages` SSE event. Other harnesses
+                    # (e.g. OpenCode subagents sharing a body-derived session key)
+                    # would otherwise have their request swallowed and never
+                    # answered. (#1608) `_should_queue_mid_turn` further restricts
+                    # this to opt-in (header-bearing) callers with an active
+                    # stream, so the coarse md5 fallback can't 202 a streaming
+                    # caller.
+                    if classify_client(
+                        request.headers
+                    ) == "claude-code" and self._should_queue_mid_turn(
+                        session_key, explicit_session_header
+                    ):
                         from fastapi.responses import JSONResponse
 
                         queued = self._queue_mid_turn_message(session_key, body)

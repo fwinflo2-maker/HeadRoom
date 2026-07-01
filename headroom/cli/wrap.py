@@ -51,6 +51,7 @@ if sys.version_info >= (3, 11):
 else:  # pragma: no cover - exercised only on Python 3.10
     import tomli as tomllib  # type: ignore[no-redef]
 
+from headroom.cli.proxy import ensure_proxy_dependencies
 from headroom import fsutil
 from headroom._version import __version__ as _HEADROOM_VERSION
 from headroom._version import normalize_release_version as _normalize_release_version
@@ -5886,6 +5887,9 @@ def _run_codex_wrap(
     codex_args: tuple,
 ) -> None:
     """Execute the Codex wrap flow against the durable Codex home."""
+    if not no_proxy:
+        ensure_proxy_dependencies()
+
     if prepare_only:
         _prepare_codex_wrap_state(
             port=port,

@@ -675,10 +675,17 @@ class HeadroomProxy(
         # normalize their request shapes into messages or CompressionUnits, and
         # the router chooses SmartCrusher, log/search/diff/code, or Kompress.
         profile_kwargs = proxy_pipeline_kwargs(config)
+        # Wire ProxyConfig.ignore (+ any .headroomignore at cwd) into the
+        # Read-lifecycle stale/superseded replacement — the one place in the
+        # compression path where a real file path is known (issue #1150).
+        from headroom.ignore import IgnorePolicy
+
+        ignore_policy = IgnorePolicy.load(Path.cwd(), config.ignore)
         router_config = ContentRouterConfig(
             enable_code_aware=config.code_aware_enabled,
             tool_profiles=config.tool_profiles,
             read_lifecycle=ReadLifecycleConfig(enabled=config.read_lifecycle),
+            ignore_policy=ignore_policy,
             smart_crusher_max_items_after_crush=cast(
                 int | None,
                 profile_kwargs.get("max_items_after_crush"),
@@ -1138,7 +1145,9 @@ class HeadroomProxy(
         if config.code_graph_watcher:
             from headroom.graph.watcher import CodeGraphWatcher
 
-            self.code_graph_watcher = CodeGraphWatcher(project_dir=Path.cwd())
+            self.code_graph_watcher = CodeGraphWatcher(
+                project_dir=Path.cwd(), ignore_config=config.ignore
+            )
             if self.code_graph_watcher.start():
                 logger.info("Code graph: file watcher started")
             else:

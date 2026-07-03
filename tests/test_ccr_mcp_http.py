@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import httpx
 import pytest
+
+pytest.importorskip("mcp")
+
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 

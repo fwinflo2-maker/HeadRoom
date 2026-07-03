@@ -7,6 +7,7 @@ from typing import Any
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
 from starlette.routing import Route
+from starlette.types import Receive, Scope, Send
 
 
 def _normalize_path(path: str) -> str:
@@ -24,7 +25,7 @@ class StreamableHTTPASGIApp:
     def __init__(self, session_manager: StreamableHTTPSessionManager):
         self.session_manager = session_manager
 
-    async def __call__(self, scope, receive, send) -> None:
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         await self.session_manager.handle_request(scope, receive, send)
 
 

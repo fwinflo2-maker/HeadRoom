@@ -50,6 +50,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `min(4, cpu)` × 1). The ONNX embedder already capped its threads; this brings
   the torch path to parity
   ([#198](https://github.com/headroomlabs-ai/headroom/issues/198)).
+- Space-separated JSON objects (the shape many web-search tools emit —
+  `{...} {...} {...}` rather than a real array) are now detected as
+  `JSON_ARRAY` and compressed. `detect_content_type` only recognized inputs
+  starting with `[`, so this shape fell through to `PLAIN_TEXT` and SmartCrusher
+  passed it through at 0% compression; the detector now recognizes a run of two
+  or more whitespace-separated JSON objects and SmartCrusher normalizes them to
+  an array before crushing (~34% reduction on a 100-result web_search payload)
+  ([#1741](https://github.com/headroomlabs-ai/headroom/issues/1741)).
 
 ### Changed
 

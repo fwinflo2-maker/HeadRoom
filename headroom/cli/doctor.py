@@ -331,7 +331,9 @@ def check_budget(stats: dict[str, Any] | None) -> CheckResult:
     return CheckResult(name=name, status=PASS, summary=f"${limit}/{period} budget enforced")
 
 
-def check_ignore_rules(project_dir: Path | None = None, config: object | None = None) -> CheckResult:
+def check_ignore_rules(
+    project_dir: Path | None = None, config: object | None = None
+) -> CheckResult:
     """Surface the ``.headroomignore`` file / ``ignore.*`` config rules in effect.
 
     Purely local (no proxy needed): always runs so users can see which paths

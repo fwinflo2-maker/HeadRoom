@@ -8,13 +8,9 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
 from starlette.routing import Route
 
-DEFAULT_HTTP_HOST = "127.0.0.1"
-DEFAULT_HTTP_PORT = 8788
-DEFAULT_HTTP_PATH = "/mcp"
-
 
 def _normalize_path(path: str) -> str:
-    normalized = path.strip() or DEFAULT_HTTP_PATH
+    normalized = path.strip()
     if not normalized.startswith("/"):
         normalized = f"/{normalized}"
     if normalized != "/":
@@ -40,7 +36,7 @@ def create_streamable_http_session_manager(server: Any) -> StreamableHTTPSession
 def create_streamable_http_app(
     session_manager: StreamableHTTPSessionManager,
     *,
-    path: str = DEFAULT_HTTP_PATH,
+    path: str,
     debug: bool = False,
 ) -> Starlette:
     """Build the Starlette app that exposes the MCP server over HTTP."""
@@ -63,7 +59,7 @@ async def serve_streamable_http(
     *,
     host: str,
     port: int,
-    path: str = DEFAULT_HTTP_PATH,
+    path: str,
     debug: bool = False,
 ) -> None:
     """Serve the MCP server over Streamable HTTP with uvicorn."""

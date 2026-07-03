@@ -145,6 +145,17 @@ def content_has_error_indicators(text: str) -> bool:
     return bool(_rust_content_has_error_indicators(text))
 
 
+# Success-summary phrases from common build/test/lint tools that legitimately
+# pair two indicator keywords (`error` + `fail`) while reporting a PASS, e.g.
+# tsc's "Found 0 errors", jest's "0 failing" / "0 failures", eslint's
+# "0 problems (0 errors, 0 warnings)". Stripped before the keyword scan below
+# so a clean JS/TS toolchain run doesn't get permanently protected from
+# compression for the rest of a long coding session (issue #1696).
+_ZERO_RESULT_PATTERN = re.compile(
+    r"\b(?:0|no)\s+(?:error|errors|failing|failure|failures)\b", re.IGNORECASE
+)
+
+
 def content_has_strong_error_indicators(text: str) -> bool:
     """Stricter triage for compression-protection gates.
 
@@ -162,7 +173,7 @@ def content_has_strong_error_indicators(text: str) -> bool:
     safe — downstream compressors (LogCompressor) still preserve
     error lines.
     """
-    lowered = text.lower()
+    lowered = _ZERO_RESULT_PATTERN.sub(" ", text.lower())
     hits = 0
     for keyword in ERROR_INDICATOR_KEYWORDS:
         if keyword in lowered:

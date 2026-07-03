@@ -146,8 +146,14 @@ class SessionAnalyzer:
     Auto-detects the best available model from environment API keys.
     """
 
-    def __init__(self, model: str | None = None):
+    def __init__(self, model: str | None = None, config: object | None = None):
         self.model = model
+        # Optional HeadroomConfig (or any object with an `ignore` attribute)
+        # so `ignore.learn` config rules are enforced here too, not just
+        # `.headroomignore` (issue #1150). `headroom learn` (the CLI) has no
+        # config-file loader today, so it constructs a SessionAnalyzer
+        # without one and only `.headroomignore` applies.
+        self.config = config
 
     def analyze(self, project: ProjectInfo, sessions: list[SessionData]) -> AnalysisResult:
         """Analyze sessions and produce recommendations via LLM."""
@@ -171,7 +177,7 @@ class SessionAnalyzer:
             return result
 
         # Build compact digest of all sessions, leading with detected loops.
-        digest = _build_digest(project, sessions, loops=loops)
+        digest = _build_digest(project, sessions, loops=loops, config=self.config)
 
         # Resolve model (auto-detect if not specified)
         model = self.model or _detect_default_model()
@@ -195,7 +201,7 @@ class SessionAnalyzer:
 # =============================================================================
 
 
-def _build_prior_patterns_section(project: ProjectInfo) -> str:
+def _build_prior_patterns_section(project: ProjectInfo, config: object | None = None) -> str:
     """Format the current marker blocks from CLAUDE.md / MEMORY.md for the LLM.
 
     Returns "" when neither file exists nor contains a marker block. When at
@@ -208,7 +214,8 @@ def _build_prior_patterns_section(project: ProjectInfo) -> str:
         ("CLAUDE.md (CONTEXT_FILE, project-level stable facts)", project.context_file),
         ("MEMORY.md (MEMORY_FILE, session-level evolving preferences)", project.memory_file),
     )
-    policy = IgnorePolicy.load(project.project_path)
+    ignore_config = getattr(config, "ignore", None) if config is not None else None
+    policy = IgnorePolicy.load(project.project_path, ignore_config)
     for label, path in candidates:
         if path is None or not path.exists():
             continue
@@ -245,6 +252,7 @@ def _build_digest(
     project: ProjectInfo,
     sessions: list[SessionData],
     loops: list[LoopPattern] | None = None,
+    config: object | None = None,
 ) -> str:
     """Build a token-efficient text digest of all session events.
 
@@ -288,7 +296,7 @@ def _build_digest(
 
     # Prior learned patterns (if any) — gives the LLM the current baseline so
     # it can produce complete updated sections instead of condensed deltas.
-    prior_section = _build_prior_patterns_section(project)
+    prior_section = _build_prior_patterns_section(project, config)
     if prior_section:
         lines.append(prior_section)
 

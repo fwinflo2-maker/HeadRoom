@@ -263,6 +263,18 @@ def _print_telemetry_notice() -> None:
         click.echo(notice)
 
 
+def _prepend_rtk_bin_to_path(env: dict[str, str]) -> None:
+    """Ensure wrapped shells can resolve Headroom-managed `rtk`."""
+
+    from headroom.rtk import RTK_BIN_DIR
+
+    rtk_bin = str(RTK_BIN_DIR)
+    current_path = env.get("PATH", "")
+    path_entries = current_path.split(os.pathsep) if current_path else []
+    if rtk_bin not in path_entries:
+        env["PATH"] = f"{rtk_bin}{os.pathsep}{current_path}" if current_path else rtk_bin
+
+
 # Proxy health check (reused from evals/suite_runner.py pattern)
 
 
@@ -2498,6 +2510,7 @@ def _launch_tool(
     signal.signal(signal.SIGTERM, cleanup)
 
     try:
+        _prepend_rtk_bin_to_path(env)
         click.echo()
         padded = f"HEADROOM WRAP: {tool_label}".center(47)
         click.echo("  ╔═══════════════════════════════════════════════╗")

@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- The dashboard's per-request metadata (the `recent_requests` / `request_logs`
+  tail and the `config` block with upstream URLs) is gated to loopback callers
+  via `_request_is_loopback`. When Headroom runs in a bridge-network container
+  (Docker/podman, or Apple Containerization / mocker), a browser on the host
+  reaches the proxy through the container gateway, so `request.client.host` is
+  the gateway IP rather than `127.0.0.1` — the sensitive block was stripped and
+  the "Recent Requests" table rendered empty even though the operator is local.
+  A peer inside an operator-configured trusted-gateway CIDR
+  (`HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS`, already used to sanitize
+  `X-Forwarded-*`) is now treated as loopback-equivalent, while the loopback
+  `Host`-header gate is retained as the DNS-rebinding defence. Opt-in and empty
+  by default, so there is no behavior change unless the gateway CIDR is
+  allow-listed.
 - Non-finite values (`NaN`, `Infinity`) in `proxy_savings.json` or in upstream
   cost/token metadata no longer crash the proxy or corrupt the savings
   dashboard. `SavingsTracker`'s numeric coercion caught only `TypeError` and

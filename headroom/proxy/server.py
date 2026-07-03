@@ -460,6 +460,7 @@ class LoopHealthState(TypedDict):
     known_failures: int
     last_known_failure: LoopFailureDetails | None
 
+
 _MULTI_WORKER_CONFIG_ENV = "HEADROOM_PROXY_CONFIG_JSON"
 
 # Env var that opts out of the Rust core deployment smoke test (Hotfix-A0).

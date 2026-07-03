@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- **proxy:** the savings store now fsyncs its parent directory after the
+  atomic rename, so the most recent `proxy_savings.json` write survives a
+  power-loss or crash. `_save_locked` fsynced the temp file's contents but
+  never the directory entry the rename created, leaving the rename itself
+  non-durable on POSIX. Best-effort — a no-op on Windows and virtual
+  filesystems where directory fsync is unsupported.
 - `headroom learn` now honors `CLAUDE_CONFIG_DIR`. It resolved the Claude
   config directory as `~/.claude` and wrote global memory to
   `~/.claude/CLAUDE.md`, so users who relocate their Claude config via that

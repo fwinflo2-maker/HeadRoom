@@ -1018,6 +1018,22 @@ class SavingsTracker:
                 except OSError:
                     pass
                 raise
+
+            # Persist the rename itself — the fsync above flushed the file's
+            # bytes, but the directory entry the rename created isn't durable
+            # until the parent directory is fsynced too (POSIX). Best-effort —
+            # directory fsync is unsupported on Windows and some virtual
+            # filesystems; the file and atomic rename are already durable, so a
+            # failure here only forgoes the last-save crash guarantee, never
+            # correctness. (FP4b)
+            try:
+                dir_fd = os.open(self._path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
         except OSError as e:
             logger.warning("Failed to save savings history to %s: %s", self._path, e)
 

@@ -576,6 +576,11 @@ class TestContentDetectorIntegration:
         result = detect_content_type('[{"id": 1}, {"id": 2}]')
         assert result.content_type == ContentType.JSON_ARRAY
 
+        # Web-search output as space-separated JSON objects
+        result = detect_content_type('{"title":"one"} {"title":"two"}')
+        assert result.content_type == ContentType.JSON_ARRAY
+        assert result.metadata["is_dict_array"] is True
+
         # Code (needs enough patterns to trigger detection)
         code = """
 import os

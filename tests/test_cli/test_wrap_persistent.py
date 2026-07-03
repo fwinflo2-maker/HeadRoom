@@ -116,7 +116,7 @@ def test_ensure_proxy_reports_unbindable_port_before_starting_subprocess(monkeyp
         wrap_cli,
         "_find_available_port",
         lambda port, **kw: (_ for _ in ()).throw(
-            OSError(errno.EACCES, "access denied by OS port reservation")
+            OSError(errno.EADDRNOTAVAIL, "address not available")
         ),
     )
     monkeypatch.setattr(wrap_cli, "_start_proxy", lambda *args, **kwargs: calls.append("start"))

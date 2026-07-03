@@ -347,6 +347,8 @@ def _port_bind_error(port: int) -> OSError | None:
             s.bind(("127.0.0.1", port))
     except OSError as exc:
         return exc
+    except OverflowError:
+        return OSError(errno.EADDRNOTAVAIL, f"Port {port} out of range (0-65535)")
     return None
 
 
@@ -358,15 +360,14 @@ def _find_available_port(start_port: int, max_attempts: int = 100) -> int:
     Other OS errors (EADDRNOTAVAIL) propagate immediately.
     Raises RuntimeError when no port is found in range.
     """
-    for port in range(start_port, start_port + max_attempts):
+    end_port = min(start_port + max_attempts, 65536)
+    for port in range(start_port, end_port):
         error = _port_bind_error(port)
         if error is None:
             return port
         if error.errno not in (errno.EADDRINUSE, errno.EACCES):
             raise error
-    raise RuntimeError(
-        f"No available port found in range {start_port}-{start_port + max_attempts - 1}"
-    )
+    raise RuntimeError(f"No available port found in range {start_port}-{end_port - 1}")
 
 
 def _get_log_path() -> Path:
@@ -1955,11 +1956,14 @@ def _run_proxy_only_watcher(
 
     try:
         _print_wrap_banner(agent_label)
+        _register_proxy_client(port)
         proxy_holder[0], actual_port = _ensure_proxy(
             port, no_proxy, learn=learn, memory=memory, agent_type=agent_type
         )
+        if actual_port != port:
+            _unregister_proxy_client(port)
+            _register_proxy_client(actual_port)
         port_holder[0] = actual_port
-        _register_proxy_client(actual_port)
         _push_runtime_env(actual_port, no_proxy)
         click.echo()
         print_setup_lines(actual_port)
@@ -3146,7 +3150,7 @@ def _live_proxy_clients(port: int, *, exclude_self: bool = True) -> list[int]:
     return live
 
 
-def _make_cleanup(proxy_proc_holder: list, port: Any = 8787) -> Any:
+def _make_cleanup(proxy_proc_holder: list, port: int | list[int] = 8787) -> Any:
     """Create a cleanup function that terminates the proxy on exit.
 
     Only kills the proxy when no other live headroom-wrapped clients remain,
@@ -3218,6 +3222,7 @@ def _launch_tool(
         click.echo("  ╚═══════════════════════════════════════════════╝")
         click.echo()
 
+        _register_proxy_client(port)
         proxy_holder[0], actual_port = _ensure_proxy(
             port,
             no_proxy,
@@ -3231,8 +3236,10 @@ def _launch_tool(
             openai_api_url=openai_api_url,
             copilot_api_token=copilot_api_token,
         )
+        if actual_port != port:
+            _unregister_proxy_client(port)
+            _register_proxy_client(actual_port)
         port_holder[0] = actual_port
-        _register_proxy_client(actual_port)
         _push_runtime_env(actual_port, no_proxy)
 
         # If port fell back, update env URLs to point at the actual port
@@ -3706,6 +3713,7 @@ def claude(
         proxy_url = _claude_proxy_base_url(port)
         vertex_upstream = _vertex_target_api_url_from_claude_env(proxy_url) if use_vertex else None
 
+        _register_proxy_client(port)
         proxy_holder[0], actual_port = _ensure_proxy(
             port,
             no_proxy,
@@ -3719,8 +3727,10 @@ def claude(
             vertex_api_url=vertex_upstream,
             clear_vertex_api_url=use_vertex and vertex_upstream is None,
         )
+        if actual_port != port:
+            _unregister_proxy_client(port)
+            _register_proxy_client(actual_port)
         port_holder[0] = actual_port
-        _register_proxy_client(actual_port)
         _push_runtime_env(actual_port, no_proxy)
 
         if not no_rtk:
@@ -4494,6 +4504,11 @@ def codex(
         click.echo("Install Codex CLI: npm install -g @openai/codex")
         raise SystemExit(1)
 
+    # Register our proxy client marker BEFORE _ensure_proxy so that another
+    # wrapper's cleanup sees us as an active client and doesn't terminate a
+    # shared proxy during the startup gap.
+    _register_proxy_client(port)
+
     # Let _ensure_proxy decide the port (same contract as other wrappers).
     # Called after config writes so unwrap has config to restore even when
     # proxy startup fails.
@@ -4508,6 +4523,12 @@ def codex(
         anyllm_provider=anyllm_provider,
         region=region,
     )
+
+    # If the proxy fell back to a different port, move our marker to the
+    # actual port so cleanup tracking stays accurate.
+    if actual_port != port:
+        _unregister_proxy_client(port)
+        _register_proxy_client(actual_port)
 
     # If the proxy fell back to a different port, update the MCP config so
     # the retrieval tool URL points at the port the proxy is actually on.
@@ -5698,6 +5719,11 @@ def opencode(
         click.echo("Install OpenCode: https://opencode.ai")
         raise SystemExit(1)
 
+    # Register our proxy client marker BEFORE _ensure_proxy so that another
+    # wrapper's cleanup sees us as an active client and doesn't terminate a
+    # shared proxy during the startup gap.
+    _register_proxy_client(port)
+
     # Resolve port before config injection so the provider block and MCP
     # URL both point at the port the proxy will actually be on.
     _opencode_proxy, actual_port = _ensure_proxy(
@@ -5712,12 +5738,15 @@ def opencode(
         region=region,
     )
 
-    # If the proxy fell back, update MCP config so retrieval points at
-    # the correct port.
-    if actual_port != port and not no_mcp:
-        from headroom.mcp_registry import OpencodeRegistrar
+    # If the proxy fell back to a different port, move our marker so
+    # cleanup tracking stays accurate and update MCP config.
+    if actual_port != port:
+        _unregister_proxy_client(port)
+        _register_proxy_client(actual_port)
+        if not no_mcp:
+            from headroom.mcp_registry import OpencodeRegistrar
 
-        _setup_headroom_mcp(OpencodeRegistrar(), actual_port, verbose=verbose, force=True)
+            _setup_headroom_mcp(OpencodeRegistrar(), actual_port, verbose=verbose, force=True)
 
     env, env_vars_display = _build_opencode_launch_env(
         actual_port, os.environ, project=_project_name_from_cwd(), include_mcp=not no_mcp

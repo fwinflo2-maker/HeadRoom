@@ -2334,6 +2334,70 @@ class OpenAIHandlerMixin:
             body["tools"] = tools
         if presend_event.headers is not None:
             headers = presend_event.headers
+
+        # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER): verbosity
+        # steering appended as a trailing system message + effort routing on
+        # mechanical tool continuations. Runs after every other body mutation
+        # so the turn classifier sees the final messages, and respects the
+        # same bypass header as compression. Mirrors the Anthropic handler's
+        # shaper block at handlers/anthropic.py:1937-1993 in structure, but
+        # uses provider="openai" so shape_request dispatches to the
+        # OpenAI-shaped variants (trailing system message, reasoning_effort
+        # clamp) instead of the Anthropic ones (system block append,
+        # output_config.effort / thinking.budget_tokens clamp).
+        if not _bypass:
+            from headroom.proxy.output_savings import (
+                assign_arm,
+                conversation_key_from_body,
+                stratum_key,
+                stratum_label,
+            )
+            from headroom.proxy.output_shaper import (
+                OutputShaperSettings,
+                classify_turn,
+                resolve_verbosity_level,
+                shape_request,
+            )
+
+            _shaper_settings = OutputShaperSettings.from_env()
+            if _shaper_settings.enabled:
+                from headroom.proxy import runtime_env
+
+                _holdout = 0.0
+                try:
+                    _holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
+                except ValueError:
+                    _holdout = 0.0
+                _arm = assign_arm(conversation_key_from_body(body), _holdout)
+
+                _turn_kind = classify_turn(body.get("messages", []), provider="openai").value
+                _stratum = stratum_key(
+                    turn_kind=_turn_kind,
+                    input_tokens=original_tokens,
+                    model=model,
+                    has_tools=bool(body.get("tools")),
+                )
+                transforms_applied.append(stratum_label(_arm, _stratum))
+
+                if _arm == "treatment":
+                    _level, _src = resolve_verbosity_level(_shaper_settings)
+                    shape_result = shape_request(
+                        body,
+                        _shaper_settings,
+                        level_override=_level,
+                        provider="openai",
+                    )
+                    if shape_result.changed:
+                        # Keep optimized_messages in sync — the shaper mutates
+                        # body["messages"] in place (may insert a system
+                        # message), and downstream code reads from both.
+                        optimized_messages = body["messages"]
+                        transforms_applied.extend(shape_result.labels or [])
+                        logger.info(
+                            f"[{request_id}] OutputShaper(L{_level}/{_src}, openai): "
+                            f"{shape_result.labels}"
+                        )
+
         optimized_tokens = tokenizer.count_messages(body["messages"])
         tokens_saved = original_tokens - optimized_tokens
 
@@ -3474,6 +3538,44 @@ class OpenAIHandlerMixin:
                             }
                         },
                     ) from _e
+
+        # Output shaping for /v1/responses. The Responses API's request shape
+        # differs from Chat Completions: prompts live in `body["input"]` as a
+        # typed item list, not `body["messages"]`. For this pass we apply
+        # only the effort-routing lever (`body["reasoning"]["effort"]`), which
+        # is the highest-value knob on reasoning models and shape-agnostic to
+        # the input-item list. Verbosity steering for the Responses shape is
+        # a follow-up because injecting a system-role instruction into a
+        # heterogeneous `input` item list requires handling multiple item
+        # types (message vs. tool_output vs. reasoning) and is orthogonal to
+        # effort routing.
+        if not _bypass:
+            from headroom.proxy.output_shaper import (
+                OutputShaperSettings,
+                TurnKind,
+                classify_turn,
+                route_effort,
+            )
+
+            _shaper_settings = OutputShaperSettings.from_env()
+            if _shaper_settings.enabled and _shaper_settings.effort_router_enabled:
+                # Best-effort turn classification: derive OpenAI-shaped
+                # messages from the Responses input list (reuses the same
+                # helper the waste-signal path uses at L3571). If the last
+                # item is a tool output with no error, that's a mechanical
+                # continuation and we clamp effort.
+                _instructions = body.get("instructions")
+                _input_data = body.get("input", "")
+                try:
+                    _responses_msgs = _responses_input_to_waste_messages(_instructions, _input_data)
+                    _kind = classify_turn(_responses_msgs, provider="openai")
+                except Exception:
+                    _kind = TurnKind.UNKNOWN
+                _labels = route_effort(body, _kind, _shaper_settings, provider="openai")
+                if _labels:
+                    body_mutation_tracker.mark_mutated("output_shaper")
+                    transforms_applied = [*_labels, *list(transforms_applied)]
+                    logger.info(f"[{request_id}] OutputShaper(/v1/responses): {_labels}")
 
         capture_codex_wire_debug(
             "http_upstream_request",

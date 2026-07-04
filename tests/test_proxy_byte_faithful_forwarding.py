@@ -1056,8 +1056,8 @@ def test_messages_custom_upstream_stream_preserves_client_beta_header() -> None:
         old_anthropic_url = type(proxy).ANTHROPIC_API_URL
         type(proxy).ANTHROPIC_API_URL = "https://custom.example"
         fake_tracker = _FakePrefixTracker(frozen_count=0)
-        proxy.session_tracker_store.compute_session_id = (
-            lambda request, model, messages: "custom-stream-beta-1"
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "custom-stream-beta-1"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
 

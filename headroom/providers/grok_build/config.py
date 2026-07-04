@@ -17,6 +17,11 @@ _BLOCK_RE = re.compile(
     re.escape(_MARKER_START) + r".*?" + re.escape(_MARKER_END) + r"\n?",
     re.DOTALL,
 )
+_GROK_BUILD_TABLE_RE = re.compile(r"(?m)^\[model\.grok-build\]\s*$")
+_NEXT_TABLE_RE = re.compile(r"(?m)^\[")
+_BASE_URL_LINE_RE = re.compile(
+    r'(?m)^(?P<indent>[ \t]*)base_url[ \t]*=[ \t]*"(?P<value>[^"\n]*)".*$'
+)
 
 
 def grok_home_dir() -> Path:
@@ -57,6 +62,46 @@ def strip_grok_headroom_blocks(content: str) -> str:
     return content.strip()
 
 
+def has_user_grok_build_model_table(content: str) -> bool:
+    """Return True when ``content`` already declares ``[model.grok-build]``."""
+    return _GROK_BUILD_TABLE_RE.search(content) is not None
+
+
+def redirect_existing_grok_build_base_url(content: str, base_url: str) -> tuple[str, bool]:
+    """Rewrite ``base_url`` inside an existing ``[model.grok-build]`` table.
+
+    TOML rejects duplicate table headers, so when the user already owns
+    ``[model.grok-build]`` we update that table in place instead of appending
+    a second one. The previous ``base_url`` value is preserved in a trailing
+    ``# was: …`` comment for visibility; the pre-wrap snapshot still enables
+    byte-for-byte restore on ``headroom unwrap grok-build``.
+    """
+    match = _GROK_BUILD_TABLE_RE.search(content)
+    if match is None:
+        return content, False
+
+    section_start = match.end()
+    next_table = _NEXT_TABLE_RE.search(content, section_start)
+    section_end = next_table.start() if next_table else len(content)
+    section = content[section_start:section_end]
+
+    if _BASE_URL_LINE_RE.search(section):
+
+        def _replace(match_obj: re.Match[str]) -> str:
+            original_value = match_obj.group("value")
+            if original_value == base_url:
+                return match_obj.group(0)
+            indent = match_obj.group("indent")
+            return f'{indent}base_url = "{base_url}"  # was: {original_value}'
+
+        section = _BASE_URL_LINE_RE.sub(_replace, section, count=1)
+    else:
+        section = f'\nbase_url = "{base_url}"' + section
+
+    updated = content[:section_start] + section + content[section_end:]
+    return updated, updated != content
+
+
 def render_headroom_block(port: int, project: str | None = None) -> str:
     """Render the Headroom-managed ``[model.grok-build]`` override block."""
     target = build_proxy_targets(port, project)
@@ -79,11 +124,15 @@ def inject_grok_provider_config(port: int, project: str | None = None) -> Path:
     else:
         content = ""
 
-    block = render_headroom_block(port, project)
-    if content:
-        content = content.rstrip() + "\n\n" + block
+    target = build_proxy_targets(port, project)
+    if has_user_grok_build_model_table(content):
+        content, _ = redirect_existing_grok_build_base_url(content, target.base_url)
     else:
-        content = block
+        block = render_headroom_block(port, project)
+        if content:
+            content = content.rstrip() + "\n\n" + block
+        else:
+            content = block
 
     fsutil.write_text(config_file, content)
     return config_file

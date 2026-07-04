@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- `TiktokenCounter` no longer stalls the event loop tokenizing large tool-result
+  blobs. `TiktokenCounter.count_messages` reimplements the content-part loop
+  instead of inheriting `BaseTokenizer`, so an unrecognized content-part type
+  fell to an unbounded `count_text(str(part))` over the whole serialized blob:
+  a multi-megabyte tool result ran hundreds of milliseconds of synchronous
+  tokenization on the shared event loop (measured ~417ms on a 3.4MB blob), and
+  pathological repeated-character content could raise `ValueError` from
+  tiktoken's regex backtracking. It now routes the part through
+  `BaseTokenizer._count_serialized`, which samples oversized blobs (~13ms for
+  the same payload, estimate within 0.5% of the full count) and serializes JSON
+  (the wire form) instead of Python `repr`, matching how the HuggingFace,
+  Mistral, and Estimating tokenizers already inherit the bound.
 - Non-finite values (`NaN`, `Infinity`) in `proxy_savings.json` or in upstream
   cost/token metadata no longer crash the proxy or corrupt the savings
   dashboard. `SavingsTracker`'s numeric coercion caught only `TypeError` and

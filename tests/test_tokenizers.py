@@ -595,3 +595,56 @@ class TestLargeToolBlobEstimation:
             cur = cur["n"]
         cur["leaf"] = "x" * 60_000
         assert EstimatingTokenCounter()._count_serialized(deep) >= 0
+
+
+class TestTiktokenLargeToolBlob:
+    """TiktokenCounter reimplements count_messages, so it must route unrecognized
+    content parts through BaseTokenizer._count_serialized to inherit the same
+    oversized-blob bound its siblings get for free via super().count_messages().
+    """
+
+    def test_oversized_unhandled_part_is_bounded(self, monkeypatch):
+        """Regression: an unrecognized content-part type fed the whole multi-megabyte
+        str(part) to count_text synchronously, stalling the event loop; the bounded
+        path must sample instead.
+
+        count_text is stubbed (records size, returns a nominal value) rather than run
+        for real: the tiktoken encoder is both the slow thing under test and prone to
+        regex-backtracking on large inputs, and this test asserts only that the input
+        size is bounded, not the token count.
+        """
+        tok = TiktokenCounter("gpt-4o")
+        sizes: list[int] = []
+
+        def stub(text):
+            sizes.append(len(text))
+            return len(text) // 4
+
+        monkeypatch.setattr(tok, "count_text", stub)
+        # Varied, structured payload (not a repeated character, which crashes
+        # tiktoken's pretokenizer) far over the 50k LARGE_BLOB_CHARS threshold,
+        # wrapped in an unhandled part type.
+        rows = [{"id": i, "v": f"row-{i}-abcdef"} for i in range(120_000)]
+        messages = [{"role": "user", "content": [{"type": "mystery", "rows": rows}]}]
+
+        tok.count_messages(messages)
+
+        assert sizes, "count_text should be exercised"
+        # the oversized blob must never be counted whole, only its bounded sample
+        assert max(sizes) <= tok.SAMPLE_CHARS + tok.SAMPLE_CHUNK
+
+    def test_unhandled_part_serialized_as_json_not_repr(self, monkeypatch):
+        """The model receives JSON; str(part) emits Python repr (single quotes, True,
+        None), which mis-tokenizes. The fix must serialize the part via json.dumps.
+        """
+        import json
+
+        tok = TiktokenCounter("gpt-4o")
+        seen: list[str] = []
+        monkeypatch.setattr(tok, "count_text", lambda text: seen.append(text) or 0)
+
+        part = {"type": "mystery", "flag": True, "note": "it's fine"}
+        tok.count_messages([{"role": "user", "content": [part]}])
+
+        assert json.dumps(part) in seen
+        assert str(part) not in seen

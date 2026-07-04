@@ -282,7 +282,12 @@ class TiktokenCounter(BaseTokenizer):
                                     else:
                                         total += 170  # Base for high detail
                                 else:
-                                    total += self.count_text(str(part))
+                                    # Bound cost on oversized blobs: raw str(part) fed
+                                    # the whole multi-MB string to count_text
+                                    # synchronously, stalling the event loop.
+                                    # _count_serialized samples oversized input and
+                                    # serializes JSON (the wire form), not Python repr.
+                                    total += self._count_serialized(part)
                             elif isinstance(part, str):
                                 total += self.count_text(part)
                 elif key == "role":

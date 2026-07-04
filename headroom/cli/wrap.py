@@ -269,10 +269,11 @@ def _prepend_rtk_bin_to_path(env: dict[str, str]) -> None:
     from headroom.rtk import RTK_BIN_DIR
 
     rtk_bin = str(RTK_BIN_DIR)
-    current_path = env.get("PATH", "")
+    path_key = next((key for key in env if key.lower() == "path"), "PATH")
+    current_path = env.get(path_key, "")
     path_entries = current_path.split(os.pathsep) if current_path else []
     if rtk_bin not in path_entries:
-        env["PATH"] = f"{rtk_bin}{os.pathsep}{current_path}" if current_path else rtk_bin
+        env[path_key] = f"{rtk_bin}{os.pathsep}{current_path}" if current_path else rtk_bin
 
 
 # Proxy health check (reused from evals/suite_runner.py pattern)

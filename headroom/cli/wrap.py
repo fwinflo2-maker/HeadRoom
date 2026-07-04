@@ -115,7 +115,12 @@ from headroom.providers.openclaw import (
 from headroom.providers.openclaw import (
     normalize_gateway_provider_ids as _normalize_openclaw_gateway_provider_ids_impl,
 )
-from headroom.providers.opencode import build_launch_env as _build_opencode_launch_env
+from headroom.providers.opencode import (
+    build_launch_env as _build_opencode_launch_env,
+)
+from headroom.providers.opencode import (
+    detect_opencode_kind,
+)
 from headroom.providers.opencode.config import (
     _MCP_MARKER_END,  # noqa: F401
     _MCP_MARKER_START,
@@ -5568,6 +5573,22 @@ def opencode(
         click.echo("Error: 'opencode' not found in PATH.")
         click.echo("Install OpenCode: https://opencode.ai")
         raise SystemExit(1)
+
+    if detect_opencode_kind(opencode_bin) == "go-cli":
+        click.echo()
+        click.echo("  Warning: Detected the OpenCode Go CLI.")
+        click.echo(
+            "  The Go CLI ignores OPENCODE_CONFIG_CONTENT plugin routing, provider "
+            "options.baseURL overrides, and OPENAI_BASE_URL/ANTHROPIC_BASE_URL for "
+            "the hardcoded opencode-go provider."
+        )
+        click.echo("  LLM traffic will bypass the Headroom proxy (0 inbound LLM requests).")
+        click.echo(
+            "  To route traffic, use the OpenCode Node SDK / a compatible OpenCode "
+            "build, or track upstream support for baseURL on opencode-go."
+        )
+        click.echo("  Continuing to launch so you can see this diagnostic alongside your session.")
+        click.echo()
 
     env, env_vars_display = _build_opencode_launch_env(
         port, os.environ, project=_project_name_from_cwd(), include_mcp=not no_mcp

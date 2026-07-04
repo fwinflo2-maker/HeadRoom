@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -131,3 +133,71 @@ def build_launch_env(
         env["HEADROOM_PROJECT"] = project
 
     return env, display
+
+
+_OPENCODE_VERSION_TIMEOUT = 2
+
+# Go CLI builds (e.g. opencode v1.16.2) print a short standalone SemVer line
+# such as "v1.16.2" or "1.17.13". The Node SDK (verified against oclif-style
+# output) usually exposes Node/npm metadata like "node-v20.12.2" or
+# "@opencode-ai/cli". The heuristic is intentionally conservative: we only
+# classify "go-cli" when the output looks like a simple version string and
+# carries no Node/npm markers. If a future Go CLI changes its output, callers
+# should update this classifier or short-circuit via monkeypatching in tests.
+_RE_SIMPLE_VERSION = re.compile(
+    r"^(v?\d+\.\d+\.\d+(?:[-+.]?[A-Za-z0-9-]+)*)$",
+    re.IGNORECASE,
+)
+
+
+def _probe_version_output(binary: str) -> str:
+    """Run ``binary --version`` and combine stdout+stderr, or return empty string on any failure."""
+    try:
+        result = subprocess.run(
+            [binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=_OPENCODE_VERSION_TIMEOUT,
+            check=False,
+        )
+    except Exception:  # pragma: no cover - defensive timeout/filesystem safety
+        return ""
+    return f"{result.stdout or ''}{result.stderr or ''}".strip()
+
+
+def _classify_version_output(output: str) -> str:
+    """Classify a ``--version`` probe result as ``go-cli``, ``node-sdk`` or ``unknown``."""
+    if not output:
+        return "unknown"
+
+    output_lower = output.lower()
+    node_markers = ("node", "npm", "npx", "@opencode-ai", "package.json")
+    if any(marker in output_lower for marker in node_markers):
+        return "node-sdk"
+
+    first_line = output.splitlines()[0].strip()
+    if _RE_SIMPLE_VERSION.match(first_line):
+        return "go-cli"
+
+    return "unknown"
+
+
+def detect_opencode_kind(binary: str | None) -> str:
+    """Detect whether ``binary`` is the OpenCode Go CLI or the Node SDK.
+
+    Returns one of:
+
+    * ``"go-cli"`` — the binary looks like the Go CLI (simple SemVer output,
+      no Node/npm markers).
+    * ``"node-sdk"`` — the binary output contains Node/npm markers.
+    * ``"unknown"`` — the binary could not be probed or the output did not
+      match either signature.
+    * ``"missing"`` — ``binary`` is empty/None.
+
+    This function never raises; errors during probing are folded into
+    ``"unknown"``.
+    """
+    if not binary:
+        return "missing"
+    output = _probe_version_output(binary)
+    return _classify_version_output(output)

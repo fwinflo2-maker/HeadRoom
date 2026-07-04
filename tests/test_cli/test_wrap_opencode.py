@@ -11,6 +11,8 @@ from click.testing import CliRunner
 
 from headroom.cli import wrap as wrap_mod
 from headroom.cli.main import main
+from headroom.providers.opencode import detect_opencode_kind
+from headroom.providers.opencode import runtime as opencode_runtime_mod
 
 
 @pytest.fixture
@@ -51,10 +53,11 @@ def test_wrap_opencode_sets_config_content_env(
     with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
         with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
             with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
-                result = runner.invoke(
-                    main,
-                    ["wrap", "opencode", "--port", "9000", "--no-mcp", "--", "--model", "gpt-4o"],
-                )
+                with patch.object(wrap_mod, "detect_opencode_kind", return_value="node-sdk"):
+                    result = runner.invoke(
+                        main,
+                        ["wrap", "opencode", "--port", "9000", "--no-mcp", "--", "--model", "gpt-4o"],
+                    )
 
     assert result.exit_code == 0, result.output
     env = captured["env"]
@@ -89,13 +92,148 @@ def test_wrap_opencode_does_not_add_base_url_env_vars(
     with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
         with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
             with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
-                result = runner.invoke(main, ["wrap", "opencode", "--port", "9000", "--no-mcp"])
+                with patch.object(wrap_mod, "detect_opencode_kind", return_value="node-sdk"):
+                    result = runner.invoke(main, ["wrap", "opencode", "--port", "9000", "--no-mcp"])
 
     assert result.exit_code == 0, result.output
     env = captured["env"]
-    assert isinstance(env, dict)
     assert env["OPENAI_BASE_URL"] == "https://deepseek.example/v1"
+
     assert env["ANTHROPIC_BASE_URL"] == "https://anthropic.example"
+
+
+def test_wrap_opencode_warns_when_go_cli_detected(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scope A: emit an actionable diagnostic when the resolved binary is the Go CLI."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
+                with patch.object(wrap_mod, "detect_opencode_kind", return_value="go-cli"):
+                    result = runner.invoke(main, ["wrap", "opencode", "--port", "9000", "--no-mcp"])
+
+    assert result.exit_code == 0, result.output
+    assert "Detected the OpenCode Go CLI" in result.output
+    assert "0 inbound LLM requests" in result.output
+    assert "Node SDK" in result.output
+    assert captured["tool_label"] == "OPENCODE"
+    assert captured["args"] == ()
+
+
+def test_wrap_opencode_silent_when_node_sdk_detected(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No Go-CLI warning when the detector identifies the Node SDK runtime."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
+                with patch.object(wrap_mod, "detect_opencode_kind", return_value="node-sdk"):
+                    result = runner.invoke(main, ["wrap", "opencode", "--port", "9000", "--no-mcp"])
+
+    assert result.exit_code == 0, result.output
+    assert "Detected the OpenCode Go CLI" not in result.output
+    assert captured["tool_label"] == "OPENCODE"
+
+
+def test_wrap_opencode_silent_when_runtime_unknown(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the runtime cannot be probed, stay silent to avoid noisy false positives."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
+                with patch.object(wrap_mod, "detect_opencode_kind", return_value="unknown"):
+                    result = runner.invoke(main, ["wrap", "opencode", "--port", "9000", "--no-mcp"])
+
+    assert result.exit_code == 0, result.output
+    assert "Detected the OpenCode Go CLI" not in result.output
+    assert captured["tool_label"] == "OPENCODE"
+
+
+def test_wrap_opencode_unprobeable_binary_does_not_raise(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A probe failure does not escape _launch_opencode; launch continues with no diagnostic."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
+                with patch.object(wrap_mod, "detect_opencode_kind", return_value="unknown"):
+                    result = runner.invoke(main, ["wrap", "opencode", "--port", "9000", "--no-mcp"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["tool_label"] == "OPENCODE"
+
+
+def test_detect_opencode_kind_classifies_version_outputs() -> None:
+    """The version-probe classifier distinguishes Go CLI, Node SDK and unknown outputs."""
+    with patch.object(opencode_runtime_mod, "_probe_version_output", return_value="v1.16.2"):
+        assert detect_opencode_kind("opencode") == "go-cli"
+
+    with patch.object(
+        opencode_runtime_mod,
+        "_probe_version_output",
+        return_value="@opencode-ai/cli/1.16.2 linux-x64 node-v20.12.2",
+    ):
+        assert detect_opencode_kind("opencode") == "node-sdk"
+
+    with patch.object(opencode_runtime_mod, "_probe_version_output", return_value="some/odd output"):
+        assert detect_opencode_kind("opencode") == "unknown"
+
+    with patch.object(opencode_runtime_mod, "_probe_version_output", return_value=""):
+        assert detect_opencode_kind("opencode") == "unknown"
+
+
+def test_detect_opencode_kind_safe_on_missing_or_failing_binary() -> None:
+    """Detection never raises: missing/empty binary returns missing, probe errors return unknown."""
+    assert detect_opencode_kind(None) == "missing"
+    assert detect_opencode_kind("") == "missing"
+
+    with patch.object(opencode_runtime_mod, "_probe_version_output", return_value=""):
+        assert detect_opencode_kind("/does/not/exist") == "unknown"
 
 
 def test_wrap_opencode_missing_binary_errors_clearly(

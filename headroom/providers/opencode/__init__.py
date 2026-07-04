@@ -11,7 +11,12 @@ from .config import (
     strip_opencode_headroom_blocks,
 )
 from .install import apply_provider_scope, build_install_env, revert_provider_scope
-from .runtime import build_launch_env, build_opencode_config_content, proxy_base_url
+from .runtime import (
+    build_launch_env,
+    build_opencode_config_content,
+    detect_opencode_kind,
+    proxy_base_url,
+)
 
 __all__ = [
     "_MCP_MARKER_END",
@@ -22,6 +27,7 @@ __all__ = [
     "build_install_env",
     "build_launch_env",
     "build_opencode_config_content",
+    "detect_opencode_kind",
     "inject_opencode_provider_config",
     "opencode_config_paths",
     "proxy_base_url",

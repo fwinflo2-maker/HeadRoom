@@ -12,7 +12,7 @@ The fix:
 * Deletes the per-call inner ``ThreadPoolExecutor``.
 * Processes routed units serially inside the frame-level worker thread
   (``self._compression_executor`` already provides frame-level parallelism
-  via 32 workers sized ``min(32, cpu*4)``).
+  via the proxy-wide bounded executor).
 * Adds a ``PERF`` log emission from ``handle_openai_responses_ws`` so
   Codex traffic is no longer invisible to ``headroom perf``.
 
@@ -85,9 +85,8 @@ def test_no_per_call_threadpool_inside_compress_routed_units() -> None:
     source = OPENAI_HANDLER.read_text()
     assert "concurrent.futures.ThreadPoolExecutor" not in source, (
         "Per-call ThreadPoolExecutor reintroduced in handlers/openai.py. "
-        "Submit work to `self._compression_executor` (already 32-worker, "
-        "instrumented, lifecycle-managed) instead of creating a new pool "
-        "per frame."
+        "Submit work to `self._compression_executor` (instrumented and "
+        "lifecycle-managed) instead of creating a new pool per frame."
     )
 
 
@@ -214,7 +213,7 @@ async def test_codex_ws_emits_perf_log_with_cache_keys() -> None:
 # ``_compress_openai_responses_payload`` produced p99 per-call latency of
 # ~2.4s on a 12-CPU machine because of the 10-slot global semaphore. After
 # the fix, units run serially within the frame-level worker, but the
-# 32-worker frame pool lets 30 frames run in parallel without contention.
+# frame-level compression executor lets 30 frames run in parallel without contention.
 #
 # Pass criteria mirror docs/superpowers/specs/P2-codex-scheduler-fix.md
 # "Success criteria":

@@ -403,6 +403,9 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.post("/v1/messages")
     async def anthropic_messages(request: Request):
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base:
+            return await proxy.handle_anthropic_messages(request, custom_base.rstrip("/"))
         return await proxy.handle_anthropic_messages(request)
 
     # AWS Bedrock InvokeModel passthrough. Registered ONLY when an upstream is

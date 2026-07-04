@@ -9,10 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- Non-finite values (`NaN`, `Infinity`) in `proxy_savings.json` or in upstream
+  cost/token metadata no longer crash the proxy or corrupt the savings
+  dashboard. `SavingsTracker`'s numeric coercion caught only `TypeError` and
+  `ValueError`, so `int(float('inf'))` raised an uncaught `OverflowError` while
+  loading persisted state (`SavingsTracker.__init__` failed and the proxy would
+  not start), and `float('nan')`/`float('inf')` passed straight through, then
+  serialized to `NaN`/`Infinity` literals that the dashboard's `JSON.parse`
+  rejects. `json.loads` accepts those literals, so one bad write poisoned every
+  later start. Both coercion helpers now also catch `OverflowError` and reject
+  non-finite floats, failing open to safe defaults.
+- `headroom learn` now honors `CLAUDE_CONFIG_DIR`. It resolved the Claude
+  config directory as `~/.claude` and wrote global memory to
+  `~/.claude/CLAUDE.md`, so users who relocate their Claude config via that
+  env var had `learn` scan the wrong directory and detect no projects. The
+  scanner and memory writer now read/write the configured directory
+  ([#1630](https://github.com/headroomlabs-ai/headroom/issues/1630)).
+- `--backend bedrock` now fails fast with an actionable error when temporary
+  AWS credentials (`AWS_SESSION_TOKEN`) are used but botocore is not installed
+  (e.g. the slim default Docker image). litellm's session-token auth path
+  imports botocore, so the missing dependency previously surfaced only at
+  request time as a misleading `authentication_error: No module named
+  'botocore'`. The proxy now tells the user to install the `bedrock` extra up
+  front ([#1551](https://github.com/headroomlabs-ai/headroom/issues/1551)).
+- Content detection no longer crashes the proxy on text containing an
+  orphaned `+++ ` target line with no preceding `--- ` source line (common in
+  `set -x` xtrace output and partial diffs). The bundled `unidiff` 0.4.0 parser
+  panics on that input instead of returning an error; the Rust diff detector now
+  contains the panic and treats the fragment as plain text, so the request is
+  compressed and forwarded normally instead of returning HTTP 500
+  ([#1547](https://github.com/headroomlabs-ai/headroom/issues/1547)).
 - Proactive expansion blocks injected into user turns are now wrapped in
   `<headroom_proactive_expansion>` XML tags, giving downstream consumers
   (LLMs, loggers, attribution parsers) a machine-readable provenance
   boundary and preventing misattribution in multi-agent threads.
+- **cli:** the startup banner no longer advertises
+  `HEADROOM_COMPRESSION_STABLE_AFTER_TURN` and
+  `HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS` as tuning knobs. Both were read
+  only to render the `Performance Tuning` banner section and were never wired
+  into the compression path, so setting them changed the banner but had no
+  effect on behavior. The banner now surfaces only the embedding sidecar,
+  which is a real, consumed setting.
+- **memory/embedder:** cap CPU thread oversubscription in the local
+  torch/sentence-transformers embedder. Concurrent encodes previously each
+  fanned out to ~`os.cpu_count()` BLAS/OpenMP threads, so under load the memory
+  path starved the asyncio event loop and spiked `/livez` latency to several
+  seconds. CPU encodes now run on a dedicated, size-limited executor whose
+  workers each pin their thread pool, bounding total embedding threads to
+  `HEADROOM_EMBED_CONCURRENCY` × `HEADROOM_EMBED_NUM_THREADS` (defaults
+  `min(4, cpu)` × 1). The ONNX embedder already capped its threads; this brings
+  the torch path to parity
+  ([#198](https://github.com/headroomlabs-ai/headroom/issues/198)).
 
 ### Changed
 
@@ -37,9 +84,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 * **proxy:** forward Codex Desktop `/v1/responses` posts byte-faithfully so they stop returning upstream `400 {"detail":"Bad Request"}`. `handle_openai_responses` decoded the inbound body to inspect it but always re-serialized a canonical body on the way out, and it never stripped the inbound `content-encoding` header — so a `content-encoding: zstd` Codex Desktop request was forwarded as already-decoded JSON still advertising `zstd`, and the upstream ChatGPT Codex endpoint rejected it. The handler now keeps the original decoded bytes and forwards them verbatim whenever nothing (compression or memory injection) mutated the request, and drops the stale `content-encoding` header, mirroring the byte-faithful passthrough the chat and Anthropic paths already use ([#1542](https://github.com/headroomlabs-ai/headroom/issues/1542)).
+* **wrap/codex:** `headroom unwrap codex` now removes the Headroom rtk instruction block from the Codex global `AGENTS.md`. `wrap codex` injects it there, but unwrap only restored `config.toml` and MCP state, so a plain `codex` launch kept following the "prefix shell commands with `rtk`" guidance and failed once the managed rtk binary was off PATH. Unwrap now strips the marker-fenced block (preserving the rest of the file), mirroring `unwrap copilot` ([#1421](https://github.com/headroomlabs-ai/headroom/issues/1421)).
+* **proxy/auth:** classify real Anthropic OAuth tokens correctly. `classify_auth_mode` matched OAuth on the `sk-ant-oat-` prefix, but real access tokens are `sk-ant-oat01-...` (a version number, no dash after `oat`), so every real subscription/OAuth token fell through to the `sk-` branch and was tagged `PAYG` — enabling aggressive lossy compression, auto `cache_control`, and `prompt_cache_key` injection on subscription-bound requests the classifier is meant to route to the passthrough-prefer path. The prefix is now the dash-less `sk-ant-oat` (still matches the legacy dashed shape). The existing parity tests only passed because they used a synthetic `sk-ant-oat-01-` fixture; a regression test now covers the real `sk-ant-oat01-` format.
+* **install:** stop leaking a file descriptor on every `headroom install start`. `start_detached_agent()` opened the agent log file and handed it to `subprocess.Popen` but never closed the parent's copy, so each call leaked one fd (and pinned the log file open against rotation). The parent now closes its copy in a `try/finally` once the child has inherited it — the close also runs if `Popen` raises ([#1554](https://github.com/headroomlabs-ai/headroom/issues/1554)).
 * **proxy:** include the system prompt, tools, and the response-shaping request fields in the SemanticCache key. `_compute_key` hashed only `{model, messages}`, so two non-streaming requests with identical messages but a different top-level `system` prompt, tool set, sampling config, or output-shaping field collided on one key and the second caller was served the first's cached response — generated under different request semantics, in the default config (`cache_enabled` defaults on). The key now folds the request fields that shape generation — `temperature`/`top_p`/`top_k`/`max_tokens`/`stop`, plus OpenAI `tool_choice`/`response_format`/`parallel_tool_calls`/`seed`/`presence_penalty`/`frequency_penalty`/`logit_bias`/`n`/`logprobs`/`top_logprobs`/`reasoning_effort`/`verbosity`/`modalities` and Anthropic `thinking`/`tool_choice`/`output_config` — canonicalizing `system`/`tools` so a moved `cache_control` breakpoint does not fragment it, and the handlers snapshot the fields once at the cache read and reuse them at write so a body mutated by the pipeline cannot diverge the key. Non-streaming path only.
 * **learn (verbosity):** `--verbosity --apply --all` now aggregates the savings baseline across every project instead of overwriting it per project (last-project-wins), which previously left the output shaper with a tiny, unrepresentative baseline. The applied verbosity level comes from the project with the most samples ([#1288](https://github.com/headroomlabs-ai/headroom/pull/1288)).
 * **proxy/anthropic:** restore token-mode compression on continued Claude Code turns with a frozen prefix and deferred CCR tool injection. Token mode now runs request-side compression even when the client did not pre-register `headroom_retrieve`, relying on the existing marker-triggered injection override to keep emitted CCR markers redeemable ([#1487](https://github.com/headroomlabs-ai/headroom/issues/1487)).
+* **proxy:** the dedicated OpenAI handlers (`/v1/chat/completions`, `/v1/responses`) now honor the `x-headroom-base-url` request header, matching the generic passthrough route. Previously only the catch-all passthrough honored it, so OpenAI-compatible gateways (LiteLLM, CPA, self-hosted vLLM, Azure OpenAI) routed correctly for passthrough traffic but the dedicated chat/responses handlers ignored the header and fell back to the default `OPENAI_API_URL`, sending requests (and the user's provider key) to the wrong upstream.
 * **subscription:** stop zeroing the 5-hour headroom contribution counters on every poll. The rollover check compared `five_hour.resets_at` with a bare `!=`, but the usage API reports that timestamp with second-level jitter (observed flapping between `01:59:59Z` and `02:00:00Z` on consecutive polls within the same window), so a spurious "5h window rolled over" reset fired every poll interval (~5 min) and the dashboard's per-window savings stuck near 0%. Only a forward jump larger than `_ROLLOVER_MIN_ADVANCE` (1 minute) now counts as a real rollover.
 * **wrap:** keep the shared proxy alive when the agent that launched it closes *ungracefully* on Windows. `_start_proxy` spawned the proxy without detaching it, so it stayed in the launcher's console and Job object; closing that terminal window (or `taskkill`/a crash) tree-killed the proxy, bypassing the marker-based reference counting in `_make_cleanup` and breaking every other `headroom wrap` instance routed through the same port. The proxy is now created with `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB` (with a graceful fallback when the launcher's Job forbids breakaway); POSIX behavior is unchanged. `CREATE_NO_WINDOW` (rather than `DETACHED_PROCESS`) gives the proxy its own *hidden* console: `DETACHED_PROCESS` leaves a console-subsystem exe (`python.exe`) consoleless, so Windows surfaces a visible console window whose close button kills the proxy.
 * **transforms/content_router:** stop replacing `role="tool"` output with a lossy-unrecoverable summary on the live compression path (refs [#1307](https://github.com/chopratejas/headroom/issues/1307)). `ContentRouter.apply()` routed OpenAI-style `role="tool"` string messages — `Bash`/`grep`/`ls`/`cat` output — through the ML/word-drop summarizers; when the result carried no CCR retrieve marker (CCR off, ratio >= 0.8, or the size-gate fallback) the original was unrecoverable and the agent acted on a fabricated summary. Tool-role string content is now kept verbatim unless the compressed form is CCR-recoverable. Assistant/user text is unaffected, and structurally-lossless passes (SmartCrusher/Log/Search) still apply. The Anthropic `tool_result` block path is tracked separately.
@@ -51,6 +102,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **install:** stop duplicating the container ENTRYPOINT in the `persistent-docker` runtime command. The published image already runs `headroom proxy` as its ENTRYPOINT, but `build_runtime_command` re-added `headroom proxy` after the image name, so the container ran `headroom proxy headroom proxy --host 0.0.0.0 …` and Click aborted with "Got unexpected extra arguments (headroom proxy)" — the deployment never became ready and rollback left nothing running. The runtime command now appends only the proxy flags ([#833](https://github.com/chopratejas/headroom/issues/833)).
 * **proxy:** retry upstream `529 overloaded_error` like a 429 on both the streaming and non-streaming forwarders, honoring `Retry-After`. The streaming path previously surfaced a 529 straight to the client with no retry (interactive sessions saw "Overloaded" immediately), and `_retry_request` retried it only via the generic 5xx path — raising on exhaustion instead of returning the 529 verbatim, and ignoring `Retry-After`. A shared `RETRYABLE_OVERLOAD_STATUSES = {429, 529}` keeps the two forwarders in agreement (extends [#1221](https://github.com/headroomlabs-ai/headroom/issues/1221)).
 * **gemini:** run compression off the asyncio event loop. The Gemini handlers (`generateContent`, Cloud Code stream, `countTokens`) ran the CPU-bound compression pipeline (Magika detection plus ML compression) synchronously on the loop, stalling every concurrent request for the duration of each Gemini request's compression. They now offload it via the shared compression executor, matching the existing OpenAI and Anthropic paths.
+* **proxy:** run image compression off the asyncio event loop. The Anthropic and OpenAI handlers ran the CPU-bound image compressor (ONNX technique routing plus Pillow resize and OCR) synchronously on the loop, stalling every concurrent request for the duration of each image request's compression. They now offload it via the shared compression executor with a timeout and fail open on error, matching the existing text-compression path.
 * **proxy:** queue mid-turn user messages on non-Bedrock streaming path instead of silently dropping them — closes [#902](https://github.com/headroomlabs-ai/headroom/issues/902).
 * **proxy:** add `--protect-tool-results` / `HEADROOM_PROTECT_TOOL_RESULTS` to prevent lossy compression of exact-output tool results (e.g. `Bash cat`/`grep` results) — closes [#1307](https://github.com/headroomlabs-ai/headroom/issues/1307).
 * **cli:** add `--rpm`/`--tpm` and `HEADROOM_RPM`/`HEADROOM_TPM` to the Click proxy command for rate-limit parity with the legacy CLI -- closes [#1350](https://github.com/headroomlabs-ai/headroom/issues/1350) (Problem 1).
@@ -84,6 +136,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **langchain:** fix `HeadroomChatModel.ainvoke()` crashing with `AttributeError: 'AsyncStream' object has no attribute 'model_dump'` when the wrapped model has `streaming=True`. `_agenerate()` now uses a per-call non-streaming copy of the wrapped model instead of mutating shared state across an `await` ([#1285](https://github.com/headroomlabs-ai/headroom/issues/1285)).
 
 
+
+## [0.29.0](https://github.com/headroomlabs-ai/headroom/compare/v0.28.0...v0.29.0) (2026-07-03)
+
+
+### Features
+
+* **proxy:** add --lossless no-CCR mode with format-native compaction ([#1721](https://github.com/headroomlabs-ai/headroom/issues/1721)) ([c75ebde](https://github.com/headroomlabs-ai/headroom/commit/c75ebdee6df9b1689a44ef321e36e8b360406ed7))
+* **stats:** surface Codex WS compression counters in /stats summary ([#1680](https://github.com/headroomlabs-ai/headroom/issues/1680)) ([2fe19c3](https://github.com/headroomlabs-ai/headroom/commit/2fe19c39e40fc350af39f72e1a3bac28f9ce9874))
+* **transforms:** adaptive Otsu KEEP/DROP threshold (+ land relevance split on main) ([#1726](https://github.com/headroomlabs-ai/headroom/issues/1726)) ([eea667a](https://github.com/headroomlabs-ai/headroom/commit/eea667a72019cc98401db9211907f67ddf45e7eb))
+
+
+### Bug Fixes
+
+* **bedrock:** fail fast when session-token auth lacks botocore ([#1553](https://github.com/headroomlabs-ai/headroom/issues/1553)) ([54cfa36](https://github.com/headroomlabs-ai/headroom/commit/54cfa361d308dec567615c346af7c77d52ebb676))
+* **bedrock:** route ARNs via converse, named AWS profiles, and au. re… ([#1456](https://github.com/headroomlabs-ai/headroom/issues/1456)) ([7d87aa2](https://github.com/headroomlabs-ai/headroom/commit/7d87aa2f1cbd93c970a77c6dfec8df03603251b9))
+* **ccr:** honor workspace dir for sqlite store ([#1564](https://github.com/headroomlabs-ai/headroom/issues/1564)) ([96e1dfe](https://github.com/headroomlabs-ai/headroom/commit/96e1dfe395a440f9e2dddf4589c4f6988f4ee4cd))
+* **claude:** surface Remote Control proxy incompatibility ([#1610](https://github.com/headroomlabs-ai/headroom/issues/1610)) ([4bf7f92](https://github.com/headroomlabs-ai/headroom/commit/4bf7f92417a8799ab3ae5f61b7ea9e96c5605a4f))
+* **cli:** stop advertising unwired compression tuning env vars in banner ([#1634](https://github.com/headroomlabs-ai/headroom/issues/1634)) ([d5bf98d](https://github.com/headroomlabs-ai/headroom/commit/d5bf98df31528dfd6c23ec45dbd3440efcb1cb75))
+* **codex:** avoid duplicate headroom provider config ([#1431](https://github.com/headroomlabs-ai/headroom/issues/1431)) ([ddd4adf](https://github.com/headroomlabs-ai/headroom/commit/ddd4adf911ee2d7a5323657a771ea0162b5590c4))
+* **compression:** reject lossy unmarked tool output in unit router path ([#1479](https://github.com/headroomlabs-ai/headroom/issues/1479)) ([de24cd5](https://github.com/headroomlabs-ai/headroom/commit/de24cd5fc0b894037c0481b5394e6851e87b3993))
+* **cortex-code:** migrate to current Cortex REST API endpoints + add e2e benchmarks ([#1474](https://github.com/headroomlabs-ai/headroom/issues/1474)) ([f00ace6](https://github.com/headroomlabs-ai/headroom/commit/f00ace6da57aec2f68b833f42603ba3fda0f9110))
+* **dashboard:** align token savings headline denominator ([#1653](https://github.com/headroomlabs-ai/headroom/issues/1653)) ([646e705](https://github.com/headroomlabs-ai/headroom/commit/646e7055143638ac4a2bc9980649fd046cea7840))
+* **dashboard:** derive per-project setup URL from live origin ([#1511](https://github.com/headroomlabs-ai/headroom/issues/1511)) ([e035aef](https://github.com/headroomlabs-ai/headroom/commit/e035aefce23fd2e20afccf2659c1db613b05d8ca))
+* **detection:** contain unidiff panic on orphaned +++ target line ([#1548](https://github.com/headroomlabs-ai/headroom/issues/1548)) ([e386c09](https://github.com/headroomlabs-ai/headroom/commit/e386c097d6d507aa311ca3a22725b226e9d7b223))
+* **evals:** CJK-aware F1 tokenization + token estimation ([#1527](https://github.com/headroomlabs-ai/headroom/issues/1527)) ([99a8540](https://github.com/headroomlabs-ai/headroom/commit/99a8540e657445df3204f1d15e213262f4289a42))
+* **install:** close parent log fd in start_detached_agent ([#1576](https://github.com/headroomlabs-ai/headroom/issues/1576)) ([816cb85](https://github.com/headroomlabs-ai/headroom/commit/816cb85fa8ee8d349fe673e7affd9a54acb1207d))
+* **install:** use Windows-safe PID liveness probe in runtime_status ([#1544](https://github.com/headroomlabs-ai/headroom/issues/1544)) ([#1560](https://github.com/headroomlabs-ai/headroom/issues/1560)) ([6b227b9](https://github.com/headroomlabs-ai/headroom/commit/6b227b9c906d708923f39c0d877989a49942adae))
+* **learn:** aggregate verbosity baselines across projects instead of overwriting ([#1288](https://github.com/headroomlabs-ai/headroom/issues/1288)) ([27a5468](https://github.com/headroomlabs-ai/headroom/commit/27a546834960b349e710a0b2e86ca3471523f34d))
+* **mcp:** show lifetime totals and label rolling session scope in headroom_stats ([#1428](https://github.com/headroomlabs-ai/headroom/issues/1428)) ([1c0e152](https://github.com/headroomlabs-ai/headroom/commit/1c0e15243eda8f2dc868fe9ed4a08d944893686b))
+* **memory:** cap local embedder CPU thread oversubscription ([#198](https://github.com/headroomlabs-ai/headroom/issues/198)) ([#1559](https://github.com/headroomlabs-ai/headroom/issues/1559)) ([b84afbf](https://github.com/headroomlabs-ai/headroom/commit/b84afbfb833999ddf164d324971bf6c11014a9d3))
+* **memory:** singleflight LocalBackend init to stop cold-start races ([#1691](https://github.com/headroomlabs-ai/headroom/issues/1691)) ([bec47a1](https://github.com/headroomlabs-ai/headroom/commit/bec47a1898883919ad8c5ea41e3a7443a6890e7f))
+* **openclaw:** detect uv-installed headroom binary in ~/.local/bin ([#1459](https://github.com/headroomlabs-ai/headroom/issues/1459)) ([adaeb88](https://github.com/headroomlabs-ai/headroom/commit/adaeb88a4d5512da5bd0bf58c1e3a276a5269d44))
+* **opencode:** preserve custom OpenAI gateway paths ([#1596](https://github.com/headroomlabs-ai/headroom/issues/1596)) ([c19347c](https://github.com/headroomlabs-ai/headroom/commit/c19347c31046bf25baf9b1a816c9bede5d3ee807))
+* **opencode:** route native providers + load transport plugin, fix Serena context ([#1573](https://github.com/headroomlabs-ai/headroom/issues/1573)) ([ad0034f](https://github.com/headroomlabs-ai/headroom/commit/ad0034f98191501c1a60d26383bc3ed9f6d532be))
+* preserve anthropic passthrough tool order ([#1427](https://github.com/headroomlabs-ai/headroom/issues/1427)) ([a932247](https://github.com/headroomlabs-ai/headroom/commit/a9322477e33ec2c5ccd6442d3f72c17b7388c9e0))
+* **proxy/auth:** match real Anthropic OAuth token prefix (sk-ant-oat) ([#1672](https://github.com/headroomlabs-ai/headroom/issues/1672)) ([8cddf9b](https://github.com/headroomlabs-ai/headroom/commit/8cddf9b58ea9ed11a0cd3532be6e779dffe57b55))
+* **proxy:** expose persistent savings metrics ([#1647](https://github.com/headroomlabs-ai/headroom/issues/1647)) ([5fe4e7b](https://github.com/headroomlabs-ai/headroom/commit/5fe4e7b19530da0c2d07d17f20b18d79b6fab367))
+* **proxy:** fail open when kompress saturation would exhaust pre-upstream budget ([#1430](https://github.com/headroomlabs-ai/headroom/issues/1430)) ([15ac650](https://github.com/headroomlabs-ai/headroom/commit/15ac650d409ea7def9e54d9962af1cfdc1f11f5d))
+* **proxy:** handle streaming CCR retrieval ([#1451](https://github.com/headroomlabs-ai/headroom/issues/1451)) ([d337e3b](https://github.com/headroomlabs-ai/headroom/commit/d337e3b828ffc1f22cd5ca1884500b8905e9bd82))
+* **proxy:** include system/tools/sampling in cache key ([#1473](https://github.com/headroomlabs-ai/headroom/issues/1473)) ([312129a](https://github.com/headroomlabs-ai/headroom/commit/312129a8e7465c97402ae45b9e9d51b7f4b5b0c7))
+* **proxy:** preserve Responses passthrough bytes ([#1598](https://github.com/headroomlabs-ai/headroom/issues/1598)) ([2a34a82](https://github.com/headroomlabs-ai/headroom/commit/2a34a822f2a39da57fbd07575752888f5515f51a))
+* **proxy:** strip Codex lite header on the HTTP /responses path ([#1663](https://github.com/headroomlabs-ai/headroom/issues/1663)) ([9fbd47b](https://github.com/headroomlabs-ai/headroom/commit/9fbd47ba6bdf38b618795541ee517b7e2fa2c6df))
+* **proxy:** wire --compression-max-workers / HEADROOM_COMPRESSION_MAX_WORKERS ([#1632](https://github.com/headroomlabs-ai/headroom/issues/1632)) ([814ffa3](https://github.com/headroomlabs-ai/headroom/commit/814ffa36a4d1bb40165a630f96a855452037735e))
+* **savings:** count cache-read tokens in input cost estimate ([#1429](https://github.com/headroomlabs-ai/headroom/issues/1429)) ([72ade37](https://github.com/headroomlabs-ai/headroom/commit/72ade3711211183b9134a46d9c5d45db6a87edc2))
+* skip Magika backend on x86 CPUs without AVX2 ([#1162](https://github.com/headroomlabs-ai/headroom/issues/1162)) ([64783d8](https://github.com/headroomlabs-ai/headroom/commit/64783d8824e3c3afc43d9980573d9440693d0963))
+* **transforms/content-router:** route grep/log output away from HTML extractor ([#1719](https://github.com/headroomlabs-ai/headroom/issues/1719)) ([0d18ef2](https://github.com/headroomlabs-ai/headroom/commit/0d18ef26f4d126f8eec9df1d34330a7129c4c63f))
+* **transforms:** bound native content detection with a Windows watchdog ([#575](https://github.com/headroomlabs-ai/headroom/issues/575)) ([#1563](https://github.com/headroomlabs-ai/headroom/issues/1563)) ([95abca3](https://github.com/headroomlabs-ai/headroom/commit/95abca3abd69add5f075d241284b565e0014d5a4))
+* Vertex AI support for Claude Code with ANTHROPIC_VERTEX_BASE_URL ([#1393](https://github.com/headroomlabs-ai/headroom/issues/1393)) ([cff7247](https://github.com/headroomlabs-ai/headroom/commit/cff7247efd6fbecc1c2e66280a4a9b6381d7b7a4))
+* **wrap:** detach the shared proxy on Windows so it survives an ungraceful agent close ([#1464](https://github.com/headroomlabs-ai/headroom/issues/1464)) ([6cba441](https://github.com/headroomlabs-ai/headroom/commit/6cba4419d04bea79c1b44632a9288cde5b48bbce))
+* **wrap:** preserve custom Vertex base URL ([#1477](https://github.com/headroomlabs-ai/headroom/issues/1477)) ([75427bb](https://github.com/headroomlabs-ai/headroom/commit/75427bbd4ad14fcb1b205f3253ec4e24ae1d2118))
+* **wrap:** remove rtk instructions from Codex AGENTS.md on unwrap ([#1604](https://github.com/headroomlabs-ai/headroom/issues/1604)) ([c9d717c](https://github.com/headroomlabs-ai/headroom/commit/c9d717c13c7ae006178e49b6570f63b3f82de9a2))
 
 ## [0.28.0](https://github.com/headroomlabs-ai/headroom/compare/v0.27.0...v0.28.0) (2026-06-29)
 

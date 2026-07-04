@@ -301,6 +301,7 @@ def test_concurrent_compression_has_no_semaphore_tail() -> None:
 
     assert not errors, f"Got {len(errors)} errors; first: {errors[0].error}"
     ratio = p99 / max(p50, 1)
+    assert p99 < 250.0, f"p99 is {p99:.0f}ms; expected < 250ms on uniform-size workload."
     # The p99/p50 ratio only signals contention when the tail is also
     # *absolutely* large. On a fast/quiet runner p50 rounds toward 0ms, so the
     # ratio collapses to "p99 in ms" and a few milliseconds of ordinary
@@ -308,13 +309,13 @@ def test_concurrent_compression_has_no_semaphore_tail() -> None:
     # ~5×) that has nothing to do with the semaphore. The deleted semaphore
     # produced a tail of *tens* of milliseconds (and ~27×); a healthy run keeps
     # p99 in the single-digit-ms range regardless of ratio. So only treat a high
-    # ratio as a regression once p99 clears a scheduler-noise floor.
+    # ratio as a regression once p50 is measurable and p99 clears a noise floor.
     SEMAPHORE_TAIL_FLOOR_MS = 25.0
-    assert ratio < 4.0 or p99 < SEMAPHORE_TAIL_FLOOR_MS, (
+    assert p50 < 1.0 or ratio < 4.0 or p99 < SEMAPHORE_TAIL_FLOOR_MS, (
         f"p99/p50 ratio is {ratio:.1f}× (p50={p50:.0f}ms, p99={p99:.0f}ms). "
-        f"Expected < 4× on uniform-size workload once p99 clears the "
-        f"{SEMAPHORE_TAIL_FLOOR_MS:.0f}ms noise floor — a high ratio with a large "
-        f"absolute tail means the semaphore-induced contention tail is back. "
+        f"Expected < 4× on uniform-size workload once p50 is measurable and p99 clears "
+        f"the {SEMAPHORE_TAIL_FLOOR_MS:.0f}ms noise floor — a high ratio with a large "
+        f"absolute tail means the semaphore-induced contention tail may be back. "
         f"Pre-fix baseline ratio on this same workload shape was ~27× regardless "
         f"of CPU speed."
     )

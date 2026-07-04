@@ -210,6 +210,8 @@ class AnchorConfig:
 # Read/Glob/Grep contain exact file contents/search results the agent needs for edits.
 # Write/Edit record what changes were made — compressing them causes duplicate/conflicting edits.
 # Bash is NOT excluded — its outputs (build logs, test output) are ideal compression targets.
+# To protect Bash or other non-excluded tools from lossy compression, use
+# HEADROOM_PROTECT_TOOL_RESULTS=Bash or --protect-tool-results Bash.
 DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
     {
         "Read",
@@ -428,6 +430,14 @@ class SmartCrusherConfig:
     # transforms-level dataclass.
     lossless_min_savings_ratio: float = 0.15
 
+    # Strict lossless mode. When True, lossless tabular compaction still
+    # applies, but any path that would emit a CCR marker (lossy row-drop
+    # OR opaque-blob offload) leaves the content uncompacted instead, so
+    # the output is always marker-free and byte-recoverable. Mirrors the
+    # Rust default. See also `CCRConfig` — with this on, no `<<ccr:…>>`
+    # markers are produced regardless of CCR settings.
+    lossless_only: bool = False
+
     # Compaction heuristics (mirror Rust CompactConfig). A field is "core"
     # if present in at least this fraction of rows; arrays whose key sets
     # are mostly non-core are bucketed by a discriminator instead.
@@ -478,7 +488,7 @@ class CCRConfig:
     1. COMPRESS: SmartCrusher compresses array from 1000 to 20 items
     2. CACHE: Original 1000 items stored in CompressionStore
     3. INJECT: Marker added to tell LLM how to retrieve more
-    4. RETRIEVE: If LLM needs more, it calls headroom_retrieve(hash, query)
+    4. RETRIEVE: If LLM needs more, it calls headroom_retrieve(hash) to get the full original back
 
     Benefits:
     - Zero-risk compression: worst case = LLM retrieves what it needs

@@ -63,6 +63,53 @@ def test_agent_90_profile_exports_cross_agent_proxy_env() -> None:
     assert env["HEADROOM_ACCURACY_GUARD"] == "strict"
 
 
+def test_coding_persona_protects_working_set_and_stays_visible() -> None:
+    profile = get_agent_savings_profile("coding")
+
+    env = profile.proxy_env()
+
+    assert env["HEADROOM_SAVINGS_PROFILE"] == "coding"
+    assert env["HEADROOM_PROTECT_RECENT"] == "2"  # keep the active code working set verbatim
+    assert env["HEADROOM_MIN_TOKENS"] == "25"  # low → compression is actually visible
+    assert env["HEADROOM_COMPRESS_USER_MESSAGES"] == "0"  # no prompt mutation / cache bust
+    assert env["HEADROOM_COMPRESS_SYSTEM_MESSAGES"] == "0"
+    assert env["HEADROOM_ACCURACY_GUARD"] == "strict"
+    assert "HEADROOM_TARGET_RATIO" not in env  # unset → Kompress / ambient default decides
+
+
+def test_general_persona_has_no_positional_code_protection() -> None:
+    profile = get_agent_savings_profile("general")
+
+    env = profile.proxy_env()
+
+    assert env["HEADROOM_PROTECT_RECENT"] == "0"
+    assert env["HEADROOM_MIN_TOKENS"] == "25"
+    assert "HEADROOM_TARGET_RATIO" not in env
+
+
+def test_personas_omit_target_ratio_in_pipeline_kwargs() -> None:
+    for name, expected_protect in (("coding", 2), ("general", 0)):
+        kwargs = proxy_pipeline_kwargs(ProxyConfig(savings_profile=name))
+
+        assert kwargs["protect_recent"] == expected_protect
+        assert kwargs["read_protection_window"] == expected_protect
+        assert kwargs["min_tokens_to_compress"] == 25
+        assert kwargs["compress_user_messages"] is False
+        assert kwargs["compress_system_messages"] is False
+        assert kwargs["force_kompress"] is False
+        assert "target_ratio" not in kwargs  # persona never pins a keep-ratio
+
+
+def test_persona_apply_profile_leaves_target_ratio_untouched() -> None:
+    cfg = CompressConfig(target_ratio=0.42)
+
+    apply_agent_savings_profile(cfg, "coding")
+
+    assert cfg.protect_recent == 2
+    assert cfg.min_tokens_to_compress == 25
+    assert cfg.target_ratio == 0.42  # persona did not override an explicit ratio
+
+
 def test_agent_savings_env_defaults_preserve_user_overrides() -> None:
     env = {
         "HEADROOM_TARGET_RATIO": "0.25",
@@ -356,6 +403,29 @@ def test_agent_90_router_uses_ccr_sampling_not_lossless_table() -> None:
     assert crusher is not None
     assert crusher.config.max_items_after_crush == 8
     assert crusher._with_compaction is False
+
+
+def test_router_lossless_only_flag_reaches_crusher() -> None:
+    # HEADROOM_LOSSLESS_ONLY=1 sets this field on the proxy router; it
+    # must flow through to the SmartCrusher so a real proxy session runs
+    # strict marker-free mode.
+    router = ContentRouter(ContentRouterConfig(smart_crusher_lossless_only=True))
+
+    crusher = router._get_smart_crusher()
+
+    assert crusher is not None
+    assert crusher._lossless_only is True
+
+
+def test_router_lossless_only_defaults_off() -> None:
+    # Unset (None) must not force the flag — default crushers stay in
+    # the marker-emitting mode.
+    router = ContentRouter(ContentRouterConfig())
+
+    crusher = router._get_smart_crusher()
+
+    assert crusher is not None
+    assert crusher._lossless_only is False
 
 
 def test_agent_90_router_json_tool_output_reaches_target_with_needle() -> None:

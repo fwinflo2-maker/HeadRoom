@@ -137,15 +137,16 @@ def build_launch_env(
 
 _OPENCODE_VERSION_TIMEOUT = 2
 
-# Go CLI builds (e.g. opencode v1.16.2) print a short standalone SemVer line
-# such as "v1.16.2" or "1.17.13". The Node SDK (verified against oclif-style
-# output) usually exposes Node/npm metadata like "node-v20.12.2" or
-# "@opencode-ai/cli". The heuristic is intentionally conservative: we only
-# classify "go-cli" when the output looks like a simple version string and
-# carries no Node/npm markers. If a future Go CLI changes its output, callers
-# should update this classifier or short-circuit via monkeypatching in tests.
-_RE_SIMPLE_VERSION = re.compile(
-    r"^(v?\d+\.\d+\.\d+(?:[-+.]?[A-Za-z0-9-]+)*)$",
+# Go CLI builds (e.g. opencode v1.16.2) may print a bare SemVer ("v1.16.2")
+# or a cobra-style line ("opencode version v1.16.2"). The Node SDK (oclif)
+# surfaces Node/npm metadata ("node-v20.12.2", "@opencode-ai/cli"). We search
+# for a SemVer token anywhere in the first line, but only after excluding
+# Node/npm markers — the exclusion-first ordering prevents false-positives
+# when a Node-SDK output also contains a SemVer (e.g.
+# "@opencode-ai/cli/1.16.2 ... node-v20.12.2" has both, but the "node" marker
+# routes it to "node-sdk" before the SemVer check runs).
+_RE_VERSION_TOKEN = re.compile(
+    r"v?\d+\.\d+\.\d+(?:[-+.]?[A-Za-z0-9-]+)*",
     re.IGNORECASE,
 )
 
@@ -160,7 +161,7 @@ def _probe_version_output(binary: str) -> str:
             timeout=_OPENCODE_VERSION_TIMEOUT,
             check=False,
         )
-    except Exception:  # pragma: no cover - defensive timeout/filesystem safety
+    except Exception:  # defensive: TimeoutExpired, FileNotFoundError, PermissionError
         return ""
     return f"{result.stdout or ''}{result.stderr or ''}".strip()
 
@@ -176,7 +177,7 @@ def _classify_version_output(output: str) -> str:
         return "node-sdk"
 
     first_line = output.splitlines()[0].strip()
-    if _RE_SIMPLE_VERSION.match(first_line):
+    if _RE_VERSION_TOKEN.search(first_line):
         return "go-cli"
 
     return "unknown"

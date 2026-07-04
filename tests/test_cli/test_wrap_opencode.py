@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -216,6 +217,20 @@ def test_detect_opencode_kind_classifies_version_outputs() -> None:
     with patch.object(
         opencode_runtime_mod,
         "_probe_version_output",
+        return_value="opencode version v1.16.2\n",
+    ):
+        assert detect_opencode_kind("opencode") == "go-cli"
+
+    with patch.object(
+        opencode_runtime_mod,
+        "_probe_version_output",
+        return_value="opencode v1.16.2 (Go binary)",
+    ):
+        assert detect_opencode_kind("opencode") == "go-cli"
+
+    with patch.object(
+        opencode_runtime_mod,
+        "_probe_version_output",
         return_value="@opencode-ai/cli/1.16.2 linux-x64 node-v20.12.2",
     ):
         assert detect_opencode_kind("opencode") == "node-sdk"
@@ -234,6 +249,30 @@ def test_detect_opencode_kind_safe_on_missing_or_failing_binary() -> None:
 
     with patch.object(opencode_runtime_mod, "_probe_version_output", return_value=""):
         assert detect_opencode_kind("/does/not/exist") == "unknown"
+
+
+def test_probe_version_output_catches_real_subprocess_errors() -> None:
+    """The never-raises safety net catches real subprocess exceptions (F2)."""
+    with patch.object(
+        opencode_runtime_mod.subprocess,
+        "run",
+        side_effect=subprocess.TimeoutExpired(cmd="opencode --version", timeout=2),
+    ):
+        assert opencode_runtime_mod._probe_version_output("opencode") == ""
+
+    with patch.object(
+        opencode_runtime_mod.subprocess,
+        "run",
+        side_effect=FileNotFoundError,
+    ):
+        assert opencode_runtime_mod._probe_version_output("/no/such/opencode") == ""
+
+    with patch.object(
+        opencode_runtime_mod.subprocess,
+        "run",
+        side_effect=PermissionError,
+    ):
+        assert detect_opencode_kind("/restricted/opencode") == "unknown"
 
 
 def test_wrap_opencode_missing_binary_errors_clearly(

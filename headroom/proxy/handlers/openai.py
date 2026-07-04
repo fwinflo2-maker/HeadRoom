@@ -44,8 +44,13 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
-from headroom.copilot_auth import apply_copilot_api_auth, build_copilot_upstream_url
+from headroom.copilot_auth import (
+    apply_copilot_api_auth,
+    build_copilot_upstream_url,
+    is_copilot_api_url,
+)
 from headroom.pipeline import PipelineStage, summarize_routing_markers
+from headroom.providers.copilot import model_prefers_responses_api
 from headroom.proxy.auth_mode import (
     classify_auth_mode,
     classify_client,
@@ -121,6 +126,14 @@ def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None
     if urlparse(normalized).scheme not in {"http", "https"}:
         return None
     return normalized
+
+
+def _resolve_openai_chat_handler_path(base_url: str, model: str | None) -> str:
+    """Return the upstream path suffix for an OpenAI chat-completions request."""
+
+    if is_copilot_api_url(base_url) and model_prefers_responses_api(model):
+        return _OPENAI_RESPONSES_PATH
+    return _OPENAI_CHAT_COMPLETIONS_PATH
 
 
 def _append_request_query(url: str, query: str) -> str:
@@ -793,8 +806,7 @@ class OpenAIHandlerMixin:
         not just the generic passthrough route that already honors it. Falls
         back to the configured ``OPENAI_API_URL`` (``OPENAI_TARGET_API_URL``).
         """
-        custom = request.headers.get("x-headroom-base-url", "").strip()
-        return custom or self.OPENAI_API_URL
+        return _resolve_openai_upstream_base(request.headers) or self.OPENAI_API_URL
 
     @staticmethod
     def _strict_previous_turn_frozen_count(
@@ -1723,6 +1735,17 @@ class OpenAIHandlerMixin:
         model = body.get("model", "unknown")
         messages = body.get("messages", [])
         original_client_messages = copy.deepcopy(messages)
+        custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
+        upstream_base_url = self._resolve_openai_upstream(request)
+        handler_path_suffix = _resolve_openai_chat_handler_path(
+            upstream_base_url,
+            model,
+        )
+        handler_path = (
+            _resolve_openai_handler_path(request.headers, handler_path=handler_path_suffix)
+            if custom_upstream_base_url is not None
+            else f"/v1{handler_path_suffix}"
+        )
         input_event = self.pipeline_extensions.emit(
             PipelineStage.INPUT_RECEIVED,
             operation="proxy.request",
@@ -1731,7 +1754,7 @@ class OpenAIHandlerMixin:
             model=model,
             messages=messages,
             tools=body.get("tools"),
-            metadata={"path": "/v1/chat/completions", "stream": body.get("stream", False)},
+            metadata={"path": handler_path, "stream": body.get("stream", False)},
         )
         if input_event.messages is not None:
             messages = input_event.messages
@@ -1924,7 +1947,7 @@ class OpenAIHandlerMixin:
                     provider="openai",
                     model=model,
                     messages=messages,
-                    metadata={"cache_hit": True, "path": "/v1/chat/completions"},
+                    metadata={"cache_hit": True, "path": handler_path},
                 )
                 # Response-cache hit: same pattern as the anthropic
                 # cache-hit site. ``from_response_cache=True`` is the
@@ -2369,7 +2392,7 @@ class OpenAIHandlerMixin:
             messages=optimized_messages,
             tools=tools,
             headers=headers,
-            metadata={"path": "/v1/chat/completions", "stream": stream},
+            metadata={"path": handler_path, "stream": stream},
         )
         if presend_event.messages is not None:
             optimized_messages = presend_event.messages
@@ -2394,7 +2417,7 @@ class OpenAIHandlerMixin:
                         model=model,
                         messages=body["messages"],
                         tools=tools,
-                        metadata={"path": "/v1/chat/completions", "stream": True},
+                        metadata={"path": handler_path, "stream": True},
                     )
                     # Streaming: use stream_openai_message() → SSE events
                     return await self._stream_openai_via_backend(
@@ -2429,7 +2452,7 @@ class OpenAIHandlerMixin:
                         tools=tools,
                         response=backend_response.body,
                         metadata={
-                            "path": "/v1/chat/completions",
+                            "path": handler_path,
                             "stream": False,
                             "status_code": backend_response.status_code,
                         },
@@ -2442,7 +2465,7 @@ class OpenAIHandlerMixin:
                         model=model,
                         response=backend_response.body,
                         metadata={
-                            "path": "/v1/chat/completions",
+                            "path": handler_path,
                             "stream": False,
                             "status_code": backend_response.status_code,
                         },
@@ -2622,18 +2645,7 @@ class OpenAIHandlerMixin:
                 )
 
         # Direct OpenAI API (no backend configured)
-        upstream_base_url = _resolve_openai_upstream_base(request.headers)
-        handler_path = (
-            _resolve_openai_handler_path(
-                request.headers, handler_path=_OPENAI_CHAT_COMPLETIONS_PATH
-            )
-            if upstream_base_url is not None
-            else "/v1/chat/completions"
-        )
-        url = build_copilot_upstream_url(
-            upstream_base_url or self.OPENAI_API_URL,
-            handler_path,
-        )
+        url = build_copilot_upstream_url(upstream_base_url, handler_path)
         url = _append_request_query(url, request.url.query)
 
         try:
@@ -2653,7 +2665,7 @@ class OpenAIHandlerMixin:
                     model=model,
                     messages=body["messages"],
                     tools=tools,
-                    metadata={"path": "/v1/chat/completions", "stream": True},
+                    metadata={"path": handler_path, "stream": True},
                 )
                 return await self._stream_response(
                     url,
@@ -2684,7 +2696,7 @@ class OpenAIHandlerMixin:
                     tools=tools,
                     response=response,
                     metadata={
-                        "path": "/v1/chat/completions",
+                        "path": handler_path,
                         "stream": False,
                         "status_code": response.status_code,
                     },
@@ -2697,7 +2709,7 @@ class OpenAIHandlerMixin:
                     model=model,
                     response=response,
                     metadata={
-                        "path": "/v1/chat/completions",
+                        "path": handler_path,
                         "stream": False,
                         "status_code": response.status_code,
                     },

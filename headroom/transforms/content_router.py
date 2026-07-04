@@ -59,7 +59,13 @@ from ..config import (
 from ..parser import CCR_RETRIEVAL_MARKER_RE
 from ..tokenizer import Tokenizer
 from .base import Transform
-from .content_detector import ContentType, DetectionResult, _try_detect_log, _try_detect_search
+from .content_detector import (
+    ContentType,
+    DetectionResult,
+    _try_detect_log,
+    _try_detect_search,
+    _try_detect_structured_config,
+)
 from .content_detector import detect_content_type as _regex_detect_content_type
 from .error_detection import content_has_strong_error_indicators
 from .relevance_split import build_relevance_query, plan_relevance_split
@@ -87,7 +93,7 @@ def _tool_call_args_text(raw: Any) -> str:
     if isinstance(raw, str):
         text = raw
     elif isinstance(raw, dict):
-        text = " ".join(str(v) for v in raw.values() if isinstance(v, (str, int, float, bool)))
+        text = " ".join(str(v) for v in raw.values() if isinstance(v, str | int | float | bool))
     else:
         return ""
     return " ".join(text.split())[:300]
@@ -419,6 +425,15 @@ def _detect_content(content: str) -> DetectionResult:
         if override is not None:
             return override
 
+    # Config misroute guard (native/magika path): magika classifies YAML/TOML/
+    # INI as SourceCode, which routes to the (default-disabled) code path and
+    # degrades to prose compression. When the structural config detector
+    # positively claims the payload, trust it over the SourceCode verdict.
+    if content_type is ContentType.SOURCE_CODE:
+        config_override = _try_detect_structured_config(content)
+        if config_override is not None and config_override.confidence >= 0.7:
+            return config_override
+
     if content_type is ContentType.PLAIN_TEXT:
         regex_result = _regex_detect_content_type(content)
         if regex_result.content_type is not ContentType.PLAIN_TEXT:
@@ -721,6 +736,7 @@ class CompressionStrategy(Enum):
     DIFF = "diff"
     HTML = "html"
     TABULAR = "tabular"
+    CONFIG = "config"
     MIXED = "mixed"
     PASSTHROUGH = "passthrough"
 
@@ -842,6 +858,7 @@ class ContentRouterConfig:
         enable_search_compressor: Enable search result compression.
         enable_log_compressor: Enable build/test log compression.
         enable_tabular_compressor: Enable CSV/TSV/markdown-table compression.
+        enable_config_compressor: Enable YAML/TOML/INI config compression.
         enable_image_optimizer: Enable image token optimization.
         prefer_code_aware_for_code: Use CodeAware over Kompress for code.
         min_section_tokens: Minimum tokens for a section to compress.
@@ -858,6 +875,7 @@ class ContentRouterConfig:
     enable_search_compressor: bool = True
     enable_log_compressor: bool = True
     enable_tabular_compressor: bool = True  # CSV/TSV/markdown tables via SmartCrusher
+    enable_config_compressor: bool = True  # YAML/TOML/INI structural compression
     enable_html_extractor: bool = True  # HTML content extraction
     enable_image_optimizer: bool = True  # Image token optimization
 
@@ -1286,6 +1304,7 @@ class ContentRouter(Transform):
         self._diff_compressor: Any = None
         self._html_extractor: Any = None
         self._tabular_compressor: Any = None
+        self._config_compressor: Any = None
         self._kompress: Any = None
         # Stage B relevance split (lazy; None until first use, sentinel-checked
         # via _relevance_scorer_tried so a failed load isn't retried per call).
@@ -1617,6 +1636,7 @@ class ContentRouter(Transform):
             ContentType.GIT_DIFF: CompressionStrategy.DIFF,
             ContentType.HTML: CompressionStrategy.HTML,
             ContentType.TABULAR: CompressionStrategy.TABULAR,
+            ContentType.STRUCTURED_CONFIG: CompressionStrategy.CONFIG,
             ContentType.PLAIN_TEXT: CompressionStrategy.TEXT,
         }
 
@@ -1815,6 +1835,7 @@ class ContentRouter(Transform):
             CompressionStrategy.LOG,
             CompressionStrategy.SEARCH,
             CompressionStrategy.DIFF,
+            CompressionStrategy.CONFIG,
         ):
             from headroom.transforms.lossless_compaction import compact_lossless
 
@@ -1822,6 +1843,7 @@ class ContentRouter(Transform):
                 CompressionStrategy.LOG: "log",
                 CompressionStrategy.SEARCH: "search",
                 CompressionStrategy.DIFF: "diff",
+                CompressionStrategy.CONFIG: "config",
             }[strategy]
             try:
                 compacted = compact_lossless(content, kind)
@@ -1906,6 +1928,18 @@ class ContentRouter(Transform):
                         )
                         decision_reason = "tabular_compressor"
 
+            elif strategy == CompressionStrategy.CONFIG:
+                if self.config.enable_config_compressor:
+                    compressor = self._get_config_compressor()
+                    if compressor:
+                        compressor_name = type(compressor).__name__
+                        result = compressor.compress(content, context=context, bias=bias)
+                        compressed, compressed_tokens = (
+                            result.compressed,
+                            len(result.compressed.split()),
+                        )
+                        decision_reason = "config_compressor"
+
             elif strategy == CompressionStrategy.DIFF:
                 compressor = self._get_diff_compressor()
                 if compressor:
@@ -1957,6 +1991,7 @@ class ContentRouter(Transform):
                 CompressionStrategy.SMART_CRUSHER,
                 CompressionStrategy.CODE_AWARE,
                 CompressionStrategy.TABULAR,
+                CompressionStrategy.CONFIG,
             }
             fallback_no_savings = compressed == content or compressed_tokens >= original_tokens
             if fallback_eligible_strategy and fallback_no_savings:
@@ -2187,6 +2222,7 @@ class ContentRouter(Transform):
             ContentType.GIT_DIFF: CompressionStrategy.DIFF,
             ContentType.HTML: CompressionStrategy.HTML,
             ContentType.TABULAR: CompressionStrategy.TABULAR,
+            ContentType.STRUCTURED_CONFIG: CompressionStrategy.CONFIG,
             ContentType.PLAIN_TEXT: CompressionStrategy.TEXT,
         }
         return mapping.get(content_type, self.config.fallback_strategy)
@@ -2201,6 +2237,7 @@ class ContentRouter(Transform):
             CompressionStrategy.DIFF: ContentType.GIT_DIFF,
             CompressionStrategy.HTML: ContentType.HTML,
             CompressionStrategy.TABULAR: ContentType.TABULAR,
+            CompressionStrategy.CONFIG: ContentType.STRUCTURED_CONFIG,
             CompressionStrategy.TEXT: ContentType.PLAIN_TEXT,
             CompressionStrategy.KOMPRESS: ContentType.PLAIN_TEXT,
             CompressionStrategy.PASSTHROUGH: ContentType.PLAIN_TEXT,
@@ -2424,6 +2461,19 @@ class ContentRouter(Transform):
             except ImportError:  # pragma: no cover - defensive; tabular_ingest is pure stdlib
                 logger.debug("TabularCompressor not available")
         return self._tabular_compressor
+
+    def _get_config_compressor(self) -> Any:
+        """Get ConfigCompressor (lazy load)."""
+        if self._config_compressor is None:
+            try:
+                from .config_compressor import ConfigCompressor, ConfigCompressorConfig
+
+                self._config_compressor = ConfigCompressor(
+                    ConfigCompressorConfig(enable_ccr=self.config.ccr_inject_marker)
+                )
+            except ImportError:  # pragma: no cover - defensive; module is pure stdlib
+                logger.debug("ConfigCompressor not available")
+        return self._config_compressor
 
     def _get_diff_compressor(self) -> Any:
         """Get DiffCompressor (lazy load). Rust-only — Python implementation

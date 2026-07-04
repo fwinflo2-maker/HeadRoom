@@ -173,6 +173,26 @@ def _read_pid(profile: str) -> int | None:
         return None
 
 
+def _pid_alive(pid: int) -> bool:
+    """Return True if ``pid`` names a live process."""
+
+    if pid <= 0:
+        return False
+    try:
+        import psutil
+
+        return bool(psutil.pid_exists(pid))
+    except Exception:
+        pass
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (ProcessLookupError, OSError, SystemError):
+        return False
+    return True
+
+
 def _clear_pid(profile: str) -> None:
     path = pid_path(profile)
     if path.exists():

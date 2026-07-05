@@ -444,3 +444,37 @@ Phase 3完了時の運用ルール反映と同じく、以下の流れで進め�
 - 全体testで既知失敗がある場合は、失敗名・原因・今回変更との関連有無を明記する。
 - Markdown更新のみの場合、pytestは原則不要。必要に応じて `git diff --check` のみ実施する。
 - commit対象は正本Markdownのみとし、`phase*_investigation/` はcommitしない。
+
+### まとめて実行可能なコード提示ルール
+
+以後、ChatGPTがPowerShellコマンドを提示する場合は、可能な限りまとめて実行可能なコードとして提示する。
+
+基本方針:
+
+- 目的が1つの作業であれば、cd、環境変数、.venv 有効化、実行、確認までを1つのコードブロックにまとめる。
+- $env:PYTHONUTF8 = "1" を原則含める。
+- .venv\Scripts\Activate.ps1 が存在する場合は有効化する。
+- $ErrorActionPreference = "Stop" を原則設定する。
+- 作業前に必要なら phase*_investigation/ へバックアップする。
+- 実行後に git diff --check、git status --short、必要に応じて git diff --stat を含める。
+- commitまで行う指示の場合は、commit対象を明示し、phase*_investigation/ をaddしない。
+- pushは禁止。
+
+分割する条件:
+
+- ChatGPT画面上のコピー可能範囲を超えそうな場合。
+- here-stringや長いPythonスクリプトを含み、途中で切れるリスクがある場合。
+- 失敗時の影響範囲を小さくしたい場合。
+- 調査、patch、test、commitを明確に分けた方が安全な場合。
+
+分割する場合の標準:
+
+1. 調査・抽出
+2. 小さいpatch
+3. focused test / ruff / diff check
+4. commit
+
+注意:
+
+- 長い自動置換より、短いStepに分けた安全な実行を優先する。
+- ただし、短く安全に収まる作業は、最初からまとめて実行可能なコードとして提示する。

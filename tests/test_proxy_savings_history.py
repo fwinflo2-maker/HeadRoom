@@ -1086,11 +1086,66 @@ def test_stats_history_persists_across_restarts_and_stats_stays_compatible(tmp_p
         assert full["history_summary"]["stored_points"] == 2
         assert full["history_summary"]["returned_points"] == 2
 
+        # The proxy batches savings writes, so force a flush before reading the
+        # file directly mid-session (a graceful shutdown flushes automatically).
+        client.app.state.proxy.metrics.savings_tracker.flush()
         persisted = json.loads(savings_path.read_text())
         assert persisted["lifetime"]["tokens_saved"] == 55
         assert persisted["lifetime"]["total_input_tokens"] == 240
         assert persisted["lifetime"]["total_input_cost_usd"] == pytest.approx(0.48)
         assert persisted["display_session"]["requests"] == 2
+
+
+def test_savings_tracker_batches_saves_and_matches_immediate(tmp_path):
+    """save_flush_every batches disk writes; the threshold and flush() together
+    produce the exact on-disk state an immediate (flush_every=1) tracker would.
+
+    Proves the batch boundary drops no data — the correctness half of the perf
+    fix, independent of timing.
+    """
+    events = [
+        {
+            "model": "gpt-4o",
+            "input_tokens": 120,
+            "tokens_saved": 10,
+            "timestamp": "2026-03-27T09:00:00Z",
+        },
+        {
+            "model": "gpt-4o",
+            "input_tokens": 80,
+            "tokens_saved": 5,
+            "timestamp": "2026-03-27T09:01:00Z",
+        },
+        {
+            "model": "gpt-4o",
+            "input_tokens": 200,
+            "tokens_saved": 25,
+            "timestamp": "2026-03-27T09:02:00Z",
+        },
+    ]
+
+    # Baseline: persists on every call (default save_flush_every=1).
+    immediate_path = tmp_path / "immediate.json"
+    immediate = SavingsTracker(path=str(immediate_path))
+    for event in events:
+        immediate.record_request(**event)
+
+    # Batched: writes only every 2 records; the tail lands on flush().
+    batched_path = tmp_path / "batched.json"
+    batched = SavingsTracker(path=str(batched_path), save_flush_every=2)
+
+    batched.record_request(**events[0])
+    assert not batched_path.exists()  # buffered, below threshold
+
+    batched.record_request(**events[1])
+    assert batched_path.exists()  # threshold reached, written
+
+    batched.record_request(**events[2])  # buffered again
+    batched.flush()  # tail persisted
+
+    assert json.loads(batched_path.read_text(encoding="utf-8")) == json.loads(
+        immediate_path.read_text(encoding="utf-8")
+    )
 
 
 def test_stats_history_csv_export_is_frontend_friendly(tmp_path, monkeypatch):

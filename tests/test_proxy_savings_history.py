@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -1146,6 +1147,37 @@ def test_savings_tracker_batches_saves_and_matches_immediate(tmp_path):
     assert json.loads(batched_path.read_text(encoding="utf-8")) == json.loads(
         immediate_path.read_text(encoding="utf-8")
     )
+
+
+def test_failed_save_retries_on_next_record_not_after_full_window(tmp_path, monkeypatch):
+    """A transient write failure must not consume the flush window.
+
+    The counter only resets after a durable write, so a save that raises leaves
+    it untouched and the next record retries immediately, rather than waiting
+    another save_flush_every calls.
+    """
+    path = tmp_path / "proxy_savings.json"
+    tracker = SavingsTracker(path=str(path), save_flush_every=5)
+
+    calls = {"n": 0}
+    real_mkstemp = tempfile.mkstemp
+
+    def flaky_mkstemp(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("simulated transient write failure")
+        return real_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(savings_tracker_module.tempfile, "mkstemp", flaky_mkstemp)
+
+    for _ in range(5):
+        tracker.record_request(model="gpt-4o", input_tokens=10, tokens_saved=5)
+    assert not path.exists()  # 5th call reached the threshold; its save failed
+
+    # The 6th call must retry the save, not wait until the 10th.
+    tracker.record_request(model="gpt-4o", input_tokens=10, tokens_saved=5)
+    assert path.exists()
+    assert json.loads(path.read_text(encoding="utf-8"))["lifetime"]["requests"] == 6
 
 
 def test_stats_history_csv_export_is_frontend_friendly(tmp_path, monkeypatch):

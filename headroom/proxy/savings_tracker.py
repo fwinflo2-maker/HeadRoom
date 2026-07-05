@@ -1031,9 +1031,9 @@ class SavingsTracker:
             self._save_locked()
 
     def _save_locked(self) -> None:
-        self._since_save = 0
         if self._stateless:
             # Stateless mode: live counters stay in memory; nothing is persisted.
+            self._since_save = 0
             return
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -1063,6 +1063,9 @@ class SavingsTracker:
                 except OSError:
                     pass
                 raise
+            # Reset only after a durable write. A failed save leaves the counter
+            # untouched so the next record retries instead of waiting a full window.
+            self._since_save = 0
         except OSError as e:
             logger.warning("Failed to save savings history to %s: %s", self._path, e)
 

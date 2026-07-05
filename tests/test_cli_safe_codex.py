@@ -1,6 +1,42 @@
+import os
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
+
+SAFE_CODEX_ENV_KEYS = (
+    "HEADROOM_PROFILE",
+    "HEADROOM_HOST",
+    "HEADROOM_MODE",
+    "HEADROOM_LOSSLESS",
+    "HEADROOM_DISABLE_KOMPRESS",
+    "HEADROOM_LOG_MESSAGES",
+    "HEADROOM_NO_CCR_INJECT_TOOL",
+    "HEADROOM_NO_CCR_MARKER",
+    "HEADROOM_CODE_AWARE_ENABLED",
+    "HEADROOM_OUTPUT_SHAPER",
+    "HEADROOM_CODEX_WIRE_DEBUG",
+    "HEADROOM_CODEX_WIRE_DEBUG_DIR",
+    "HEADROOM_PROMPT_CACHE_KEY",
+    "HEADROOM_PROMPT_CACHE_RETENTION",
+)
+
+
+@pytest.fixture(autouse=True)
+def restore_safe_codex_env():
+    """Keep safe-codex CLI tests from leaking HEADROOM_* state to later tests."""
+    previous = {key: os.environ.get(key) for key in SAFE_CODEX_ENV_KEYS}
+    for key in SAFE_CODEX_ENV_KEYS:
+        os.environ.pop(key, None)
+
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def test_proxy_safe_codex_rejects_non_loopback_host() -> None:

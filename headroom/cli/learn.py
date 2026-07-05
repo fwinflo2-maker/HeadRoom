@@ -78,6 +78,12 @@ Use 'auto' (default) to scan all detected agents."""
     help="Write recommendations to context/memory files (default: dry-run).",
 )
 @click.option(
+    "--allow-context-write",
+    is_flag=True,
+    default=False,
+    help="Allow --apply to write context/memory files with the safe-codex profile.",
+)
+@click.option(
     "--target",
     type=str,
     default=None,
@@ -132,6 +138,7 @@ def learn(
     project: Path | None,
     analyze_all: bool,
     apply: bool,
+    allow_context_write: bool,
     target: str | None,
     agent: str,
     model: str | None,
@@ -163,6 +170,12 @@ def learn(
 
     from ..learn.analyzer import SessionAnalyzer, _detect_default_model
     from ..learn.registry import auto_detect_plugins, get_plugin
+    from ._utils.safe_codex import reject_safe_codex_learn_apply
+
+    reject_safe_codex_learn_apply(
+        apply=apply,
+        allow_context_write=allow_context_write,
+    )
 
     # Flag-combination validation — reject contradictory/no-op combinations up
     # front rather than letting one flag silently win or be ignored.

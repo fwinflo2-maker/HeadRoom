@@ -190,3 +190,22 @@ def reject_safe_codex_wrap_options(*, memory: bool, codex_args: tuple[Any, ...])
         raise click.UsageError(
             "--codex-wire-debug is not allowed with --safe because it may persist Codex traffic"
         )
+
+
+def reject_safe_codex_learn_apply(
+    *,
+    apply: bool,
+    allow_context_write: bool,
+    profile: str | None = None,
+) -> None:
+    """Reject headroom learn --apply for safe-codex unless explicitly allowed."""
+    if not apply:
+        return
+    effective_profile = profile if profile is not None else os.environ.get("HEADROOM_PROFILE")
+    if not is_safe_codex_profile(effective_profile):
+        return
+    if allow_context_write:
+        return
+    raise click.UsageError(
+        "--apply is not allowed with safe-codex unless --allow-context-write is specified"
+    )

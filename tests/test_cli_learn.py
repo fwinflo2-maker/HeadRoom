@@ -175,6 +175,81 @@ def test_learn_project_lookup_and_apply_flow(
     assert plugin.writer.calls[0][2] is False
 
 
+def test_safe_codex_learn_apply_requires_explicit_context_write(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    project_path = tmp_path / "project-a"
+    project_path.mkdir()
+    monkeypatch.setenv("HEADROOM_PROFILE", "safe-codex")
+
+    result = runner.invoke(
+        main,
+        ["learn", "--agent", "codex", "--project", str(project_path), "--apply"],
+    )
+
+    assert result.exit_code != 0
+    assert "safe-codex" in result.output
+    assert "--allow-context-write" in result.output
+
+
+def test_safe_codex_learn_dry_run_is_allowed(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    project_path = tmp_path / "project-a"
+    project_path.mkdir()
+    matched = SimpleNamespace(name="project-a", project_path=project_path)
+    plugin = FakePlugin("codex", "Codex", [matched])
+    analyzer = FakeAnalyzer()
+
+    monkeypatch.setenv("HEADROOM_PROFILE", "safe-codex")
+    monkeypatch.setattr("headroom.learn.analyzer._detect_default_model", lambda: "gpt-4o")
+    monkeypatch.setattr("headroom.learn.registry.get_plugin", lambda name: plugin)
+    monkeypatch.setattr("headroom.learn.analyzer.SessionAnalyzer", lambda model=None: analyzer)
+
+    result = runner.invoke(
+        main,
+        ["learn", "--agent", "codex", "--project", str(project_path)],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "[WOULD WRITE]" in result.output
+    assert plugin.writer.calls[0][2] is True
+
+
+def test_safe_codex_learn_apply_allows_explicit_context_write(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    project_path = tmp_path / "project-a"
+    project_path.mkdir()
+    matched = SimpleNamespace(name="project-a", project_path=project_path)
+    plugin = FakePlugin("codex", "Codex", [matched])
+    analyzer = FakeAnalyzer()
+
+    monkeypatch.setenv("HEADROOM_PROFILE", "safe-codex")
+    monkeypatch.setattr("headroom.learn.analyzer._detect_default_model", lambda: "gpt-4o")
+    monkeypatch.setattr("headroom.learn.registry.get_plugin", lambda name: plugin)
+    monkeypatch.setattr("headroom.learn.analyzer.SessionAnalyzer", lambda model=None: analyzer)
+
+    result = runner.invoke(
+        main,
+        [
+            "learn",
+            "--agent",
+            "codex",
+            "--project",
+            str(project_path),
+            "--apply",
+            "--allow-context-write",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "[WROTE]" in result.output
+    assert plugin.writer.calls[0][2] is False
+
+
 def test_verbosity_all_apply_aggregates_baselines_across_projects(
     monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
 ) -> None:

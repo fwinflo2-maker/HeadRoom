@@ -1400,9 +1400,7 @@ class HeadroomProxy(
         # Reuse the primary client when HTTP/2 is already off; otherwise keep a
         # dedicated HTTP/1.1 client for ChatGPT passthrough.
         self.http_client_h1 = (
-            self.http_client
-            if not _http2
-            else httpx.AsyncClient(http2=False, **_client_kwargs)
+            self.http_client if not _http2 else httpx.AsyncClient(http2=False, **_client_kwargs)
         )
         logger.info("Headroom Proxy started")
         logger.info(f"Optimization: {'ENABLED' if self.config.optimize else 'DISABLED'}")
@@ -4593,10 +4591,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--http-proxy",
-        help=(
-            "HTTP proxy URL for upstream provider requests only "
-            "(env: HEADROOM_HTTP_PROXY)"
-        ),
+        help=("HTTP proxy URL for upstream provider requests only (env: HEADROOM_HTTP_PROXY)"),
     )
     parser.add_argument(
         "--workers",

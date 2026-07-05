@@ -20,6 +20,7 @@ These tests pin the contract for the three relevant shapes.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -91,10 +92,14 @@ def _make_response(usage: _FakeUsage) -> MagicMock:
     return response
 
 
-def _make_backend() -> LiteLLMBackend:
+def _make_backend(
+    *,
+    provider: str = "openrouter",
+    api_base: str | None = None,
+) -> LiteLLMBackend:
     # Patch the inference-profile fetch so `__init__` doesn't try to talk to AWS.
     with patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}):
-        return LiteLLMBackend(provider="openrouter")
+        return LiteLLMBackend(provider=provider, api_base=api_base)
 
 
 def _request_body() -> dict[str, Any]:
@@ -103,6 +108,76 @@ def _request_body() -> dict[str, Any]:
         "messages": [{"role": "user", "content": "hello"}],
         "max_tokens": 32,
     }
+
+
+async def test_api_base_is_forwarded_to_litellm_openai_calls() -> None:
+    usage = _FakeUsage(prompt_tokens=500, completion_tokens=25, total_tokens=525)
+    response = _make_response(usage)
+
+    backend = _make_backend(provider="openai", api_base="http://127.0.0.1:8790")
+    with patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp:
+        mock_acomp.return_value = response
+        result = await backend.send_openai_message(_request_body(), {})
+
+    assert result.status_code == 200
+    assert mock_acomp.await_args.kwargs["api_base"] == "http://127.0.0.1:8790"
+
+
+async def test_api_base_is_omitted_when_unset_for_compatibility() -> None:
+    usage = _FakeUsage(prompt_tokens=500, completion_tokens=25, total_tokens=525)
+    response = _make_response(usage)
+
+    backend = _make_backend(provider="openai")
+    with patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp:
+        mock_acomp.return_value = response
+        result = await backend.send_openai_message(_request_body(), {})
+
+    assert result.status_code == 200
+    assert "api_base" not in mock_acomp.await_args.kwargs
+
+
+async def test_prompt_cache_options_are_forwarded_to_litellm_openai_calls() -> None:
+    usage = _FakeUsage(prompt_tokens=1200, completion_tokens=50, total_tokens=1250)
+    response = _make_response(usage)
+
+    body = {
+        **_request_body(),
+        "prompt_cache_key": "codex:test-cache-key",
+        "prompt_cache_retention": "in_memory",
+    }
+
+    backend = _make_backend(provider="openai", api_base="http://127.0.0.1:8790")
+    with patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp:
+        mock_acomp.return_value = response
+        result = await backend.send_openai_message(body, {})
+
+    assert result.status_code == 200
+    extra_body = mock_acomp.await_args.kwargs["extra_body"]
+    assert extra_body["prompt_cache_key"] == "codex:test-cache-key"
+    assert extra_body["prompt_cache_retention"] == "in_memory"
+
+
+def test_create_proxy_backend_passes_openai_api_url_to_litellm_backend() -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeLiteLLMBackend:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    backend = __import__(
+        "headroom.providers.registry",
+        fromlist=["create_proxy_backend"],
+    ).create_proxy_backend(
+        backend="litellm-openai",
+        anyllm_provider="openai",
+        bedrock_region=None,
+        logger=logging.getLogger(__name__),
+        openai_api_url="http://127.0.0.1:8790",
+        litellm_backend_cls=FakeLiteLLMBackend,
+    )
+
+    assert backend is not None
+    assert captured["api_base"] == "http://127.0.0.1:8790"
 
 
 # =============================================================================

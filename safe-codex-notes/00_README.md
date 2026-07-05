@@ -142,8 +142,8 @@ python --version
 
 | 項目 | 内容 |
 |---|---|
-| 現在の完了Phase | Phase 0 |
-| 次のPhase | Phase 1: safe-codex詳細設計 |
+| 現在の完了Phase | Phase 6 |
+| 次のPhase | Phase 7: ドキュメント整備 |
 | local path | `C:\dev\headroom-safe-codex` |
 | upstream | `https://github.com/headroomlabs-ai/headroom.git` |
 | base tag | `v0.30.0` |
@@ -217,3 +217,17 @@ Phase 4以降は、Phase 3 / Phase 3-Bで安定した以下の流れを標準と
 - `Get-Content` で全文表示する指示は原則避ける。
 - 貼り付けが必要な場合も、必要範囲だけを抽出する。
 - commit対象には `phase*_investigation/` を含めない。
+
+<!-- PHASE6-WINDOWS-NOTE-START -->
+## Phase 6 Windows検証メモ
+
+Windowsローカル検証により、`safe-codex` profile の OpenAI backend path で以下を確認済み。
+
+- loopback proxy起動
+- fake OpenAIへのrouting
+- `--openai-api-url` の実送信反映
+- `prompt_cache_key` / `prompt_cache_retention` の上流送信
+- `cached_tokens` の取り込み
+- prompt本文 / API key / Authorization のログ非露出
+- 通常profile互換性
+<!-- PHASE6-WINDOWS-NOTE-END -->

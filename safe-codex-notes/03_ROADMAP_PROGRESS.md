@@ -9,9 +9,9 @@
 
 | 項目 | 内容 |
 |---|---|
-| 現在の完了Phase | Phase 5 |
-| 現在の作業前状態 | Phase 5完了、Phase 6未開始 |
-| 次のPhase | Phase 6: Windows検証 |
+| 現在の完了Phase | Phase 6 |
+| 現在の作業前状態 | Phase 6完了、Phase 7未開始 |
+| 次のPhase | Phase 7: ドキュメント整備 |
 | current branch | `safe-codex/phase2-safe-profile` |
 | base branch | `safe-codex-base` |
 | base tag | `v0.30.0` |
@@ -19,7 +19,7 @@
 | Phase 2 commit | `e69a4515 Add safe-codex profile wiring` |
 | Phase 3-B commit | `efbdc811 Add safe-codex prompt caching for Codex websocket` |
 | Phase 4 commit | `623324e0 Harden safe-codex logging` |
-| latest commit | `623324e0 Harden safe-codex logging` |
+| latest commit | `Validate safe-codex OpenAI cache path on Windows` |
 | push | 未実行 |
 | worktree | ソース差分なし、`phase*_investigation/` のみ未追跡想定 |
 
@@ -32,8 +32,8 @@
 | 2 | 完了 | 100% | `safe-codex` profileとCLI追加 |
 | 3 | 完了 | 100% | Prompt Caching対応 |
 | 4 | 完了 | 100% | ログ安全化 |
-| 5 | 未開始 | 0% | `headroom learn`抑制 |
-| 6 | 未開始 | 0% | Windows検証 |
+| 5 | 完了 | 100% | `headroom learn`抑制 |
+| 6 | 完了 | 100% | Windows検証 |
 | 7 | 未開始 | 0% | ドキュメント整備 |
 | 8 | 未開始 | 0% | 総合レビュー |
 
@@ -255,9 +255,9 @@ OpenAI Prompt Cachingを壊さず、cache hit率を上げる。
 - 明示許可時のみ書き込み可能。
 ## Phase 6: Windows検証
 
-状態: 未開始
+状態: 完了
 
-達成度: 0%
+達成度: 100%
 
 ### 目的
 
@@ -340,9 +340,9 @@ Windowsローカル環境で実用可能か検証する。
 | R-002 | request/response本文がログに残る | 高 | `--log-messages` 禁止 | Phase 2でsafe時拒否を実装 |
 | R-003 | Codex wire debugに機密情報が残る | 高 | safe profileで禁止 | Phase 2でsafe時拒否を実装 |
 | R-004 | `AGENTS.md` が自動書き換えされる | 中 | safe時にwrap側の自動書き換えを抑制し、`headroom learn --apply` も明示許可制にする | Phase 5で対応済み |
-| R-005 | Prompt Cachingが壊れる | 中 | `cache-first` / stable prefix | Phase 3で対応予定 |
-| R-006 | prompt_cache_keyに生パスが入る | 中 | hash化 | Phase 3で対応予定 |
-| R-007 | Windowsで起動しない | 高 | Phase 6で手動検証 | 未確認 |
+| R-005 | Prompt Cachingが壊れる | 中 | `cache-first` / stable prefix | Phase 3-B / Phase 6で対応済み |
+| R-006 | prompt_cache_keyに生パスが入る | 中 | hash化 | Phase 3-B / Phase 6で対応済み |
+| R-007 | Windowsで起動しない | 高 | Phase 6で手動検証 | fake OpenAI経由のproxy検証は確認済み |
 | R-008 | 通常Headroom挙動を壊す | 高 | safe明示時のみ新挙動 | Phase 2テストで確認済み |
 
 ## 更新履歴
@@ -356,6 +356,7 @@ Windowsローカル環境で実用可能か検証する。
 | 2026-07-05 | 5 | Phase 5完了、headroom learn --apply 抑制commitを反映 |
 | 2026-07-05 | 5 | 長い調査出力を画面表示せず phase*_investigation/ へファイル化する運用ルールを追記 |
 | 2026-07-05 | 5 | Phase完了時に失敗・手戻り・改善策を運用ルールへ反映する共通ルールを追記 |
+| 2026-07-05 | 6 | Windows検証完了、OpenAI backend path / prompt cache / cached_tokens / safe log / 通常profile互換性を確認 |
 
 ## Phase 4以降の標準作業フロー
 
@@ -560,3 +561,57 @@ Phase 5で得た改善策:
 
 - 長い自動置換より、短いStepに分けた安全な実行を優先する。
 - ただし、短く安全に収まる作業は、最初からまとめて実行可能なコードとして提示する。
+
+<!-- PHASE6-WINDOWS-VALIDATION-START -->
+## Phase 6 Windows検証 結果
+
+状態: 完了
+
+達成度: 100%
+
+### 実装commit
+
+- `Validate safe-codex OpenAI cache path on Windows`
+- 最新hashは `git log -1 --oneline` で確認する。
+
+### 実施結果
+
+- Windows / PowerShell 5.1 / Python 3.12.13 環境で、safe-codex profile の実機検証を実施。
+- fake OpenAI endpoint 経由で `headroom proxy --profile safe-codex --backend openai --openai-api-url ...` の到達を確認。
+- `prompt_cache_key=codex:<opaque hash>` と `prompt_cache_retention=in-memory` が上流request bodyへ送信されることを確認。
+- `usage.prompt_tokens_details.cached_tokens` を `cache_read_input_tokens` / `prompt_tokens_details.cached_tokens` として取り込めることを確認。
+- safe proxy stdout / stderr / health / stats に prompt本文、Authorization、dummy API key が残らないことを確認。
+- 通常profile互換性を壊さないため、`api_base` は対応backendにのみ渡す実装に修正。
+
+### 変更ファイル
+
+- `headroom/backends/litellm.py`
+- `headroom/providers/registry.py`
+- `headroom/proxy/handlers/openai.py`
+- `tests/test_backends/test_litellm_cache_stats.py`
+- `tests/test_proxy/test_openai_backend_path.py`
+
+### 最終確認
+
+- scoped tests: `151 passed, 1 skipped`
+- focused compatibility tests: `92 passed, 1 skipped`
+- ruff: `headroom tests` および変更ファイルで `All checks passed!`
+- mypy: 変更source 3件で `Success`
+- `git diff --check`: CRLF warningのみ
+- 既知対象外:
+  - Windows SQLite file lock / sqlite path issue
+  - full mypy の `headroom/release_version.py` 既存 `tomllib` no-redef
+  - `phase*_investigation/` 配下の一時scriptに対するruff
+
+### Phase 6で判明した主な問題
+
+- `python - <<'PY'` は PowerShell 5.1 非対応で、ParserError と誤実行を誘発する。
+- `headroom proxy --no-open` は実CLIに存在せず、help照合不足だった。
+- `--openai-api-url` は表示上のrouteには反映されるが、当初 LiteLLM 実送信へ `api_base` が渡っていなかった。
+- `prompt_cache_key` / `prompt_cache_retention` は通常kwargsではLiteLLM経由のHTTP bodyへ出ず、`extra_body` 経由にする必要があった。
+- backend factoryで常に `api_base` を渡すと、テスト用 injected backend 互換性を壊すため、signature確認が必要だった。
+- `git diff --check` は PowerShell `$ErrorActionPreference=Stop` と組み合わせるとCRLF warningでも停止し得る。
+- `ruff check .` は `phase*_investigation/` の一時scriptを拾うため、tracked source/testに限定する。
+- `ruff` に全tracked pyを展開するとWindows引数長制限に当たるため、`ruff check headroom tests` を使う。
+- Markdown本文にバッククォートを含む場合、PowerShell double-quoted here-string では `` `a `` / `` `r `` / `` `t `` が制御文字化するため、single-quoted here-stringを使う。
+<!-- PHASE6-WINDOWS-VALIDATION-END -->

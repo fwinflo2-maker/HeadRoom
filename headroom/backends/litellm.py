@@ -440,6 +440,7 @@ class LiteLLMBackend(Backend):
         self.region = region
         self.profile_name = profile_name
         self.kwargs = kwargs
+        self.api_base = kwargs.get("api_base") or None
 
         # Get provider config from registry
         self._config = get_provider_config(provider)
@@ -740,6 +741,9 @@ class LiteLLMBackend(Backend):
             logger.debug(f"LiteLLM request: model={litellm_model}")
 
             # Make the call
+            if self.api_base is not None:
+                kwargs["api_base"] = self.api_base
+
             response = await acompletion(**kwargs)
 
             # Convert to Anthropic format
@@ -865,6 +869,9 @@ class LiteLLMBackend(Backend):
             )
 
             # Stream content — blocks emitted dynamically based on response
+            if self.api_base is not None:
+                kwargs["api_base"] = self.api_base
+
             response = await acompletion(**kwargs)
             output_tokens = 0
             current_block_index = -1
@@ -1050,6 +1057,14 @@ class LiteLLMBackend(Backend):
                 if param in body:
                     kwargs[param] = body[param]
 
+            prompt_cache_extra_body = {
+                name: body[name]
+                for name in ("prompt_cache_key", "prompt_cache_retention")
+                if name in body
+            }
+            if prompt_cache_extra_body:
+                kwargs.setdefault("extra_body", {}).update(prompt_cache_extra_body)
+
             # Provider-specific region config
             if self.region:
                 if self.provider == "bedrock":
@@ -1074,6 +1089,9 @@ class LiteLLMBackend(Backend):
             logger.debug(f"LiteLLM OpenAI request: model={litellm_model}")
 
             # Make the call
+            if self.api_base is not None:
+                kwargs["api_base"] = self.api_base
+
             response = await acompletion(**kwargs)
 
             # Build the usage block. LiteLLM normalizes prompt-cache stats from
@@ -1228,6 +1246,14 @@ class LiteLLMBackend(Backend):
             if "stream_options" in body:
                 kwargs["stream_options"] = body["stream_options"]
 
+            prompt_cache_extra_body = {
+                name: body[name]
+                for name in ("prompt_cache_key", "prompt_cache_retention")
+                if name in body
+            }
+            if prompt_cache_extra_body:
+                kwargs.setdefault("extra_body", {}).update(prompt_cache_extra_body)
+
             # Provider-specific region config
             if self.region:
                 if self.provider == "bedrock":
@@ -1248,6 +1274,9 @@ class LiteLLMBackend(Backend):
                     kwargs["api_key"] = auth_header[7:]
                 elif headers.get("x-api-key"):
                     kwargs["api_key"] = headers["x-api-key"]
+
+            if self.api_base is not None:
+                kwargs["api_base"] = self.api_base
 
             response = await acompletion(**kwargs)
 

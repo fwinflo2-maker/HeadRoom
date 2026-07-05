@@ -1754,6 +1754,7 @@ class OpenAIHandlerMixin:
         # Parse request
         try:
             body = await _read_request_json(request)
+            _apply_prompt_cache_options(body)
         except (json.JSONDecodeError, ValueError) as e:
             return JSONResponse(
                 status_code=400,

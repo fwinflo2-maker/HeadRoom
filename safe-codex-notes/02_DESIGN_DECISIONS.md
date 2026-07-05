@@ -1,4 +1,4 @@
-﻿# DESIGN_DECISIONS
+# DESIGN_DECISIONS
 
 ## 基本設計
 
@@ -90,7 +90,7 @@ HEADROOM_STABLE_PREFIX=1
 Phase 2で実装済み:
 
 ```powershell
-headroom proxy --profile safe-codex --port 8787 --no-open
+headroom proxy --profile safe-codex --port 8787
 headroom wrap codex --safe
 ```
 
@@ -271,3 +271,15 @@ Phase 4以降は、Phase 3 / Phase 3-Bで安定した以下の流れを標準と
 - pushは禁止し、local commitまでに留める。
 - 通常profileを壊さず、safe-codex 明示時のみ変更する。
 - CodexではなくChatGPT主導で、設計・差分作成・レビュー・テスト方針を進める。
+
+<!-- PHASE6-DESIGN-DECISIONS-START -->
+## Phase 6 Windows検証で確定した設計判断
+
+- OpenAI上流URLの切替は、proxy表示だけでなく LiteLLM backend の実送信kwargsへ `api_base` として渡す。
+- LiteLLM OpenAI-format送信では、OpenAI互換raw request field の `prompt_cache_key` / `prompt_cache_retention` を `extra_body` に入れて渡す。
+- safe-codex profile の prompt cache option は、client指定値を上書きしない。
+- `prompt_cache_key=auto` はローカル絶対パスやユーザー名を露出しない opaque hash とする。
+- backend factoryは、injected backend / test fake backendの互換性を保つため、`api_base` を受け取れるbackendにのみ渡す。
+- safe-codexでは本文ログ、API key、Authorization、prompt本文をstdout/stderr/health/statsへ残さない。
+- Windows検証では `phase*_investigation/` をruff対象外とし、最終lintは `ruff check headroom tests` と変更ファイルruffで確認する。
+<!-- PHASE6-DESIGN-DECISIONS-END -->

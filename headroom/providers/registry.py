@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from collections.abc import Callable, Mapping
@@ -182,10 +183,25 @@ def create_proxy_backend(
         provider = "vertex_ai"
     try:
         backend_cls = litellm_backend_cls or _load_litellm_backend()
-        instance = cast(
-            "Backend",
-            backend_cls(provider=provider, region=bedrock_region, profile_name=bedrock_profile),
-        )
+        backend_kwargs: dict[str, Any] = {
+            "provider": provider,
+            "region": bedrock_region,
+            "profile_name": bedrock_profile,
+        }
+        if openai_api_url is not None:
+            try:
+                signature = inspect.signature(backend_cls)
+            except (TypeError, ValueError):
+                backend_kwargs["api_base"] = openai_api_url
+            else:
+                parameters = signature.parameters
+                if "api_base" in parameters or any(
+                    param.kind == inspect.Parameter.VAR_KEYWORD
+                    for param in parameters.values()
+                ):
+                    backend_kwargs["api_base"] = openai_api_url
+
+        instance = cast("Backend", backend_cls(**backend_kwargs))
         logger.info("LiteLLM backend enabled (provider=%s, region=%s)", provider, bedrock_region)
         return instance
     except ImportError as exc:

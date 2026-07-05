@@ -365,3 +365,49 @@ def test_backend_streaming_passes_prefix_tracker_through():
         "_stream_openai_via_backend must accept optimized_messages so the "
         "tracker can record the messages that were sent"
     )
+
+def test_backend_path_injects_prompt_cache_options_for_safe_codex(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("HEADROOM_PROFILE", "safe-codex")
+    monkeypatch.setenv("HEADROOM_PROMPT_CACHE_KEY", "codex:backend")
+    monkeypatch.setenv("HEADROOM_PROMPT_CACHE_RETENTION", "in-memory")
+
+    config = _make_config()
+    response_body = {
+        "id": "chatcmpl-openai-cache-options",
+        "object": "chat.completion",
+        "model": "gpt-4o-mini",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "Hi!"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 500,
+            "completion_tokens": 10,
+            "total_tokens": 510,
+            "prompt_tokens_details": {"cached_tokens": 200},
+        },
+    }
+
+    mock_backend = _make_mock_backend(response_body)
+    with patch("headroom.proxy.server.AnyLLMBackend", return_value=mock_backend):
+        app = create_app(config)
+        with TestClient(app) as client:
+            resp = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False,
+                },
+                headers={"Authorization": "Bearer test-key"},
+            )
+
+    assert resp.status_code == 200, resp.text
+    forwarded_body = mock_backend.send_openai_message.await_args.args[0]
+    assert forwarded_body["prompt_cache_key"] == "codex:backend"
+    assert forwarded_body["prompt_cache_retention"] == "in-memory"

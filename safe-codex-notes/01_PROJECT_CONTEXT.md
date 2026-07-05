@@ -175,3 +175,16 @@ Phase 4以降は、Phase 3 / Phase 3-Bで安定した以下の流れを標準と
 - 通常profileを壊さず、safe-codex 明示時のみ変更する。
 - CodexではなくChatGPT主導で、設計・差分作成・レビュー・テスト方針を進める。
 
+
+<!-- PHASE6-OPERATION-RULES-START -->
+## Phase 6運用ルール追記
+
+- PowerShell 5.1では bash here-doc 形式の `python - <<'PY'` を使わない。
+- Pythonを使う場合は、一時 `.py` ファイルをASCIIで生成して実行する。
+- 日本語Markdown更新はPowerShell側で行い、`.NET WriteAllText(..., UTF8Encoding(false))` を使う。
+- Markdown本文にバッククォートを含む場合は、PowerShellの double-quoted here-string を使わない。
+- 正本Markdown更新時は相対パスではなく `Resolve-Path` 済みの絶対パスを `.NET File API` へ渡す。
+- CLI optionは実行前に `headroom proxy --help` / `headroom wrap ... --help` と照合する。
+- `git diff --check` はCRLF warningを出すことがあるため、実エラーとwarningを分けて判断する。
+- Windowsで多数ファイルをruffへ個別展開すると引数長制限に当たるため、`ruff check headroom tests` を優先する。
+<!-- PHASE6-OPERATION-RULES-END -->

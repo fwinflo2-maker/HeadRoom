@@ -98,3 +98,53 @@ def test_get_memory_stats_accounts_for_compressed_messages():
     stats = logger.get_memory_stats()
     assert stats.entry_count == 1
     assert stats.size_bytes > 0
+
+
+def test_safe_mode_never_keeps_messages_or_response_content(tmp_path):
+    log_file = tmp_path / "requests.jsonl"
+    logger = RequestLogger(log_file=str(log_file), log_full_messages=True, safe_mode=True)
+    logger.log(
+        _entry(
+            request_messages=[{"role": "user", "content": "sk-testsecret123456"}],
+            compressed_messages=[{"role": "user", "content": "post"}],
+            response_content="secret response",
+            error="upstream failed with sk-testsecret123456",
+            tags={"authorization": "Authorization: Bearer token123456789"},
+        )
+    )
+
+    recent_with_messages = logger.get_recent_with_messages(10)
+    assert len(recent_with_messages) == 1
+    assert "request_messages" not in recent_with_messages[0]
+    assert "compressed_messages" not in recent_with_messages[0]
+    assert "response_content" not in recent_with_messages[0]
+    assert recent_with_messages[0]["error"] == "[REDACTED_ERROR]"
+    assert recent_with_messages[0]["tags"]["authorization"] == "Authorization: Bearer [REDACTED]"
+
+    recent = logger.get_recent(10)
+    assert len(recent) == 1
+    assert "request_messages" not in recent[0]
+    assert "compressed_messages" not in recent[0]
+    assert "response_content" not in recent[0]
+
+    import json
+
+    obj = json.loads(log_file.read_text().strip())
+    assert "request_messages" not in obj
+    assert "compressed_messages" not in obj
+    assert "response_content" not in obj
+    assert "sk-testsecret123456" not in log_file.read_text()
+
+
+def test_safe_mode_forces_log_full_messages_off():
+    logger = RequestLogger(log_file=None, log_full_messages=True, safe_mode=True)
+
+    assert logger.safe_mode is True
+    assert logger.log_full_messages is False
+
+
+def test_normal_mode_preserves_log_full_messages_true():
+    logger = RequestLogger(log_file=None, log_full_messages=True, safe_mode=False)
+
+    assert logger.safe_mode is False
+    assert logger.log_full_messages is True

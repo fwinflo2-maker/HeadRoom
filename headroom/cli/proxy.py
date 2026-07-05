@@ -1208,6 +1208,7 @@ def proxy(
         log_file=None if is_stateless else log_file,
         log_full_messages=log_messages
         or os.environ.get("HEADROOM_LOG_MESSAGES", "").lower() in ("true", "1", "yes", "on"),
+        safe_mode=is_safe_codex_profile(profile),
         budget_limit_usd=budget,
         budget_period=cast(Literal["hourly", "daily", "monthly"], budget_period),
         # Code-aware compression resolution:

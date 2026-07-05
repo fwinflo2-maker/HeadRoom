@@ -20,7 +20,7 @@ def _debug_dump_mode(config: Any) -> str:
                    (``HEADROOM_DEBUG_DUMP=1``/``true``/``on``/``redacted``)
     - "full"     : everything including content (``HEADROOM_DEBUG_DUMP=full``)
     """
-    if getattr(config, "stateless", False):
+    if getattr(config, "stateless", False) or getattr(config, "safe_mode", False):
         return "off"
     raw = os.environ.get("HEADROOM_DEBUG_DUMP", "").strip().lower()
     if raw in ("full", "all", "content"):

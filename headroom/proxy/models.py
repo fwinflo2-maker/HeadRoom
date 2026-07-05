@@ -264,6 +264,7 @@ class ProxyConfig:
     log_requests: bool = True
     log_file: str | None = None
     log_full_messages: bool = False
+    safe_mode: bool = False
 
     # Third-party proxy extensions (opt-in only). List of entry-point names
     # to enable from the `headroom.proxy_extension` group, or `["*"]` for

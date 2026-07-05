@@ -824,6 +824,7 @@ class HeadroomProxy(
             RequestLogger(
                 log_file=config.log_file,
                 log_full_messages=config.log_full_messages,
+                safe_mode=config.safe_mode,
             )
             if config.log_requests
             else None

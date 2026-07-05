@@ -17,8 +17,8 @@ pytest.importorskip("fastapi")
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
 
 
-def _config(stateless: bool = False) -> SimpleNamespace:
-    return SimpleNamespace(stateless=stateless)
+def _config(stateless: bool = False, safe_mode: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(stateless=stateless, safe_mode=safe_mode)
 
 
 def test_debug_dump_off_by_default(monkeypatch):
@@ -47,6 +47,11 @@ def test_stateless_forces_dump_off_even_when_opted_in(monkeypatch):
     # Stateless mode must win over any opt-in: no filesystem writes, period.
     monkeypatch.setenv("HEADROOM_DEBUG_DUMP", "full")
     assert _debug_dump_mode(_config(stateless=True)) == "off"
+
+
+def test_safe_mode_forces_dump_off_even_when_opted_in(monkeypatch):
+    monkeypatch.setenv("HEADROOM_DEBUG_DUMP", "full")
+    assert _debug_dump_mode(_config(safe_mode=True)) == "off"
 
 
 def test_redact_elides_long_strings_keeps_structure():

@@ -110,3 +110,22 @@ def test_wrap_codex_safe_rejects_memory() -> None:
 
     assert result.exit_code != 0
     assert "--memory is not allowed" in result.output
+
+
+def test_proxy_safe_codex_sets_proxy_config_safe_mode(monkeypatch) -> None:
+    from headroom.cli.main import main
+
+    captured: dict[str, object] = {}
+
+    def fake_run_server(config, **_kwargs):
+        captured["config"] = config
+        captured["ran"] = True
+
+    monkeypatch.setattr("headroom.proxy.server.run_server", fake_run_server)
+
+    result = CliRunner().invoke(main, ["proxy", "--profile", "safe-codex"])
+
+    assert result.exit_code == 0
+    assert captured["ran"] is True
+    assert captured["config"].safe_mode is True
+    assert captured["config"].log_full_messages is False

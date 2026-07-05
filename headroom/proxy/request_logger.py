@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 from collections import deque
 from collections.abc import Mapping, Sequence
@@ -92,6 +93,37 @@ _DATA_IMAGE_URL_PREFIX = "data:image/"
 # Python-side counter, which is the natural owner.
 _redactions_total: int = 0
 _redactions_lock = Lock()
+
+_SECRET_REDACTION_PATTERNS = (
+    re.compile(r"Authorization:\s*Bearer\s+[A-Za-z0-9._\-]+", re.IGNORECASE),
+    re.compile(r"sk-[A-Za-z0-9_\-]{8,}"),
+    re.compile(r"ghp_[A-Za-z0-9_]{8,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{8,}"),
+)
+
+
+def redact_sensitive_text(value: str) -> str:
+    """Redact token/API-key-like text before it reaches safe logs."""
+    redacted = value
+    for pattern in _SECRET_REDACTION_PATTERNS:
+        if pattern.pattern.lower().startswith("authorization"):
+            redacted = pattern.sub("Authorization: Bearer [REDACTED]", redacted)
+        else:
+            redacted = pattern.sub("[REDACTED_SECRET]", redacted)
+    return redacted
+
+
+def _redact_safe_log_value(value: Any) -> Any:
+    """Recursively redact token/API-key-like text in safe log metadata."""
+    if isinstance(value, str):
+        return redact_sensitive_text(value)
+    if isinstance(value, dict):
+        return {k: _redact_safe_log_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_safe_log_value(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_safe_log_value(v) for v in value)
+    return value
 
 
 def redactions_total() -> int:
@@ -191,9 +223,15 @@ class RequestLogger:
 
     MAX_LOG_ENTRIES = 10_000
 
-    def __init__(self, log_file: str | None = None, log_full_messages: bool = False):
+    def __init__(
+        self,
+        log_file: str | None = None,
+        log_full_messages: bool = False,
+        safe_mode: bool = False,
+    ):
         self.log_file = Path(log_file) if log_file else None
-        self.log_full_messages = log_full_messages
+        self.safe_mode = safe_mode
+        self.log_full_messages = False if safe_mode else log_full_messages
         # Use deque with maxlen for automatic FIFO eviction
         self._logs: deque[RequestLog] = deque(maxlen=self.MAX_LOG_ENTRIES)
 
@@ -217,16 +255,27 @@ class RequestLogger:
         deque so the ``/stats/recent_requests`` endpoint never serves a
         multi-MB image either.
         """
-        # Redact image payloads in-place on the deque entry so memory
-        # use stays bounded. We mutate the dataclass fields rather
-        # than wrapping the entry to keep ``get_recent`` /
-        # ``get_recent_with_messages`` unchanged.
-        if entry.request_messages is not None:
-            entry.request_messages = redact_image_base64(entry.request_messages)
-        if entry.compressed_messages is not None:
-            entry.compressed_messages = redact_image_base64(entry.compressed_messages)
-        if entry.response_content is not None:
-            entry.response_content = redact_image_base64(entry.response_content)
+        if self.safe_mode:
+            # safe-codex logs are metrics-only. Do not retain prompt, tool,
+            # compressed, or response bodies in memory or on disk.
+            entry.request_messages = None
+            entry.compressed_messages = None
+            entry.response_content = None
+            if entry.error:
+                entry.error = "[REDACTED_ERROR]"
+            if entry.tags:
+                entry.tags = _redact_safe_log_value(entry.tags)
+        else:
+            # Redact image payloads in-place on the deque entry so memory
+            # use stays bounded. We mutate the dataclass fields rather
+            # than wrapping the entry to keep ``get_recent`` /
+            # ``get_recent_with_messages`` unchanged.
+            if entry.request_messages is not None:
+                entry.request_messages = redact_image_base64(entry.request_messages)
+            if entry.compressed_messages is not None:
+                entry.compressed_messages = redact_image_base64(entry.compressed_messages)
+            if entry.response_content is not None:
+                entry.response_content = redact_image_base64(entry.response_content)
 
         self._logs.append(entry)
 
@@ -258,6 +307,15 @@ class RequestLogger:
     def get_recent_with_messages(self, n: int = 20) -> list[dict]:
         """Get recent log entries including full request/response messages."""
         entries = list(self._logs)[-n:]
+        if self.safe_mode:
+            return [
+                {
+                    k: v
+                    for k, v in asdict(e).items()
+                    if k not in ("request_messages", "compressed_messages", "response_content")
+                }
+                for e in entries
+            ]
         return [asdict(e) for e in entries]
 
     def stats(self) -> dict:

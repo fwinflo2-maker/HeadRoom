@@ -1,4 +1,4 @@
-﻿# ROADMAP_PROGRESS
+# ROADMAP_PROGRESS
 
 ## 運用方針
 
@@ -354,6 +354,8 @@ Windowsローカル環境で実用可能か検証する。
 | 2026-07-05 | 3 | Phase 3-B完了、Prompt Caching対応commitを反映 |
 | 2026-07-05 | 4 | Phase 4完了、ログ安全化commitと作業方法を反映 |
 | 2026-07-05 | 5 | Phase 5完了、headroom learn --apply 抑制commitを反映 |
+| 2026-07-05 | 5 | 長い調査出力を画面表示せず phase*_investigation/ へファイル化する運用ルールを追記 |
+| 2026-07-05 | 5 | Phase完了時に失敗・手戻り・改善策を運用ルールへ反映する共通ルールを追記 |
 
 ## Phase 4以降の標準作業フロー
 
@@ -489,6 +491,56 @@ Phase 3完了時の運用ルール反映と同じく、以下の流れで進め�
 - 実行後に git diff --check、git status --short、必要に応じて git diff --stat を含める。
 - commitまで行う指示の場合は、commit対象を明示し、phase*_investigation/ をaddしない。
 - pushは禁止。
+
+
+### Phase完了時の失敗・改善反映ルール
+
+各Phase完了時は、実装内容・テスト結果だけでなく、そのPhase中に発生した失敗、手戻り、想定外の挙動、改善策も運用ルールへ反映する。
+
+記録対象:
+
+- 貼り付けたscriptが途中で崩れた作業。
+- PowerShell / Python / encoding 由来の文字化け。
+- PowerShell 5.1 のBOM付きUTF-8保存による不要差分。
+- .NET の File API へ相対パスを渡したことで、PowerShellの表示上のカレントディレクトリと異なる場所を参照した作業。
+- `Get-Content` 等で長い出力を画面に出して扱いにくくなった作業。
+- test順序依存、環境変数漏れ、fixture不足などのテスト運用問題。
+- 既知失敗と今回変更由来の失敗を切り分けた結果。
+- 次回以降の手順を変えるべき作業。
+- 運用ルール、コマンド提示方法、検証手順に反映すべき改善点。
+
+反映方法:
+
+- Phase完了時に `03_ROADMAP_PROGRESS.md` へ、そのPhaseで得た失敗と改善策を追記する。
+- 恒常的な運用変更は `00_README.md` にも反映する。
+- 設計判断へ影響する内容は `02_DESIGN_DECISIONS.md` にも反映する。
+- 出力が長くなる検証結果や調査結果は画面表示せず、`phase*_investigation/` 配下に保存する。
+- `phase*_investigation/` はcommitしない。
+
+Phase 5で得た改善策:
+
+- PowerShell 5.1 から Python stdin / here-string へ日本語入りMarkdownを渡す更新scriptは避ける。
+- PowerShell 5.1 の Set-Content -Encoding UTF8 はBOM付きUTF-8になるため、正本Markdown更新では .NET の WriteAllText と UTF8Encoding(false) を使う。
+- .NET の File API を使う場合は、Resolve-Path / Join-Path で絶対パス化してから渡す。
+- 日本語Markdown更新は、PowerShell側で UTF-8 入出力を明示して `Get-Content -Raw -Encoding UTF8` / `Set-Content -Encoding UTF8` で処理する。
+- Markdown内に三連バッククォートを含む長い置換scriptは、貼り付け崩れや構文崩れの原因になるため避ける。
+- 長い調査結果は画面表示せず、`phase*_investigation/` 配下に保存して、必要時にファイルをアップロードする。
+- テストで `os.environ` を直接変更する処理がある場合、`yield` fixture などで終了時に明示復元する。
+- 関連テストで失敗した場合は、単独実行と順序実行を分け、今回変更由来か既存の順序依存かを切り分ける。
+- 既知失敗は、失敗名・原因・今回変更との関連有無を正本Markdownに記録する。
+
+### 長い出力のファイル化ルール
+
+調査コマンド、grep、diff、ログ抽出、コード断片抽出など、結果出力が長くなる可能性がある作業では、原則として画面に直接全文を出さない。
+
+運用:
+
+- `phase*_investigation/` 配下に結果ファイルを作成する。
+- 画面には作成ファイルパス、件数、短い要約のみ表示する。
+- 必要に応じて、そのファイルをChatGPTへアップロードする。
+- `Get-Content` で全文表示する指示は原則避ける。
+- 貼り付けが必要な場合も、必要範囲だけを抽出する。
+- commit対象には `phase*_investigation/` を含めない。
 
 分割する条件:
 

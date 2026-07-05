@@ -16,7 +16,10 @@ from headroom.cli._utils.safe_codex import (
     resolve_prompt_cache_key,
     resolve_prompt_cache_options,
 )
-from headroom.proxy.handlers.openai import _apply_prompt_cache_options
+from headroom.proxy.handlers.openai import (
+    _apply_prompt_cache_options,
+    _apply_prompt_cache_options_to_ws_response_create_frame,
+)
 from headroom.proxy.server import ProxyConfig, create_app
 
 
@@ -110,6 +113,57 @@ def test_apply_prompt_cache_options_does_not_override_client_values(
     assert _apply_prompt_cache_options(body) is False
     assert body["prompt_cache_key"] == "codex:client"
     assert body["prompt_cache_retention"] == "24h"
+
+
+def test_apply_prompt_cache_options_ws_response_create_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_PROFILE", "safe-codex")
+    monkeypatch.setenv("HEADROOM_PROMPT_CACHE_KEY", "codex:ws")
+    monkeypatch.setenv("HEADROOM_PROMPT_CACHE_RETENTION", "in-memory")
+
+    frame: dict[str, Any] = {
+        "type": "response.create",
+        "response": {"model": "gpt-5.5", "input": "hello"},
+    }
+
+    assert _apply_prompt_cache_options_to_ws_response_create_frame(frame) is True
+    assert frame["response"]["prompt_cache_key"] == "codex:ws"
+    assert frame["response"]["prompt_cache_retention"] == "in-memory"
+
+
+def test_apply_prompt_cache_options_ws_response_create_frame_ignores_other_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_PROFILE", "safe-codex")
+    monkeypatch.setenv("HEADROOM_PROMPT_CACHE_KEY", "codex:ws")
+
+    frame: dict[str, Any] = {"type": "input_audio_buffer.append", "audio": "..."}
+
+    assert _apply_prompt_cache_options_to_ws_response_create_frame(frame) is False
+    assert "prompt_cache_key" not in frame
+
+
+def test_apply_prompt_cache_options_ws_response_create_frame_does_not_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_PROFILE", "safe-codex")
+    monkeypatch.setenv("HEADROOM_PROMPT_CACHE_KEY", "codex:env")
+    monkeypatch.setenv("HEADROOM_PROMPT_CACHE_RETENTION", "in-memory")
+
+    frame: dict[str, Any] = {
+        "type": "response.create",
+        "response": {
+            "model": "gpt-5.5",
+            "input": "hello",
+            "prompt_cache_key": "codex:client",
+            "prompt_cache_retention": "24h",
+        },
+    }
+
+    assert _apply_prompt_cache_options_to_ws_response_create_frame(frame) is False
+    assert frame["response"]["prompt_cache_key"] == "codex:client"
+    assert frame["response"]["prompt_cache_retention"] == "24h"
 
 
 def _make_proxy_client() -> TestClient:

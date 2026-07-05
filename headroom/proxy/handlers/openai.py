@@ -666,6 +666,25 @@ def _apply_prompt_cache_options(body: dict[str, Any]) -> bool:
     return changed
 
 
+def _apply_prompt_cache_options_to_ws_response_create_frame(frame: dict[str, Any]) -> bool:
+    """Inject Prompt Caching options into a WS response.create frame.
+
+    Handles both the normal Codex WS envelope:
+    {"type": "response.create", "response": {...}}
+    and a direct response body shape as a defensive fallback.
+    """
+    if frame.get("type") == "response.create":
+        response_body = frame.get("response")
+        if isinstance(response_body, dict):
+            return _apply_prompt_cache_options(response_body)
+        return False
+
+    if "model" in frame and ("input" in frame or "instructions" in frame):
+        return _apply_prompt_cache_options(frame)
+
+    return False
+
+
 def _infer_openai_cache_write_tokens(input_tokens: int, cache_read_tokens: int) -> int:
     """Infer OpenAI automatic prompt-cache writes from uncached input tokens.
 
@@ -4911,6 +4930,16 @@ class OpenAIHandlerMixin:
 
             if ws_connected:
                 async with upstream:
+                    try:
+                        _prompt_cache_frame = json.loads(first_msg_raw)
+                    except Exception:
+                        _prompt_cache_frame = None
+                    if isinstance(
+                        _prompt_cache_frame, dict
+                    ) and _apply_prompt_cache_options_to_ws_response_create_frame(
+                        _prompt_cache_frame
+                    ):
+                        first_msg_raw = json.dumps(_prompt_cache_frame)
                     await upstream.send(first_msg_raw)
 
                     # Unit 3: flag the upstream side flips on seeing
@@ -5216,7 +5245,18 @@ class OpenAIHandlerMixin:
                                         "transforms_applied": transforms_applied,
                                     },
                                 )
-                                await upstream.send(msg)
+                                _prompt_cache_msg = msg
+                                try:
+                                    _prompt_cache_frame = json.loads(msg)
+                                except Exception:
+                                    _prompt_cache_frame = None
+                                if isinstance(
+                                    _prompt_cache_frame, dict
+                                ) and _apply_prompt_cache_options_to_ws_response_create_frame(
+                                    _prompt_cache_frame
+                                ):
+                                    _prompt_cache_msg = json.dumps(_prompt_cache_frame)
+                                await upstream.send(_prompt_cache_msg)
                         except asyncio.CancelledError:
                             # Explicit cancel from the outer
                             # orchestrator — re-raise so

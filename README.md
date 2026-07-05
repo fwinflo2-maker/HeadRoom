@@ -228,10 +228,11 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 | Goose        | ✅              | starts proxy + launches          |
 | OpenHands    | ✅              | starts proxy + launches          |
 | Mistral Vibe | ✅              | starts proxy + launches          |
+| Oh My Pi     | ✅              | injects config · starts proxy + launches |
 | Cortex Code  | Library only    | 60–65% savings (library mode; no `wrap`) |
 
 Any OpenAI-compatible client works via `headroom proxy`. MCP-native: `headroom mcp install`.
-Undo durable wrapping with `headroom unwrap <tool>` (supports: `claude`, `copilot`, `codex`, `opencode`, `openclaw`).
+Undo durable wrapping with `headroom unwrap <tool>` (supports: `claude`, `copilot`, `codex`, `omp`, `opencode`, `openclaw`).
 
 ### GitHub Copilot CLI subscription mode
 

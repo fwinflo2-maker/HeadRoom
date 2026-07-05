@@ -149,3 +149,34 @@ python --version
 | base tag | `v0.30.0` |
 | base commit | `728b3308` |
 | base branch | `safe-codex-base` |
+
+## Phase 4以降の標準作業フロー
+
+Phase 4以降は、Phase 3 / Phase 3-Bで安定した以下の流れを標準とする。
+
+```text
+1. 新規Phaseは新規チャットで開始
+2. 4つの正本Markdownを参照
+3. 現在状態を開始プロンプトに明記
+4. まず調査
+5. 必要箇所だけ抽出
+6. 小分けpatch
+7. focused test
+8. ruff
+9. final test
+10. local commit
+11. pushしない
+```
+
+運用ルール:
+
+- 巨大patch貼り付けは避ける。
+- PowerShellはなるべくコピーしやすくまとめる。
+- 長くなる場合はStep単位で分割する。
+- .venv / Python 3.12.13 を優先する。
+- $env:PYTHONUTF8 = "1" を原則設定する。
+- phase*_investigation/ は原則commitしない。
+- pushは禁止し、local commitまでに留める。
+- 通常profileを壊さず、safe-codex 明示時のみ変更する。
+- CodexではなくChatGPT主導で、設計・差分作成・レビュー・テスト方針を進める。
+

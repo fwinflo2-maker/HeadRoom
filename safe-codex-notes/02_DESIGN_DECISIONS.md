@@ -134,9 +134,9 @@ coding compressor setup
 
 ## Prompt Caching方針
 
-Prompt CachingはPhase 3へ分離する。
+Prompt CachingはPhase 3-B / Phase 6で実装・検証済み。
 
-### Phase 3で確認すること
+### 確認済み事項
 
 - `prompt_cache_key` をOpenAI request bodyへ入れる箇所。
 - `prompt_cache_retention` を扱う箇所。
@@ -232,7 +232,7 @@ mypy: numpy stub起因で失敗、Phase 2対象外
 | U-003 | `prompt_cache_key` 注入箇所 | Phase 3 |
 | U-004 | `cached_tokens` 集計箇所 | Phase 3 |
 | U-005 | `learn --apply` 抑制の実装方法 | Phase 5 |
-| U-006 | Windows実運用でのproxy/Codex動作 | Phase 6 |
+| U-006 | Windows実運用でのproxy/Codex動作 | Phase 6 / Phase 8で条件付き実運用可と判断 |
 
 ## 設計更新履歴
 
@@ -241,6 +241,7 @@ mypy: numpy stub起因で失敗、Phase 2対象外
 | 2026-07-05 | 0 | 初期設計方針を作成 |
 | 2026-07-05 | 2 | Phase 2実装方針と実装場所を反映 |
 | 2026-07-05 | 5 | Phase 5で headroom learn --apply のsafe-codex明示許可制を反映 |
+| 2026-07-05 | 8 | Phase 8総合レビューで実運用は条件付き可、未決定事項は残リスク管理へ移行 |
 
 ## Phase 4以降の標準作業フロー
 
@@ -248,7 +249,7 @@ Phase 4以降は、Phase 3 / Phase 3-Bで安定した以下の流れを標準と
 
 ```text
 1. 新規Phaseは新規チャットで開始
-2. 4つの正本Markdownを参照
+2. 5つの正本Markdownを参照
 3. 現在状態を開始プロンプトに明記
 4. まず調査
 5. 必要箇所だけ抽出

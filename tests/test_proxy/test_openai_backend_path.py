@@ -366,6 +366,7 @@ def test_backend_streaming_passes_prefix_tracker_through():
         "tracker can record the messages that were sent"
     )
 
+
 def test_backend_path_injects_prompt_cache_options_for_safe_codex(
     monkeypatch: pytest.MonkeyPatch,
 ):

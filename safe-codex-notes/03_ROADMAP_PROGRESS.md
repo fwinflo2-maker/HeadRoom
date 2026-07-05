@@ -9,9 +9,9 @@
 
 | 項目 | 内容 |
 |---|---|
-| 現在の完了Phase | Phase 7 |
-| 現在の作業前状態 | Phase 7完了、Phase 8未開始 |
-| 次のPhase | Phase 8: 総合レビュー |
+| 現在の完了Phase | Phase 8 |
+| 現在の作業前状態 | Phase 8総合レビュー完了、実運用は条件付き可 |
+| 次のPhase | 実運用 / 必要時メンテナンス |
 | current branch | `safe-codex/phase2-safe-profile` |
 | base branch | `safe-codex-base` |
 | base tag | `v0.30.0` |
@@ -35,7 +35,7 @@
 | 5 | 完了 | 100% | `headroom learn`抑制 |
 | 6 | 完了 | 100% | Windows検証 |
 | 7 | 完了 | 100% | ドキュメント整備 |
-| 8 | 未開始 | 0% | 総合レビュー |
+| 8 | 完了 | 100% | 総合レビュー |
 
 ## Phase 0: upstream固定・環境確認
 
@@ -158,9 +158,9 @@ mypy headroom
 
 ## Phase 3: Prompt Caching対応
 
-状態: 未開始
+状態: 完了
 
-達成度: 0%
+達成度: 100%
 
 ### 目的
 
@@ -182,9 +182,9 @@ OpenAI Prompt Cachingを壊さず、cache hit率を上げる。
 
 ## Phase 4: ログ安全化
 
-状態: 未開始
+状態: 完了
 
-達成度: 0%
+達成度: 100%
 
 ### 目的
 
@@ -333,23 +333,75 @@ Windowsローカル環境で実用可能か検証する。
 - Codexを使う場合でも作業範囲を誤らない。
 ## Phase 8: 総合レビュー
 
-状態: 未開始
+状態: 完了
 
-達成度: 0%
+達成度: 100%
 
 ### 目的
 
 実運用へ入れてよいか総合判断する。
 
+### 判定
+
+`GO with conditions`
+
+実運用へ入れてよい。ただし、以下の条件を守る。
+
+- 個人ローカル運用に限定する。
+- proxyはloopbackのみで起動する。
+- `--log-messages` / `--codex-wire-debug` / `--codex-wire-debug-dir` は使わない。
+- `wrap codex --safe --memory` は使わない。
+- `headroom learn --apply` は原則使わず、必要時のみ `--allow-context-write` を明示する。
+- `--openai-api-url` は検証用途中心とし、信頼できないendpointへAPI keyや内容を送らない。
+- 医療情報、職場情報、患者情報、実データの本文ログは扱わない。
+- `prompt_cache_retention` は通常 `in_memory` を使い、`24h` は慎重扱いにする。
+
 ### 確認観点
 
-- 安全性
-- 正確性
-- Prompt Caching効率
-- Windows安定性
-- 既存互換性
-- 運用性
-- 未解決リスク
+| 観点 | 判定 | 内容 |
+|---|---|---|
+| 安全性 | 条件付きOK | 本文ログ禁止、wire debug禁止、loopback制限、context自動書き換え抑制を確認 |
+| 正確性 | OK | safe-codex明示時のみ新挙動を有効化する方針を確認 |
+| Prompt Caching効率 | OK | `prompt_cache_key` / `prompt_cache_retention` / `cached_tokens` 経路を確認 |
+| Windows安定性 | 条件付きOK | focused testsとruffは確認。mypyはnumpy stub / Python version解釈に起因する既知制約として扱う |
+| 既存互換性 | OK | 通常profile互換性テストを確認 |
+| 運用性 | OK | 5つの正本Markdown、検証手順、切り戻し手順を確認 |
+| 未解決リスク | 許容 | 残リスクは運用条件として明文化 |
+
+### Phase 8検証結果
+
+- `python -m pytest tests/test_safe_codex_profile.py tests/test_cli_safe_codex.py tests/test_cli_learn.py`: 32 passed
+- `python -m pytest tests/test_backends/test_litellm_cache_stats.py tests/test_proxy/test_openai_backend_path.py`: 13 passed, 1 warning
+- `python -m pytest tests/test_cli_proxy_env.py tests/test_proxy_loopback_gating.py tests/test_provider_codex_runtime.py`: 86 passed, 1 skipped, 1 warning
+- `ruff check headroom tests`: pass
+- `ruff format --check headroom tests`: Phase 8で2ファイルのformat差分を検出し、修正対象化
+- `mypy` scoped: numpy stub / Python version解釈に起因する失敗を確認。今回変更由来ではない既知制約として扱う
+- `git diff --check`: pass
+
+### Phase 8で判明した主な問題
+
+- `phase8_command_results.txt` の集計では全コマンドが `ok=True` になったが、実ログ上は `ruff format --check` と `mypy` に失敗内容があった。
+- PowerShellでnative commandの成否を集計する場合、`$?` だけでなく `$LASTEXITCODE` を即時保存して判定する必要がある。
+- 正本Markdown内に `4つの正本Markdown` 表記が残っていた。
+- `03_ROADMAP_PROGRESS.md` にPhase 3 / Phase 4の古い `未開始` ブロックが残っていた。
+- `03_ROADMAP_PROGRESS.md` の `latest commit` がPhase 7 commitではなくPhase 6 commit相当のままだった。
+
+### 残リスク
+
+| ID | 残リスク | 扱い |
+|---|---|---|
+| R-009 | 実OpenAI/Codex長時間運用でのcache hit率は環境・会話内容に依存する | 実運用中にstatsで確認する |
+| R-010 | `--prompt-cache-retention 24h` は情報残存期間が長くなる | 通常は `in_memory` を使う |
+| R-011 | `--openai-api-url` を誤って信頼できないendpointへ向けるリスク | 検証用途中心とし、運用時は指定先を確認する |
+| R-012 | full pytest / full mypy にはWindows既知問題が残る | focused test / related test / scoped mypyで切り分ける |
+| R-013 | Phase調査スクリプトの成否集計がnative command失敗を拾えない場合がある | `$LASTEXITCODE` を即時記録する方式へ改善する |
+
+### 切り戻し確認
+
+- proxy停止は `Ctrl+C`。
+- 一時環境変数は `04_SAFE_CODEX_OPERATION.md` の手順で削除する。
+- 未commit差分は `git status --short --branch` と `git diff --stat` を確認してから戻す。
+- commit済み変更を戻す場合、いきなり `git reset --hard` しない。
 
 ### 完了条件
 
@@ -368,7 +420,12 @@ Windowsローカル環境で実用可能か検証する。
 | R-005 | Prompt Cachingが壊れる | 中 | `cache-first` / stable prefix | Phase 3-B / Phase 6で対応済み |
 | R-006 | prompt_cache_keyに生パスが入る | 中 | hash化 | Phase 3-B / Phase 6で対応済み |
 | R-007 | Windowsで起動しない | 高 | Phase 6で手動検証し、Phase 7で検証手順を文書化 | fake OpenAI経由のproxy検証と手順文書化は確認済み |
-| R-008 | 通常Headroom挙動を壊す | 高 | safe明示時のみ新挙動 | Phase 2テストで確認済み |
+| R-008 | 通常Headroom挙動を壊す | 高 | safe明示時のみ新挙動 | Phase 2 / Phase 8テストで確認済み |
+| R-009 | 実OpenAI/Codex長時間運用でのcache hit率は環境・会話内容に依存する | 中 | 実運用中にstatsで確認する | 残リスクとして許容 |
+| R-010 | --prompt-cache-retention 24h による情報残存期間延長 | 中 | 通常は in_memory を使う | 残リスクとして許容 |
+| R-011 | --openai-api-url を信頼できないendpointへ向ける | 高 | 検証用途中心、指定先確認を徹底 | 残リスクとして許容 |
+| R-012 | full pytest / full mypy のWindows既知問題 | 低 | focused / related testで切り分ける | 残リスクとして許容 |
+| R-013 | PowerShell native commandの失敗集計漏れ | 中 | $LASTEXITCODE を即時保存して判定する | Phase 8で検出、運用改善対象 |
 
 ## 更新履歴
 
@@ -383,6 +440,7 @@ Windowsローカル環境で実用可能か検証する。
 | 2026-07-05 | 5 | Phase完了時に失敗・手戻り・改善策を運用ルールへ反映する共通ルールを追記 |
 | 2026-07-05 | 6 | Windows検証完了、OpenAI backend path / prompt cache / cached_tokens / safe log / 通常profile互換性を確認 |
 | 2026-07-05 | 7 | Phase 7完了、safe-codex運用手順、危険オプション、Windows検証手順、切り戻し方法を文書化 |
+| 2026-07-05 | 8 | Phase 8完了、実運用は条件付き可、残リスクと切り戻し確認を反映 |
 
 ## Phase 4以降の標準作業フロー
 
@@ -390,7 +448,7 @@ Phase 4以降は、Phase 3 / Phase 3-Bで安定した以下の流れを標準と
 
 ```text
 1. 新規Phaseは新規チャットで開始
-2. 4つの正本Markdownを参照
+2. 5つの正本Markdownを参照
 3. 現在状態を開始プロンプトに明記
 4. まず調査
 5. 必要箇所だけ抽出

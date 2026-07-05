@@ -145,8 +145,8 @@ python --version
 
 | 項目 | 内容 |
 |---|---|
-| 現在の完了Phase | Phase 7 |
-| 次のPhase | Phase 8: 総合レビュー |
+| 現在の完了Phase | Phase 8 |
+| 次のPhase | 実運用 / 必要時メンテナンス |
 | local path | `C:\dev\headroom-safe-codex` |
 | upstream | `https://github.com/headroomlabs-ai/headroom.git` |
 | base tag | `v0.30.0` |

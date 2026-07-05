@@ -196,8 +196,7 @@ def create_proxy_backend(
             else:
                 parameters = signature.parameters
                 if "api_base" in parameters or any(
-                    param.kind == inspect.Parameter.VAR_KEYWORD
-                    for param in parameters.values()
+                    param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()
                 ):
                     backend_kwargs["api_base"] = openai_api_url
 

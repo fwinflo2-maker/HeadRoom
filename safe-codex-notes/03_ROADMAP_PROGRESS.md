@@ -9,16 +9,19 @@
 
 | 項目 | 内容 |
 |---|---|
-| 現在の完了Phase | Phase 2 |
-| 現在の作業前状態 | Phase 3未開始 |
-| 次のPhase | Phase 3: Prompt Caching対応 |
+| 現在の完了Phase | Phase 4 |
+| 現在の作業前状態 | Phase 4完了、Phase 5未開始 |
+| 次のPhase | Phase 5: headroom learn抑制 |
 | current branch | `safe-codex/phase2-safe-profile` |
 | base branch | `safe-codex-base` |
 | base tag | `v0.30.0` |
 | base commit | `728b3308` |
 | Phase 2 commit | `e69a4515 Add safe-codex profile wiring` |
-| notes commit | `3665c32a Add safe-codex project notes` |
-| latest notes update | `a885f560 Update safe-codex notes for phase 2` をamend対象 |
+| Phase 3-B commit | `efbdc811 Add safe-codex prompt caching for Codex websocket` |
+| Phase 4 commit | `623324e0 Harden safe-codex logging` |
+| latest commit | `623324e0 Harden safe-codex logging` |
+| push | 未実行 |
+| worktree | ソース差分なし、`phase*_investigation/` のみ未追跡想定 |
 
 ## Phase一覧
 
@@ -27,8 +30,8 @@
 | 0 | 完了 | 100% | upstream固定・作業環境確認 |
 | 1 | 完了 | 100% | `safe-codex`設計・変更対象確定 |
 | 2 | 完了 | 100% | `safe-codex` profileとCLI追加 |
-| 3 | 未開始 | 0% | Prompt Caching対応 |
-| 4 | 未開始 | 0% | ログ安全化 |
+| 3 | 完了 | 100% | Prompt Caching対応 |
+| 4 | 完了 | 100% | ログ安全化 |
 | 5 | 未開始 | 0% | `headroom learn`抑制 |
 | 6 | 未開始 | 0% | Windows検証 |
 | 7 | 未開始 | 0% | ドキュメント整備 |
@@ -319,6 +322,8 @@ Windowsローカル環境で実用可能か検証する。
 |---|---:|---|
 | 2026-07-05 | 0 | Phase 0完了内容を反映 |
 | 2026-07-05 | 2 | Phase 1/2完了、`safe-codex` profile wiring実装commitを反映 |
+| 2026-07-05 | 3 | Phase 3-B完了、Prompt Caching対応commitを反映 |
+| 2026-07-05 | 4 | Phase 4完了、ログ安全化commitと作業方法を反映 |
 
 ## Phase 4以降の標準作業フロー
 
@@ -350,3 +355,92 @@ Phase 4以降は、Phase 3 / Phase 3-Bで安定した以下の流れを標準と
 - 通常profileを壊さず、safe-codex 明示時のみ変更する。
 - CodexではなくChatGPT主導で、設計・差分作成・レビュー・テスト方針を進める。
 
+
+
+## Phase 3/4 完了追記
+
+### Phase 3-B: Prompt Caching対応
+
+状態: 完了
+
+実装commit:
+
+- `efbdc811 Add safe-codex prompt caching for Codex websocket`
+
+実装内容:
+
+- `safe-codex` 用 `prompt_cache_key` / `prompt_cache_retention` optionを追加。
+- HTTP `/v1/chat/completions` に対応。
+- HTTP `/v1/responses` に対応。
+- Codex WebSocket `/v1/responses response.create` に対応。
+- `auto` keyは `codex:<hash>` 形式とし、絶対パスを送らない。
+- client指定済み値は上書きしない。
+- `cached_tokens` がない場合も落ちない。
+
+確認結果:
+
+- pytest: 40 passed
+- ruff: All checks passed
+
+### Phase 4: ログ安全化
+
+状態: 完了
+
+実装commit:
+
+- `623324e0 Harden safe-codex logging`
+
+実装内容:
+
+- `ProxyConfig.safe_mode` を追加。
+- `cli proxy --profile safe-codex` から `safe_mode=True` を伝播。
+- `RequestLogger` に `safe_mode` を追加。
+- safe時は `log_full_messages=True` が渡されても本文ログを強制無効化。
+- safe時は `request_messages` / `compressed_messages` / `response_content` をrecent logにもJSONLにも保持しない。
+- safe時は `get_recent_with_messages()` でも本文系フィールドを返さない。
+- safe時は `HEADROOM_DEBUG_DUMP=full` でもdebug dumpをoffにする。
+- safe log metadata内の token / API-key風文字列をredact。
+- 通常profileの `log_full_messages=True` 挙動は維持。
+
+確認結果:
+
+- focused pytest: 40 passed
+- related pytest: 101 passed, 1 warning
+- ruff check headroom tests: All checks passed
+- git diff --check: pass
+
+全体pytestの扱い:
+
+- command: python -m pytest -q -x --tb=short
+- result: 1 failed, 90 passed, 88 skipped, 1 warning
+- failure: tests/test_adapter_hooks.py::TestStorageEntryPointLoading::test_sqlite_scheme
+- reason: Windows上で sqlite:///{tmp_path}/test.db が \C:\... 形式に解釈され、WinError 123で失敗
+- judgement: Phase 4ログ安全化変更とは別領域の既存Windows path系失敗として扱う
+
+### 今回の作業方法
+
+Phase 3完了時の運用ルール反映と同じく、以下の流れで進めた。
+
+1. 正本Markdownと開始時状態を確認。
+2. 広めにログ面を調査。
+3. 候補が広すぎたため、高リスク箇所だけ再抽出。
+4. 実際に本文を保持・保存し得る経路に絞った。
+5. `RequestLogger` / debug dump / `ProxyConfig` / CLI伝播に限定して小分けpatch。
+6. focused testを実行。
+7. 関連テストへ拡大。
+8. ruffを実行。
+9. `git diff --check` を実行。
+10. 全体pytestの既知失敗を切り分け。
+11. 実装差分だけlocal commit。
+12. Phase完了後、正本Markdownに作業方法と結果を反映。
+
+### Phase完了時の正本更新ルール
+
+- 実装commit完了後、すぐに `safe-codex-notes/03_ROADMAP_PROGRESS.md` を更新する。
+- 更新前に `safe-codex-notes/03_ROADMAP_PROGRESS.md` を `phase*_investigation/` へバックアップする。
+- 正本Markdownは全置換しない。既存構成を確認し、必要箇所だけ追記・更新する。
+- 長いスクリプトはコピー可能範囲で途切れる可能性があるため、短いStepに分割する。
+- 反映内容には、Phase状態、実装commit、変更概要、作業方法、test / ruff / `git diff --check` 結果を含める。
+- 全体testで既知失敗がある場合は、失敗名・原因・今回変更との関連有無を明記する。
+- Markdown更新のみの場合、pytestは原則不要。必要に応じて `git diff --check` のみ実施する。
+- commit対象は正本Markdownのみとし、`phase*_investigation/` はcommitしない。

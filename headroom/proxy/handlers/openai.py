@@ -640,6 +640,32 @@ def _extract_codex_handshake_headers(upstream: Any) -> list[tuple[str, str]]:
     return out
 
 
+def _apply_prompt_cache_options(body: dict[str, Any]) -> bool:
+    """Inject OpenAI Prompt Caching options for safe-codex only.
+
+    Values come from safe-codex CLI env wiring. This helper never reads request
+    content and never logs the key.
+    """
+    import os
+
+    if os.environ.get("HEADROOM_PROFILE", "").strip().lower() != "safe-codex":
+        return False
+
+    changed = False
+
+    prompt_cache_key = os.environ.get("HEADROOM_PROMPT_CACHE_KEY", "").strip()
+    if prompt_cache_key and "prompt_cache_key" not in body:
+        body["prompt_cache_key"] = prompt_cache_key
+        changed = True
+
+    prompt_cache_retention = os.environ.get("HEADROOM_PROMPT_CACHE_RETENTION", "").strip()
+    if prompt_cache_retention and "prompt_cache_retention" not in body:
+        body["prompt_cache_retention"] = prompt_cache_retention
+        changed = True
+
+    return changed
+
+
 def _infer_openai_cache_write_tokens(input_tokens: int, cache_read_tokens: int) -> int:
     """Infer OpenAI automatic prompt-cache writes from uncached input tokens.
 
@@ -2381,6 +2407,7 @@ class OpenAIHandlerMixin:
             headers = presend_event.headers
         optimized_tokens = tokenizer.count_messages(body["messages"])
         tokens_saved = original_tokens - optimized_tokens
+        _apply_prompt_cache_options(body)
 
         # Route through LiteLLM/any-llm backend if configured
         if self.anthropic_backend is not None:
@@ -3538,6 +3565,9 @@ class OpenAIHandlerMixin:
                 "transforms_applied": transforms_applied,
             },
         )
+
+        if _apply_prompt_cache_options(body):
+            body_mutation_tracker.mark_mutated("prompt_cache_options")
 
         # Waste-signal detection for the Responses path (#820). The transform
         # pipeline never runs here (compression goes through CompressionUnits),

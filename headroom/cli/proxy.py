@@ -15,6 +15,7 @@ from headroom.proxy.modes import PROXY_MODE_TOKEN, normalize_proxy_mode
 from ._utils.safe_codex import (
     SAFE_CODEX_PROFILE,
     is_safe_codex_profile,
+    resolve_prompt_cache_options,
     safe_codex_proxy_defaults,
     validate_known_profile,
     validate_safe_codex_proxy_options,
@@ -153,6 +154,19 @@ def dashboard(port: int, no_open: bool) -> None:
     default=None,
     envvar="HEADROOM_PROFILE",
     help="Configuration profile to apply. Currently supported: safe-codex.",
+)
+@click.option(
+    "--prompt-cache-key",
+    default=None,
+    help=(
+        "OpenAI prompt_cache_key for safe-codex. Use 'auto' to send an opaque "
+        "per-project key. Use 'default' to disable injection."
+    ),
+)
+@click.option(
+    "--prompt-cache-retention",
+    default=None,
+    help="OpenAI prompt_cache_retention for safe-codex: default, in_memory, in-memory, or 24h.",
 )
 @click.option(
     "--host",
@@ -849,6 +863,8 @@ def dashboard(port: int, no_open: bool) -> None:
 def proxy(
     ctx: click.Context,
     profile: str | None,
+    prompt_cache_key: str | None,
+    prompt_cache_retention: str | None,
     mode: str | None,
     target_ratio: float | None,
     host: str,
@@ -965,7 +981,15 @@ def proxy(
 
     validate_known_profile(profile)
     safe_profile = is_safe_codex_profile(profile)
+    if not safe_profile and (prompt_cache_key or prompt_cache_retention):
+        raise click.UsageError(
+            "--prompt-cache-key and --prompt-cache-retention require --profile safe-codex"
+        )
     if safe_profile:
+        resolved_prompt_cache_key, resolved_prompt_cache_retention = resolve_prompt_cache_options(
+            prompt_cache_key=prompt_cache_key,
+            prompt_cache_retention=prompt_cache_retention,
+        )
         validate_safe_codex_proxy_options(
             host=host,
             log_messages=log_messages,
@@ -991,6 +1015,10 @@ def proxy(
         os.environ.setdefault("HEADROOM_DISABLE_KOMPRESS", "1")
         os.environ.setdefault("HEADROOM_CODE_AWARE_ENABLED", "0")
         os.environ.setdefault("HEADROOM_OUTPUT_SHAPER", "0")
+        if resolved_prompt_cache_key is not None:
+            os.environ["HEADROOM_PROMPT_CACHE_KEY"] = resolved_prompt_cache_key
+        if resolved_prompt_cache_retention is not None:
+            os.environ["HEADROOM_PROMPT_CACHE_RETENTION"] = resolved_prompt_cache_retention
         mode = safe_defaults.mode
         host = safe_defaults.host
         lossless = safe_defaults.lossless

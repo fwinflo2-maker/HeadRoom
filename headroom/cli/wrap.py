@@ -37,6 +37,7 @@ from headroom._subprocess import pid_alive, run
 from headroom.cli._utils.safe_codex import (
     SAFE_CODEX_PROFILE,
     reject_safe_codex_wrap_options,
+    resolve_prompt_cache_options,
 )
 
 # Fix Windows cp1252 encoding — box-drawing characters require UTF-8
@@ -4278,6 +4279,19 @@ def unwrap_copilot(port: int, no_stop_proxy: bool) -> None:
     is_flag=True,
     help="Use the safe-codex profile and suppress persistent Codex/MCP context writes",
 )
+@click.option(
+    "--prompt-cache-key",
+    default=None,
+    help=(
+        "OpenAI prompt_cache_key for --safe. Use 'auto' to send an opaque "
+        "per-project key. Use 'default' to disable injection."
+    ),
+)
+@click.option(
+    "--prompt-cache-retention",
+    default=None,
+    help="OpenAI prompt_cache_retention for --safe: default, in_memory, in-memory, or 24h.",
+)
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--prepare-only", is_flag=True, hidden=True)
 @click.argument("codex_args", nargs=-1, type=click.UNPROCESSED)
@@ -4293,6 +4307,8 @@ def codex(
     learn: bool,
     memory: bool,
     safe: bool,
+    prompt_cache_key: str | None,
+    prompt_cache_retention: str | None,
     backend: str | None,
     anyllm_provider: str | None,
     region: str | None,
@@ -4321,8 +4337,17 @@ def codex(
         headroom wrap codex --port 9999             # Custom proxy port
         headroom wrap codex --backend anyllm --anyllm-provider groq
     """
+    resolved_prompt_cache_key: str | None = None
+    resolved_prompt_cache_retention: str | None = None
+    if not safe and (prompt_cache_key or prompt_cache_retention):
+        raise click.UsageError("--prompt-cache-key and --prompt-cache-retention require --safe")
+
     if safe:
         reject_safe_codex_wrap_options(memory=memory, codex_args=codex_args)
+        resolved_prompt_cache_key, resolved_prompt_cache_retention = resolve_prompt_cache_options(
+            prompt_cache_key=prompt_cache_key,
+            prompt_cache_retention=prompt_cache_retention,
+        )
         no_rtk = True
         no_mcp = True
         no_tokensave = True
@@ -4332,6 +4357,10 @@ def codex(
         learn = False
         memory = False
         os.environ["HEADROOM_PROFILE"] = SAFE_CODEX_PROFILE
+        if resolved_prompt_cache_key is not None:
+            os.environ["HEADROOM_PROMPT_CACHE_KEY"] = resolved_prompt_cache_key
+        if resolved_prompt_cache_retention is not None:
+            os.environ["HEADROOM_PROMPT_CACHE_RETENTION"] = resolved_prompt_cache_retention
 
     # Snapshot Codex config.toml BEFORE any wrap-time mutation so
     # `headroom unwrap codex` can restore the user's pre-wrap state
@@ -4436,6 +4465,10 @@ def codex(
         raise SystemExit(1)
 
     env, env_vars_display = _build_codex_launch_env(port, os.environ)
+    if resolved_prompt_cache_key is not None:
+        env["HEADROOM_PROMPT_CACHE_KEY"] = resolved_prompt_cache_key
+    if resolved_prompt_cache_retention is not None:
+        env["HEADROOM_PROMPT_CACHE_RETENTION"] = resolved_prompt_cache_retention
 
     # Per-project savings attribution: the injected provider config maps the
     # X-Headroom-Project header to HEADROOM_PROJECT via env_http_headers, so

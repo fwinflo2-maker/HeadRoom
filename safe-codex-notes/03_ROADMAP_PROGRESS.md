@@ -2,27 +2,31 @@
 
 ## 運用方針
 
-このファイルは、プロジェクトの達成度に応じて更新する。  
+このファイルは、プロジェクトの達成度に応じて更新する。
 各Phase完了時に、状態・達成度・実施内容・未完了事項を更新する。
 
 ## 現在の状態
 
 | 項目 | 内容 |
 |---|---|
-| 現在の完了Phase | Phase 0 |
-| 現在の作業前状態 | Phase 1未開始 |
-| 次のPhase | Phase 1: safe-codex詳細設計 |
+| 現在の完了Phase | Phase 2 |
+| 現在の作業前状態 | Phase 3未開始 |
+| 次のPhase | Phase 3: Prompt Caching対応 |
+| current branch | `safe-codex/phase2-safe-profile` |
 | base branch | `safe-codex-base` |
 | base tag | `v0.30.0` |
 | base commit | `728b3308` |
+| Phase 2 commit | `e69a4515 Add safe-codex profile wiring` |
+| notes commit | `3665c32a Add safe-codex project notes` |
+| latest notes update | `a885f560 Update safe-codex notes for phase 2` をamend対象 |
 
 ## Phase一覧
 
 | Phase | 状態 | 達成度 | 目的 |
 |---:|---|---:|---|
 | 0 | 完了 | 100% | upstream固定・作業環境確認 |
-| 1 | 未開始 | 0% | `safe-codex`設計・変更対象確定 |
-| 2 | 未開始 | 0% | `safe-codex` profileとCLI追加 |
+| 1 | 完了 | 100% | `safe-codex`設計・変更対象確定 |
+| 2 | 完了 | 100% | `safe-codex` profileとCLI追加 |
 | 3 | 未開始 | 0% | Prompt Caching対応 |
 | 4 | 未開始 | 0% | ログ安全化 |
 | 5 | 未開始 | 0% | `headroom learn`抑制 |
@@ -32,7 +36,8 @@
 
 ## Phase 0: upstream固定・環境確認
 
-状態: 完了  
+状態: 完了
+
 達成度: 100%
 
 ### 目的
@@ -62,70 +67,96 @@
 
 ## Phase 1: safe-codex詳細設計
 
-状態: 未開始  
-達成度: 0%
+状態: 完了
+
+達成度: 100%
 
 ### 目的
 
 実装前に既存構成を確認し、`safe-codex` profileを最小変更で追加する設計を確定する。
 
-### 確認対象
+### 完了内容
 
-```text
-headroom/cli/proxy.py
-headroom/cli/wrap.py
-headroom/providers/codex/runtime.py
-tests/
-pyproject.toml
-```
+- 既存構成を確認。
+- `headroom/cli/proxy.py`、`headroom/cli/wrap.py`、`headroom/providers/codex/runtime.py`、`tests/`、`pyproject.toml` を確認。
+- 新しい圧縮器は作らず、既存Headroomに `safe-codex` profile相当を追加する方針を確定。
+- `headroom/profiles/` はPhase 2では作らず、CLI utilsへ集約する方針を確定。
+- Prompt CachingはPhase 3へ分離する方針を確定。
+- `headroom learn --apply` 抑制はPhase 5へ分離する方針を確定。
 
-### 完了条件
+### 成果物
 
-- 変更ファイル候補が決まっている。
-- 新規ファイル候補が決まっている。
-- safe-codexの既定値が決まっている。
-- 禁止する危険オプションが決まっている。
-- テスト項目が決まっている。
-- 通常profileの既存挙動を壊さない設計になっている。
-
-### 成果物予定
-
-- Phase 2に渡せる実装対象リスト
+- Phase 2実装対象リスト
 - 追加ファイル案
 - 変更ファイル案
 - テスト方針
 - 未決定事項の整理
 
+### 残課題
+
+なし。Prompt CachingはPhase 3で扱う。
+
 ## Phase 2: safe-codex最小実装
 
-状態: 未開始  
-達成度: 0%
+状態: 完了
 
-### 目的
+達成度: 100%
 
-`headroom proxy --profile safe-codex` と `headroom wrap codex --safe` を最小実装する。
+### 実装commit
 
-### 実装対象
+- `e69a4515 Add safe-codex profile wiring`
 
-- safe-codex profile追加
-- `--profile safe-codex`
-- `wrap codex --safe`
-- loopback制限
-- 危険ログオプション拒否
-- 最小テスト追加
+### 実装内容
 
-### 完了条件
+- `headroom/cli/_utils/safe_codex.py` を追加。
+- `headroom proxy --profile safe-codex` を追加。
+- `headroom wrap codex --safe` を追加。
+- safe時のloopback制限を追加。
+- safe時の危険ログoption拒否を追加。
+- safe時のCodex/MCP/context自動書き換え抑制を追加。
+- 新規テストを追加。
 
-- `--profile safe-codex` が認識される。
-- `wrap codex --safe` が認識される。
-- `OPENAI_BASE_URL` は既存通り設定される。
-- safeではhost `127.0.0.1` 以外を拒否する。
-- safeでは `--log-messages` / `--codex-wire-debug` を拒否する。
-- 既存の通常profileを壊していない。
+### 変更ファイル
+
+```text
+headroom/cli/_utils/safe_codex.py
+headroom/cli/proxy.py
+headroom/cli/wrap.py
+tests/test_cli_safe_codex.py
+tests/test_safe_codex_profile.py
+```
+
+### 確認結果
+
+```text
+python -m pytest tests/test_safe_codex_profile.py tests/test_cli_safe_codex.py
+=> 15 passed
+
+python -m pytest tests/test_cli_proxy_env.py tests/test_proxy_loopback_gating.py tests/test_provider_codex_runtime.py tests/test_cli_learn.py
+=> 99 passed, 1 skipped, 1 warning
+
+ruff check headroom tests
+=> All checks passed
+
+ruff format --check headroom tests
+=> 936 files already formatted
+
+mypy headroom
+=> .venv\Lib\site-packages\numpy\__init__.pyi の syntax error で失敗
+=> Phase 2変更由来ではなく、依存stub / 環境起因として扱う
+```
+
+### 残課題
+
+- Prompt Caching対応はPhase 3へ分離。
+- ログ安全化の追加強化はPhase 4へ分離。
+- `headroom learn --apply` 抑制はPhase 5へ分離。
+- Windows実運用検証はPhase 6へ分離。
 
 ## Phase 3: Prompt Caching対応
 
-状態: 未開始  
+状態: 未開始
+
 達成度: 0%
 
 ### 目的
@@ -148,7 +179,8 @@ OpenAI Prompt Cachingを壊さず、cache hit率を上げる。
 
 ## Phase 4: ログ安全化
 
-状態: 未開始  
+状態: 未開始
+
 達成度: 0%
 
 ### 目的
@@ -157,10 +189,9 @@ OpenAI Prompt Cachingを壊さず、cache hit率を上げる。
 
 ### 実装対象
 
-- `--log-messages` 禁止
-- `--codex-wire-debug` 禁止
 - redact関数追加
 - 数値メトリクス中心のログ設計
+- Phase 2で拒否済みの `--log-messages` / `--codex-wire-debug` の補強
 
 ### 完了条件
 
@@ -170,7 +201,8 @@ OpenAI Prompt Cachingを壊さず、cache hit率を上げる。
 
 ## Phase 5: headroom learn抑制
 
-状態: 未開始  
+状態: 未開始
+
 達成度: 0%
 
 ### 目的
@@ -191,7 +223,8 @@ OpenAI Prompt Cachingを壊さず、cache hit率を上げる。
 
 ## Phase 6: Windows検証
 
-状態: 未開始  
+状態: 未開始
+
 達成度: 0%
 
 ### 目的
@@ -219,7 +252,8 @@ Windowsローカル環境で実用可能か検証する。
 
 ## Phase 7: ドキュメント整備
 
-状態: 未開始  
+状態: 未開始
+
 達成度: 0%
 
 ### 目的
@@ -242,7 +276,8 @@ Windowsローカル環境で実用可能か検証する。
 
 ## Phase 8: 総合レビュー
 
-状態: 未開始  
+状態: 未開始
+
 達成度: 0%
 
 ### 目的
@@ -269,17 +304,18 @@ Windowsローカル環境で実用可能か検証する。
 
 | ID | リスク | 影響 | 対策 | 状態 |
 |---|---|---:|---|---|
-| R-001 | 圧縮でCodexが誤読する | 高 | 初期はlossless-first / Kompress無効 | 未確認 |
-| R-002 | request/response本文がログに残る | 高 | `--log-messages` 禁止 | 未実装 |
-| R-003 | Codex wire debugに機密情報が残る | 高 | safe profileで禁止 | 未実装 |
-| R-004 | `AGENTS.md` が自動書き換えされる | 中 | `learn --apply` 明示許可制 | 未実装 |
-| R-005 | Prompt Cachingが壊れる | 中 | `cache-first` / stable prefix | 未実装 |
-| R-006 | prompt_cache_keyに生パスが入る | 中 | hash化 | 未実装 |
+| R-001 | 圧縮でCodexが誤読する | 高 | 初期はlossless-first / Kompress無効 | Phase 2で一部対応 |
+| R-002 | request/response本文がログに残る | 高 | `--log-messages` 禁止 | Phase 2でsafe時拒否を実装 |
+| R-003 | Codex wire debugに機密情報が残る | 高 | safe profileで禁止 | Phase 2でsafe時拒否を実装 |
+| R-004 | `AGENTS.md` が自動書き換えされる | 中 | safe時にwrap側の自動書き換えを抑制 | Phase 2で一部対応、Phase 5で追加対応 |
+| R-005 | Prompt Cachingが壊れる | 中 | `cache-first` / stable prefix | Phase 3で対応予定 |
+| R-006 | prompt_cache_keyに生パスが入る | 中 | hash化 | Phase 3で対応予定 |
 | R-007 | Windowsで起動しない | 高 | Phase 6で手動検証 | 未確認 |
-| R-008 | 通常Headroom挙動を壊す | 高 | safe明示時のみ新挙動 | 未確認 |
+| R-008 | 通常Headroom挙動を壊す | 高 | safe明示時のみ新挙動 | Phase 2テストで確認済み |
 
 ## 更新履歴
 
 | 日付 | Phase | 更新内容 |
 |---|---:|---|
 | 2026-07-05 | 0 | Phase 0完了内容を反映 |
+| 2026-07-05 | 2 | Phase 1/2完了、`safe-codex` profile wiring実装commitを反映 |

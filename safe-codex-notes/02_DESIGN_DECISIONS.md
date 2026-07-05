@@ -23,17 +23,46 @@ safe-codex profile
 - `safe-codex` 明示時のみ新挙動を有効化する。
 - 通常の `headroom proxy` / `headroom wrap codex` の既存挙動は壊さない。
 - 大規模リファクタリングは避ける。
-- まずは安全な既定値セットを追加し、圧縮強度は後から段階的に調整する。
 - request / response本文を保存しない。
 - API key、GitHub token、個人情報、職場情報、医療情報をログやcache keyに含めない。
 
-## safe-codexの既定値案
+## Phase 2で採用した構成
+
+### 実装場所
+
+`safe-codex` profile相当の判定・既定値・危険option検証は以下に集約する。
+
+```text
+headroom/cli/_utils/safe_codex.py
+```
+
+### 採用理由
+
+- 既存に `headroom/cli/_utils/` が存在する。
+- Phase 2ではCLI入口の最小変更で足りる。
+- `headroom/profiles/` という新しいprofile基盤を作ると過剰設計になる。
+- `proxy.py` と `wrap.py` の重複実装を避けられる。
+
+### 不採用
+
+```text
+headroom/profiles/__init__.py
+headroom/profiles/safe_codex.py
+```
+
+理由:
+
+- 現時点では既存 `headroom/profiles/` がない。
+- CLI以外からprofile参照する要件がまだない。
+- Phase 2の目的に対して新しいprofile基盤は大きすぎる。
+
+## safe-codexの既定値
+
+Phase 2で実装済み:
 
 ```text
 HEADROOM_PROFILE=safe-codex
 HEADROOM_MODE=cache
-HEADROOM_CACHE_FIRST=1
-HEADROOM_STABLE_PREFIX=1
 HEADROOM_LOSSLESS=1
 HEADROOM_DISABLE_KOMPRESS=1
 HEADROOM_LOG_MESSAGES=0
@@ -44,117 +73,75 @@ HEADROOM_OUTPUT_SHAPER=0
 HEADROOM_HOST=127.0.0.1
 ```
 
-## 想定CLI
+Phase 3へ分離:
+
+```text
+HEADROOM_CACHE_FIRST=1
+HEADROOM_STABLE_PREFIX=1
+```
+
+理由:
+
+- Phase 2確認時点では実効的な参照箇所が未確定。
+- Prompt Caching対応と一緒に設計・実装する方が安全。
+
+## CLI
+
+Phase 2で実装済み:
 
 ```powershell
 headroom proxy --profile safe-codex --port 8787 --no-open
 headroom wrap codex --safe
 ```
 
-Prompt Caching利用時:
+Prompt Caching利用時の想定CLIはPhase 3で扱う。
 
 ```powershell
 headroom wrap codex --safe --prompt-cache-key auto --prompt-cache-retention in_memory
 ```
 
-節約優先時:
+## safe-codexで拒否するもの
 
-```powershell
-headroom wrap codex --safe --prompt-cache-key auto --prompt-cache-retention 24h
-```
+| 対象 | 扱い | 理由 |
+|---|---|---|
+| `--host 0.0.0.0` | 拒否 | ローカルプロキシ公開リスク |
+| 非loopback host | 拒否 | 外部公開リスク |
+| `HEADROOM_HOST=0.0.0.0` | 拒否 | 外部公開リスク |
+| `--log-messages` | 拒否 | request/response本文が残る |
+| `HEADROOM_LOG_MESSAGES=1` | 拒否 | request/response本文が残る |
+| `--codex-wire-debug` | 拒否 | Codex通信内容が残る |
+| `--codex-wire-debug-dir` | 拒否 | Codex通信内容が残る |
+| `HEADROOM_CODEX_WIRE_DEBUG=1` | 拒否 | Codex通信内容が残る |
+| `wrap codex --safe --memory` | 拒否 | 永続memory/context file書き込みリスク |
+| `wrap codex --safe --codex-wire-debug` | 拒否 | Codex通信内容が残る |
 
-## 変更候補ファイル
+## wrap codex --safe の方針
+
+safe時は以下を抑制する。
 
 ```text
-headroom/profiles/__init__.py
-headroom/profiles/safe_codex.py
-headroom/cli/proxy.py
-headroom/cli/wrap.py
-tests/test_safe_codex_profile.py
+RTK AGENTS注入
+MCP自動登録
+tokensave登録
+Serena登録
+memory guidance注入
+coding compressor setup
 ```
 
-Prompt Caching対応時は、OpenAI request bodyの変換箇所とusage集計箇所を追加で確認する。
-
-## safe-codexで禁止または明示許可にするもの
-
-| 項目 | safe-codexでの扱い | 理由 |
-|---|---|---|
-| `--host 0.0.0.0` | 原則拒否 | ローカルプロキシ公開リスク |
-| `--log-messages` | 拒否 | request/response本文が残る |
-| `--codex-wire-debug` | 拒否 | Codex通信内容が残る |
-| `headroom learn --apply` | 拒否または明示許可制 | `AGENTS.md` 自動変更リスク |
-| `prompt_cache_retention 24h` | 明示指定時のみ | 機密性への配慮 |
+ただし、Codex通信をproxyへ向けるprovider configと `OPENAI_BASE_URL` 設定は維持する。
 
 ## Prompt Caching方針
 
-`safe-codex` は `cache-first` を基本にする。
+Prompt CachingはPhase 3へ分離する。
 
-方針:
+### Phase 3で確認すること
 
-- 既存の `--mode cache` を活用する。
-- 固定prefixを安定させる。
-- 変動ログ・diff・今回指示は末尾に寄せる。
-- prior turnsを無理に毎回再圧縮しない。
-- `cached_tokens` を計測して効果を確認する。
-
-## 推奨prompt構造
-
-```text
-[固定prefix]
-- system/developer instructions
-- AGENTS.md
-- プロジェクト共通ルール
-- テスト方針
-- 禁止事項
-- 出力フォーマット
-
-[準固定prefix]
-- repository summary
-- directory map
-- known commands
-- dependency summary
-
-[変動tail]
-- 今回の依頼
-- git diff
-- test log
-- error log
-- review comment
-- Codexへの今回指示
-```
-
-## prompt_cache_key方針
-
-指定案:
-
-```text
---prompt-cache-key auto
---prompt-cache-key <key>
---no-prompt-cache-key
-```
-
-auto key:
-
-- repo rootまたはworking directoryをもとにhash化する。
-- 生の絶対パスは送らない。
-- ユーザー名、職場名、token、API keyを含めない。
-- 例: `codex:<repo-root-hash>`
-
-## prompt_cache_retention方針
-
-指定案:
-
-```text
---prompt-cache-retention default
---prompt-cache-retention in_memory
---prompt-cache-retention 24h
-```
-
-初期方針:
-
-- safe-codexの既定は `default` または `in_memory`。
-- `24h` は明示指定時のみ。
-- 医療情報・職場情報を含む可能性がある場合は `24h` を避ける。
+- `prompt_cache_key` をOpenAI request bodyへ入れる箇所。
+- `prompt_cache_retention` を扱う箇所。
+- `cached_tokens` をusage metricsへ反映する箇所。
+- auto keyに生パス・ユーザー名・token・API keyを含めない方法。
+- safe-codex時のみ有効化する分岐。
+- 既存OpenAI/Codex routing testへの追加位置。
 
 ## metrics方針
 
@@ -203,26 +190,25 @@ Authorization: Bearer ...
 
 ## テスト方針
 
-最小テスト:
+Phase 2で実行済み:
 
 ```powershell
-python -m pytest tests/test_safe_codex_profile.py
-python -m pytest tests/test_cli_wrap.py tests/test_cli_proxy.py
+python -m pytest tests/test_safe_codex_profile.py tests/test_cli_safe_codex.py
+python -m pytest tests/test_cli_proxy_env.py tests/test_proxy_loopback_gating.py tests/test_provider_codex_runtime.py tests/test_cli_learn.py
 ruff check headroom tests
 ruff format --check headroom tests
 mypy headroom
 ```
 
-確認すること:
+確認結果:
 
-- `safe-codex` 明示時のみ新挙動になる。
-- 通常profileの既存挙動を壊していない。
-- `safe-codex + --host 0.0.0.0` は失敗する。
-- `safe-codex + --log-messages` は失敗する。
-- `safe-codex + --codex-wire-debug` は失敗する。
-- `wrap codex --safe` が `OPENAI_BASE_URL=http://127.0.0.1:<port>/v1` を設定する。
-- `prompt_cache_key auto` に生パス・ユーザー名が含まれない。
-- `cached_tokens` が存在しないレスポンスでも落ちない。
+```text
+新規pytest: 15 passed
+既存pytest: 99 passed, 1 skipped, 1 warning
+ruff check: pass
+ruff format --check: pass
+mypy: numpy stub起因で失敗、Phase 2対象外
+```
 
 ## 採用済み判断
 
@@ -233,19 +219,22 @@ mypy headroom
 | D-003 | safe-codexはcache-first | Prompt Cachingを壊さないため |
 | D-004 | 本文ログを禁止 | API key、個人情報、職場情報の残存リスクを下げる |
 | D-005 | `AGENTS.md` 自動書き換えを抑制 | Codex運用ルールの正本を壊さないため |
+| D-006 | Phase 2では `headroom/cli/_utils/safe_codex.py` に集約 | 最小変更でCLI実装に閉じるため |
+| D-007 | Prompt CachingはPhase 3へ分離 | request body変換・metrics集計まで影響が広がるため |
+| D-008 | `learn --apply` 抑制はPhase 5へ分離 | Phase 2範囲を超えるため |
 
 ## 未決定事項
 
 | ID | 未決定事項 | 判断タイミング |
 |---|---|---|
-| U-001 | `safe-codex` profileの実装場所 | Phase 1 |
-| U-002 | `--profile` optionの追加位置 | Phase 1 |
 | U-003 | `prompt_cache_key` 注入箇所 | Phase 3 |
 | U-004 | `cached_tokens` 集計箇所 | Phase 3 |
 | U-005 | `learn --apply` 抑制の実装方法 | Phase 5 |
+| U-006 | Windows実運用でのproxy/Codex動作 | Phase 6 |
 
 ## 設計更新履歴
 
 | 日付 | Phase | 更新内容 |
 |---|---:|---|
 | 2026-07-05 | 0 | 初期設計方針を作成 |
+| 2026-07-05 | 2 | Phase 2実装方針と実装場所を反映 |

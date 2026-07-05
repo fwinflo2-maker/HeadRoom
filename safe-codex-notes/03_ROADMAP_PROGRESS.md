@@ -9,9 +9,9 @@
 
 | 項目 | 内容 |
 |---|---|
-| 現在の完了Phase | Phase 6 |
-| 現在の作業前状態 | Phase 6完了、Phase 7未開始 |
-| 次のPhase | Phase 7: ドキュメント整備 |
+| 現在の完了Phase | Phase 7 |
+| 現在の作業前状態 | Phase 7完了、Phase 8未開始 |
+| 次のPhase | Phase 8: 総合レビュー |
 | current branch | `safe-codex/phase2-safe-profile` |
 | base branch | `safe-codex-base` |
 | base tag | `v0.30.0` |
@@ -34,7 +34,7 @@
 | 4 | 完了 | 100% | ログ安全化 |
 | 5 | 完了 | 100% | `headroom learn`抑制 |
 | 6 | 完了 | 100% | Windows検証 |
-| 7 | 未開始 | 0% | ドキュメント整備 |
+| 7 | 完了 | 100% | ドキュメント整備 |
 | 8 | 未開始 | 0% | 総合レビュー |
 
 ## Phase 0: upstream固定・環境確認
@@ -284,28 +284,53 @@ Windowsローカル環境で実用可能か検証する。
 
 ## Phase 7: ドキュメント整備
 
-状態: 未開始
+状態: 完了
 
-達成度: 0%
+達成度: 100%
+
+### 実装commit
+
+- `Document safe-codex operation procedures`
 
 ### 目的
 
 運用に必要な最小ドキュメントを整える。
 
-### 作成対象
+### 作成・更新内容
 
-- 導入手順
-- 安全設定の理由
-- 危険オプション
-- Windows検証手順
-- 切り戻し方法
+- `safe-codex-notes/04_SAFE_CODEX_OPERATION.md` を新規作成。
+- 導入前確認、safe-codex proxy起動、`headroom wrap codex --safe` 起動手順を整理。
+- 安全設定の理由を表で整理。
+- 危険オプションと使用禁止・慎重扱いの理由を整理。
+- Windows検証手順を、CLI help確認、focused test、lint / format / diff check、OpenAI backend path検証に分けて整理。
+- 切り戻し方法を、proxy停止、環境変数削除、未commit差分の戻し、基準branch復帰、commit済み変更の扱いに分けて整理。
+- `safe-codex-notes/00_README.md` に `04_SAFE_CODEX_OPERATION.md` を正本Markdownとして追加。
+- `safe-codex-notes/00_README.md` の現在状態をPhase 7完了、次PhaseをPhase 8へ更新。
+
+### 変更ファイル
+
+- `safe-codex-notes/00_README.md`
+- `safe-codex-notes/03_ROADMAP_PROGRESS.md`
+- `safe-codex-notes/04_SAFE_CODEX_OPERATION.md`
+
+### 確認結果
+
+- `git diff --check -- safe-codex-notes/00_README.md safe-codex-notes/03_ROADMAP_PROGRESS.md safe-codex-notes/04_SAFE_CODEX_OPERATION.md`: pass
+- Markdownのみの変更のため、pytest / ruff は未実行。
+- commit対象は正本Markdownのみ。
+- `phase*_investigation/` は未追跡のままcommit対象外。
+
+### Phase 7で判明した主な問題
+
+- ChatGPTの外側コードブロック内にMarkdown本文用の三連バッククォートを含めると、貼り付けが途中で崩れる可能性がある。
+- 長いMarkdownをPowerShell here-stringで流し込む場合、本文側のコードフェンスは三連バッククォートではなく `~~~` を使う方が安全。
+- 新規未追跡ファイルは `git diff --stat` には出ないため、`git status --short` と `git diff --cached --stat` で確認する。
 
 ### 完了条件
 
 - 自分が数週間後に見ても再開できる。
 - 新規チャットで必要な前提を復元できる。
 - Codexを使う場合でも作業範囲を誤らない。
-
 ## Phase 8: 総合レビュー
 
 状態: 未開始
@@ -342,7 +367,7 @@ Windowsローカル環境で実用可能か検証する。
 | R-004 | `AGENTS.md` が自動書き換えされる | 中 | safe時にwrap側の自動書き換えを抑制し、`headroom learn --apply` も明示許可制にする | Phase 5で対応済み |
 | R-005 | Prompt Cachingが壊れる | 中 | `cache-first` / stable prefix | Phase 3-B / Phase 6で対応済み |
 | R-006 | prompt_cache_keyに生パスが入る | 中 | hash化 | Phase 3-B / Phase 6で対応済み |
-| R-007 | Windowsで起動しない | 高 | Phase 6で手動検証 | fake OpenAI経由のproxy検証は確認済み |
+| R-007 | Windowsで起動しない | 高 | Phase 6で手動検証し、Phase 7で検証手順を文書化 | fake OpenAI経由のproxy検証と手順文書化は確認済み |
 | R-008 | 通常Headroom挙動を壊す | 高 | safe明示時のみ新挙動 | Phase 2テストで確認済み |
 
 ## 更新履歴
@@ -357,6 +382,7 @@ Windowsローカル環境で実用可能か検証する。
 | 2026-07-05 | 5 | 長い調査出力を画面表示せず phase*_investigation/ へファイル化する運用ルールを追記 |
 | 2026-07-05 | 5 | Phase完了時に失敗・手戻り・改善策を運用ルールへ反映する共通ルールを追記 |
 | 2026-07-05 | 6 | Windows検証完了、OpenAI backend path / prompt cache / cached_tokens / safe log / 通常profile互換性を確認 |
+| 2026-07-05 | 7 | Phase 7完了、safe-codex運用手順、危険オプション、Windows検証手順、切り戻し方法を文書化 |
 
 ## Phase 4以降の標準作業フロー
 

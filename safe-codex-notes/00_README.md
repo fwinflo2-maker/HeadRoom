@@ -10,7 +10,8 @@ headroom-safe-codex-best-source/
 ├─ 00_README.md
 ├─ 01_PROJECT_CONTEXT.md
 ├─ 02_DESIGN_DECISIONS.md
-└─ 03_ROADMAP_PROGRESS.md
+├─ 03_ROADMAP_PROGRESS.md
+└─ 04_SAFE_CODEX_OPERATION.md
 ```
 
 | ファイル | 役割 | 更新タイミング |
@@ -19,6 +20,7 @@ headroom-safe-codex-best-source/
 | `01_PROJECT_CONTEXT.md` | プロジェクト背景、目的、環境、基準commit、Phase 0の実績 | 環境・前提・upstream基準が変わったとき |
 | `02_DESIGN_DECISIONS.md` | safe-codexの設計方針、禁止事項、Prompt Caching方針、テスト方針 | 設計判断を変更したとき |
 | `03_ROADMAP_PROGRESS.md` | Phase別進捗、完了条件、残課題、リスク | 各Phase完了時・計画変更時 |
+| `04_SAFE_CODEX_OPERATION.md` | safe-codexの導入、危険オプション、Windows検証、切り戻し手順 | 運用手順を変えたとき |
 
 ## 読む順番
 
@@ -27,12 +29,13 @@ headroom-safe-codex-best-source/
 1. `03_ROADMAP_PROGRESS.md`
 2. `01_PROJECT_CONTEXT.md`
 3. `02_DESIGN_DECISIONS.md`
+4. `04_SAFE_CODEX_OPERATION.md`
 
 理由:
 
 - 最初に現在のPhaseと次アクションを確認する。
 - 次に現在の環境・base tag / commitを確認する。
-- 最後に設計上の制約と禁止事項を確認する。
+- 最後に設計上の制約、禁止事項、実運用手順を確認する。
 
 ## 更新ルール
 
@@ -142,8 +145,8 @@ python --version
 
 | 項目 | 内容 |
 |---|---|
-| 現在の完了Phase | Phase 6 |
-| 次のPhase | Phase 7: ドキュメント整備 |
+| 現在の完了Phase | Phase 7 |
+| 次のPhase | Phase 8: 総合レビュー |
 | local path | `C:\dev\headroom-safe-codex` |
 | upstream | `https://github.com/headroomlabs-ai/headroom.git` |
 | base tag | `v0.30.0` |
@@ -156,7 +159,7 @@ Phase 4以降は、Phase 3 / Phase 3-Bで安定した以下の流れを標準と
 
 ```text
 1. 新規Phaseは新規チャットで開始
-2. 4つの正本Markdownを参照
+2. 5つの正本Markdownを参照
 3. 現在状態を開始プロンプトに明記
 4. まず調査
 5. 必要箇所だけ抽出

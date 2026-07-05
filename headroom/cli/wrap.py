@@ -34,6 +34,10 @@ from pathlib import Path
 from typing import Any, cast
 
 from headroom._subprocess import pid_alive, run
+from headroom.cli._utils.safe_codex import (
+    SAFE_CODEX_PROFILE,
+    reject_safe_codex_wrap_options,
+)
 
 # Fix Windows cp1252 encoding — box-drawing characters require UTF-8
 if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
@@ -385,6 +389,7 @@ def _start_proxy(
     learn: bool = False,
     memory: bool = False,
     agent_type: str = "unknown",
+    safe_profile: bool = False,
     code_graph: bool = False,
     backend: str | None = None,
     anyllm_provider: str | None = None,
@@ -402,6 +407,8 @@ def _start_proxy(
     competing with the rotating `proxy.log` runtime log.
     """
     cmd = [sys.executable, "-m", "headroom.cli", "proxy", "--port", str(port)]
+    if safe_profile:
+        cmd.extend(["--profile", SAFE_CODEX_PROFILE])
 
     # Forward HEADROOM_MODE env var so the proxy respects the user's mode choice
     headroom_mode = os.environ.get("HEADROOM_MODE")
@@ -2668,6 +2675,7 @@ def _ensure_proxy(
     learn: bool = False,
     memory: bool = False,
     agent_type: str = "unknown",
+    safe_profile: bool = False,
     code_graph: bool = False,
     backend: str | None = None,
     anyllm_provider: str | None = None,
@@ -2971,6 +2979,7 @@ def _ensure_proxy(
                     vertex_api_url=vertex_api_url,
                     clear_vertex_api_url=clear_vertex_api_url,
                     copilot_api_token=copilot_api_token,
+                    safe_profile=safe_profile,
                 ),
             )
             click.echo(f"  Proxy ready on http://127.0.0.1:{port}")
@@ -3170,6 +3179,7 @@ def _launch_tool(
     learn: bool = False,
     memory: bool = False,
     agent_type: str = "unknown",
+    safe_profile: bool = False,
     code_graph: bool = False,
     backend: str | None = None,
     anyllm_provider: str | None = None,
@@ -3198,6 +3208,7 @@ def _launch_tool(
             learn=learn,
             memory=memory,
             agent_type=agent_type,
+            safe_profile=safe_profile,
             code_graph=code_graph,
             backend=backend,
             anyllm_provider=anyllm_provider,
@@ -4262,6 +4273,11 @@ def unwrap_copilot(port: int, no_stop_proxy: bool) -> None:
     "--region", default=None, help="Cloud region for Bedrock/Vertex (env: HEADROOM_REGION)"
 )
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--safe",
+    is_flag=True,
+    help="Use the safe-codex profile and suppress persistent Codex/MCP context writes",
+)
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--prepare-only", is_flag=True, hidden=True)
 @click.argument("codex_args", nargs=-1, type=click.UNPROCESSED)
@@ -4276,6 +4292,7 @@ def codex(
     no_proxy: bool,
     learn: bool,
     memory: bool,
+    safe: bool,
     backend: str | None,
     anyllm_provider: str | None,
     region: str | None,
@@ -4304,6 +4321,18 @@ def codex(
         headroom wrap codex --port 9999             # Custom proxy port
         headroom wrap codex --backend anyllm --anyllm-provider groq
     """
+    if safe:
+        reject_safe_codex_wrap_options(memory=memory, codex_args=codex_args)
+        no_rtk = True
+        no_mcp = True
+        no_tokensave = True
+        serena = False
+        no_serena = True
+        code_graph = False
+        learn = False
+        memory = False
+        os.environ["HEADROOM_PROFILE"] = SAFE_CODEX_PROFILE
+
     # Snapshot Codex config.toml BEFORE any wrap-time mutation so
     # `headroom unwrap codex` can restore the user's pre-wrap state
     # byte-for-byte. The snapshot is a no-op if the backup already exists
@@ -4340,17 +4369,20 @@ def codex(
 
     # Coding-task compressor: tokensave primary, Serena backup. Codex starts
     # long-lived MCP subprocesses from config.toml, so force re-registration.
-    from headroom.mcp_registry import CodexRegistrar
+    # safe-codex suppresses all persistent MCP/context registration except the
+    # Codex provider config that routes traffic through the local proxy.
+    if not safe:
+        from headroom.mcp_registry import CodexRegistrar
 
-    _setup_coding_compressor(
-        CodexRegistrar(),
-        serena_context="codex",
-        serena=serena,
-        no_serena=no_serena,
-        no_tokensave=no_tokensave,
-        verbose=verbose,
-        force=True,
-    )
+        _setup_coding_compressor(
+            CodexRegistrar(),
+            serena_context="codex",
+            serena=serena,
+            no_serena=no_serena,
+            no_tokensave=no_tokensave,
+            verbose=verbose,
+            force=True,
+        )
 
     # Setup memory MCP server for Codex (native tool integration)
     if memory:
@@ -4432,6 +4464,7 @@ def codex(
         learn=learn,
         memory=memory,
         agent_type="codex",
+        safe_profile=safe,
         code_graph=code_graph,
         backend=backend,
         anyllm_provider=anyllm_provider,

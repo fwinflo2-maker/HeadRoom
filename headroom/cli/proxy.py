@@ -12,6 +12,13 @@ from headroom import paths as _paths
 from headroom.providers.registry import resolve_api_overrides, resolve_api_targets
 from headroom.proxy.modes import PROXY_MODE_TOKEN, normalize_proxy_mode
 
+from ._utils.safe_codex import (
+    SAFE_CODEX_PROFILE,
+    is_safe_codex_profile,
+    safe_codex_proxy_defaults,
+    validate_known_profile,
+    validate_safe_codex_proxy_options,
+)
 from .main import main
 
 # ---------------------------------------------------------------------------
@@ -141,6 +148,12 @@ def dashboard(port: int, no_open: bool) -> None:
 
 
 @main.command()
+@click.option(
+    "--profile",
+    default=None,
+    envvar="HEADROOM_PROFILE",
+    help="Configuration profile to apply. Currently supported: safe-codex.",
+)
 @click.option(
     "--host",
     default="127.0.0.1",
@@ -835,6 +848,7 @@ def dashboard(port: int, no_open: bool) -> None:
 @click.pass_context
 def proxy(
     ctx: click.Context,
+    profile: str | None,
     mode: str | None,
     target_ratio: float | None,
     host: str,
@@ -948,6 +962,43 @@ def proxy(
         )
         click.secho(f"Details: {e}", fg="red", err=True)
         raise SystemExit(1) from None
+
+    validate_known_profile(profile)
+    safe_profile = is_safe_codex_profile(profile)
+    if safe_profile:
+        validate_safe_codex_proxy_options(
+            host=host,
+            log_messages=log_messages,
+            codex_wire_debug=codex_wire_debug,
+            codex_wire_debug_dir=codex_wire_debug_dir,
+        )
+        safe_defaults = safe_codex_proxy_defaults(
+            mode=mode,
+            host=host,
+            lossless=lossless,
+            no_ccr_inject_tool=no_ccr_inject_tool,
+            no_ccr_marker=no_ccr_marker,
+            code_aware_flag=code_aware_flag,
+            disable_kompress=disable_kompress,
+            log_messages=log_messages,
+        )
+        os.environ["HEADROOM_PROFILE"] = SAFE_CODEX_PROFILE
+        os.environ.setdefault("HEADROOM_MODE", safe_defaults.mode)
+        os.environ.setdefault("HEADROOM_HOST", safe_defaults.host)
+        os.environ.setdefault("HEADROOM_LOSSLESS", "1")
+        os.environ.setdefault("HEADROOM_NO_CCR_INJECT_TOOL", "1")
+        os.environ.setdefault("HEADROOM_NO_CCR_MARKER", "1")
+        os.environ.setdefault("HEADROOM_DISABLE_KOMPRESS", "1")
+        os.environ.setdefault("HEADROOM_CODE_AWARE_ENABLED", "0")
+        os.environ.setdefault("HEADROOM_OUTPUT_SHAPER", "0")
+        mode = safe_defaults.mode
+        host = safe_defaults.host
+        lossless = safe_defaults.lossless
+        no_ccr_inject_tool = safe_defaults.no_ccr_inject_tool
+        no_ccr_marker = safe_defaults.no_ccr_marker
+        code_aware_flag = safe_defaults.code_aware_flag
+        disable_kompress = safe_defaults.disable_kompress
+        log_messages = safe_defaults.log_messages
 
     # Warn if --learn and --no-learn are both set (--no-learn wins, per docstring)
     if learn and no_learn:

@@ -1,4 +1,4 @@
-# DESIGN_DECISIONS
+﻿# DESIGN_DECISIONS
 
 ## 基本設計
 
@@ -114,6 +114,8 @@ headroom wrap codex --safe --prompt-cache-key auto --prompt-cache-retention in_m
 | `HEADROOM_CODEX_WIRE_DEBUG=1` | 拒否 | Codex通信内容が残る |
 | `wrap codex --safe --memory` | 拒否 | 永続memory/context file書き込みリスク |
 | `wrap codex --safe --codex-wire-debug` | 拒否 | Codex通信内容が残る |
+| `headroom learn --apply` with safe-codex | 拒否 | `AGENTS.md` / `instructions.md` 等の無確認なcontext書き込みリスク |
+| `headroom learn --apply --allow-context-write` with safe-codex | 許可 | 明示許可がある場合のみcontext書き込みを認める |
 
 ## wrap codex --safe の方針
 
@@ -238,6 +240,7 @@ mypy: numpy stub起因で失敗、Phase 2対象外
 |---|---:|---|
 | 2026-07-05 | 0 | 初期設計方針を作成 |
 | 2026-07-05 | 2 | Phase 2実装方針と実装場所を反映 |
+| 2026-07-05 | 5 | Phase 5で headroom learn --apply のsafe-codex明示許可制を反映 |
 
 ## Phase 4以降の標準作業フロー
 
@@ -268,4 +271,3 @@ Phase 4以降は、Phase 3 / Phase 3-Bで安定した以下の流れを標準と
 - pushは禁止し、local commitまでに留める。
 - 通常profileを壊さず、safe-codex 明示時のみ変更する。
 - CodexではなくChatGPT主導で、設計・差分作成・レビュー・テスト方針を進める。
-

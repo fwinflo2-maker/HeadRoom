@@ -1,4 +1,4 @@
-# ROADMAP_PROGRESS
+﻿# ROADMAP_PROGRESS
 
 ## 運用方針
 
@@ -9,9 +9,9 @@
 
 | 項目 | 内容 |
 |---|---|
-| 現在の完了Phase | Phase 4 |
-| 現在の作業前状態 | Phase 4完了、Phase 5未開始 |
-| 次のPhase | Phase 5: headroom learn抑制 |
+| 現在の完了Phase | Phase 5 |
+| 現在の作業前状態 | Phase 5完了、Phase 6未開始 |
+| 次のPhase | Phase 6: Windows検証 |
 | current branch | `safe-codex/phase2-safe-profile` |
 | base branch | `safe-codex-base` |
 | base tag | `v0.30.0` |
@@ -204,26 +204,55 @@ OpenAI Prompt Cachingを壊さず、cache hit率を上げる。
 
 ## Phase 5: headroom learn抑制
 
-状態: 未開始
+状態: 完了
 
-達成度: 0%
+達成度: 100%
+
+### 実装commit
+
+- `890c79b5 Guard safe-codex learn apply`
 
 ### 目的
 
 `AGENTS.md` / `instructions.md` の自動変更を防ぐ。
 
-### 方針
+### 実装内容
 
-- dry-runは許可。
-- `--apply` はsafe profileでは拒否。
-- `--allow-context-write` 明示時のみ許可。
+- `headroom learn` に `--allow-context-write` を追加。
+- `HEADROOM_PROFILE=safe-codex` 時は `headroom learn --apply` を拒否。
+- `HEADROOM_PROFILE=safe-codex` でも `--apply` なしのdry-runは許可。
+- `HEADROOM_PROFILE=safe-codex` かつ `--apply --allow-context-write` の場合のみ書き込みを許可。
+- safe-codex判定は `headroom/cli/_utils/safe_codex.py` に集約。
+- `tests/test_cli_safe_codex.py` にenv復元fixtureを追加し、safe系テストが後続テストへ `HEADROOM_PROFILE` 等を漏らさないようにした。
+
+### 変更ファイル
+
+- `headroom/cli/_utils/safe_codex.py`
+- `headroom/cli/learn.py`
+- `tests/test_cli_learn.py`
+- `tests/test_cli_safe_codex.py`
+
+### 確認結果
+
+- `python -m pytest tests/test_cli_learn.py`: 16 passed
+- `python -m pytest tests/test_cli_safe_codex.py tests/test_cli_proxy_env.py`: 75 passed, 1 skipped
+- related pytest: 118 passed, 1 skipped, 1 warning
+- `ruff check headroom tests`: All checks passed
+- `git diff --check`: CRLF warningのみ、whitespace errorなし
+
+### 全体pytestの扱い
+
+- command: `python -m pytest -q -x --tb=short`
+- result: 1 failed, 90 passed, 88 skipped, 1 warning
+- failure: `tests/test_adapter_hooks.py::TestStorageEntryPointLoading::test_sqlite_scheme`
+- reason: Windows上で `sqlite:///{tmp_path}/test.db` が `\\C:\\...` 形式に解釈され、WinError 123で失敗
+- judgement: Phase 5変更とは別領域の既存Windows path系失敗として扱う
 
 ### 完了条件
 
 - safeでは `AGENTS.md` が無確認に変更されない。
 - dry-run結果は表示できる。
 - 明示許可時のみ書き込み可能。
-
 ## Phase 6: Windows検証
 
 状態: 未開始
@@ -310,7 +339,7 @@ Windowsローカル環境で実用可能か検証する。
 | R-001 | 圧縮でCodexが誤読する | 高 | 初期はlossless-first / Kompress無効 | Phase 2で一部対応 |
 | R-002 | request/response本文がログに残る | 高 | `--log-messages` 禁止 | Phase 2でsafe時拒否を実装 |
 | R-003 | Codex wire debugに機密情報が残る | 高 | safe profileで禁止 | Phase 2でsafe時拒否を実装 |
-| R-004 | `AGENTS.md` が自動書き換えされる | 中 | safe時にwrap側の自動書き換えを抑制 | Phase 2で一部対応、Phase 5で追加対応 |
+| R-004 | `AGENTS.md` が自動書き換えされる | 中 | safe時にwrap側の自動書き換えを抑制し、`headroom learn --apply` も明示許可制にする | Phase 5で対応済み |
 | R-005 | Prompt Cachingが壊れる | 中 | `cache-first` / stable prefix | Phase 3で対応予定 |
 | R-006 | prompt_cache_keyに生パスが入る | 中 | hash化 | Phase 3で対応予定 |
 | R-007 | Windowsで起動しない | 高 | Phase 6で手動検証 | 未確認 |
@@ -324,6 +353,7 @@ Windowsローカル環境で実用可能か検証する。
 | 2026-07-05 | 2 | Phase 1/2完了、`safe-codex` profile wiring実装commitを反映 |
 | 2026-07-05 | 3 | Phase 3-B完了、Prompt Caching対応commitを反映 |
 | 2026-07-05 | 4 | Phase 4完了、ログ安全化commitと作業方法を反映 |
+| 2026-07-05 | 5 | Phase 5完了、headroom learn --apply 抑制commitを反映 |
 
 ## Phase 4以降の標準作業フロー
 

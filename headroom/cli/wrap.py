@@ -108,7 +108,6 @@ from headroom.providers.copilot import (
 )
 from headroom.providers.cursor import render_setup_lines as _render_cursor_setup_lines
 from headroom.providers.mistral_vibe import build_launch_env as _build_mistral_vibe_launch_env
-from headroom.providers.zcode import render_setup_lines as _render_zcode_setup_lines
 from headroom.providers.openclaw import (
     OPENCLAW_NPM_PACKAGE,
 )
@@ -135,6 +134,7 @@ from headroom.providers.opencode.config import (
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
 )
+from headroom.providers.zcode import render_setup_lines as _render_zcode_setup_lines
 from headroom.proxy.project_context import with_project_prefix as _with_project_prefix
 
 from .main import main

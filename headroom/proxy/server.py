@@ -3031,6 +3031,28 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         cli_filtering_label = (
             str(cli_filtering_stats.get("label", "RTK")) if cli_filtering_stats else "RTK"
         )
+        context_tool_installed = bool(
+            cli_filtering_stats and cli_filtering_stats.get("installed", True)
+        )
+        context_tool_stats_available = bool(
+            cli_filtering_stats
+            and cli_filtering_stats.get("stats_available", context_tool_installed)
+        )
+        default_context_tool_status = (
+            "ok"
+            if context_tool_stats_available
+            else ("error" if context_tool_installed else "unavailable")
+        )
+        context_tool_status = (
+            str(cli_filtering_stats.get("status", default_context_tool_status))
+            if cli_filtering_stats
+            else "unavailable"
+        )
+        context_tool_unavailable_reason = (
+            cli_filtering_stats.get("unavailable_reason")
+            if cli_filtering_stats
+            else "not_installed"
+        )
         cli_tokens_avoided = (
             cli_filtering_stats.get("tokens_saved", 0) if cli_filtering_stats else 0
         )
@@ -3156,6 +3178,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     "cli_filtering": {
                         "tool": cli_filtering_tool,
                         "label": cli_filtering_label,
+                        "available": context_tool_installed,
+                        "stats_available": context_tool_stats_available,
+                        "status": context_tool_status,
+                        "unavailable_reason": context_tool_unavailable_reason,
                         "tokens": cli_tokens_avoided,
                         "tokens_saved": cli_tokens_avoided,
                         "session": cli_filtering_session,
@@ -3424,9 +3450,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "context_tool": {
                 "configured": cli_filtering_tool,
                 "label": cli_filtering_label,
-                "available": bool(
-                    cli_filtering_stats and cli_filtering_stats.get("installed", False)
-                ),
+                "available": context_tool_installed,
+                "stats_available": context_tool_stats_available,
+                "status": context_tool_status,
+                "unavailable_reason": context_tool_unavailable_reason,
                 "stats": cli_filtering_stats,
             },
             "cli_filtering": cli_filtering_stats,
@@ -3550,9 +3577,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         The JSON payload also carries a ``cli_filtering`` key with live RTK
         stats. This is a curated subset (``tool``, ``label``, ``lifetime``,
         ``session``) tailored to the Historical tab, not the full
-        ``_get_context_tool_stats()`` payload that ``/stats`` exposes. It is
-        ``None`` when RTK is absent or its stats cannot be read, so the tab
-        simply hides the card rather than erroring.
+        ``_get_context_tool_stats()`` payload that ``/stats`` exposes. When
+        the selected context tool is absent or unreadable, the subset carries
+        ``stats_available=false`` so the tab can render an honest unavailable
+        state instead of a fake zero.
         """
         if format == "csv":
             filename = f"headroom-stats-history-{series}.csv"
@@ -3576,9 +3604,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             logger.debug("stats-history: RTK stats unavailable", exc_info=True)
             cli_stats = None
         if cli_stats:
+            installed = bool(cli_stats.get("installed", True))
+            stats_available = bool(cli_stats.get("stats_available", installed))
+            default_status = "ok" if stats_available else ("error" if installed else "unavailable")
             history["cli_filtering"] = {
                 "tool": str(cli_stats.get("tool", "rtk")),
                 "label": str(cli_stats.get("label", "RTK")),
+                "available": installed,
+                "stats_available": stats_available,
+                "status": str(cli_stats.get("status", default_status)),
+                "unavailable_reason": cli_stats.get("unavailable_reason"),
                 "lifetime": cli_stats.get("lifetime", {}),
                 "session": cli_stats.get("session", {}),
             }

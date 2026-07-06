@@ -29,6 +29,9 @@ services:
     environment:
       HOME: /tmp/headroom-home
       HEADROOM_HOST: 0.0.0.0
+      # RTK dashboard stats are read by this proxy container. Host-only RTK
+      # installs are not visible unless their binary/state live under the
+      # mounted HEADROOM_HOST_HOME paths below.
       # Canonical Headroom filesystem contract (issue #175). See `cli` service
       # above for rationale.
       HEADROOM_WORKSPACE_DIR: /tmp/headroom-home/.headroom

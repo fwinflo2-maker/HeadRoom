@@ -220,7 +220,12 @@
                 <div class="mt-1 text-xs text-gray-500 leading-relaxed">
                     <span x-text="'Proxy ' + formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' (' + proxyShareOfTotal.toFixed(1) + '%)'"></span>
                     <span class="mx-1 text-gray-600">/</span>
-                    <span x-text="cliFilteringLabel + ' ' + formatNumber(cliFilteringSaved) + ' this session (' + cliFilteringSessionPctDisplay.toFixed(1) + '%)'"></span>
+                    <template x-if="cliFilteringStatsAvailable">
+                        <span x-text="cliFilteringLabel + ' ' + formatNumber(cliFilteringSaved) + ' this session (' + cliFilteringSessionPctDisplay.toFixed(1) + '%)'"></span>
+                    </template>
+                    <template x-if="!cliFilteringStatsAvailable">
+                        <span class="text-amber-400" x-text="cliFilteringStatusText" :title="cliFilteringStatusTitle"></span>
+                    </template>
                 </div>
                 <div class="mt-1 text-xs text-gray-600 leading-relaxed">
                     <span x-text="'Of total wire: ' + (stats.tokens?.savings_percent || 0).toFixed(2) + '%'" title="Savings as fraction of all input tokens including frozen prefix"></span>
@@ -1030,9 +1035,15 @@
                     </div>
                     <div class="flex justify-between items-center">
                         <span class="text-sm text-gray-400" x-text="cliFilteringLabel + ' Filtered (this session)'"></span>
-                        <span class="font-mono text-sm text-emerald-400" x-text="formatNumber(cliFilteringSaved)"></span>
+                        <span class="font-mono text-sm text-emerald-400"
+                              x-show="cliFilteringStatsAvailable"
+                              x-text="formatNumber(cliFilteringSaved)"></span>
+                        <span class="font-mono text-sm text-amber-400"
+                              x-show="!cliFilteringStatsAvailable"
+                              x-text="'Unavailable'"
+                              :title="cliFilteringStatusTitle"></span>
                     </div>
-                    <div class="flex justify-between items-center" x-show="cliFilteringLifetime > 0">
+                    <div class="flex justify-between items-center" x-show="cliFilteringStatsAvailable && cliFilteringLifetime > 0">
                         <span class="text-sm text-gray-500" x-text="cliFilteringLabel + ' Filtered (lifetime)'"></span>
                         <span class="font-mono text-sm text-emerald-400/70" x-text="formatNumber(cliFilteringLifetime)"></span>
                     </div>
@@ -1402,7 +1413,7 @@
                         <div class="mt-2 text-xs text-gray-500">Based on persisted weekly buckets</div>
                     </div>
 
-                    <template x-if="historyStats.cli_filtering">
+                    <template x-if="historyStats.cli_filtering && historyCliFilteringStatsAvailable">
                         <div class="bg-surface rounded-lg p-4 border border-border">
                             <div class="text-xs text-gray-500 uppercase tracking-wide mb-1"
                                  x-text="(historyStats.cli_filtering?.label || cliFilteringLabel) + ' Lifetime Saved'"></div>
@@ -1411,6 +1422,16 @@
                                       x-text="formatNumber(historyStats.cli_filtering?.lifetime?.tokens_saved || 0)"></span>
                             </div>
                             <div class="mt-2 text-xs text-gray-500">CLI output filtering (lifetime)</div>
+                        </div>
+                    </template>
+                    <template x-if="historyStats.cli_filtering && !historyCliFilteringStatsAvailable">
+                        <div class="bg-surface rounded-lg p-4 border border-border">
+                            <div class="text-xs text-gray-500 uppercase tracking-wide mb-1"
+                                 x-text="(historyStats.cli_filtering?.label || cliFilteringLabel) + ' Stats'"></div>
+                            <div class="flex items-baseline gap-2">
+                                <span class="text-2xl font-light tabular-nums text-amber-400">Unavailable</span>
+                            </div>
+                            <div class="mt-2 text-xs text-gray-500" x-text="historyCliFilteringStatusText"></div>
                         </div>
                     </template>
                 </div>
@@ -2532,6 +2553,27 @@
                     return String(raw);
                 },
 
+                get cliFilteringStatsAvailable() {
+                    const layer = this.stats.savings?.by_layer?.cli_filtering;
+                    const tool = this.stats.context_tool;
+                    const available = tool?.stats_available
+                        ?? layer?.stats_available
+                        ?? tool?.available
+                        ?? layer?.available;
+                    return available !== false;
+                },
+
+                get cliFilteringStatusText() {
+                    return `${this.cliFilteringLabel} stats unavailable to this proxy`;
+                },
+
+                get cliFilteringStatusTitle() {
+                    const reason = this.stats.context_tool?.unavailable_reason
+                        || this.stats.savings?.by_layer?.cli_filtering?.unavailable_reason;
+                    const suffix = reason ? ` Reason: ${reason}.` : '';
+                    return `${this.cliFilteringLabel} stats are read by the Headroom proxy process.${suffix}`;
+                },
+
                 get cliFilteringSaved() {
                     return this.stats.tokens?.cli_filtering_saved
                         ?? this.stats.tokens?.cli_tokens_avoided
@@ -2552,6 +2594,19 @@
                 get cliFilteringSessionPctDisplay() {
                     const p = this.stats.savings?.by_layer?.cli_filtering?.session_savings_pct;
                     return (p === null || p === undefined) ? this.cliFilteringShareOfTotal : p;
+                },
+
+                get historyCliFilteringStatsAvailable() {
+                    const stats = this.historyStats.cli_filtering;
+                    if (!stats) return false;
+                    const available = stats.stats_available ?? stats.available;
+                    return available !== false;
+                },
+
+                get historyCliFilteringStatusText() {
+                    const stats = this.historyStats.cli_filtering;
+                    const label = stats?.label || this.cliFilteringLabel;
+                    return `${label} stats were unavailable when /stats-history was fetched.`;
                 },
 
                 // --- Headline savings percent ---

@@ -137,6 +137,10 @@ docker compose -f docker/docker-compose.native.yml up -d proxy
 
 This is a supported persistent-Docker path when you want the proxy managed explicitly through Compose instead of the installed wrapper.
 
+<Callout type="info" title="RTK stats and Docker">
+The dashboard reads RTK stats from the Headroom proxy process. In Docker, that means the container must be able to run `rtk gain` against the same mounted state that your wrapped host tools use. A host-only or WSL2-only `rtk` install on `PATH` is not visible inside the proxy container; in that case the dashboard reports RTK stats as unavailable rather than importing host telemetry.
+</Callout>
+
 <Callout type="info" title="HEADROOM_WORKSPACE vs HEADROOM_WORKSPACE_DIR">
 These are two different variables — both are set by the compose file, and both are retained for backward compatibility:
 

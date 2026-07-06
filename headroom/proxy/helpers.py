@@ -1102,6 +1102,8 @@ def _context_tool_summary_payload(
     installed: bool,
     scope: str | None = None,
     summary: dict[str, Any] | None = None,
+    stats_available: bool = True,
+    unavailable_reason: str | None = None,
 ) -> dict[str, Any]:
     """Normalize RTK/lean-ctx lifetime gain output into one schema.
 
@@ -1173,6 +1175,9 @@ def _context_tool_summary_payload(
         "tool": tool,
         "label": _context_tool_label(tool),
         "installed": installed,
+        "stats_available": stats_available,
+        "status": "ok" if stats_available else ("unavailable" if not installed else "error"),
+        "unavailable_reason": unavailable_reason,
         "scope": scope or _context_tool_default_scope(tool),
         "total_commands": _coerce_int(
             _first_value(
@@ -1203,12 +1208,18 @@ def _context_tool_zero_payload(
     tool: str,
     installed: bool,
     scope: str | None = None,
+    stats_available: bool | None = None,
+    unavailable_reason: str | None = None,
 ) -> dict[str, Any]:
+    if stats_available is None:
+        stats_available = installed
     return _context_tool_summary_payload(
         tool=tool,
         installed=installed,
         scope=scope,
         summary={},
+        stats_available=stats_available,
+        unavailable_reason=unavailable_reason,
     )
 
 
@@ -1224,6 +1235,8 @@ def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
             tool=_CONTEXT_TOOL_RTK,
             installed=False,
             scope=scope,
+            stats_available=False,
+            unavailable_reason="not_installed",
         )
 
     try:
@@ -1257,6 +1270,8 @@ def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
                 tool=_CONTEXT_TOOL_RTK,
                 installed=True,
                 scope=scope,
+                stats_available=False,
+                unavailable_reason="subprocess_failed",
             )
     except Exception as exc:
         # PR-G2 remediation (H2): log the exception path too. Reason is the
@@ -1271,6 +1286,8 @@ def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
             tool=_CONTEXT_TOOL_RTK,
             installed=True,
             scope=scope,
+            stats_available=False,
+            unavailable_reason=type(exc).__name__,
         )
 
     return payload
@@ -1283,9 +1300,19 @@ def _read_lean_ctx_lifetime_stats() -> dict[str, Any] | None:
 
     lean_ctx_path = get_lean_ctx_path()
     if not lean_ctx_path:
-        return _context_tool_zero_payload(tool=_CONTEXT_TOOL_LEAN_CTX, installed=False)
+        return _context_tool_zero_payload(
+            tool=_CONTEXT_TOOL_LEAN_CTX,
+            installed=False,
+            stats_available=False,
+            unavailable_reason="not_installed",
+        )
 
-    base_payload = _context_tool_zero_payload(tool=_CONTEXT_TOOL_LEAN_CTX, installed=True)
+    base_payload = _context_tool_zero_payload(
+        tool=_CONTEXT_TOOL_LEAN_CTX,
+        installed=True,
+        stats_available=False,
+        unavailable_reason="stats_unavailable",
+    )
 
     try:
         result = run(
@@ -1295,12 +1322,16 @@ def _read_lean_ctx_lifetime_stats() -> dict[str, Any] | None:
             timeout=5,
         )
         if result.returncode != 0 or not result.stdout.strip():
-            return dict(base_payload)
+            payload = dict(base_payload)
+            payload["unavailable_reason"] = "subprocess_failed"
+            return payload
 
         data = json.loads(result.stdout)
         summary = data.get("summary", data) if isinstance(data, dict) else {}
         if not isinstance(summary, dict):
-            return dict(base_payload)
+            payload = dict(base_payload)
+            payload["unavailable_reason"] = "malformed_output"
+            return payload
 
         return _context_tool_summary_payload(
             tool=_CONTEXT_TOOL_LEAN_CTX,

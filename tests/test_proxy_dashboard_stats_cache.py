@@ -99,6 +99,8 @@ def test_get_rtk_stats_memoizes_subprocess_calls(monkeypatch: pytest.MonkeyPatch
     assert first["tool"] == "rtk"
     assert first["label"] == "RTK"
     assert first["installed"] is True
+    assert first["stats_available"] is True
+    assert first["status"] == "ok"
     assert first["scope"] == "global"
     assert first["total_commands"] == 0
     assert first["input_tokens"] == 0
@@ -186,6 +188,8 @@ def test_get_rtk_stats_can_read_project_scoped_gain(monkeypatch: pytest.MonkeyPa
 
     assert payload is not None
     assert payload["scope"] == "project"
+    assert payload["stats_available"] is True
+    assert payload["status"] == "ok"
     assert payload["total_commands"] == 1
     assert payload["tokens_saved"] == 25
     assert calls["run"] == 1
@@ -219,6 +223,22 @@ def test_get_rtk_stats_invalid_scope_defaults_to_global(
     assert calls["run"] == 1
     warning_calls = " ".join(str(call) for call in mock_warning.call_args_list)
     assert "event=rtk_gain_scope_invalid" in warning_calls
+
+
+def test_get_rtk_stats_marks_missing_binary_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("headroom.rtk.get_rtk_path", lambda: None)
+
+    payload = proxy_helpers._read_rtk_lifetime_stats()
+
+    assert payload is not None
+    assert payload["tool"] == "rtk"
+    assert payload["installed"] is False
+    assert payload["stats_available"] is False
+    assert payload["status"] == "unavailable"
+    assert payload["unavailable_reason"] == "not_installed"
+    assert payload["tokens_saved"] == 0
 
 
 def test_get_context_tool_stats_reads_lean_ctx_gain(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -266,6 +286,8 @@ def test_get_context_tool_stats_reads_lean_ctx_gain(monkeypatch: pytest.MonkeyPa
     assert first["tool"] == "lean-ctx"
     assert first["label"] == "lean-ctx"
     assert first["installed"] is True
+    assert first["stats_available"] is True
+    assert first["status"] == "ok"
     assert first["total_commands"] == 0
     assert first["tokens_saved"] == 0
     assert first["avg_savings_pct"] == 40.0
@@ -445,6 +467,77 @@ def test_stats_reports_lean_ctx_as_selected_cli_filter(monkeypatch: pytest.Monke
     assert payload["savings"]["by_layer"]["compression"]["lean_ctx_tokens"] == 9
 
 
+def test_stats_marks_unavailable_context_tool_without_counting_fake_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    import headroom.proxy.server as server
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    monkeypatch.setattr(
+        server,
+        "get_compression_store",
+        lambda: _StatsStub({"store": 0}, "store", {}),
+    )
+    monkeypatch.setattr(
+        server,
+        "get_telemetry_collector",
+        lambda: _StatsStub({"telemetry": 0}, "telemetry", {}),
+    )
+    monkeypatch.setattr(
+        server,
+        "get_compression_feedback",
+        lambda: _StatsStub({"feedback": 0}, "feedback", {}),
+    )
+    monkeypatch.setattr(
+        server,
+        "_get_context_tool_stats",
+        lambda: {
+            "tool": "rtk",
+            "label": "RTK",
+            "installed": False,
+            "stats_available": False,
+            "status": "unavailable",
+            "unavailable_reason": "not_installed",
+            "tokens_saved": 0,
+            "session": {"tokens_saved": 0},
+            "lifetime": {"tokens_saved": 0},
+        },
+    )
+    monkeypatch.setattr(server, "get_toin", lambda: _ToinStub())
+
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            http2=False,
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/stats")
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["context_tool"]["configured"] == "rtk"
+    assert payload["context_tool"]["available"] is False
+    assert payload["context_tool"]["stats_available"] is False
+    assert payload["context_tool"]["status"] == "unavailable"
+    assert payload["context_tool"]["unavailable_reason"] == "not_installed"
+    assert payload["savings"]["by_layer"]["cli_filtering"]["stats_available"] is False
+    assert payload["savings"]["by_layer"]["cli_filtering"]["unavailable_reason"] == "not_installed"
+    assert payload["tokens"]["cli_filtering_saved"] == 0
+    assert payload["tokens"]["rtk_saved"] == 0
+
+
 def test_cost_merge_uses_generic_cli_filtering_name() -> None:
     from headroom.proxy.cost import merge_cost_stats
 
@@ -603,6 +696,10 @@ def test_dashboard_uses_cached_stats_and_lazy_history_feed_polling() -> None:
     assert "Context Tool" in html
     assert "cliFilteringLabel + ' Filtered (this session)'" in html
     assert "cliFilteringLabel + ' Filtered (lifetime)'" in html
+    assert "cliFilteringStatsAvailable" in html
+    assert "cliFilteringStatusText" in html
+    assert "stats unavailable to this proxy" in html
+    assert "historyCliFilteringStatsAvailable" in html
 
 
 def test_dashboard_session_metrics_do_not_repeat_proxy_tokens_without_new_context() -> None:

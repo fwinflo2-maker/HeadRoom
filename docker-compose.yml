@@ -4,6 +4,10 @@ services:
     command: ["--host", "0.0.0.0"]
     environment:
       - HEADROOM_HOST=0.0.0.0
+      # RTK dashboard stats are read inside this container. A host/WSL2
+      # `rtk` on PATH is not visible here unless you mount its binary and
+      # state into the container; otherwise the dashboard marks RTK stats
+      # unavailable instead of importing host `rtk gain`.
       # if you want to use a custom OpenAI-compatible API endpoint,
       # uncomment and set the following line with the desired URL
       # - OPENAI_TARGET_API_URL=https://api.x.ai

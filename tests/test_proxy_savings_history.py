@@ -1296,6 +1296,7 @@ def test_stats_history_includes_cli_filtering(tmp_path, monkeypatch):
         cache_enabled=False,
         rate_limit_enabled=False,
         log_requests=False,
+        http2=False,
     )
 
     with TestClient(create_app(config)) as client:
@@ -1307,7 +1308,51 @@ def test_stats_history_includes_cli_filtering(tmp_path, monkeypatch):
     assert data["cli_filtering"] is not None
     assert data["cli_filtering"]["tool"] == "rtk"
     assert data["cli_filtering"]["label"] == "RTK"
+    assert data["cli_filtering"]["available"] is True
+    assert data["cli_filtering"]["stats_available"] is True
+    assert data["cli_filtering"]["status"] == "ok"
     assert data["cli_filtering"]["lifetime"]["tokens_saved"] == 999
+
+
+def test_stats_history_marks_cli_filtering_unavailable(tmp_path, monkeypatch):
+    """Absent RTK stats must be explicit, not a misleading lifetime 0 card."""
+    import headroom.proxy.server as server
+
+    savings_path = tmp_path / "proxy_savings.json"
+    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(savings_path))
+    monkeypatch.setattr(
+        server,
+        "_get_context_tool_stats",
+        lambda: {
+            "tool": "rtk",
+            "label": "RTK",
+            "installed": False,
+            "stats_available": False,
+            "status": "unavailable",
+            "unavailable_reason": "not_installed",
+            "session": {"tokens_saved": 0},
+            "lifetime": {"tokens_saved": 0},
+        },
+    )
+
+    config = ProxyConfig(
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        log_requests=False,
+        http2=False,
+    )
+
+    with TestClient(create_app(config)) as client:
+        response = client.get("/stats-history")
+        assert response.status_code == 200
+        data = response.json()
+
+    assert data["cli_filtering"]["tool"] == "rtk"
+    assert data["cli_filtering"]["available"] is False
+    assert data["cli_filtering"]["stats_available"] is False
+    assert data["cli_filtering"]["status"] == "unavailable"
+    assert data["cli_filtering"]["unavailable_reason"] == "not_installed"
+    assert data["cli_filtering"]["lifetime"]["tokens_saved"] == 0
 
 
 def test_coercion_helpers_reject_non_finite_values():

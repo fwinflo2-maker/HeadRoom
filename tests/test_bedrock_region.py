@@ -432,12 +432,15 @@ class TestNormalizeBedrockProfileId:
 
     def test_global_prefix_dated_full_suffix(self):
         # "global." prefix with the legacy dated "-vN:M" suffix.
-        assert _normalize_bedrock_profile_id(
-            "global.anthropic.claude-haiku-4-5-20251001-v1:0"
-        ) == "claude-haiku-4-5-20251001"
+        assert (
+            _normalize_bedrock_profile_id("global.anthropic.claude-haiku-4-5-20251001-v1:0")
+            == "claude-haiku-4-5-20251001"
+        )
 
     def test_global_prefix_next_gen_names(self):
-        assert _normalize_bedrock_profile_id("global.anthropic.claude-sonnet-5") == "claude-sonnet-5"
+        assert (
+            _normalize_bedrock_profile_id("global.anthropic.claude-sonnet-5") == "claude-sonnet-5"
+        )
         assert _normalize_bedrock_profile_id("global.anthropic.claude-fable-5") == "claude-fable-5"
 
 

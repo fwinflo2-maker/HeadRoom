@@ -125,15 +125,15 @@ def test_agent_savings_env_defaults_preserve_user_overrides() -> None:
     assert env["HEADROOM_SMART_CRUSHER_COMPACTION"] == "0"
 
 
-def test_unknown_agent_savings_profile_falls_back_to_default(
+def test_unknown_agent_savings_profile_falls_back_to_balanced(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     # An unknown profile must NOT raise: it's resolved during proxy startup, so
     # raising takes the whole proxy down before it opens its port (desktop asked
-    # for a profile a fallback runtime predates). Degrade to the default instead.
+    # for a profile a fallback runtime predates). Degrade to "balanced" instead.
     with caplog.at_level(logging.WARNING):
         profile = get_agent_savings_profile("missing")
-    assert profile is get_agent_savings_profile(AGENT_90_PROFILE)
+    assert profile is get_agent_savings_profile("balanced")
     assert "unknown savings profile" in caplog.text
     assert "missing" in caplog.text
 

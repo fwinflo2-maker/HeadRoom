@@ -239,9 +239,7 @@ def test_response_to_sse_emits_unknown_content_block_verbatim() -> None:
     parser = _Parser()
     block = {"type": "future_block", "payload": {"preserve": ["me"]}}
 
-    sse_text = b"".join(
-        parser._response_to_sse({"content": [block]}, "anthropic")
-    ).decode("utf-8")
+    sse_text = b"".join(parser._response_to_sse({"content": [block]}, "anthropic")).decode("utf-8")
     events = _sse_events(sse_text)
 
     block_start = next(ev for ev in events if ev["type"] == "content_block_start")
@@ -275,9 +273,7 @@ def test_response_to_sse_emits_server_tool_use_without_delta() -> None:
     block_starts = [ev for ev in events if ev["type"] == "content_block_start"]
     assert block_starts[1]["index"] == 1
     assert block_starts[1]["content_block"] == server_tool_use
-    assert not any(
-        ev["type"] == "content_block_delta" and ev["index"] == 1 for ev in events
-    )
+    assert not any(ev["type"] == "content_block_delta" and ev["index"] == 1 for ev in events)
     assert any(
         ev["type"] == "content_block_delta"
         and ev["index"] == 0

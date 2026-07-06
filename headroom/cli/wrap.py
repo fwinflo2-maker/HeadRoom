@@ -108,6 +108,7 @@ from headroom.providers.copilot import (
 )
 from headroom.providers.cursor import render_setup_lines as _render_cursor_setup_lines
 from headroom.providers.mistral_vibe import build_launch_env as _build_mistral_vibe_launch_env
+from headroom.providers.zcode import render_setup_lines as _render_zcode_setup_lines
 from headroom.providers.openclaw import (
     OPENCLAW_NPM_PACKAGE,
 )
@@ -5332,6 +5333,93 @@ def cline(
 
 
 # =============================================================================
+# ZCode (zcode.z.ai desktop app)
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup",
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+def zcode(
+    port: int,
+    no_rtk: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    verbose: bool,
+    prepare_only: bool,
+) -> None:
+    """Start Headroom proxy for use with ZCode (zcode.z.ai desktop app).
+
+    \b
+    ZCode is a desktop Electron app that reads its API configuration from
+    the settings UI, not from environment variables. This command starts the
+    proxy, sets up the selected CLI context tool (injecting RTK guidance into
+    AGENTS.md at the project root), and prints the ZCode settings the user
+    should configure.
+
+    \b
+    After running this command, open ZCode and configure:
+        Settings > Model Settings > Add Provider
+        Set OpenAI Base URL and/or Anthropic Base URL to the proxy URLs.
+
+    \b
+    Example:
+        headroom wrap zcode                # Start proxy + context-tool instructions
+        headroom wrap zcode --no-context-tool  # Proxy only, no CLI context tool
+        headroom wrap zcode --port 9999    # Custom proxy port
+    """
+    agents_md: Path | None = Path.cwd() / "AGENTS.md" if not no_rtk else None
+    if not no_rtk:
+        _setup_context_tool_for_agent(
+            agent="zcode",
+            agent_display="ZCode",
+            marker_path=agents_md,
+            on_rtk_ready=lambda _rtk: _inject_rtk_instructions(
+                cast(Path, agents_md), verbose=verbose
+            ),
+            verbose=verbose,
+        )
+
+    if prepare_only:
+        return
+
+    def _print_zcode_setup() -> None:
+        for line in _render_zcode_setup_lines(port):
+            click.echo(line)
+        if not no_rtk:
+            click.echo()
+            if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+                click.echo("  lean-ctx configured for ZCode")
+            else:
+                click.echo("  rtk instructions injected into AGENTS.md")
+            click.echo("  ZCode will use token-optimized commands automatically.")
+
+    _run_proxy_only_watcher(
+        agent_label="zcode",
+        port=port,
+        no_proxy=no_proxy,
+        learn=learn,
+        memory=memory,
+        agent_type="zcode",
+        print_setup_lines=_print_zcode_setup,
+    )
+
+
+# =============================================================================
 # Continue (VS Code / JetBrains extension)
 # =============================================================================
 
@@ -6443,5 +6531,43 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
     click.echo()
     click.echo("✓ Codex is no longer routed through the Headroom proxy.")
     if not no_stop_proxy and status != "noop":
+        _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
+    click.echo()
+
+
+# =============================================================================
+# ZCode (unwrap)
+# =============================================================================
+
+
+@unwrap.command("zcode")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
+@click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
+def unwrap_zcode(port: int, no_stop_proxy: bool) -> None:
+    """Undo ``headroom wrap zcode`` edits to AGENTS.md.
+
+    Removes RTK instructions injected into AGENTS.md at the project root.
+    If the file only contained RTK instructions, it is deleted entirely.
+    """
+    click.echo()
+    click.echo("  ╔═══════════════════════════════════════════════╗")
+    click.echo("  ║           HEADROOM UNWRAP: ZCODE             ║")
+    click.echo("  ╚═══════════════════════════════════════════════╝")
+    click.echo()
+
+    agents_md = Path.cwd() / "AGENTS.md"
+    if _remove_rtk_instructions(agents_md):
+        click.echo(f"  Removed Headroom rtk instructions from {agents_md}")
+        if agents_md.exists() and not agents_md.read_text().strip():
+            agents_md.unlink()
+            click.echo(f"  Removed empty {agents_md}")
+    else:
+        click.echo(f"  Nothing to undo: {agents_md} has no Headroom RTK markers.")
+
+    click.echo()
+    click.echo("✓ ZCode is no longer routed through the Headroom proxy.")
+    if not no_stop_proxy:
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
     click.echo()

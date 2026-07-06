@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- Buffered upstream responses containing a `server_tool_use` (or any other
+  unrecognized Anthropic content block) no longer turn a fully-generated
+  response into an HTTP 502. `StreamingMixin._response_to_sse` raised
+  `ValueError` on unknown block types after the entire upstream generation had
+  already been buffered, so a slow-but-successful response failed and the client
+  retried the whole multi-minute request. Unknown blocks are now emitted
+  verbatim in `content_block_start` (following the existing `redacted_thinking`
+  pattern), so `server_tool_use`, `server_tool_result`, `mcp_tool_use`, and
+  future block types round-trip
+  ([#1806](https://github.com/headroomlabs-ai/headroom/issues/1806)).
 - Non-finite values (`NaN`, `Infinity`) in `proxy_savings.json` or in upstream
   cost/token metadata no longer crash the proxy or corrupt the savings
   dashboard. `SavingsTracker`'s numeric coercion caught only `TypeError` and

@@ -244,3 +244,224 @@ def test_render_setup_lines_includes_mcp_instruction() -> None:
     assert "headroom" in joined.lower()
     assert "MCP" in joined
     assert '"stdio"' in joined
+
+
+# ---------------------------------------------------------------------------
+# Runtime: upstream detection
+# ---------------------------------------------------------------------------
+
+
+def test_detect_upstream_from_config(tmp_path: Path) -> None:
+    """detect_upstream reads config.json and returns the enabled provider."""
+    from headroom.providers.zcode.runtime import detect_upstream
+
+    config = tmp_path / "config.json"
+    config.write_text(
+        '{"provider": {"zai": {"name": "Z.ai", "kind": "anthropic", '
+        '"enabled": true, "options": {"baseURL": "https://api.z.ai/api/anthropic"}}}}',
+        encoding="utf-8",
+    )
+    upstream = detect_upstream(config)
+    assert upstream.provider_name == "Z.ai"
+    assert upstream.base_url == "https://api.z.ai/api/anthropic"
+    assert upstream.kind == "anthropic"
+
+
+def test_detect_upstream_openai_compatible(tmp_path: Path) -> None:
+    """detect_upstream handles OpenAI-compatible providers."""
+    from headroom.providers.zcode.runtime import detect_upstream
+
+    config = tmp_path / "config.json"
+    config.write_text(
+        '{"provider": {"custom": {"name": "Custom", "kind": "openai", '
+        '"enabled": true, "options": {"baseURL": "https://my-api.example.com/v1"}}}}',
+        encoding="utf-8",
+    )
+    upstream = detect_upstream(config)
+    assert upstream.kind == "openai"
+    assert upstream.base_url == "https://my-api.example.com/v1"
+
+
+def test_detect_upstream_disabled_provider_ignored(tmp_path: Path) -> None:
+    """detect_upstream skips disabled providers."""
+    from headroom.providers.zcode.runtime import detect_upstream
+
+    config = tmp_path / "config.json"
+    config.write_text(
+        '{"provider": {"zai": {"name": "Z.ai", "kind": "anthropic", '
+        '"enabled": false, "options": {"baseURL": "https://api.z.ai/api/anthropic"}}}}',
+        encoding="utf-8",
+    )
+    upstream = detect_upstream(config)
+    assert upstream.provider_name == "Z.ai (default)"
+    assert upstream.base_url == "https://api.z.ai/api/anthropic"
+
+
+def test_detect_upstream_no_baseurl_skips(tmp_path: Path) -> None:
+    """detect_upstream skips providers with empty or missing baseURL."""
+    from headroom.providers.zcode.runtime import detect_upstream
+
+    config = tmp_path / "config.json"
+    config.write_text(
+        '{"provider": {"zai": {"name": "Z.ai", "kind": "anthropic", '
+        '"enabled": true, "options": {"baseURL": ""}}}}',
+        encoding="utf-8",
+    )
+    upstream = detect_upstream(config)
+    assert upstream.provider_name == "Z.ai (default)"
+    assert upstream.base_url == "https://api.z.ai/api/anthropic"
+
+
+def test_detect_upstream_missing_file_fallback(tmp_path: Path) -> None:
+    """detect_upstream falls back to default when config file is missing."""
+    from headroom.providers.zcode.runtime import detect_upstream
+
+    config = tmp_path / "nonexistent.json"
+    upstream = detect_upstream(config)
+    assert upstream.provider_name == "Z.ai (default)"
+    assert upstream.base_url == "https://api.z.ai/api/anthropic"
+    assert upstream.kind == "anthropic"
+
+
+def test_detect_upstream_invalid_json_fallback(tmp_path: Path) -> None:
+    """detect_upstream falls back to default on malformed JSON."""
+    from headroom.providers.zcode.runtime import detect_upstream
+
+    config = tmp_path / "config.json"
+    config.write_text("not json at all", encoding="utf-8")
+    upstream = detect_upstream(config)
+    assert upstream.provider_name == "Z.ai (default)"
+    assert upstream.base_url == "https://api.z.ai/api/anthropic"
+
+
+def test_detect_upstream_no_providers_fallback(tmp_path: Path) -> None:
+    """detect_upstream falls back when config has no provider section."""
+    from headroom.providers.zcode.runtime import detect_upstream
+
+    config = tmp_path / "config.json"
+    config.write_text('{"settings": {}}', encoding="utf-8")
+    upstream = detect_upstream(config)
+    assert upstream.provider_name == "Z.ai (default)"
+    assert upstream.base_url == "https://api.z.ai/api/anthropic"
+
+
+# ---------------------------------------------------------------------------
+# Runtime: upstream to proxy URLs
+# ---------------------------------------------------------------------------
+
+
+def test_upstream_to_proxy_urls_anthropic() -> None:
+    """upstream_to_proxy_urls returns (url, None) for anthropic upstream."""
+    from headroom.providers.zcode.runtime import ZCodeUpstream, upstream_to_proxy_urls
+
+    upstream = ZCodeUpstream(
+        provider_name="Z.ai", base_url="https://api.z.ai/api/anthropic", kind="anthropic"
+    )
+    anthropic_url, openai_url = upstream_to_proxy_urls(upstream)
+    assert anthropic_url == "https://api.z.ai/api/anthropic"
+    assert openai_url is None
+
+
+def test_upstream_to_proxy_urls_openai() -> None:
+    """upstream_to_proxy_urls returns (None, url) for openai-compatible upstream."""
+    from headroom.providers.zcode.runtime import ZCodeUpstream, upstream_to_proxy_urls
+
+    upstream = ZCodeUpstream(
+        provider_name="Custom",
+        base_url="https://my-api.example.com/v1",
+        kind="openai",
+    )
+    anthropic_url, openai_url = upstream_to_proxy_urls(upstream)
+    assert anthropic_url is None
+    assert openai_url == "https://my-api.example.com/v1"
+
+
+# ---------------------------------------------------------------------------
+# Wrap: upstream detection integration
+# ---------------------------------------------------------------------------
+
+
+def test_wrap_zcode_detects_upstream(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """wrap zcode detects upstream and prints detected provider in setup."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+
+    config = tmp_path / "config.json"
+    config.write_text(
+        '{"provider": {"zai": {"name": "Z.ai Coding", "kind": "anthropic", '
+        '"enabled": true, "options": {"baseURL": "https://api.z.ai/api/anthropic"}}}}',
+        encoding="utf-8",
+    )
+
+    from headroom.providers.zcode.runtime import detect_upstream, upstream_to_proxy_urls
+
+    upstream = detect_upstream(config)
+    assert upstream.provider_name == "Z.ai Coding"
+    assert upstream.base_url == "https://api.z.ai/api/anthropic"
+
+    anthropic_url, openai_url = upstream_to_proxy_urls(upstream)
+    assert anthropic_url == "https://api.z.ai/api/anthropic"
+    assert openai_url is None
+
+
+def test_wrap_zcode_passes_upstream_to_watcher(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """wrap zcode forwards detected upstream URLs to _run_proxy_only_watcher."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+
+    from headroom.providers.zcode.runtime import ZCodeUpstream
+
+    captured: dict[str, object] = {}
+
+    def fake_watcher(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    fake_upstream = ZCodeUpstream(
+        provider_name="Z.ai", base_url="https://api.z.ai/api/anthropic", kind="anthropic"
+    )
+
+    with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
+        with patch.object(wrap_mod, "_detect_zcode_upstream", return_value=fake_upstream):
+            with patch.object(wrap_mod, "_run_proxy_only_watcher", side_effect=fake_watcher):
+                runner.invoke(main, ["wrap", "zcode", "--port", "9000"])
+
+    assert captured.get("anthropic_api_url") == "https://api.z.ai/api/anthropic"
+    assert captured.get("openai_api_url") is None
+    assert captured.get("port") == 9000
+
+
+def test_wrap_zcode_passes_openai_upstream(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """wrap zcode forwards OpenAI-compatible upstream URLs correctly."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+
+    from headroom.providers.zcode.runtime import ZCodeUpstream
+
+    captured: dict[str, object] = {}
+
+    def fake_watcher(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    fake_upstream = ZCodeUpstream(
+        provider_name="Custom", base_url="https://my-api.example.com/v1", kind="openai"
+    )
+
+    with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
+        with patch.object(wrap_mod, "_detect_zcode_upstream", return_value=fake_upstream):
+            with patch.object(wrap_mod, "_run_proxy_only_watcher", side_effect=fake_watcher):
+                runner.invoke(main, ["wrap", "zcode", "--port", "9000"])
+
+    assert captured.get("anthropic_api_url") is None
+    assert captured.get("openai_api_url") == "https://my-api.example.com/v1"

@@ -6475,8 +6475,14 @@ class OpenAIHandlerMixin:
         # provider adaptation, but without this local compression pass the long
         # coding-agent request body is forwarded byte-for-byte.
         hermes_codex_proxy = path.startswith("/api/codex-proxy/") and path.endswith("/v1/responses")
-        hermes_claude_proxy = path.startswith("/api/claude-code-proxy/") and path.endswith("/v1/messages")
-        if (hermes_codex_proxy or hermes_claude_proxy) and self.config.optimize and not _headroom_bypass_enabled(request.headers):
+        hermes_claude_proxy = path.startswith("/api/claude-code-proxy/") and path.endswith(
+            "/v1/messages"
+        )
+        if (
+            (hermes_codex_proxy or hermes_claude_proxy)
+            and self.config.optimize
+            and not _headroom_bypass_enabled(request.headers)
+        ):
             try:
                 payload = json.loads(body)
                 model = str(payload.get("model") or "").strip()
@@ -6497,12 +6503,16 @@ class OpenAIHandlerMixin:
 
                     before_bytes = len(json.dumps(messages, ensure_ascii=False).encode("utf-8"))
                     result = headroom_compress(messages=messages, model=model, optimize=True)
-                    after_bytes = len(json.dumps(result.messages, ensure_ascii=False).encode("utf-8"))
+                    after_bytes = len(
+                        json.dumps(result.messages, ensure_ascii=False).encode("utf-8")
+                    )
                     if hermes_claude_proxy:
                         payload["messages"] = result.messages
                     else:
                         payload["input"] = result.messages
-                    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode(
+                        "utf-8"
+                    )
                     headers["content-length"] = str(len(body))
                     logger.info(
                         "Hermes %s passthrough compression: %d -> %d bytes (saved %d)",

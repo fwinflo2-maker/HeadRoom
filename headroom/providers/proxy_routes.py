@@ -11,7 +11,10 @@ from urllib.parse import quote
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response
 
-from headroom.proxy.handlers.openai import _resolve_codex_routing_headers
+from headroom.proxy.handlers.openai import (
+    _resolve_codex_routing_headers,
+    _sanitize_forwarded_response_headers,
+)
 
 logger = logging.getLogger("headroom.proxy.routes")
 
@@ -444,9 +447,7 @@ async def _handle_chatgpt_codex_images(
             content=body,
             timeout=120.0,
         )
-        response_headers = dict(resp.headers)
-        response_headers.pop("content-encoding", None)
-        response_headers.pop("content-length", None)
+        response_headers = _sanitize_forwarded_response_headers(resp.headers)
         return Response(
             content=resp.content,
             status_code=resp.status_code,

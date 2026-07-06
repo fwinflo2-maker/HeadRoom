@@ -35,6 +35,7 @@ PROJECT_NAME_MAX_LENGTH = 128
 DEFAULT_MAX_HISTORY_AGE_DAYS = 365
 DEFAULT_MAX_RESPONSE_HISTORY_POINTS = 500
 DEFAULT_DISPLAY_SESSION_INACTIVITY_MINUTES = 60
+DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN = 3.0 / 1_000_000
 
 LITELLM_AVAILABLE = importlib.util.find_spec("litellm") is not None
 litellm: Any | None = None
@@ -119,7 +120,7 @@ def _coerce_float(value: Any, default: float = 0.0) -> float:
     # accumulator forever, so reject non-finite values outright.
     try:
         coerced = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     if not math.isfinite(coerced):
         return default
@@ -197,18 +198,20 @@ def _resolve_litellm_model(model: str) -> str:
 def _estimate_compression_savings_usd(model: str, tokens_saved: int) -> float:
     """Estimate compression savings in USD from saved input tokens."""
     litellm = _get_litellm_module()
-    if tokens_saved <= 0 or litellm is None:
+    if tokens_saved <= 0:
         return 0.0
+    if litellm is None:
+        return float(tokens_saved) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
     try:
         resolved = _resolve_litellm_model(model)
         info = litellm.model_cost.get(resolved, {})
         input_cost_per_token = info.get("input_cost_per_token")
         if not input_cost_per_token:
-            return 0.0
+            raise RuntimeError("input cost unavailable")
         return float(tokens_saved) * float(input_cost_per_token)
     except Exception:
-        return 0.0
+        return float(tokens_saved) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
 
 def _estimate_cache_savings_usd(model: str, cache_read_tokens: int) -> float:
@@ -258,23 +261,31 @@ def _estimate_input_cost_usd(
     cache_read = _coerce_int(cache_read_tokens)
     cache_write = _coerce_int(cache_write_tokens)
     uncached = _coerce_int(uncached_input_tokens)
-    litellm = _get_litellm_module()
-    # Gate on tokens actually sent. Providers like Anthropic report cache
-    # reads/writes separately from `input_tokens` (the uncached portion), so a
-    # fully prefix-cached request has input_tokens == 0 while cache_read > 0.
-    # Bailing on `input_tokens <= 0` alone dropped the real cache-read cost,
-    # leaving days with compression savings but zero recorded spend.
-    if total_input_tokens + cache_read + cache_write + uncached <= 0 or litellm is None:
+
+    # Prefer the breakdown when callers supply segmented token counts.
+    # Never add `input_tokens` on top of the breakdown to avoid double-counting.
+    use_breakdown = (cache_read + cache_write + uncached) > 0
+    chargeable_tokens = (
+        (cache_read + cache_write + uncached) if use_breakdown else total_input_tokens
+    )
+    if chargeable_tokens <= 0:
         return 0.0
+
+    litellm = _get_litellm_module()
+    # Keep exact provider pricing authoritative when available.
+    # `litellm` can be present but lack an entry for the resolved model,
+    # in which case we fall back to a blended rate instead of zeroing usage.
+    if litellm is None:
+        return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
     try:
         resolved = _resolve_litellm_model(model)
         info = litellm.model_cost.get(resolved, {})
         input_cost_per_token = info.get("input_cost_per_token")
         if not input_cost_per_token:
-            return 0.0
+            raise RuntimeError("input cost unavailable")
 
-        if cache_read + cache_write + uncached > 0:
+        if use_breakdown:
             cache_read_cost = info.get(
                 "cache_read_input_token_cost",
                 input_cost_per_token,
@@ -291,7 +302,7 @@ def _estimate_input_cost_usd(
 
         return float(total_input_tokens) * float(input_cost_per_token)
     except Exception:
-        return 0.0
+        return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
 
 def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:

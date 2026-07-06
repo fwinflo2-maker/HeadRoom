@@ -34,10 +34,11 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import fields, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
 if TYPE_CHECKING:
     from ..backends.base import Backend
@@ -446,6 +447,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("headroom.proxy")
 
+LoopExceptionHandler = Callable[[asyncio.AbstractEventLoop, dict[str, Any]], object]
+
+
+class LoopFailureDetails(TypedDict):
+    message: Any | None
+    exception: str | None
+
+
+class LoopHealthState(TypedDict):
+    status: str
+    known_failures: int
+    last_known_failure: LoopFailureDetails | None
+
+
 _MULTI_WORKER_CONFIG_ENV = "HEADROOM_PROXY_CONFIG_JSON"
 
 # Env var that opts out of the Rust core deployment smoke test (Hotfix-A0).
@@ -674,7 +689,18 @@ class HeadroomProxy(
             ),
             ccr_inject_marker=config.ccr_inject_marker,
             force_kompress_all=config.force_kompress_all,
+            lossless=config.lossless,
         )
+        # No-CCR lossless mode: compress tool outputs with format-native
+        # lossless compaction and marker-free SmartCrusher, and suppress every
+        # retrieval marker + the retrieve-tool injection so no MCP round-trip is
+        # needed. Mirrors the force_kompress_all wiring precedent.
+        if config.lossless:
+            router_config.lossless = True
+            router_config.smart_crusher_lossless_only = True
+            router_config.ccr_inject_marker = False
+            if hasattr(config, "ccr_inject_tool"):
+                config.ccr_inject_tool = False
         if config.disable_kompress:
             router_config.enable_kompress = False
             # Opt-in restore of the legacy behaviour: send fall-through content
@@ -934,6 +960,7 @@ class HeadroomProxy(
             backend=config.backend,
             anyllm_provider=config.anyllm_provider,
             bedrock_region=config.bedrock_region,
+            bedrock_profile=config.bedrock_profile,
             logger=logger,
             openai_api_url=config.openai_api_url,
             anyllm_backend_cls=AnyLLMBackend,
@@ -1910,6 +1937,20 @@ def _request_is_loopback(request: Request) -> bool:
     return is_loopback_host(client_host) and is_loopback_host_header(host_header)
 
 
+def _is_known_websocket_callback_failure(context: dict[str, Any]) -> bool:
+    """Return True iff this exact websockets callback failure shape is observed."""
+    if (
+        context.get("message")
+        != "Exception in callback Connection.connection_lost(ConnectionResetError())"
+    ):
+        return False
+    exception = context.get("exception")
+    return (
+        isinstance(exception, AttributeError)
+        and str(exception) == "'ClientConnection' object has no attribute 'recv_messages'"
+    )
+
+
 def create_app(config: ProxyConfig | None = None) -> FastAPI:
     """Create FastAPI application."""
     if not FASTAPI_AVAILABLE:
@@ -2039,6 +2080,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         try:
             try:
+                previous_handler = _install_loop_exception_handler()
                 # Startup
                 await proxy.startup()
                 if config.periodic_toin_stats_enabled:
@@ -2067,6 +2109,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 app.state.startup_error = str(exc)
                 raise
         finally:
+            loop: asyncio.AbstractEventLoop | None
+            previous: LoopExceptionHandler | None
+            try:
+                loop = asyncio.get_running_loop()
+                previous = previous_handler
+            except RuntimeError:
+                loop = None
+                previous = app.state.previous_loop_exception_handler
+            if loop is not None:
+                loop.set_exception_handler(previous)
+
             app.state.ready = False
             # Shutdown
             if _cc_reconciler is not None:
@@ -2092,10 +2145,18 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         version=__version__,
         lifespan=lifespan,
     )
+    loop_health_state: LoopHealthState = {
+        "status": "healthy",
+        "known_failures": 0,
+        "last_known_failure": None,
+    }
     app.state.proxy = proxy
     app.state.started_at = None
     app.state.ready = False
     app.state.startup_error = None
+    app.state.loop_callback_health = loop_health_state
+    app.state.loop_exception_handler = None
+    app.state.previous_loop_exception_handler = None
     # Set by the lifespan startup smoke test (`_check_rust_core`). Default
     # "missing" means lifespan hasn't run yet — anything reading /health
     # before startup completes (rare; lifespan runs before the first
@@ -2227,6 +2288,46 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "active_relay_tasks": ws_active_relay_tasks,
             },
         }
+
+    def _loop_callback_payload() -> LoopHealthState:
+        return {
+            "status": loop_health_state["status"],
+            "known_failures": loop_health_state["known_failures"],
+            "last_known_failure": loop_health_state["last_known_failure"],
+        }
+
+    def _install_loop_exception_handler() -> LoopExceptionHandler | None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+
+        previous_handler = loop.get_exception_handler()
+
+        def _loop_exception_handler(
+            _loop: asyncio.AbstractEventLoop, context: dict[str, Any]
+        ) -> None:
+            if _is_known_websocket_callback_failure(context):
+                loop_health_state["status"] = "unhealthy"
+                loop_health_state["known_failures"] += 1
+                loop_health_state["last_known_failure"] = {
+                    "message": context.get("message"),
+                    "exception": str(context.get("exception"))
+                    if context.get("exception")
+                    else None,
+                }
+                return
+
+            delegate_handler = app.state.previous_loop_exception_handler
+            if delegate_handler is not None:
+                delegate_handler(_loop, context)
+                return
+            _loop.default_exception_handler(context)
+
+        loop.set_exception_handler(_loop_exception_handler)
+        app.state.loop_exception_handler = _loop_exception_handler
+        app.state.previous_loop_exception_handler = previous_handler
+        return previous_handler
 
     def _health_payload(*, include_config: bool) -> dict[str, Any]:
         checks = _health_checks()
@@ -2618,15 +2719,18 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # Health & Metrics
     @app.get("/livez")
     async def livez():
+        callback_state = _loop_callback_payload()
+        healthy = callback_state["status"] == "healthy"
         return JSONResponse(
-            status_code=200,
+            status_code=200 if healthy else 503,
             content={
                 "service": "headroom-proxy",
-                "status": "healthy",
-                "alive": True,
+                "status": "healthy" if healthy else "unhealthy",
+                "alive": healthy,
                 "version": __version__,
                 "timestamp": _iso_utc_now(),
                 "uptime_seconds": _uptime_seconds(),
+                "loop_health": callback_state,
             },
         )
 
@@ -4080,6 +4184,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         disable_kompress_anthropic=_get_env_optional_bool("HEADROOM_DISABLE_KOMPRESS_ANTHROPIC"),
         disable_kompress_openai=_get_env_optional_bool("HEADROOM_DISABLE_KOMPRESS_OPENAI"),
         force_kompress_all=_get_env_bool("HEADROOM_FORCE_KOMPRESS_ALL", False),
+        lossless=_get_env_bool("HEADROOM_LOSSLESS", False),
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", 500),
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", 100),
         keepalive_expiry=_get_env_float("HEADROOM_KEEPALIVE_EXPIRY", 90.0),
@@ -4575,6 +4680,16 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--lossless",
+        action="store_true",
+        help=(
+            "No-CCR lossless mode: compress LOG/SEARCH/DIFF tool outputs with "
+            "format-native lossless compaction (and marker-free SmartCrusher) "
+            "without emitting any CCR retrieval marker, so no MCP retrieve tool "
+            "is needed. Also settable via HEADROOM_LOSSLESS=1."
+        ),
+    )
+    parser.add_argument(
         "--exclude-tools",
         default=None,
         help="Comma-separated tool names whose output is never compressed, "
@@ -4655,6 +4770,7 @@ if __name__ == "__main__":
     force_kompress_all = args.force_kompress_all or _get_env_bool(
         "HEADROOM_FORCE_KOMPRESS_ALL", False
     )
+    lossless = getattr(args, "lossless", False) or _get_env_bool("HEADROOM_LOSSLESS", False)
 
     # Set OpenRouter API key from CLI if provided
     if hasattr(args, "openrouter_api_key") and args.openrouter_api_key:
@@ -4710,6 +4826,7 @@ if __name__ == "__main__":
         disable_kompress_anthropic=disable_kompress_anthropic,
         disable_kompress_openai=disable_kompress_openai,
         force_kompress_all=force_kompress_all,
+        lossless=lossless,
         # Connection pool settings
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", args.max_connections),
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", args.max_keepalive),

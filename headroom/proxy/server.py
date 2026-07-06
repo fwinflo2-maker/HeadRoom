@@ -1856,7 +1856,7 @@ class HeadroomProxy(
                             logger.info(
                                 "Shutdown interrupted retry backoff for %s %s",
                                 method,
-                                path_for_log or url,
+                                path_for_log or "<upstream-url>",
                             )
                             return self._shutdown_retry_response(method, url)
                         continue
@@ -1895,7 +1895,7 @@ class HeadroomProxy(
                     logger.info(
                         "Shutdown interrupted retry backoff for %s %s",
                         method,
-                        path_for_log or url,
+                        path_for_log or "<upstream-url>",
                     )
                     return self._shutdown_retry_response(method, url)
 

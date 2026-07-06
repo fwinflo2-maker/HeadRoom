@@ -20,9 +20,7 @@ _anthropic_usage_from_litellm = litellm_backend._anthropic_usage_from_litellm
 
 
 def test_plain_usage_without_cache_fields() -> None:
-    usage = _anthropic_usage_from_litellm(
-        SimpleNamespace(prompt_tokens=100, completion_tokens=7)
-    )
+    usage = _anthropic_usage_from_litellm(SimpleNamespace(prompt_tokens=100, completion_tokens=7))
     assert usage == {"input_tokens": 100, "output_tokens": 7}
 
 
@@ -58,9 +56,7 @@ def test_prompt_tokens_details_fallback() -> None:
         SimpleNamespace(
             prompt_tokens=1213,
             completion_tokens=4,
-            prompt_tokens_details=SimpleNamespace(
-                cached_tokens=1202, cache_creation_tokens=0
-            ),
+            prompt_tokens_details=SimpleNamespace(cached_tokens=1202, cache_creation_tokens=0),
         )
     )
     assert usage["input_tokens"] == 11

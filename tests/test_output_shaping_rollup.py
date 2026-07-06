@@ -6,6 +6,7 @@ per-request output_tokens_saved, accumulates it into each time bucket as
 output_tokens_saved_delta / output_savings_usd_delta, and the read-only
 SavingsRecorder.estimate_request_savings supplies that per-request number.
 """
+
 from __future__ import annotations
 
 from headroom.proxy.output_savings import (
@@ -59,9 +60,7 @@ def test_record_request_without_output_savings_is_backward_compatible(tmp_path):
 
 
 def _key() -> str:
-    return stratum_key(
-        turn_kind="code", input_tokens=8000, model="claude-opus-4-8", has_tools=True
-    )
+    return stratum_key(turn_kind="code", input_tokens=8000, model="claude-opus-4-8", has_tools=True)
 
 
 def test_estimate_request_savings_treatment_uses_baseline(tmp_path):

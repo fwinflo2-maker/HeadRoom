@@ -235,6 +235,7 @@ def _estimate_output_savings_usd(model: str, tokens_saved: int) -> float:
     except Exception:
         return float(tokens_saved) * float(DEFAULT_FALLBACK_OUTPUT_COST_PER_TOKEN)
 
+
 def _estimate_input_cost_usd(
     model: str,
     input_tokens: int,
@@ -598,9 +599,7 @@ class SavingsTracker:
         delta_input_tokens = _coerce_int(input_tokens)
         delta_savings_usd = _estimate_compression_savings_usd(model, delta_tokens_saved)
         delta_output_tokens_saved = max(_coerce_int(output_tokens_saved), 0)
-        delta_output_savings_usd = _estimate_output_savings_usd(
-            model, delta_output_tokens_saved
-        )
+        delta_output_savings_usd = _estimate_output_savings_usd(model, delta_output_tokens_saved)
         delta_input_cost_usd = _estimate_input_cost_usd(
             model,
             delta_input_tokens,

@@ -312,6 +312,43 @@ def test_detect_upstream_no_baseurl_skips(tmp_path: Path) -> None:
     assert upstream.base_url == "https://api.z.ai/api/anthropic"
 
 
+@pytest.mark.parametrize(
+    "bad_options",
+    [
+        None,
+        [],
+        42,
+        "just a string",
+    ],
+    ids=["null", "list", "int", "string"],
+)
+def test_detect_upstream_malformed_options_skips(tmp_path: Path, bad_options: object) -> None:
+    """detect_upstream falls back when provider options is not a dict."""
+    import json as _json
+
+    from headroom.providers.zcode.runtime import detect_upstream
+
+    config = tmp_path / "config.json"
+    config.write_text(
+        _json.dumps(
+            {
+                "provider": {
+                    "bad": {
+                        "name": "Bad Provider",
+                        "kind": "anthropic",
+                        "enabled": True,
+                        "options": bad_options,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    upstream = detect_upstream(config)
+    assert upstream.provider_name == "Z.ai (default)"
+    assert upstream.base_url == "https://api.z.ai/api/anthropic"
+
+
 def test_detect_upstream_missing_file_fallback(tmp_path: Path) -> None:
     """detect_upstream falls back to default when config file is missing."""
     from headroom.providers.zcode.runtime import detect_upstream

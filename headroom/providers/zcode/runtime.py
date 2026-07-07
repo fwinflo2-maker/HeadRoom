@@ -81,6 +81,8 @@ def detect_upstream(config_path: Path | None = None) -> ZCodeUpstream:
         if not provider.get("enabled"):
             continue
         opts = provider.get("options", {})
+        if not isinstance(opts, dict):
+            continue
         base_url = opts.get("baseURL", "").strip()
         if not base_url:
             continue

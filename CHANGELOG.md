@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- **ccr:** buffered Anthropic CCR re-streaming now preserves adaptive-thinking
+  response shape, including empty `thinking` blocks, `signature_delta`,
+  `redacted_thinking.data`, verbatim `stop_reason` values such as `refusal`,
+  and `stop_details`.
 - `headroom wrap claude` no longer leaves a dead `ANTHROPIC_BASE_URL` in a
   project's `.claude/settings.local.json` after an unclean exit (`SIGKILL`,
   OOM, reboot, or terminal/tmux close via `SIGHUP`, which was not caught).

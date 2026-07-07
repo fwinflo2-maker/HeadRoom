@@ -72,6 +72,18 @@ _detect_panic_warned = False
 _detect_native_unhealthy = False  # circuit breaker: native detect hung once (#575)
 
 
+def _estimate_tokens(text: str) -> int:
+    """Cheap size-proportional token estimate (~4 chars/token).
+
+    Whitespace splitting undercounts pathologically on compact
+    machine-generated JSON (no spaces means the whole payload is ~1
+    "word"), which made section compression ratios compute as ~1.0 and
+    the min_ratio acceptance gate silently reject real compression.
+    chars/4 is monotone in content size for any format.
+    """
+    return max(1, len(text) // 4)
+
+
 def _router_debug_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
 
@@ -335,7 +347,7 @@ def _section_debug(section: ContentSection, index: int) -> dict[str, Any]:
         "is_code_fence": getattr(section, "is_code_fence", False),
         "chars": len(section.content),
         "bytes": len(section.content.encode("utf-8", errors="replace")),
-        "tokens_estimate": len(section.content.split()),
+        "tokens_estimate": _estimate_tokens(section.content),
         "json_shape": _json_shape(section.content),
         "content": section.content,
     }
@@ -1670,7 +1682,7 @@ class ContentRouter(Transform):
             {
                 "chars": len(content),
                 "bytes": len(content.encode("utf-8", errors="replace")),
-                "tokens_estimate": len(content.split()),
+                "tokens_estimate": _estimate_tokens(content),
                 "json_shape": _json_shape(content),
                 "mixed_indicators": _mixed_indicators(content),
                 "context_chars": len(context),
@@ -1889,7 +1901,7 @@ class ContentRouter(Transform):
             strategy = self._strategy_from_detection_type(section.content_type)
 
             # Compress section
-            original_tokens = len(section.content.split())
+            original_tokens = _estimate_tokens(section.content)
             compressed_content, compressed_tokens, _section_chain = self._apply_strategy_to_content(
                 section.content,
                 strategy,
@@ -1942,7 +1954,7 @@ class ContentRouter(Transform):
         Returns:
             RouterCompressionResult.
         """
-        original_tokens = len(content.split())
+        original_tokens = _estimate_tokens(content)
 
         compressed, compressed_tokens, strategy_chain = self._apply_strategy_to_content(
             content, strategy, context, question=question, bias=bias
@@ -2064,7 +2076,7 @@ class ContentRouter(Transform):
             final compressor without parsing decision_reason strings.
         """
         # Track original tokens for TOIN recording
-        original_tokens = len(content.split())
+        original_tokens = _estimate_tokens(content)
         compressed: str | None = None
         compressed_tokens: int | None = None
         requested_strategy = strategy
@@ -2093,7 +2105,7 @@ class ContentRouter(Transform):
         # never a marker-free lossy drop that could not be recovered.
         if self.config.lossless:
             if _ll_label is not None:
-                return _ll_content, len(_ll_content.split()), [_ll_label]
+                return _ll_content, _estimate_tokens(_ll_content), [_ll_label]
             return content, original_tokens, [CompressionStrategy.PASSTHROUGH.value]
 
         # ── LOSSY / CCR mode: layer relevance-split + lossy ON TOP of the fold ─
@@ -2117,7 +2129,7 @@ class ContentRouter(Transform):
             kind = "log" if strategy is CompressionStrategy.LOG else "search"
             split = self._relevance_split_compress(content, kind, context)
             if split is not None:
-                return split, len(split.split()), [kind, "relevance_split"]
+                return split, _estimate_tokens(split), [kind, "relevance_split"]
 
         # No relevance split adopted → return the STAGE 0 lossless fold as the
         # floor. Lossless-then-lossy: before returning, run the aggressive lossy
@@ -2134,7 +2146,7 @@ class ContentRouter(Transform):
                 and not self._looks_like_diff(content)
             )
             if _lossy_after_fold:
-                _fold_tokens = len(_ll_content.split())
+                _fold_tokens = _estimate_tokens(_ll_content)
                 try:
                     _komp, _komp_tokens = self._try_ml_compressor(_ll_content, context, question)
                 except Exception as exc:  # noqa: BLE001
@@ -2151,7 +2163,7 @@ class ContentRouter(Transform):
                         _komp_tokens,
                         [_ll_label, CompressionStrategy.KOMPRESS.value],
                     )
-            return _ll_content, len(_ll_content.split()), [_ll_label]
+            return _ll_content, _estimate_tokens(_ll_content), [_ll_label]
 
         # CCR/lossy mode, nothing foldable (code/json/text/mixed) and no relevance
         # split → fall through to the lossy compressors below (kompress /
@@ -2214,7 +2226,7 @@ class ContentRouter(Transform):
                         result = crusher.crush(content, query=context, bias=bias)
                         compressed, compressed_tokens = (
                             result.compressed,
-                            len(result.compressed.split()),
+                            _estimate_tokens(result.compressed),
                         )
                         decision_reason = "smart_crusher"
                         # Fallback to Kompress (and possibly Log) is
@@ -2230,7 +2242,7 @@ class ContentRouter(Transform):
                         result = compressor.compress(content, context=context, bias=bias)
                         compressed, compressed_tokens = (
                             result.compressed,
-                            len(result.compressed.split()),
+                            _estimate_tokens(result.compressed),
                         )
                         decision_reason = "search_compressor"
 
@@ -2246,7 +2258,7 @@ class ContentRouter(Transform):
                         # ratios meaningless against `original_tokens`.
                         compressed, compressed_tokens = (
                             result.compressed,
-                            len(result.compressed.split()),
+                            _estimate_tokens(result.compressed),
                         )
                         decision_reason = "log_compressor"
 
@@ -2258,7 +2270,7 @@ class ContentRouter(Transform):
                         result = compressor.compress(content, context=context, bias=bias)
                         compressed, compressed_tokens = (
                             result.compressed,
-                            len(result.compressed.split()),
+                            _estimate_tokens(result.compressed),
                         )
                         decision_reason = "tabular_compressor"
 
@@ -2269,7 +2281,7 @@ class ContentRouter(Transform):
                     result = compressor.compress(content, context=context)
                     compressed, compressed_tokens = (
                         result.compressed,
-                        len(result.compressed.split()),
+                        _estimate_tokens(result.compressed),
                     )
                     decision_reason = "diff_compressor"
 
@@ -2281,7 +2293,7 @@ class ContentRouter(Transform):
                         result = extractor.extract(content)
                         compressed = result.extracted
                         # Estimate tokens from extracted text (simple word count)
-                        compressed_tokens = len(compressed.split()) if compressed else 0
+                        compressed_tokens = _estimate_tokens(compressed) if compressed else 0
                         decision_reason = "html_extractor"
 
             elif strategy == CompressionStrategy.KOMPRESS:
@@ -2353,7 +2365,7 @@ class ContentRouter(Transform):
                             except Exception as exc:  # noqa: BLE001
                                 logger.debug("Log fallback failed for SMART_CRUSHER: %s", exc)
                             else:
-                                log_compressed_tokens = len(log_result.compressed.split())
+                                log_compressed_tokens = _estimate_tokens(log_result.compressed)
                                 if log_compressed_tokens < compressed_tokens:
                                     compressed = log_result.compressed
                                     compressed_tokens = log_compressed_tokens
@@ -2501,7 +2513,7 @@ class ContentRouter(Transform):
 
         # If the entire content is custom tags with nothing to compress
         if protected and not cleaned.strip():
-            return content, len(content.split())
+            return content, _estimate_tokens(content)
 
         # Use the cleaned (tag-free) text for compression
         text_to_compress = cleaned if protected else content
@@ -2546,7 +2558,7 @@ class ContentRouter(Transform):
                         out = text_to_compress
             if protected:
                 out = restore_tags(out, protected)
-            return out, len(out.split())
+            return out, _estimate_tokens(out)
 
         # Primary: Kompress. On a cold cache the model is fetched once in the
         # background (ensure_background_load) instead of blocking this request
@@ -2576,14 +2588,14 @@ class ContentRouter(Transform):
                         logger.warning("Kompress failed: %s", e)
 
         if compressed is None:
-            return content, len(content.split())
+            return content, _estimate_tokens(content)
 
         # Restore protected tag blocks into the compressed text
         if protected:
             compressed = restore_tags(compressed, protected)
-            compressed_tokens = len(compressed.split())
+            compressed_tokens = _estimate_tokens(compressed)
 
-        return compressed, compressed_tokens or len(compressed.split())
+        return compressed, compressed_tokens or _estimate_tokens(compressed)
 
     def _experimental_compress_read(self, content: Any, context: str = "") -> str | None:
         """EXPERIMENT (HEADROOM_EXPERIMENTAL_READ_KEEP_RATIO): lightly Kompress a

@@ -1,15 +1,12 @@
 """Claude Code MCP registrar.
 
 Claude Code 2.x stores user-scope MCP server configuration in
-``~/.claude.json`` (directly under the home directory, not inside a
-``.claude`` subdirectory) and ships a CLI (``claude mcp add/remove/list/get``)
-that owns the file. Verified directly against a running Claude Code 2.1.202:
-``claude mcp add`` reports writing to ``~/.claude.json``, and ``claude mcp
-list`` only picks up entries from that same flat path. Setting
-``CLAUDE_CONFIG_DIR`` moves this file to ``$CLAUDE_CONFIG_DIR/.claude.json``.
+``~/.claude.json``, directly under the home directory. The ``claude`` CLI
+(``claude mcp add/remove/list/get``) owns this file; setting
+``CLAUDE_CONFIG_DIR`` relocates it to ``$CLAUDE_CONFIG_DIR/.claude.json``.
 Older Claude Code releases (and the Claude Desktop app) read
-``~/.claude/mcp.json``. This registrar prefers the CLI for writes when
-available, and reads the underlying JSON files directly for compare /
+``~/.claude/mcp.json`` instead. This registrar prefers the CLI for writes
+when available, and reads the underlying JSON files directly for compare /
 ``get_server`` so it is robust to CLI output format changes.
 """
 
@@ -211,12 +208,9 @@ def _resolve_claude_config_dir(
 ) -> Path:
     """Resolve the directory holding the *modern* ``.claude.json`` config.
 
-    Defaults to ``home`` itself — Claude Code's modern config lives at
-    ``~/.claude.json``, not ``~/.claude/.claude.json``. Confirmed against a
-    real Claude Code 2.1.202 install: with ``CLAUDE_CONFIG_DIR`` unset,
-    ``claude mcp add`` reports "File modified: ~/.claude.json", and
-    subsequent entries were only visible in ``claude mcp list`` when written
-    to that flat path.
+    Defaults to ``home`` itself, since Claude Code's modern config lives at
+    ``~/.claude.json`` directly under the home directory. ``CLAUDE_CONFIG_DIR``,
+    when set, relocates it to ``$CLAUDE_CONFIG_DIR/.claude.json``.
     """
     if config_dir is not None:
         return config_dir

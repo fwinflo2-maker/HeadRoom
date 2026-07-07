@@ -73,96 +73,14 @@ var nodeRequire = createRequire(import.meta.url);
 var http = nodeRequire("node:http");
 var https = nodeRequire("node:https");
 var http2 = nodeRequire("node:http2");
-var childProcess = nodeRequire("node:child_process");
 var BASE_URL_HEADER = "x-headroom-base-url";
 var ORIGINAL_PATH_HEADER = "x-headroom-original-path";
-var PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
 var STATE_KEY = /* @__PURE__ */ Symbol.for("headroom.opencode.transport");
 function getState() {
   return globalThis[STATE_KEY];
 }
 function setState(state) {
   globalThis[STATE_KEY] = state;
-}
-function shimImportSpecifier() {
-  return new URL("../hook-shim/handler.js", import.meta.url).href;
-}
-function withNodeImportOption(existing, shim) {
-  const parts = existing?.trim() ? existing.trim().split(/\s+/) : [];
-  const alreadyPresent = parts.some((part, index) => {
-    return part === `--import=${shim}` || part === "--import" && parts[index + 1] === shim;
-  });
-  if (!alreadyPresent) {
-    parts.push(`--import=${shim}`);
-  }
-  return parts.join(" ");
-}
-function withShimEnv(env, proxyUrl) {
-  const nextEnv = { ...env ?? process.env };
-  nextEnv[PROXY_ENV] = proxyUrl;
-  nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shimImportSpecifier());
-  return nextEnv;
-}
-function installProcessEnv(proxyUrl) {
-  process.env[PROXY_ENV] = proxyUrl;
-  process.env.NODE_OPTIONS = withNodeImportOption(process.env.NODE_OPTIONS, shimImportSpecifier());
-}
-function isOptions(value) {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value) && !(value instanceof URL);
-}
-function injectOptionsEnv(args, optionIndex, proxyUrl) {
-  const nextArgs = [...args];
-  const callback = typeof nextArgs.at(-1) === "function" ? nextArgs.pop() : void 0;
-  const existing = isOptions(nextArgs[optionIndex]) ? { ...nextArgs[optionIndex] } : {};
-  existing.env = withShimEnv(existing.env, proxyUrl);
-  if (isOptions(nextArgs[optionIndex])) {
-    nextArgs[optionIndex] = existing;
-  } else {
-    nextArgs.splice(optionIndex, 0, existing);
-  }
-  if (callback) {
-    nextArgs.push(callback);
-  }
-  return nextArgs;
-}
-function wrapSpawn(originalSpawn) {
-  return function headroomSpawn(...args) {
-    const state = getState();
-    if (!state) {
-      return Reflect.apply(originalSpawn, this, args);
-    }
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
-    return Reflect.apply(originalSpawn, this, injectOptionsEnv(args, optionIndex, state.proxyUrl));
-  };
-}
-function wrapExec(originalExec) {
-  return function headroomExec(...args) {
-    const state = getState();
-    if (!state) {
-      return Reflect.apply(originalExec, this, args);
-    }
-    return Reflect.apply(originalExec, this, injectOptionsEnv(args, 1, state.proxyUrl));
-  };
-}
-function wrapExecFile(originalExecFile) {
-  return function headroomExecFile(...args) {
-    const state = getState();
-    if (!state) {
-      return Reflect.apply(originalExecFile, this, args);
-    }
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
-    return Reflect.apply(originalExecFile, this, injectOptionsEnv(args, optionIndex, state.proxyUrl));
-  };
-}
-function wrapFork(originalFork) {
-  return function headroomFork(...args) {
-    const state = getState();
-    if (!state) {
-      return Reflect.apply(originalFork, this, args);
-    }
-    const optionIndex = Array.isArray(args[1]) ? 2 : 1;
-    return Reflect.apply(originalFork, this, injectOptionsEnv(args, optionIndex, state.proxyUrl));
-  };
 }
 function normalizeProxyUrl(proxyUrl) {
   return new URL(proxyUrl);
@@ -377,7 +295,6 @@ function installHeadroomTransport(options) {
     existing.refs += 1;
     existing.proxyUrl = options.proxyUrl;
     existing.debug = Boolean(options.debug);
-    installProcessEnv(options.proxyUrl);
     return () => uninstallHeadroomTransport();
   }
   const state = {
@@ -389,14 +306,9 @@ function installHeadroomTransport(options) {
     originalHttpGet: http.get,
     originalHttpsRequest: https.request,
     originalHttpsGet: https.get,
-    originalHttp2Connect: http2.connect,
-    originalChildSpawn: childProcess.spawn,
-    originalChildExec: childProcess.exec,
-    originalChildExecFile: childProcess.execFile,
-    originalChildFork: childProcess.fork
+    originalHttp2Connect: http2.connect
   };
   setState(state);
-  installProcessEnv(options.proxyUrl);
   globalThis.fetch = async (...args) => {
     const current = getState();
     if (!current) {
@@ -411,10 +323,6 @@ function installHeadroomTransport(options) {
   http.get = wrapGet(http.request);
   https.get = wrapGet(https.request);
   http2.connect = wrapHttp2Connect(state.originalHttp2Connect);
-  childProcess.spawn = wrapSpawn(state.originalChildSpawn);
-  childProcess.exec = wrapExec(state.originalChildExec);
-  childProcess.execFile = wrapExecFile(state.originalChildExecFile);
-  childProcess.fork = wrapFork(state.originalChildFork);
   syncBuiltinESMExports();
   return () => uninstallHeadroomTransport();
 }
@@ -433,10 +341,6 @@ function uninstallHeadroomTransport() {
   https.request = state.originalHttpsRequest;
   https.get = state.originalHttpsGet;
   http2.connect = state.originalHttp2Connect;
-  childProcess.spawn = state.originalChildSpawn;
-  childProcess.exec = state.originalChildExec;
-  childProcess.execFile = state.originalChildExecFile;
-  childProcess.fork = state.originalChildFork;
   syncBuiltinESMExports();
   setState(void 0);
 }
@@ -13048,4 +12952,4 @@ export {
   installHeadroomTransport,
   HeadroomPlugin
 };
-//# sourceMappingURL=chunk-7Z7ZWMUI.js.map
+//# sourceMappingURL=chunk-FNAHHECN.js.map

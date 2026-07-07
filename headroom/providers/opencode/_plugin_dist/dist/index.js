@@ -5,7 +5,7 @@ import {
   getDefaultProxyUrl,
   installHeadroomTransport,
   setDefaultProxyUrl
-} from "./chunk-7Z7ZWMUI.js";
+} from "./chunk-FNAHHECN.js";
 
 // src/provider.ts
 var DEFAULT_MODELS = {

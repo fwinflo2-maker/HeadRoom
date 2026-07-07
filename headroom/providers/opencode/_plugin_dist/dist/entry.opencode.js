@@ -1,6 +1,6 @@
 import {
   HeadroomPlugin
-} from "./chunk-7Z7ZWMUI.js";
+} from "./chunk-FNAHHECN.js";
 export {
   HeadroomPlugin as default
 };

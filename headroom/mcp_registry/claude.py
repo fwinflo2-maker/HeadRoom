@@ -44,8 +44,11 @@ class ClaudeRegistrar(MCPRegistrar):
         ``claude_cli`` defaults to :func:`shutil.which` lookup. Pass
         ``None`` to force the file-based fallback path. Pass an explicit
         path to point at a specific binary. ``CLAUDE_CONFIG_DIR`` is honored
-        for real user sessions; ``home_dir`` keeps tests isolated from the
-        caller's environment unless ``config_dir`` is passed explicitly.
+        for real user sessions; ``home_dir`` isolates file-based reads and
+        writes from the caller's real home directory, unless ``config_dir``
+        is passed explicitly. It does not isolate CLI subprocess calls (see
+        ``claude_cli``) — pass ``claude_cli=None`` alongside ``home_dir`` to
+        keep a test fully off the real ``claude`` binary.
         """
         home = home_dir if home_dir is not None else Path.home()
         modern_dir = _resolve_claude_config_dir(home, config_dir, honor_env=home_dir is None)
@@ -158,7 +161,9 @@ class ClaudeRegistrar(MCPRegistrar):
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             config = _read_json(target)
-            servers = config.setdefault("mcpServers", {})
+            servers = config.get("mcpServers")
+            if not isinstance(servers, dict):
+                config["mcpServers"] = servers = {}
             servers[spec.name] = _spec_to_entry(spec)
             _write_json(target, config)
         except OSError as exc:
@@ -172,8 +177,8 @@ class ClaudeRegistrar(MCPRegistrar):
             config = _read_json(path)
         except OSError:
             return False
-        servers = config.get("mcpServers", {})
-        if server_name not in servers:
+        servers = config.get("mcpServers")
+        if not isinstance(servers, dict) or server_name not in servers:
             return False
         del servers[server_name]
         try:
@@ -189,7 +194,10 @@ class ClaudeRegistrar(MCPRegistrar):
             config = _read_json(path)
         except OSError:
             return None
-        entry = config.get("mcpServers", {}).get(server_name)
+        servers = config.get("mcpServers")
+        if not isinstance(servers, dict):
+            return None
+        entry = servers.get(server_name)
         if not isinstance(entry, dict):
             return None
         return _entry_to_spec(server_name, entry)

@@ -412,3 +412,30 @@ def test_get_server_robust_to_bad_json(tmp_path: Path, contents: str) -> None:
     cfg.write_text(contents)
     reg = _make_registrar(tmp_path, cli=None)
     assert reg.get_server("headroom") is None
+
+
+@pytest.mark.parametrize("mcp_servers", ["null", "[]", '"oops"'])
+def test_get_server_robust_to_non_dict_mcp_servers(tmp_path: Path, mcp_servers: str) -> None:
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(f'{{"mcpServers": {mcp_servers}}}')
+    reg = _make_registrar(tmp_path, cli=None)
+    assert reg.get_server("headroom") is None
+
+
+@pytest.mark.parametrize("mcp_servers", ["null", "[]", '"oops"'])
+def test_unregister_robust_to_non_dict_mcp_servers(tmp_path: Path, mcp_servers: str) -> None:
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(f'{{"mcpServers": {mcp_servers}}}')
+    reg = _make_registrar(tmp_path, cli=None)
+    assert reg.unregister_server("headroom") is False
+
+
+@pytest.mark.parametrize("mcp_servers", ["null", "[]", '"oops"'])
+def test_register_robust_to_non_dict_mcp_servers(tmp_path: Path, mcp_servers: str) -> None:
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(f'{{"mcpServers": {mcp_servers}}}')
+    reg = _make_registrar(tmp_path, cli=None)
+    result = reg.register_server(_spec())
+    assert result.status == RegisterStatus.REGISTERED
+    data = json.loads(cfg.read_text())
+    assert data["mcpServers"]["headroom"]["command"] == _RESOLVED_COMMAND[0]

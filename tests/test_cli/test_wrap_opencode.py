@@ -41,7 +41,7 @@ def test_wrap_opencode_sets_config_content_env(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OPENCODE_CONFIG_CONTENT env var is set with the Headroom plugin."""
+    """HEADROOM_PROXY_URL env var is set and the plugin is installed as local files."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
     _set_test_home(monkeypatch, tmp_path)
@@ -64,11 +64,10 @@ def test_wrap_opencode_sets_config_content_env(
     assert result.exit_code == 0, result.output
     env = captured["env"]
     assert isinstance(env, dict)
-    assert "OPENCODE_CONFIG_CONTENT" in env
-    config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
-    assert "provider" not in config
-    assert "model" not in config
-    assert config["plugin"] == _expected_plugin_entry(9000)
+    assert "OPENCODE_CONFIG_CONTENT" not in env
+    assert env["HEADROOM_PROXY_URL"] == "http://127.0.0.1:9000"
+    plugin_dir = tmp_path / ".config" / "opencode" / "plugins"
+    assert list(plugin_dir.glob("index.js"))
     assert captured["tool_label"] == "OPENCODE"
     assert captured["agent_type"] == "opencode"
     assert captured["args"] == ("--model", "gpt-4o")
@@ -125,7 +124,7 @@ def test_wrap_opencode_prepare_only_injects_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`wrap opencode --prepare-only` writes the plugin bootstrap to opencode.json."""
+    """`wrap opencode --prepare-only` installs the plugin as local files."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
     _set_test_home(monkeypatch, tmp_path)
@@ -135,11 +134,32 @@ def test_wrap_opencode_prepare_only_injects_config(
             result = runner.invoke(main, ["wrap", "opencode", "--port", "9000", "--prepare-only"])
 
     assert result.exit_code == 0, result.output
+    plugin_dir = tmp_path / ".config" / "opencode" / "plugins"
+    assert list(plugin_dir.glob("index.js"))
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
-    assert config_file.exists()
+    if config_file.exists():
+        config = json.loads(config_file.read_text())
+        assert "provider" not in config
+
+
+def test_wrap_opencode_prepare_only_registers_serena_with_agent_context(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
+            result = runner.invoke(main, ["wrap", "opencode", "--prepare-only"])
+
+    assert result.exit_code == 0, result.output
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
     config = json.loads(config_file.read_text())
-    assert config["plugin"] == _expected_plugin_entry(9000)
-    assert "provider" not in config
+    serena_command = config["mcp"]["serena"]["command"]
+    assert serena_command[serena_command.index("--context") + 1] == "agent"
 
 
 def test_wrap_opencode_no_mcp_skips_mcp_injection(
@@ -164,8 +184,8 @@ def test_wrap_opencode_no_mcp_skips_mcp_injection(
 
     assert result.exit_code == 0, result.output
     env = captured["env"]
-    config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
-    assert "mcp" not in config
+    assert "OPENCODE_CONFIG_CONTENT" not in env
+    assert env["HEADROOM_PROXY_URL"] == "http://127.0.0.1:9000"
 
 
 def test_wrap_opencode_injects_mcp_by_default(
@@ -173,7 +193,7 @@ def test_wrap_opencode_injects_mcp_by_default(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Runtime OPENCODE_CONFIG_CONTENT stays plugin-only; MCP is handled by the registrar."""
+    """Runtime env stays plugin-only; MCP is handled by the registrar."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
     _set_test_home(monkeypatch, tmp_path)
@@ -192,8 +212,8 @@ def test_wrap_opencode_injects_mcp_by_default(
 
     assert result.exit_code == 0, result.output
     env = captured["env"]
-    config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
-    assert "mcp" not in config
+    assert "OPENCODE_CONFIG_CONTENT" not in env
+    assert env["HEADROOM_PROXY_URL"] == "http://127.0.0.1:9000"
 
 
 def test_wrap_opencode_injects_rtk_into_agents_md(

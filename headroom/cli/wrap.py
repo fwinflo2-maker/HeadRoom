@@ -123,6 +123,7 @@ from headroom.providers.opencode.config import (
     _PROVIDER_MARKER_START,
     inject_opencode_provider_config,
     opencode_config_paths,
+    remove_headroom_opencode_plugin_files,
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
     strip_opencode_runtime_plugin_config,
@@ -5845,6 +5846,9 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
             click.echo("  Removed Headroom-installed Serena MCP server from OpenCode.")
         elif serena_status == "failed":
             click.echo("  Serena MCP server matched Headroom ledger but could not be removed.")
+
+    if remove_headroom_opencode_plugin_files():
+        click.echo("  Removed Headroom plugin files from OpenCode's local plugin directory.")
 
     click.echo()
     click.echo("✓ OpenCode is no longer routed through the Headroom proxy.")

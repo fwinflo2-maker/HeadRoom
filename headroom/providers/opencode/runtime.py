@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Mapping
-from pathlib import Path
 
-from .config import HEADROOM_OPENCODE_PLUGIN
+from .config import install_headroom_opencode_plugin_files
 
 
 def proxy_base_url(port: int) -> str:
@@ -20,26 +18,6 @@ def proxy_server_url(port: int) -> str:
     return f"http://127.0.0.1:{port}"
 
 
-_opencode_plugin_spec_override: str | None = None
-
-
-def _resolve_opencode_plugin_spec() -> str:
-    """Resolve a plugin spec that OpenCode can load.
-    """
-    if _opencode_plugin_spec_override is not None:
-        return _opencode_plugin_spec_override
-    candidates = (
-        Path(__file__).resolve().parents[2] / "plugins" / "opencode",
-        Path(__file__).resolve().parents[3] / "plugins" / "opencode",
-    )
-    for candidate in candidates:
-        manifest = candidate / "package.json"
-        dist_entry = candidate / "dist" / "index.js"
-        if manifest.is_file() and dist_entry.is_file():
-            return candidate.as_uri()
-    return HEADROOM_OPENCODE_PLUGIN
-
-
 def build_opencode_config_content(
     *,
     port: int,
@@ -48,27 +26,24 @@ def build_opencode_config_content(
 ) -> dict[str, object]:
     """Build JSON payload for ``OPENCODE_CONFIG_CONTENT``.
 
-    Runtime wrap keeps OpenCode's provider/model selection intact and injects
-    only the Headroom plugin. The plugin sits under the user's existing
-    provider configuration and transparently routes outbound traffic through the
-    local proxy.
+    Runtime wrap keeps OpenCode's provider/model selection intact. The
+    Headroom plugin itself is installed as a local plugin file under
+    OpenCode's own plugin directory (see
+    ``install_headroom_opencode_plugin_files``) rather than referenced here:
+    OpenCode's local-plugin loader only resolves external npm dependencies
+    (like ``@opencode-ai/plugin``) for files inside its own plugin/config
+    tree, so a ``plugin`` entry pointing elsewhere — a ``file://`` URI or an
+    unpublished npm package name — can never load. The plugin picks up its
+    proxy URL/mode from environment variables set by ``build_launch_env``
+    instead of constructor options.
 
-    ``include_mcp`` is currently a no-op here. Runtime MCP wiring is handled by
-    the OpenCode MCP registrar so we do not inject an invalid remote ``/mcp``
-    entry into ``OPENCODE_CONFIG_CONTENT``.
+    ``include_mcp``/``include_plugin`` are accepted for backward
+    compatibility with existing call sites but no longer affect the emitted
+    content; both are handled outside ``OPENCODE_CONFIG_CONTENT`` now
+    (MCP via the OpenCode MCP registrar, the plugin via local plugin files).
     """
-    del include_mcp
-    config: dict[str, object] = {}
-    if include_plugin:
-        plugin_spec = _resolve_opencode_plugin_spec()
-        config["plugin"] = [[
-            plugin_spec,
-            {
-                "mode": "native-fetch",
-                "proxyUrl": proxy_server_url(port),
-            },
-        ]]
-    return config
+    del port, include_mcp, include_plugin
+    return {}
 
 
 def build_launch_env(
@@ -81,21 +56,23 @@ def build_launch_env(
 ) -> tuple[dict[str, str], list[str]]:
     """Build environment variables for launching OpenCode through Headroom.
 
-    ``OPENCODE_CONFIG_CONTENT`` carries only the Headroom plugin bootstrap.
-    Existing provider/base URL environment variables are preserved.
+    Installs the Headroom plugin bundle into OpenCode's local plugin
+    directory (idempotent, always resolvable — no npm publish or local build
+    required) and points it at the local proxy via ``HEADROOM_PROXY_URL``,
+    which the plugin reads as a fallback when loaded without constructor
+    options (as all OpenCode local-file plugins are).
     """
     env = dict(environ or os.environ)
+    display: list[str] = []
 
-    config_content = build_opencode_config_content(
-        port=port,
-        include_mcp=include_mcp,
-        include_plugin=include_plugin,
-    )
-    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config_content, separators=(",", ":"))
-
-    display = ["OPENCODE_CONFIG_CONTENT={plugin: headroom-opencode}"]
     if include_plugin:
-        display.append(f"plugin={HEADROOM_OPENCODE_PLUGIN}")
+        install_headroom_opencode_plugin_files()
+        env["HEADROOM_PROXY_URL"] = proxy_server_url(port)
+        env.setdefault("HEADROOM_OPENCODE_MODE", "native-fetch")
+        display.append(f"HEADROOM_PROXY_URL={proxy_server_url(port)}")
+        display.append("plugin=~/.config/opencode/plugins/headroom-opencode-*.js (local file)")
+
+    del include_mcp
 
     if project and "HEADROOM_PROJECT" not in env:
         env["HEADROOM_PROJECT"] = project

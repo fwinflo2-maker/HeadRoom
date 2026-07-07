@@ -164,26 +164,32 @@ def test_inject_key_overwrites_non_dict() -> None:
 def test_inject_provider_config_creates_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """inject_opencode_provider_config creates the config file when missing."""
+    """inject_opencode_provider_config installs the plugin as local files.
+
+    It does not write a `plugin` entry into opencode.json: local plugins
+    with external npm dependencies only resolve inside OpenCode's own
+    plugin/config directory, so the bootstrap installs files there instead
+    of touching opencode.json at all when there is nothing else to clean up.
+    """
     _set_test_home(monkeypatch, tmp_path)
     inject_opencode_provider_config(port=8787)
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
-    assert config_file.exists()
-    config = _parse_json_loose(config_file.read_text())
-    assert config["plugin"] == _expected_plugin_entry(8787)
-    assert "provider" not in config
-    assert "mcp" not in config
-    assert "model" not in config
+    assert not config_file.exists()
+    plugin_dir = tmp_path / ".config" / "opencode" / "plugins"
+    installed = list(plugin_dir.glob("index.js"))
+    assert installed, "expected Headroom plugin files under OpenCode's plugin directory"
 
 
 def test_inject_provider_config_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """inject_opencode_provider_config is safe to call multiple times."""
     _set_test_home(monkeypatch, tmp_path)
     inject_opencode_provider_config(port=8787)
+    plugin_dir = tmp_path / ".config" / "opencode" / "plugins"
+    first_run = {p.name: p.read_bytes() for p in plugin_dir.glob("index.js")}
     inject_opencode_provider_config(port=9999)
-    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
-    config = _parse_json_loose(config_file.read_text())
-    assert config["plugin"] == _expected_plugin_entry(9999)
+    second_run = {p.name: p.read_bytes() for p in plugin_dir.glob("index.js")}
+    assert first_run.keys() == second_run.keys()
+    assert first_run == second_run
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +324,9 @@ def test_inject_provider_config_merges_with_existing_mcp(
     config = json.loads(config_file.read_text())
     assert "existing-server" in config["mcp"]
     assert "headroom" not in config["mcp"]
-    assert config["plugin"] == _expected_plugin_entry(8787)
+    assert "plugin" not in config
+    plugin_dir = tmp_path / ".config" / "opencode" / "plugins"
+    assert list(plugin_dir.glob("index.js"))
 
 
 def test_inject_provider_config_idempotent_with_complex_config(
@@ -345,13 +353,18 @@ def test_inject_provider_config_idempotent_with_complex_config(
     assert "openai" in config["provider"]
     assert "myserver" in config["mcp"]
     assert "headroom" not in config["mcp"]
-    assert config["plugin"] == _expected_plugin_entry(8787)
+    assert "plugin" not in config
 
 
 def test_inject_provider_config_preserves_unrelated_top_level_keys(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """inject_opencode_provider_config preserves top-level keys like plugin, permission, etc."""
+    """inject_opencode_provider_config never touches opencode.json's `plugin` key.
+
+    The Headroom plugin bootstrap installs local plugin files instead (see
+    `install_headroom_opencode_plugin_files`); any pre-existing `plugin`
+    array in opencode.json — the user's own — is left completely untouched.
+    """
     _set_test_home(monkeypatch, tmp_path)
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
     config_file.parent.mkdir(parents=True, exist_ok=True)
@@ -368,10 +381,7 @@ def test_inject_provider_config_preserves_unrelated_top_level_keys(
     inject_opencode_provider_config(port=8787)
 
     config = json.loads(config_file.read_text())
-    assert config["plugin"] == [
-        "some-plugin",
-        [_resolve_plugin_spec(), {"proxyUrl": "http://127.0.0.1:8787", "mode": "native-fetch"}],
-    ]
+    assert config["plugin"] == ["some-plugin"]
     assert config["permission"] == {"bash": {"*": "ask"}}
     assert "provider" not in config or "headroom" not in config.get("provider", {})
 
@@ -482,15 +492,15 @@ def test_build_opencode_config_content_without_mcp() -> None:
     from headroom.providers.opencode.runtime import build_opencode_config_content
 
     config = build_opencode_config_content(port=8787, include_mcp=False)
-    assert "provider" not in config
-    assert "mcp" not in config
-    assert "model" not in config
-    assert config["plugin"] == _expected_plugin_entry(8787)
+    assert config == {}
 
 
-def test_build_launch_env_with_project(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_build_launch_env_with_project(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     from headroom.providers.opencode.runtime import build_launch_env
 
+    _set_test_home(monkeypatch, tmp_path)
     monkeypatch.delenv("HEADROOM_PROJECT", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
@@ -501,10 +511,12 @@ def test_build_launch_env_with_project(monkeypatch: pytest.MonkeyPatch) -> None:
         include_mcp=False,
     )
     assert env["HEADROOM_PROJECT"] == "test-proj"
-    payload = json.loads(env["OPENCODE_CONFIG_CONTENT"])
-    assert payload["plugin"] == _expected_plugin_entry(8787)
+    assert env["HEADROOM_PROXY_URL"] == "http://127.0.0.1:8787"
+    assert "OPENCODE_CONFIG_CONTENT" not in env
     assert "OPENAI_BASE_URL" not in env
     assert "ANTHROPIC_BASE_URL" not in env
+    plugin_dir = tmp_path / ".config" / "opencode" / "plugins"
+    assert list(plugin_dir.glob("index.js"))
 
 
 def test_build_launch_env_with_custom_environ() -> None:
@@ -534,15 +546,16 @@ def test_proxy_base_url() -> None:
 def test_inject_provider_config_strips_existing_markers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Re-running the bootstrap is idempotent and doesn't duplicate plugin files."""
     _set_test_home(monkeypatch, tmp_path)
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
     config_file.parent.mkdir(parents=True, exist_ok=True)
+    plugin_dir = tmp_path / ".config" / "opencode" / "plugins"
 
     inject_opencode_provider_config(port=9000)
-    first = config_file.read_text()
-    assert _resolve_plugin_spec() in first
+    first = sorted(p.name for p in plugin_dir.glob("index.js"))
+    assert first
 
     inject_opencode_provider_config(port=9001)
-    second = config_file.read_text()
-    assert _resolve_plugin_spec() in second
-    assert second.count(_resolve_plugin_spec()) == first.count(_resolve_plugin_spec())
+    second = sorted(p.name for p in plugin_dir.glob("index.js"))
+    assert second == first

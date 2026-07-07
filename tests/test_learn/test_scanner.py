@@ -168,6 +168,31 @@ class TestGreedyPathDecode:
         result = _greedy_path_decode(tmp_path / "missing", [])
         assert result is None
 
+    def test_skips_unreadable_sibling_and_still_finds_target(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A sibling directory that raises OSError on is_dir() must not abort decoding.
+
+        Mirrors a real-world Windows junction like ``C:\\Users\\All Users`` throwing
+        PermissionError under restricted domain policy while the user's own profile
+        directory next to it is perfectly readable (#1849).
+        """
+        _make_dirs(tmp_path, "pradipe.yoggi/source/repos")
+        _make_dirs(tmp_path, "poisoned_sibling")
+
+        real_is_dir = Path.is_dir
+
+        def poisoned_is_dir(self: Path) -> bool:
+            if self.name == "poisoned_sibling":
+                raise PermissionError(5, "Access is denied", str(self))
+            return real_is_dir(self)
+
+        monkeypatch.setattr(Path, "is_dir", poisoned_is_dir)
+
+        result = _greedy_path_decode(tmp_path, ["pradipe", "yoggi", "source", "repos"])
+
+        assert result == tmp_path / "pradipe.yoggi" / "source" / "repos"
+
 
 # ---------------------------------------------------------------------------
 # _decode_project_path

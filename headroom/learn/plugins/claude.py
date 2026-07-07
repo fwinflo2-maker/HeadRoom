@@ -398,9 +398,18 @@ def _greedy_path_decode(base: Path, parts: list[str]) -> Path | None:
         return None
 
     try:
-        children = sorted(child for child in base.iterdir() if child.is_dir())
+        entries = list(base.iterdir())
     except OSError:
         return None
+
+    children = []
+    for child in entries:
+        try:
+            if child.is_dir():
+                children.append(child)
+        except OSError:
+            continue
+    children.sort()
 
     for child in children:
         for tokenization in _component_tokenizations(child.name):

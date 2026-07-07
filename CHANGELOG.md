@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- `headroom learn --apply` no longer fails to write recommendations for every
+  project when a directory listing under a decoded project path (e.g.
+  `C:\Users` on Windows) contains an unreadable sibling entry, such as a
+  restricted junction like `All Users` or `Default`. `_greedy_path_decode`
+  previously wrapped its entire child listing in one `try/except OSError`, so
+  a single inaccessible sibling aborted decoding at that directory level even
+  though the actual target (e.g. a Windows username containing a dot, like
+  `pradipe.yoggi`) was perfectly readable — causing the decoder to fall back
+  to an incorrectly split path and every write to fail with
+  `[WinError 161] The specified path is invalid`. Unreadable siblings are now
+  skipped individually instead of poisoning the whole listing
+  ([#1849](https://github.com/headroomlabs-ai/headroom/issues/1849)).
 - `headroom wrap claude` no longer leaves a dead `ANTHROPIC_BASE_URL` in a
   project's `.claude/settings.local.json` after an unclean exit (`SIGKILL`,
   OOM, reboot, or terminal/tmux close via `SIGHUP`, which was not caught).

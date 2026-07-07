@@ -71,7 +71,7 @@ class ClaudeRegistrar(MCPRegistrar):
     def detect(self) -> bool:
         if self._claude_cli:
             return True
-        return self._claude_dir.is_dir()
+        return self._claude_dir.is_dir() or self._modern_config.exists()
 
     def get_server(self, server_name: str) -> ServerSpec | None:
         # Read from disk regardless of whether the CLI is present — the file

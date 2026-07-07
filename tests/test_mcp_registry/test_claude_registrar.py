@@ -59,6 +59,12 @@ def test_detect_true_when_only_claude_dir_exists(tmp_path: Path) -> None:
     assert reg.detect() is True
 
 
+def test_detect_true_when_only_modern_config_exists(tmp_path: Path) -> None:
+    (tmp_path / ".claude.json").write_text("{}")
+    reg = _make_registrar(tmp_path, cli=None)
+    assert reg.detect() is True
+
+
 def test_detect_false_when_neither_present(tmp_path: Path) -> None:
     reg = _make_registrar(tmp_path, cli=None)
     assert reg.detect() is False

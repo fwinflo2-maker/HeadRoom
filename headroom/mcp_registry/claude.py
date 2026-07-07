@@ -100,6 +100,7 @@ class ClaudeRegistrar(MCPRegistrar):
         return self._register_via_file(spec)
 
     def unregister_server(self, server_name: str) -> bool:
+        removed = False
         if self._claude_cli:
             result = run(
                 [str(self._claude_cli), "mcp", "remove", server_name, "-s", "user"],
@@ -107,11 +108,11 @@ class ClaudeRegistrar(MCPRegistrar):
                 text=True,
             )
             if result.returncode == 0:
-                return True
-            logger.debug("claude mcp remove failed: %s", result.stderr.strip())
-            # Fall through to file-based removal in case CLI didn't know
-            # about the user-scope entry but the file still has it.
-        removed = False
+                removed = True
+            else:
+                logger.debug("claude mcp remove failed: %s", result.stderr.strip())
+        # Always clean up both files too — the CLI only touches the modern
+        # config, so a legacy entry (or one it didn't know about) can remain.
         for config_path in (self._modern_config, self._legacy_config):
             removed = self._remove_from_file(config_path, server_name) or removed
         return removed

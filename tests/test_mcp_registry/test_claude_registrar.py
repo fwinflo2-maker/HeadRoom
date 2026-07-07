@@ -361,6 +361,18 @@ def test_unregister_via_file_when_no_cli(tmp_path: Path) -> None:
     assert "other" in data["mcpServers"]
 
 
+def test_unregister_via_cli_also_removes_stale_legacy_entry(tmp_path: Path) -> None:
+    legacy = tmp_path / ".claude" / "mcp.json"
+    legacy.parent.mkdir()
+    legacy.write_text(json.dumps({"mcpServers": {"headroom": {"command": "old"}}}))
+    reg = _make_registrar(tmp_path, cli="/usr/local/bin/claude")
+    ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    with patch("subprocess.run", return_value=ok):
+        assert reg.unregister_server("headroom") is True
+    data = json.loads(legacy.read_text())
+    assert "headroom" not in data["mcpServers"]
+
+
 def test_unregister_returns_false_when_absent(tmp_path: Path) -> None:
     reg = _make_registrar(tmp_path, cli=None)
     assert reg.unregister_server("headroom") is False

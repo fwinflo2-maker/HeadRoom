@@ -137,6 +137,7 @@ def test_get_server_reads_claude_config_dir(
         )
     )
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     reg = ClaudeRegistrar(claude_cli=None)
     got = reg.get_server("headroom")
     assert got is not None
@@ -219,6 +220,7 @@ def test_register_writes_to_claude_config_dir(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     reg = ClaudeRegistrar(claude_cli=None)
     result = reg.register_server(_spec())
     assert result.status == RegisterStatus.REGISTERED
@@ -373,6 +375,7 @@ def test_unregister_removes_from_claude_config_dir(
         )
     )
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     reg = ClaudeRegistrar(claude_cli=None)
     assert reg.unregister_server("headroom") is True
     data = json.loads(cfg.read_text())

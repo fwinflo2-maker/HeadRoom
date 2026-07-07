@@ -5,10 +5,10 @@
   ██╔══██║██╔══╝  ██╔══██║██║  ██║██╔══██╗██║   ██║██║   ██║██║╚██╔╝██║
   ██║  ██║███████╗██║  ██║██████╔╝██║  ██║╚██████╔╝╚██████╔╝██║ ╚═╝ ██║
   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝     ╚═╝
-                  The context compression layer for AI agents
+              The context compression layer for AI agents
 </pre></div>
 
-<p align="center"><strong>60–95% fewer tokens · library · proxy · MCP · content-aware compressors · local-first · reversible</strong></p>
+<p align="center"><strong>60–95% fewer tokens (for JSON data), 15-20% fewer tokens (for coding agents) · library · proxy · MCP · content-aware compressors · local-first · reversible</strong></p>
 
 <p align="center">
   <a href="https://github.com/chopratejas/headroom/actions/workflows/ci.yml"><img src="https://github.com/chopratejas/headroom/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -340,6 +340,12 @@ pipx install --python python3.13 "headroom-ai[all]"
 
 → [Installation guide](https://headroom-docs.vercel.app/docs/installation) — Docker tags, persistent service, PowerShell, devcontainers.
 
+> **CPU requirement (x86/x86_64):** the ONNX-backed features — Magika content
+> detection and embedding relevance — use a precompiled ONNX Runtime that needs
+> **AVX2**. On x86 hosts without AVX2 (some Docker/QEMU setups and older cloud
+> VMs) Headroom automatically falls back to its non-ONNX paths (BM25 relevance,
+> heuristic detection) rather than crashing. `arm64`/Apple Silicon needs no AVX2.
+
 ### Updating
 
 ```bash
@@ -374,8 +380,8 @@ winget install Rustlang.Rustup && rustup default stable
 Restart your shell, then `pip install "headroom-ai[all]"`. A prebuilt wheel avoids the Rust
 build entirely where available: `pip install --only-binary headroom-ai headroom-ai`. Prebuilt
 wheels are published for Windows (`win_amd64`), Linux (`x86_64` / `aarch64`), and macOS
-(Apple Silicon), so installs on those platforms never need a local Rust toolchain — the
-Rust-first dance above is only for the platform-independent sdist fallback (e.g. Intel macOS).
+(Apple Silicon and Intel), so installs on those platforms never need a local Rust toolchain — the
+Rust-first dance above is only for the platform-independent sdist fallback when no wheel matches.
 
 Two runtime assets are fetched over TLS; if they are blocked, trust your corporate CA via
 `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE` / `CURL_CA_BUNDLE`:

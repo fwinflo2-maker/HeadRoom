@@ -1,7 +1,12 @@
 """Claude Code MCP registrar.
 
-Claude Code 2.x stores MCP server configuration in ``~/.claude/.claude.json``
-and ships a CLI (``claude mcp add/remove/list/get``) that owns the file.
+Claude Code 2.x stores user-scope MCP server configuration in
+``~/.claude.json`` (directly under the home directory, not inside a
+``.claude`` subdirectory) and ships a CLI (``claude mcp add/remove/list/get``)
+that owns the file. Verified directly against a running Claude Code 2.1.202:
+``claude mcp add`` reports writing to ``~/.claude.json``, and ``claude mcp
+list`` only picks up entries from that same flat path. Setting
+``CLAUDE_CONFIG_DIR`` moves this file to ``$CLAUDE_CONFIG_DIR/.claude.json``.
 Older Claude Code releases (and the Claude Desktop app) read
 ``~/.claude/mcp.json``. This registrar prefers the CLI for writes when
 available, and reads the underlying JSON files directly for compare /
@@ -46,8 +51,12 @@ class ClaudeRegistrar(MCPRegistrar):
         caller's environment unless ``config_dir`` is passed explicitly.
         """
         home = home_dir if home_dir is not None else Path.home()
-        self._claude_dir = _resolve_claude_config_dir(home, config_dir, honor_env=home_dir is None)
-        self._modern_config = self._claude_dir / ".claude.json"
+        modern_dir = _resolve_claude_config_dir(home, config_dir, honor_env=home_dir is None)
+        # Legacy config lives under the real ``.claude`` directory regardless
+        # of where the modern config resolved to (CLAUDE_CONFIG_DIR only
+        # relocates the modern file, per Claude Code's own behavior).
+        self._claude_dir = home / ".claude"
+        self._modern_config = modern_dir / ".claude.json"
         self._legacy_config = self._claude_dir / "mcp.json"
         if claude_cli is ...:
             self._claude_cli = shutil.which("claude")
@@ -199,13 +208,22 @@ def _resolve_claude_config_dir(
     *,
     honor_env: bool,
 ) -> Path:
+    """Resolve the directory holding the *modern* ``.claude.json`` config.
+
+    Defaults to ``home`` itself — Claude Code's modern config lives at
+    ``~/.claude.json``, not ``~/.claude/.claude.json``. Confirmed against a
+    real Claude Code 2.1.202 install: with ``CLAUDE_CONFIG_DIR`` unset,
+    ``claude mcp add`` reports "File modified: ~/.claude.json", and
+    subsequent entries were only visible in ``claude mcp list`` when written
+    to that flat path.
+    """
     if config_dir is not None:
         return config_dir
     if honor_env:
         env_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
         if env_dir:
             return Path(env_dir).expanduser()
-    return home / ".claude"
+    return home
 
 
 def _read_json(path: Path) -> dict[str, Any]:

@@ -75,8 +75,7 @@ def test_get_server_returns_none_when_unregistered(tmp_path: Path) -> None:
 
 
 def test_get_server_reads_modern_config(tmp_path: Path) -> None:
-    cfg = tmp_path / ".claude" / ".claude.json"
-    cfg.parent.mkdir()
+    cfg = tmp_path / ".claude.json"
     cfg.write_text(
         json.dumps(
             {
@@ -196,7 +195,7 @@ def test_register_writes_file_when_no_cli(tmp_path: Path) -> None:
     reg = _make_registrar(tmp_path, cli=None)
     result = reg.register_server(_spec())
     assert result.status == RegisterStatus.REGISTERED
-    cfg = tmp_path / ".claude" / ".claude.json"
+    cfg = tmp_path / ".claude.json"
     data = json.loads(cfg.read_text())
     assert "headroom" in data["mcpServers"]
     assert data["mcpServers"]["headroom"]["command"] == _RESOLVED_COMMAND[0]
@@ -213,7 +212,7 @@ def test_register_writes_to_legacy_when_only_legacy_exists(tmp_path: Path) -> No
     data = json.loads(legacy.read_text())
     assert "headroom" in data["mcpServers"]
     # Modern config should NOT have been created.
-    assert not (tmp_path / ".claude" / ".claude.json").exists()
+    assert not (tmp_path / ".claude.json").exists()
 
 
 def test_register_writes_to_claude_config_dir(
@@ -235,8 +234,7 @@ def test_register_writes_to_claude_config_dir(
 
 
 def test_register_already_when_spec_matches(tmp_path: Path) -> None:
-    cfg = tmp_path / ".claude" / ".claude.json"
-    cfg.parent.mkdir()
+    cfg = tmp_path / ".claude.json"
     cfg.write_text(
         json.dumps(
             {
@@ -257,8 +255,7 @@ def test_register_already_when_spec_matches(tmp_path: Path) -> None:
 
 
 def test_register_mismatch_when_spec_differs_no_force(tmp_path: Path) -> None:
-    cfg = tmp_path / ".claude" / ".claude.json"
-    cfg.parent.mkdir()
+    cfg = tmp_path / ".claude.json"
     cfg.write_text(
         json.dumps(
             {
@@ -281,8 +278,7 @@ def test_register_mismatch_when_spec_differs_no_force(tmp_path: Path) -> None:
 
 
 def test_register_force_overwrites_mismatch(tmp_path: Path) -> None:
-    cfg = tmp_path / ".claude" / ".claude.json"
-    cfg.parent.mkdir()
+    cfg = tmp_path / ".claude.json"
     cfg.write_text(
         json.dumps(
             {
@@ -317,7 +313,7 @@ def test_register_cli_failure_falls_back_to_file(tmp_path: Path) -> None:
         result = reg.register_server(_spec())
     # Even though CLI failed, we wrote the config file as a fallback.
     assert result.status == RegisterStatus.REGISTERED
-    cfg = tmp_path / ".claude" / ".claude.json"
+    cfg = tmp_path / ".claude.json"
     assert cfg.exists()
     data = json.loads(cfg.read_text())
     assert "headroom" in data["mcpServers"]
@@ -339,8 +335,7 @@ def test_unregister_via_cli(tmp_path: Path) -> None:
 
 
 def test_unregister_via_file_when_no_cli(tmp_path: Path) -> None:
-    cfg = tmp_path / ".claude" / ".claude.json"
-    cfg.parent.mkdir()
+    cfg = tmp_path / ".claude.json"
     cfg.write_text(
         json.dumps(
             {
@@ -392,8 +387,7 @@ def test_unregister_removes_from_claude_config_dir(
 
 @pytest.mark.parametrize("contents", ["", "not json", "{", "[]"])
 def test_get_server_robust_to_bad_json(tmp_path: Path, contents: str) -> None:
-    cfg = tmp_path / ".claude" / ".claude.json"
-    cfg.parent.mkdir()
+    cfg = tmp_path / ".claude.json"
     cfg.write_text(contents)
     reg = _make_registrar(tmp_path, cli=None)
     assert reg.get_server("headroom") is None

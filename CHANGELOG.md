@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[WinError 161] The specified path is invalid`. Unreadable siblings are now
   skipped individually instead of poisoning the whole listing
   ([#1849](https://github.com/headroomlabs-ai/headroom/issues/1849)).
+- Concurrent large requests no longer 502 on a transient HTTP/2 stream reset.
+  A single upstream `StreamReset` poisons the shared h2 connection and raises
+  `RemoteProtocolError` / `LocalProtocolError` on every in-flight request; those
+  transport errors weren't in the proxy's retry paths, so they collapsed
+  straight to a 502 with no reconnect. The Anthropic non-streaming and streaming
+  retry paths now treat any `httpx.TransportError` (including h2 protocol
+  errors) as retryable before the first client byte, so the bad connection
+  is dropped and the request re-sent on a fresh one
+  ([#1639](https://github.com/headroomlabs-ai/headroom/issues/1639)).
 - `headroom wrap claude` no longer leaves a dead `ANTHROPIC_BASE_URL` in a
   project's `.claude/settings.local.json` after an unclean exit (`SIGKILL`,
   OOM, reboot, or terminal/tmux close via `SIGHUP`, which was not caught).
@@ -63,6 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contains the panic and treats the fragment as plain text, so the request is
   compressed and forwarded normally instead of returning HTTP 500
   ([#1547](https://github.com/headroomlabs-ai/headroom/issues/1547)).
+* **proxy:** persist lifetime cache-read savings (tokens + USD) in `proxy_savings.json` (schema v4, additive) so cache-mode savings survive proxy restarts and upgrades. Previously prefix-cache read savings lived only in process memory and every restart reset the dashboard's cache figure to zero; the "Cache Reads (lifetime)" tile now reads the persisted value and the Prefix Cache Impact card renders after a restart with zero traffic, marking session-scoped tiles "no activity since restart".
 - Proactive expansion blocks injected into user turns are now wrapped in
   `<headroom_proactive_expansion>` XML tags, giving downstream consumers
   (LLMs, loggers, attribution parsers) a machine-readable provenance
@@ -120,6 +130,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+* **proxy/openai:** thread the savings-profile kwargs into the live `/v1/chat/completions` compression path. The chat handler called `openai_pipeline.apply()` without `proxy_pipeline_kwargs(config)`, so `HEADROOM_SAVINGS_PROFILE=agent-90` (and the individual `compress_user_messages`/`target_ratio`/`min_tokens_to_compress`/... knobs) were silently dropped — OpenAI-compatible clients like OpenCode kept protecting user messages and missed the configured profile. Both the token-mode and non-token chat branches now pass the profile kwargs, matching `handlers/anthropic.py` and the dedicated OpenAI compress endpoint ([#1534](https://github.com/headroomlabs-ai/headroom/issues/1534)).
 * **proxy:** forward Codex Desktop `/v1/responses` posts byte-faithfully so they stop returning upstream `400 {"detail":"Bad Request"}`. `handle_openai_responses` decoded the inbound body to inspect it but always re-serialized a canonical body on the way out, and it never stripped the inbound `content-encoding` header — so a `content-encoding: zstd` Codex Desktop request was forwarded as already-decoded JSON still advertising `zstd`, and the upstream ChatGPT Codex endpoint rejected it. The handler now keeps the original decoded bytes and forwards them verbatim whenever nothing (compression or memory injection) mutated the request, and drops the stale `content-encoding` header, mirroring the byte-faithful passthrough the chat and Anthropic paths already use ([#1542](https://github.com/headroomlabs-ai/headroom/issues/1542)).
 * **wrap/codex:** `headroom unwrap codex` now removes the Headroom rtk instruction block from the Codex global `AGENTS.md`. `wrap codex` injects it there, but unwrap only restored `config.toml` and MCP state, so a plain `codex` launch kept following the "prefix shell commands with `rtk`" guidance and failed once the managed rtk binary was off PATH. Unwrap now strips the marker-fenced block (preserving the rest of the file), mirroring `unwrap copilot` ([#1421](https://github.com/headroomlabs-ai/headroom/issues/1421)).
 * **proxy/auth:** classify real Anthropic OAuth tokens correctly. `classify_auth_mode` matched OAuth on the `sk-ant-oat-` prefix, but real access tokens are `sk-ant-oat01-...` (a version number, no dash after `oat`), so every real subscription/OAuth token fell through to the `sk-` branch and was tagged `PAYG` — enabling aggressive lossy compression, auto `cache_control`, and `prompt_cache_key` injection on subscription-bound requests the classifier is meant to route to the passthrough-prefer path. The prefix is now the dash-less `sk-ant-oat` (still matches the legacy dashed shape). The existing parity tests only passed because they used a synthetic `sk-ant-oat-01-` fixture; a regression test now covers the real `sk-ant-oat01-` format.

@@ -158,7 +158,10 @@ def content_has_error_indicators(text: str) -> bool:
 # scrubber must strip all of them too, not just the forms literally named
 # "failing"/"failure(s)".
 _ZERO_RESULT_PATTERN = re.compile(
+    # "0 errors" / "no failed" — count-first forms.
     r"\b(?:0|no)\s+(?:errors?|fail(?:ed|ing|ures?)?)\b"
+    # "Errors: 0" / "failed=0" — label:value / label=value forms used by
+    # other CI/test tools' summary lines.
     r"|\b(?:errors?|fail(?:ed|ing|ures?)?)\s*[:=]\s*0\b",
     re.IGNORECASE,
 )
@@ -180,6 +183,14 @@ def content_has_strong_error_indicators(text: str) -> bool:
     ``crash``), while passing mentions rarely do. Misses here are
     safe — downstream compressors (LogCompressor) still preserve
     error lines.
+
+    Before scanning, ``_ZERO_RESULT_PATTERN`` strips zero-result
+    summary phrases (``"0 errors"``, ``"failed: 0"``, ...) so a
+    passing build/test/lint run doesn't trip the two-keyword
+    threshold just because its PASS summary happens to mention both
+    "error" and "fail" at count zero (see issue #1696 — this was
+    firing on nearly every request in a long JS/TS coding session
+    and defeating compression almost entirely).
     """
     lowered = _ZERO_RESULT_PATTERN.sub(" ", text.lower())
     hits = 0

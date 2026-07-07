@@ -36,3 +36,23 @@ def test_zero_result_phrase_does_not_mask_a_real_second_error() -> None:
     # elsewhere in the same blob must still trigger protection.
     text = "0 errors from linter, but the build crashed with a fatal signal"
     assert content_has_strong_error_indicators(text)
+
+
+def test_zero_failed_form_is_not_flagged() -> None:
+    # Reviewer regression (PR #1740): "0 failed" wasn't covered by the
+    # original pattern (only "failing"/"failure(s)"), so "failed" still
+    # contributed a "fail" keyword hit alongside "0 errors" and tripped
+    # the false positive this fix targets.
+    text = "Found 0 errors\nTests: 0 failed, 42 passed"
+    assert not content_has_strong_error_indicators(text)
+
+
+def test_label_value_summary_formats_are_not_flagged() -> None:
+    # Broader CI summary formats (not just "N word" / "word N"): label:value
+    # and label=value pairs, in either error/fail order.
+    for text in (
+        "Failures: 0, Errors: 0",
+        "failed: 0, errors: 0",
+        "Errors=0 Failures=0",
+    ):
+        assert not content_has_strong_error_indicators(text), text

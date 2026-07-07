@@ -147,12 +147,20 @@ def content_has_error_indicators(text: str) -> bool:
 
 # Success-summary phrases from common build/test/lint tools that legitimately
 # pair two indicator keywords (`error` + `fail`) while reporting a PASS, e.g.
-# tsc's "Found 0 errors", jest's "0 failing" / "0 failures", eslint's
-# "0 problems (0 errors, 0 warnings)". Stripped before the keyword scan below
-# so a clean JS/TS toolchain run doesn't get permanently protected from
+# tsc's "Found 0 errors", jest's "0 failing" / "0 failures" / "0 failed",
+# eslint's "0 problems (0 errors, 0 warnings)", or label:value summaries like
+# "Failures: 0", "failed: 0", "Errors=0". Stripped before the keyword scan
+# below so a clean JS/TS toolchain run doesn't get permanently protected from
 # compression for the rest of a long coding session (issue #1696).
+#
+# `fail(?:ed|ing|ures?)?` covers fail/failed/failing/failure/failures — the
+# keyword scan below matches the "fail" substring inside all of them, so the
+# scrubber must strip all of them too, not just the forms literally named
+# "failing"/"failure(s)".
 _ZERO_RESULT_PATTERN = re.compile(
-    r"\b(?:0|no)\s+(?:error|errors|failing|failure|failures)\b", re.IGNORECASE
+    r"\b(?:0|no)\s+(?:errors?|fail(?:ed|ing|ures?)?)\b"
+    r"|\b(?:errors?|fail(?:ed|ing|ures?)?)\s*[:=]\s*0\b",
+    re.IGNORECASE,
 )
 
 

@@ -716,6 +716,7 @@ def test_apply_copilot_api_auth_passes_through_github_oauth_bearer(
 
     assert headers["authorization"] == "Bearer gho_liveClientToken123"
 
+
 def test_apply_copilot_api_auth_replaces_non_bearer_auth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -752,7 +753,6 @@ def test_is_copilot_api_token_matches_expected_prefixes() -> None:
     assert copilot_auth._is_copilot_api_token("Bearer maybe") is False
 
 
-
 def test_is_forwardable_copilot_bearer_token_matches_expected_prefixes() -> None:
     """The inference-path helper (unlike _is_copilot_api_token, which is
     scoped only to subscription/user-info resolution) accepts BOTH
@@ -770,6 +770,7 @@ def test_is_forwardable_copilot_bearer_token_matches_expected_prefixes() -> None
     assert copilot_auth._is_forwardable_copilot_bearer_token("sk-unrelated-anthropic-key") is False
     assert copilot_auth._is_forwardable_copilot_bearer_token("") is False
     assert copilot_auth._is_forwardable_copilot_bearer_token("   ") is False
+
 
 def test_apply_copilot_api_auth_injects_required_headers(
     monkeypatch: pytest.MonkeyPatch,

@@ -1154,7 +1154,11 @@ async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[s
     incoming_auth = next((v for k, v in resolved.items() if k.lower() == "authorization"), None)
     if incoming_auth:
         scheme, _, raw_token = incoming_auth.partition(" ")
-        if scheme.lower() == "bearer" and raw_token and _is_forwardable_copilot_bearer_token(raw_token):
+        if (
+            scheme.lower() == "bearer"
+            and raw_token
+            and _is_forwardable_copilot_bearer_token(raw_token)
+        ):
             logger.info(
                 "apply_copilot_api_auth: passing through client token kind=%s",
                 _token_kind(raw_token),

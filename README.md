@@ -87,10 +87,11 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
 
 ```bash
 # 1 — Install
+uv tool install "headroom-ai[all]"      # Install `headroom` CLI as a global tool in self-contained virtual env
 pip install "headroom-ai[all]"          # Python — ships the `headroom` CLI
 npm install headroom-ai                 # TypeScript SDK only — no `headroom` CLI
 
-# 2 — Pick your mode  (the `headroom` commands below come from the pip install)
+# 2 — Pick your mode  (the `headroom` commands below come from the uv or pip install)
 headroom wrap claude                    # wrap a coding agent
 headroom proxy --port 8787              # drop-in proxy, zero code changes
 # or: from headroom import compress      # inline library
@@ -101,9 +102,30 @@ headroom perf
 headroom dashboard                      # live savings dashboard (proxy must be running)
 ```
 
+To use headroom, it is recommended you launch a wrapped agent session each time so that all necessary setup is completed. When wrapping a coding agent, headroom starts a local proxy, sets up an MCP server that provides tools such as rtk and tokensave, and launches a coding agent session configured to proxy requests to headroom. 
+
 The `headroom` CLI ships **only** via the PyPI package. The npm `headroom-ai` is the TypeScript SDK — a library you import (`import { compress } from 'headroom-ai'`), not a CLI, so it provides no `headroom` command.
 
 Granular extras: `[proxy]`, `[mcp]`, `[ml]`, `[code]`, `[memory]`, `[vector]` (optional HNSW backend — needs a C++ toolchain, not in `[all]`), `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`, `[pytorch-mps]` (Apple-GPU memory-embedder offload — set `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.
+
+### Codex / global install
+
+If Codex or another MCP client cannot inherit a shell `PATH` reliably, install Headroom as a persistent uv tool and point the client at the absolute binary path:
+
+```bash
+uv tool install "headroom-ai[all]"
+command -v headroom
+```
+
+Then use the returned path in MCP config:
+
+```toml
+[mcp_servers.headroom]
+command = "/absolute/path/from/command-v/headroom"
+args = ["mcp", "serve"]
+```
+
+`command = "headroom"` only works when the client starts with a `PATH` that already includes the uv tool directory.
 
 ## Proof
 
@@ -279,6 +301,7 @@ Platform support note: macOS auth reuse via Copilot CLI Keychain storage has bee
 - **Kompress-v2-base** — our HuggingFace model, trained on agentic traces.
 - **Image compression** — 40–90% reduction via trained ML router.
 - **CacheAligner** — stabilizes prefixes so Anthropic/OpenAI KV caches actually hit.
+- **Live-zone compression** — compress fresh tool output while keeping frozen prefix byte-stable.
 - **CCR** — reversible compression; LLM retrieves originals on demand.
 - **Cross-agent memory** — shared store, agent provenance, auto-dedup.
 - **SharedContext** — compressed context passing across multi-agent workflows.
@@ -450,7 +473,7 @@ Headroom runs **locally**, covers **every** content type, works with every major
 |------------------------------------------------------------------------------|------------------------------------------------|------------------------------------|:-----:|:----------:|
 | **Headroom**                                                                 | All context — tools, RAG, logs, files, history | Proxy · library · middleware · MCP | Yes   | Yes        |
 | [RTK](https://github.com/rtk-ai/rtk)                                        | CLI command outputs                            | CLI wrapper                        | Yes   | No         |
-| [lean-ctx](https://github.com/yvgude/lean-ctx)                               | CLI commands, MCP tools, editor rules          | CLI wrapper · MCP                  | Yes   | No         |
+| [lean-ctx](https://github.com/yvgude/lean-ctx)                               | Tool output, files, shell, history             | Proxy · library · middleware · MCP · CLI | Yes | Yes    |
 | [Compresr](https://compresr.ai), [Token Co.](https://thetokencompany.ai)    | Text sent to their API                         | Hosted API call                    | No    | No         |
 | OpenAI Compaction                                                            | Conversation history                           | Provider-native                    | No    | No         |
 

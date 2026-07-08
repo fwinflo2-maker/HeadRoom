@@ -38,7 +38,7 @@ def _resolve_copilot_or_custom_base(request: Request) -> str | None:
 
     `x-headroom-base-url` takes precedence. Otherwise, honor `X-Original-Host`
     sent by the patched VS Code Copilot extension, but only for hostnames in
-    `_COPILOT_ALLOWED_HOSTS` — any other value is rejected to prevent SSRF
+    `_COPILOT_ALLOWED_HOSTS`; any other value is rejected to prevent SSRF
     (localhost, link-local metadata addresses, internal service names, or
     arbitrary external hosts).
     """

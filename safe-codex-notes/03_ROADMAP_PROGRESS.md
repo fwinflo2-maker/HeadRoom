@@ -9,9 +9,9 @@
 
 | 項目 | 内容 |
 |---|---|
-| 現在の完了Phase | Phase 8 |
-| 現在の作業前状態 | Phase 8総合レビュー完了、実運用は条件付き可 |
-| 次のPhase | 実運用 / 必要時メンテナンス |
+| 現在の完了Phase | Phase 9-A |
+| 現在の作業前状態 | Phase 9-A完了、Phase 9-B未開始 |
+| 次のPhase | Phase 9-B: Codex custom model provider 検証 |
 | current branch | `safe-codex/phase2-safe-profile` |
 | base branch | `safe-codex-base` |
 | base tag | `v0.30.0` |
@@ -36,6 +36,7 @@
 | 6 | 完了 | 100% | Windows検証 |
 | 7 | 完了 | 100% | ドキュメント整備 |
 | 8 | 完了 | 100% | 総合レビュー |
+| 9-A | 完了 | 100% | Codex Desktop Actions からsafe-codex proxyを起動・確認・停止する |
 
 ## Phase 0: upstream固定・環境確認
 
@@ -409,6 +410,52 @@ Windowsローカル環境で実用可能か検証する。
 - 残リスクを明文化済み。
 - 切り戻し方法を確認済み。
 
+
+## Phase 9-A: Codex Desktop Actions 運用補助
+
+状態: 完了
+
+達成度: 100%
+
+### 目的
+
+Codex Desktop Actions から `safe-codex` proxy を起動・確認・停止しやすくする。
+
+### 対象
+
+- `scripts/start-safe-codex-proxy.ps1`
+- `scripts/check-safe-codex-status.ps1`
+- `scripts/stop-safe-codex-env.ps1`
+- `safe-codex-notes/05_CODEX_APP_OPERATION.md`
+- `safe-codex-notes/00_README.md`
+- `safe-codex-notes/03_ROADMAP_PROGRESS.md`
+
+### 対象外
+
+- `~/.codex/config.toml` の変更
+- `~/.codex/.env` の変更
+- API key の保存
+- Codex Skill 化
+- push
+
+### 実装方針
+
+- proxy起動は `127.0.0.1` 固定とする。
+- `--host 0.0.0.0` は使わない。
+- `--log-messages` / `--codex-wire-debug` / `--codex-wire-debug-dir` は使わない。
+- `prompt_cache_retention` は `in_memory` とする。
+- PowerShell 5.1で動く構成にする。
+- `.venv\Scripts\Activate.ps1` があれば有効化する。
+- `$env:PYTHONUTF8 = "1"` を設定する。
+- API key、token、Authorization header、prompt本文、response本文をdocsやscript出力に残さない。
+
+### 完了条件
+
+- Actions用の起動・確認・停止scriptを作成する。
+- Codex Desktop Actions向け手順を文書化する。
+- focused test、ruff、format check、diff checkを実行する。
+- local commitまで行う。
+- pushしない。
 ## リスク管理表
 
 | ID | リスク | 影響 | 対策 | 状態 |
@@ -441,6 +488,7 @@ Windowsローカル環境で実用可能か検証する。
 | 2026-07-05 | 6 | Windows検証完了、OpenAI backend path / prompt cache / cached_tokens / safe log / 通常profile互換性を確認 |
 | 2026-07-05 | 7 | Phase 7完了、safe-codex運用手順、危険オプション、Windows検証手順、切り戻し方法を文書化 |
 | 2026-07-05 | 8 | Phase 8完了、実運用は条件付き可、残リスクと切り戻し確認を反映 |
+| 2026-07-08 | 9-A | Codex Desktop Actions向けのsafe-codex proxy起動・確認・停止手順を追加 |
 
 ## Phase 4以降の標準作業フロー
 

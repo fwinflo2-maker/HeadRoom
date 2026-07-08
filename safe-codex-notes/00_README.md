@@ -113,6 +113,21 @@ Phase完了ごとに行うこと:
 - 長いログ全文は正本Markdownに貼らず、必要な事実だけを記録する。
 - Phase完了後の情報源更新は、実装commitまたはdocs commit後に行う。
 
+### commit記録ルール
+
+正本Markdown内では、docs commit自身のhashを `latest commit` として無理に記録しない。
+
+理由:
+
+- commit hashはファイル内容から決まるため、docs内にそのcommit自身のhashを完全に書くことは安定しない。
+- 最新HEADは `git log -1 --oneline` で確認する。
+
+記録方針:
+
+- `03_ROADMAP_PROGRESS.md` には `latest Phase work commit` や `latest source Markdown refresh commit` のように、意味を明確にしたcommitを記録する。
+- Phase完了後は `git log -1 --oneline` を確認し、必要なら次回docs更新時に記録する。
+- 古い `latest commit` 表記が残っていないか、Phase完了時に確認する。
+
 ## 書いてはいけない情報
 
 この情報源には以下を書かない。

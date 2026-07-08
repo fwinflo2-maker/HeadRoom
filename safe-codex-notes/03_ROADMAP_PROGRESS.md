@@ -367,7 +367,7 @@ Windowsローカル環境で実用可能か検証する。
 | Prompt Caching効率 | OK | `prompt_cache_key` / `prompt_cache_retention` / `cached_tokens` 経路を確認 |
 | Windows安定性 | 条件付きOK | focused testsとruffは確認。mypyはnumpy stub / Python version解釈に起因する既知制約として扱う |
 | 既存互換性 | OK | 通常profile互換性テストを確認 |
-| 運用性 | OK | 5つの正本Markdown、検証手順、切り戻し手順を確認 |
+| 運用性 | OK | 6つの正本Markdown、検証手順、切り戻し手順を確認 |
 | 未解決リスク | 許容 | 残リスクは運用条件として明文化 |
 
 ### Phase 8検証結果
@@ -384,7 +384,7 @@ Windowsローカル環境で実用可能か検証する。
 
 - `phase8_command_results.txt` の集計では全コマンドが `ok=True` になったが、実ログ上は `ruff format --check` と `mypy` に失敗内容があった。
 - PowerShellでnative commandの成否を集計する場合、`$?` だけでなく `$LASTEXITCODE` を即時保存して判定する必要がある。
-- 正本Markdown内に `4つの正本Markdown` 表記が残っていた。
+- 正本Markdown内に `6つの正本Markdown` 表記が残っていた。
 - `03_ROADMAP_PROGRESS.md` にPhase 3 / Phase 4の古い `未開始` ブロックが残っていた。
 - `03_ROADMAP_PROGRESS.md` の `latest commit` がPhase 7 commitではなくPhase 6 commit相当のままだった。
 
@@ -564,6 +564,7 @@ Codex Desktop Actions から `safe-codex` proxy を起動・確認・停止し�
 | 2026-07-05 | 8 | Phase 8完了、実運用は条件付き可、残リスクと切り戻し確認を反映 |
 | 2026-07-08 | 9-A | Codex Desktop Actions向けのsafe-codex proxy起動・確認・停止手順を追加 |
 | 2026-07-08 | 9-B | Codex custom model provider設定、safe-codex proxy到達、provider認識結果を追加 |
+| 2026-07-08 | 9-B-source | safe-codex-notes配下6ファイルを情報源の正本としてPhase完了ごとに更新する運用ルールを追加 |
 
 ## Phase 4以降の標準作業フロー
 
@@ -571,7 +572,7 @@ Phase 4以降は、Phase 3 / Phase 3-Bで安定した以下の流れを標準と
 
 ```text
 1. 新規Phaseは新規チャットで開始
-2. 5つの正本Markdownを参照
+2. 6つの正本Markdownを参照
 3. 現在状態を開始プロンプトに明記
 4. まず調査
 5. 必要箇所だけ抽出
@@ -673,6 +674,31 @@ Phase 3完了時の運用ルール反映と同じく、以下の流れで進め�
 10. 全体pytestの既知失敗を切り分け。
 11. 実装差分だけlocal commit。
 12. Phase完了後、正本Markdownに作業方法と結果を反映。
+
+### 正本Markdown更新ルール
+
+Phase完了ごとに、`C:\dev\headroom-safe-codex\safe-codex-notes` 配下の6つの正本Markdownを最新状態へ更新する。
+
+更新対象:
+
+- `00_README.md`: 情報源の使い方、共通運用ルール、禁止事項
+- `01_PROJECT_CONTEXT.md`: 環境、前提、local path、基準commit
+- `02_DESIGN_DECISIONS.md`: 設計判断、採用・不採用理由、リスク方針
+- `03_ROADMAP_PROGRESS.md`: Phase状態、達成度、実施内容、確認結果、残課題
+- `04_SAFE_CODEX_OPERATION.md`: safe-codex運用、危険オプション、切り戻し
+- `05_CODEX_APP_OPERATION.md`: Codex Desktop Actions、custom provider、Codexアプリ側手順
+
+Phase完了時の必須反映:
+
+- Phase状態
+- latest Phase commit
+- 実施内容
+- 確認したコマンドと結果
+- 未確認事項
+- 失敗・手戻り・改善策
+- 次Phaseへ引き継ぐ残課題
+
+`phase*_investigation/` は調査用一時ファイルとして扱い、正本Markdownの代わりにしない。
 
 ### Phase完了時の正本更新ルール
 

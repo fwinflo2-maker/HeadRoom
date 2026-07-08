@@ -83,6 +83,36 @@ headroom-safe-codex-best-source/
 - test方針
 - 採用 / 不採用判断
 
+## 正本Markdownの保管場所と更新ルール
+
+`C:\dev\headroom-safe-codex\safe-codex-notes` を、このプロジェクトの6つの正本Markdownの保管場所とする。
+
+対象ファイル:
+
+- `00_README.md`
+- `01_PROJECT_CONTEXT.md`
+- `02_DESIGN_DECISIONS.md`
+- `03_ROADMAP_PROGRESS.md`
+- `04_SAFE_CODEX_OPERATION.md`
+- `05_CODEX_APP_OPERATION.md`
+
+Phase完了ごとに行うこと:
+
+1. `safe-codex-notes/` 配下の6ファイルを確認する。
+2. Phase状態、latest Phase commit、実施内容、確認結果、残課題、失敗・改善策を必要最小限で反映する。
+3. 恒常的な運用変更は `00_README.md` に反映する。
+4. 設計判断へ影響する内容は `02_DESIGN_DECISIONS.md` に反映する。
+5. 実運用手順の変更は `04_SAFE_CODEX_OPERATION.md` または `05_CODEX_APP_OPERATION.md` に反映する。
+6. `03_ROADMAP_PROGRESS.md` はPhase完了時に必ず更新する。
+7. `phase*_investigation/` は調査用一時ファイルとして扱い、commitしない。
+8. ChatGPTプロジェクト等へ情報源として渡す場合は、更新後の `safe-codex-notes/` 内6ファイルを使う。
+
+注意:
+
+- API key、token、Authorization header、prompt本文、response本文は記録しない。
+- 長いログ全文は正本Markdownに貼らず、必要な事実だけを記録する。
+- Phase完了後の情報源更新は、実装commitまたはdocs commit後に行う。
+
 ## 書いてはいけない情報
 
 この情報源には以下を書かない。
@@ -148,8 +178,8 @@ python --version
 
 | 項目 | 内容 |
 |---|---|
-| 現在の完了Phase | Phase 9-A |
-| 次のPhase | Phase 9-B: Codex custom model provider 検証 |
+| 現在の完了Phase | Phase 9-B（条件付き） |
+| 次のPhase | Phase 9-B completion再確認後、Phase 9-C: Codex Skill化 |
 | local path | `C:\dev\headroom-safe-codex` |
 | upstream | `https://github.com/headroomlabs-ai/headroom.git` |
 | base tag | `v0.30.0` |
@@ -162,7 +192,7 @@ Phase 4以降は、Phase 3 / Phase 3-Bで安定した以下の流れを標準と
 
 ```text
 1. 新規Phaseは新規チャットで開始
-2. 5つの正本Markdownを参照
+2. 6つの正本Markdownを参照
 3. 現在状態を開始プロンプトに明記
 4. まず調査
 5. 必要箇所だけ抽出

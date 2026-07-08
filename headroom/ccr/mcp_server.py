@@ -34,6 +34,7 @@ from typing import Any
 
 from headroom import paths as _paths
 from headroom import savings_ledger
+from headroom.cache.compression_store import format_retrieval_miss_detail
 
 # fcntl is Unix-only; on Windows we skip file locking (stats are best-effort).
 # Keep the module typed as Any so Windows mypy runs don't try to resolve Unix-only attrs.
@@ -165,9 +166,14 @@ def _format_session_summary(
     if isinstance(persistent_lifetime, dict):
         lifetime_tokens = persistent_lifetime.get("tokens_saved", 0) or 0
         lifetime_usd = persistent_lifetime.get("compression_savings_usd", 0.0) or 0.0
+        lifetime_cache_reads = persistent_lifetime.get("cache_read_tokens", 0) or 0
+        lifetime_cache_usd = persistent_lifetime.get("cache_savings_usd", 0.0) or 0.0
         lines.append("Lifetime Savings:")
         lines.append(f"  Tokens saved: {lifetime_tokens:,}")
         lines.append(f"  Compression savings: ${lifetime_usd:.2f}")
+        if lifetime_cache_reads:
+            lines.append(f"  Cache-read tokens: {lifetime_cache_reads:,}")
+            lines.append(f"  Cache savings: ${lifetime_cache_usd:.2f}")
         lines.append("")
 
     # Tip
@@ -435,7 +441,9 @@ class HeadroomMCPServer:
         """
         # Check local store first
         store = self._get_local_store()
+        entry_status = store.get_entry_status(hash_key, clean_expired=False)
         entry = store.retrieve(hash_key)
+        expired_entry_status = None
         if entry:
             self._stats.record_retrieval(hash_key)
             return {
@@ -446,6 +454,19 @@ class HeadroomMCPServer:
                 "compressed_item_count": entry.compressed_item_count,
                 "retrieval_count": entry.retrieval_count,
             }
+        if entry_status.get("status") == "expired":
+            expired_entry_status = entry_status
+        elif entry_status.get("status") == "available":
+            created_at = entry_status.get("created_at")
+            ttl_seconds = entry_status.get("ttl_seconds")
+            if isinstance(created_at, (int, float)) and isinstance(ttl_seconds, (int, float)):
+                age_seconds = time.time() - created_at
+                if age_seconds > ttl_seconds:
+                    expired_entry_status = {
+                        **entry_status,
+                        "status": "expired",
+                        "age_seconds": age_seconds,
+                    }
 
         # Fall back to proxy if available
         if self.check_proxy and HTTPX_AVAILABLE:
@@ -457,6 +478,26 @@ class HeadroomMCPServer:
                     return result
             except Exception:
                 pass  # Proxy unavailable, that's fine
+
+        if expired_entry_status:
+            ttl_seconds = expired_entry_status.get(
+                "ttl_seconds",
+                expired_entry_status["default_ttl_seconds"],
+            )
+            return {
+                "error": (
+                    f"{format_retrieval_miss_detail(expired_entry_status)}. "
+                    "Do not retry the same hash. Re-run the source command or re-read the source file."
+                ),
+                "hash": hash_key,
+                "status": "expired",
+                "ttl_seconds": ttl_seconds,
+                "age_seconds": expired_entry_status.get("age_seconds"),
+                "hint": (
+                    "Use the source of truth to regenerate fresh content. "
+                    "Re-run the command or re-read the file."
+                ),
+            }
 
         return {
             "error": "Content not found. It may have expired or the hash may be incorrect.",

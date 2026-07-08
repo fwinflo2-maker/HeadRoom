@@ -167,3 +167,13 @@ scripts\stop-safe-codex-env.ps1 -SkipProcessStop
 - このPhaseでは `~/.codex/.env` は変更しない。
 - API key、token、Authorization header、prompt本文、response本文をこの文書やログへ残さない。
 - 実行中proxyを止める最も確実な方法は、起動したPowerShellで `Ctrl+C` を押すこと。
+
+## Codex Skill
+
+Phase 9-Cで、成功した運用手順を次のSkillに集約する。
+
+- skills/safe-codex-codex-app/SKILL.md
+
+このSkillは、Codex Desktop Actionsからのproxy起動・確認・停止、headroom custom provider確認、completion検証時の保存禁止事項を扱う。
+
+Skillに含める内容は運用手順と安全制約のみとし、API key、token、Authorization header、prompt本文、response本文、stderr本文は含めない。

@@ -11,7 +11,7 @@
 |---|---|
 | 現在の完了Phase | Phase 9-B |
 | 現在の作業前状態 | Phase 9-B完了。custom provider設定、proxy到達、provider認識、completion成功を確認済み |
-| 次のPhase | Phase 9-C: 成功手順のCodex Skill化 |
+| 次のPhase | Phase 9-C完了。次Phase未定 |
 | current branch | `safe-codex/phase2-safe-profile` |
 | base branch | `safe-codex-base` |
 | base tag | `v0.30.0` |
@@ -868,3 +868,52 @@ Phase 5で得た改善策:
 - `ruff` に全tracked pyを展開するとWindows引数長制限に当たるため、`ruff check headroom tests` を使う。
 - Markdown本文にバッククォートを含む場合、PowerShell double-quoted here-string では `` `a `` / `` `r `` / `` `t `` が制御文字化するため、single-quoted here-stringを使う。
 <!-- PHASE6-WINDOWS-VALIDATION-END -->
+
+## Phase 9-C: Codex Skill化
+
+状態: 完了
+
+達成度: 100%
+
+### 目的
+
+Phase 9-A / 9-Bで成功したCodex Desktop Actions、safe-codex proxy、Codex custom provider headroom の運用手順をCodex Skillとして再利用可能にする。
+
+### 対象
+
+- skills/safe-codex-codex-app/SKILL.md
+- safe-codex-notes/00_README.md
+- safe-codex-notes/03_ROADMAP_PROGRESS.md
+- safe-codex-notes/05_CODEX_APP_OPERATION.md
+
+### 対象外
+
+- push
+- ~/.codex/config.toml の追加変更
+- API key の保存
+- prompt本文、response本文、stderr本文の保存
+- phase*_investigation/ のcommit
+
+### 実装方針
+
+- 既存repoに skills/ と .codex/ が存在しないため、最小構成として skills/safe-codex-codex-app/SKILL.md を追加する。
+- Skillには実行手順、安全制約、確認観点のみを記載する。
+- API key、token、Authorization header、prompt本文、response本文、stderr本文はSkillへ含めない。
+- PowerShell 5.1、PYTHONUTF8=1、UTF-8 BOMなしの運用を維持する。
+
+### 完了条件
+
+- Skill本体を追加する。
+- 正本MarkdownからSkillへの参照を追加する。
+- NUL byte、diff check、secret/prompt保存リスクの簡易scanを通す。
+- local commitまで行う。
+- pushしない。
+
+### 完了結果
+
+- `skills/safe-codex-codex-app/SKILL.md` を追加した。
+- Codex Desktop Actions、safe-codex proxy、Codex custom provider `headroom` の成功手順をSkill化した。
+- Skillには起動、確認、completion検証、停止、安全制約を記載した。
+- API key、token、Authorization header、prompt本文、response本文、stderr本文はSkillへ含めていない。
+- `phase*_investigation/` はcommit対象外のままとした。
+- pushは実行していない。

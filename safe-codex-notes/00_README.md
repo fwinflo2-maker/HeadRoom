@@ -194,7 +194,7 @@ python --version
 | 項目 | 内容 |
 |---|---|
 | 現在の完了Phase | Phase 9-B |
-| 次のPhase | Phase 9-C: Codex Skill化 |
+| 次のPhase | Phase 9-C完了。次Phase未定 |
 | local path | `C:\dev\headroom-safe-codex` |
 | upstream | `https://github.com/headroomlabs-ai/headroom.git` |
 | base tag | `v0.30.0` |
@@ -282,3 +282,11 @@ Windowsローカル検証により、`safe-codex` profile の OpenAI backend pat
 - prompt本文 / API key / Authorization のログ非露出
 - 通常profile互換性
 <!-- PHASE6-WINDOWS-NOTE-END -->
+
+## Codex Skill
+
+Phase 9-Cで、成功したCodex Desktop Actions / custom provider運用手順を以下にSkill化する。
+
+- skills/safe-codex-codex-app/SKILL.md
+
+このSkillには、safe-codex proxyの起動・確認・停止、Codex custom provider headroom の確認、安全上の禁止事項、prompt本文・response本文・stderr本文を保存しない検証方針を集約する。

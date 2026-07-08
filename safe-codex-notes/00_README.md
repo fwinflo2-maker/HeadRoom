@@ -193,8 +193,8 @@ python --version
 
 | 項目 | 内容 |
 |---|---|
-| 現在の完了Phase | Phase 9-B（条件付き） |
-| 次のPhase | Phase 9-B completion再確認後、Phase 9-C: Codex Skill化 |
+| 現在の完了Phase | Phase 9-B |
+| 次のPhase | Phase 9-C: Codex Skill化 |
 | local path | `C:\dev\headroom-safe-codex` |
 | upstream | `https://github.com/headroomlabs-ai/headroom.git` |
 | base tag | `v0.30.0` |

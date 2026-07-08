@@ -96,15 +96,15 @@ Phase 9-Bでは、既存の `[model_providers.headroom]` を使い、user-level 
 - `[model_providers.headroom]` と対象 `base_url` が存在することを確認した。
 - `0.0.0.0`、log / wire debug系、token風文字列がないことを確認した。
 - `safe-codex` proxy は `127.0.0.1:8787` でlistenし、`/health` が `200` を返すことを確認した。
-- `codex exec` は `provider: headroom` を認識した。
-- completion成功はCodex usage limitにより未確認。usage limit解除後に再確認する。
+- `codex exec` は `provider: headroom` を認識し、usage limit解除後にcompletion成功も確認した。
+- completion成功はusage limit解除後に確認済み。
 - prompt本文を含む可能性がある一時stderr artifactは削除した。
 
 注意:
 
 - `codex exec` のstdout / stderrをそのままファイル保存すると、prompt本文が残る場合がある。
 - 接続確認では、prompt本文やresponse本文を保存しない。
-- 失敗時も、error全文ではなく、exit code、provider名、usage limit有無などの事実だけを抽出して記録する。
+- 失敗時も、error全文ではなく、exit code、provider名、usage limit有無などの事実だけを抽出して記録する。`r`n- completion確認時も、prompt本文・response本文・stderr本文は保存しない。
 
 ## 禁止事項
 

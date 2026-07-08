@@ -9,9 +9,9 @@
 
 | 項目 | 内容 |
 |---|---|
-| 現在の完了Phase | Phase 9-B（条件付き） |
-| 現在の作業前状態 | Phase 9-B実施中。custom provider設定、proxy到達、provider認識は確認済み。completion成功はusage limitにより未確認 |
-| 次のPhase | Phase 9-C: 成功手順のCodex Skill化。ただしusage limit解除後にcompletion再確認を先行する |
+| 現在の完了Phase | Phase 9-B |
+| 現在の作業前状態 | Phase 9-B完了。custom provider設定、proxy到達、provider認識、completion成功を確認済み |
+| 次のPhase | Phase 9-C: 成功手順のCodex Skill化 |
 | current branch | `safe-codex/phase2-safe-profile` |
 | base branch | `safe-codex-base` |
 | base tag | `v0.30.0` |
@@ -39,7 +39,7 @@
 | 7 | 完了 | 100% | ドキュメント整備 |
 | 8 | 完了 | 100% | 総合レビュー |
 | 9-A | 完了 | 100% | Codex Desktop Actions からsafe-codex proxyを起動・確認・停止する |
-| 9-B | 条件付き完了 | 90% | Codex custom model provider を設定し、safe-codex proxy 到達とprovider認識を確認する |
+| 9-B | 完了 | 100% | Codex custom model provider を設定し、safe-codex proxy 到達、provider認識、completion成功を確認する |
 
 ## Phase 0: upstream固定・環境確認
 
@@ -461,9 +461,9 @@ Codex Desktop Actions から `safe-codex` proxy を起動・確認・停止し�
 - pushしない。
 ## Phase 9-B: Codex custom model provider 検証
 
-状態: 条件付き完了
+状態: 完了
 
-達成度: 90%
+達成度: 100%
 
 ### 目的
 
@@ -498,7 +498,7 @@ Codex Desktop Actions から `safe-codex` proxy を起動・確認・停止し�
 - `safe-codex` proxyが `127.0.0.1:8787` でlistenすることを確認した。
 - `/health` が `200` を返すことを確認した。
 - `codex exec` が `provider: headroom` を認識することを確認した。
-- Codex usage limitによりcompletion成功は未確認。
+- Codex usage limit解除後にcompletion成功を確認した。
 - prompt本文を含む可能性があるstderr artifactを削除した。
 
 ### 確認済み安全条件
@@ -512,9 +512,9 @@ Codex Desktop Actions から `safe-codex` proxy を起動・確認・停止し�
 
 ### 残課題
 
-- Codex usage limit解除後に、prompt本文・response本文を保存しない方法でcompletion成功を再確認する。
-- 再確認後、必要ならPhase 9-Bを100%完了へ更新する。
-- Phase 9-CのCodex Skill化は、completion再確認後に進める。
+- prompt本文・response本文・stderr本文を保存しない方法でcompletion成功を再確認した。
+- Phase 9-Bを100%完了へ更新する。
+- Phase 9-CのCodex Skill化へ進む。
 
 ### Phase 9-Bで判明した主な問題
 
@@ -568,6 +568,7 @@ Codex Desktop Actions から `safe-codex` proxy を起動・確認・停止し�
 | 2026-07-08 | 9-B | Codex custom model provider設定、safe-codex proxy到達、provider認識結果を追加 |
 | 2026-07-08 | 9-B-source | safe-codex-notes配下6ファイルを情報源の正本としてPhase完了ごとに更新する運用ルールを追加 |
 | 2026-07-08 | 9-B-commit-rule | 正本Markdown内のcommit記録ルールを明確化 |
+| 2026-07-09 | 9-B-completion | usage limit解除後にCodex custom provider経由のcompletion成功を確認し、Phase 9-Bを完了へ更新 |
 
 ## Phase 4以降の標準作業フロー
 

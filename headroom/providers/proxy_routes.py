@@ -11,7 +11,10 @@ from urllib.parse import quote
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response
 
-from headroom.proxy.handlers.openai import _resolve_codex_routing_headers
+from headroom.proxy.handlers.openai import (
+    _custom_base_passthrough_telemetry,
+    _resolve_codex_routing_headers,
+)
 
 logger = logging.getLogger("headroom.proxy.routes")
 
@@ -747,22 +750,25 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         return await vertex_publisher_passthrough(request, publisher, "rawPredict")
 
     @app.post(
-        "/projects/{project}/locations/{location}/publishers/anthropic/models/{model}:rawPredict"
+        "/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:rawPredict"
     )
     async def vertex_raw_predict_no_version(
         request: Request,
         project: str,
         location: str,
+        publisher: str,
         model: str,
     ):
-        del project
-        target = _vertex_target_for_location(proxy, location).rstrip("/") + "/v1"
-        return await proxy.handle_anthropic_messages(
-            request,
-            target,
-            "vertex:anthropic",
-            model,
-        )
+        if publisher == "anthropic":
+            del project
+            target = _vertex_target_for_location(proxy, location).rstrip("/") + "/v1"
+            return await proxy.handle_anthropic_messages(
+                request,
+                target,
+                "vertex:anthropic",
+                model,
+            )
+        return await vertex_publisher_passthrough(request, publisher, "rawPredict")
 
     @app.post(
         "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamRawPredict"
@@ -787,23 +793,26 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         return await vertex_publisher_passthrough(request, publisher, "streamRawPredict")
 
     @app.post(
-        "/projects/{project}/locations/{location}/publishers/anthropic/models/{model}:streamRawPredict"
+        "/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamRawPredict"
     )
     async def vertex_stream_raw_predict_no_version(
         request: Request,
         project: str,
         location: str,
+        publisher: str,
         model: str,
     ):
-        del project
-        target = _vertex_target_for_location(proxy, location).rstrip("/") + "/v1"
-        return await proxy.handle_anthropic_messages(
-            request,
-            target,
-            "vertex:anthropic",
-            model,
-            True,
-        )
+        if publisher == "anthropic":
+            del project
+            target = _vertex_target_for_location(proxy, location).rstrip("/") + "/v1"
+            return await proxy.handle_anthropic_messages(
+                request,
+                target,
+                "vertex:anthropic",
+                model,
+                True,
+            )
+        return await vertex_publisher_passthrough(request, publisher, "streamRawPredict")
 
     @app.get("/v1/models")
     async def list_models(request: Request):
@@ -1011,7 +1020,18 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
                     "Rejected X-Original-Host %r: not in Copilot allowlist", original_host
                 )
         if custom_base:
-            return await proxy.handle_passthrough(request, custom_base.rstrip("/"))
+            base_url = custom_base.rstrip("/")
+            endpoint_name, provider_name = _custom_base_passthrough_telemetry(
+                request.method,
+                path,
+                base_url,
+            )
+            return await proxy.handle_passthrough(
+                request,
+                base_url,
+                endpoint_name,
+                provider_name,
+            )
 
         # Intercept Code Assist authentication and onboarding routes
         clean_path = path.lstrip("/")

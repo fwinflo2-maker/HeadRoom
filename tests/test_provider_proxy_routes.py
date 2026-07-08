@@ -1057,6 +1057,93 @@ def test_v1_models_still_forwards_under_non_chatgpt_auth() -> None:
     assert calls, "Non-ChatGPT-auth /v1/models must forward, not synthesize"
 
 
+def test_v1_models_routes_copilot_original_host_to_copilot_upstream() -> None:
+    """The patched VS Code Copilot extension's model-list request must reach
+    the Copilot host named in X-Original-Host — not whatever
+    model_metadata_provider() would otherwise default to. Covers both
+    `/v1/models` and `/v1/models/{model_id}`."""
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.url.path, base_url, provider_name))
+        return JSONResponse({"base_url": base_url, "provider": provider_name})
+
+    with patch.object(HeadroomProxy, "handle_passthrough", fake_passthrough):
+        with TestClient(_app()) as client:
+            list_response = client.get(
+                "/v1/models",
+                headers={
+                    "authorization": "Bearer gh-token",
+                    "x-original-host": "api.githubcopilot.com",
+                },
+            )
+            get_response = client.get(
+                "/v1/models/gpt-4o",
+                headers={
+                    "authorization": "Bearer gh-token",
+                    "x-original-host": "api.githubcopilot.com",
+                },
+            )
+
+    assert list_response.status_code == 200
+    assert get_response.status_code == 200
+    assert list_response.json()["base_url"] == "https://api.githubcopilot.com"
+    assert get_response.json()["base_url"] == "https://api.githubcopilot.com"
+    assert calls == [
+        ("/v1/models", "https://api.githubcopilot.com", ""),
+        ("/v1/models/gpt-4o", "https://api.githubcopilot.com", ""),
+    ]
+
+
+def test_v1_models_x_headroom_base_url_takes_precedence_over_original_host() -> None:
+    """`x-headroom-base-url` must win over `X-Original-Host` on the model-list
+    routes too, matching the catch-all passthrough's precedence rule."""
+    calls: list[tuple[str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.url.path, base_url))
+        return JSONResponse({"base_url": base_url})
+
+    with patch.object(HeadroomProxy, "handle_passthrough", fake_passthrough):
+        with TestClient(_app()) as client:
+            response = client.get(
+                "/v1/models",
+                headers={
+                    "x-headroom-base-url": "https://explicit.example",
+                    "x-original-host": "api.githubcopilot.com",
+                },
+            )
+
+    assert response.status_code == 200
+    assert response.json()["base_url"] == "https://explicit.example"
+    assert calls == [("/v1/models", "https://explicit.example")]
+
+
+def test_v1_models_rejects_non_allowlisted_original_host() -> None:
+    """A non-Copilot X-Original-Host must not be honored on the model-list
+    routes — same SSRF guard as the catch-all passthrough."""
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.url.path, base_url, provider_name))
+        return JSONResponse({"base_url": base_url, "provider": provider_name})
+
+    with patch.object(HeadroomProxy, "handle_passthrough", fake_passthrough):
+        with TestClient(_app()) as client:
+            response = client.get(
+                "/v1/models",
+                headers={
+                    "authorization": "Bearer sk-real-api-key",
+                    "x-original-host": "evil.example.com",
+                },
+            )
+
+    assert response.status_code == 200
+    # Falls through to the existing model_metadata_provider() resolution
+    # (default OpenAI target here), not the attacker-supplied host.
+    assert calls == [("/v1/models", "https://api.openai.test", "openai")]
+
+
 def test_v1_models_routes_claude_code_gateway_discovery_to_anthropic() -> None:
     """Claude Code gateway/OAuth model discovery can use a Bearer token that
     does not look like an Anthropic API key. Route those `/v1/models` requests

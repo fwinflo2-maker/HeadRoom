@@ -33,6 +33,26 @@ _COPILOT_ALLOWED_HOSTS: frozenset[str] = frozenset(
 )
 
 
+def _resolve_copilot_or_custom_base(request: Request) -> str | None:
+    """Resolve an explicit upstream base URL from request headers, if present.
+
+    `x-headroom-base-url` takes precedence. Otherwise, honor `X-Original-Host`
+    sent by the patched VS Code Copilot extension, but only for hostnames in
+    `_COPILOT_ALLOWED_HOSTS` — any other value is rejected to prevent SSRF
+    (localhost, link-local metadata addresses, internal service names, or
+    arbitrary external hosts).
+    """
+    custom_base = request.headers.get("x-headroom-base-url")
+    if custom_base:
+        return custom_base
+    original_host = request.headers.get("x-original-host", "")
+    if original_host in _COPILOT_ALLOWED_HOSTS:
+        return f"https://{original_host}"
+    if original_host:
+        logger.warning("Rejected X-Original-Host %r: not in Copilot allowlist", original_host)
+    return None
+
+
 def _api_target(proxy: Any, provider_name: str) -> str:
     legacy_attrs = {
         "anthropic": "ANTHROPIC_API_URL",
@@ -816,6 +836,10 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.get("/v1/models")
     async def list_models(request: Request):
+        custom_base = _resolve_copilot_or_custom_base(request)
+        if custom_base:
+            return await proxy.handle_passthrough(request, custom_base.rstrip("/"))
+
         chatgpt_response = await _handle_chatgpt_model_metadata(
             proxy,
             request,
@@ -834,6 +858,10 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.get("/v1/models/{model_id}")
     async def get_model(request: Request, model_id: str):
+        custom_base = _resolve_copilot_or_custom_base(request)
+        if custom_base:
+            return await proxy.handle_passthrough(request, custom_base.rstrip("/"))
+
         chatgpt_response = await _handle_chatgpt_model_metadata(
             proxy,
             request,

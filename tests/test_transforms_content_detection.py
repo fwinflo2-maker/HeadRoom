@@ -54,6 +54,7 @@ def test_json_detection_distinguishes_dict_arrays_and_other_lists() -> None:
     assert empty_result.metadata == {"item_count": 0, "is_dict_array": False}
 
     assert _try_detect_json('{"id": 1}') is None
+    assert _try_detect_json('{"title":"one"}') is None
     assert _try_detect_json("[not valid json") is None
     assert is_json_array_of_dicts('[{"id": 1}]') is True
     assert is_json_array_of_dicts('["value"]') is False

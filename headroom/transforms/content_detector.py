@@ -220,7 +220,7 @@ def _try_detect_json(content: str) -> DetectionResult | None:
             parsed_items.append(parsed_item)
             idx = next_idx
 
-        if parsed_items:
+        if len(parsed_items) > 1:
             return DetectionResult(
                 ContentType.JSON_ARRAY,
                 0.9,

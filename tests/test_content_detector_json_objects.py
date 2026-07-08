@@ -37,3 +37,9 @@ def test_detect_content_type_braces_inside_string_values() -> None:
     assert result.metadata["item_count"] == 2
     assert result.metadata["is_dict_array"] is True
     assert result.metadata["was_space_separated"] is True
+
+
+def test_detect_content_type_single_json_object_stays_unclaimed() -> None:
+    result = detect_content_type('{"title":"one"}')
+
+    assert result.content_type != ContentType.JSON_ARRAY

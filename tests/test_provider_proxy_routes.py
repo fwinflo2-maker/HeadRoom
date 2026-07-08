@@ -112,6 +112,25 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
         assert client.post("/v1/messages/count_tokens").json()["base_url"] == (
             "https://api.anthropic.test"
         )
+        assert client.post("/v1/messages").json() == {
+            "handler": "handle_anthropic_messages",
+            "path": "/v1/messages",
+            "upstream_base_url": None,
+            "provider": "anthropic",
+            "model": None,
+            "force_stream": False,
+        }
+        assert client.post(
+            "/v1/messages",
+            headers={"x-headroom-base-url": "https://opencode.ai/zen/go/"},
+        ).json() == {
+            "handler": "handle_anthropic_messages",
+            "path": "/v1/messages",
+            "upstream_base_url": "https://opencode.ai/zen/go",
+            "provider": "anthropic",
+            "model": None,
+            "force_stream": False,
+        }
         assert client.get("/v1/models", headers={"x-goog-api-key": "test"}).json()["base_url"] == (
             "https://api.openai.test"
         )

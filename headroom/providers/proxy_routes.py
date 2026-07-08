@@ -484,6 +484,17 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.post("/v1/messages")
     async def anthropic_messages(request: Request):
+        """Handle Anthropic Messages endpoint with optional per-request upstream override.
+
+        Honors the x-headroom-base-url request header so Anthropic-Messages-format
+        gateways (OpenCode Zen, Azure Anthropic, custom gateways) route through the
+        dedicated /v1/messages handler, not just the generic passthrough route.
+        """
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base:
+            return await proxy.handle_anthropic_messages(
+                request, upstream_base_url=custom_base.rstrip("/")
+            )
         return await proxy.handle_anthropic_messages(request)
 
     # AWS Bedrock InvokeModel passthrough. Registered ONLY when an upstream is

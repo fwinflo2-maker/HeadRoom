@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+<<<<<<< fix/tiktoken-blob-guard
 - `TiktokenCounter` no longer stalls the event loop tokenizing large tool-result
   blobs. `TiktokenCounter.count_messages` reimplements the content-part loop
   instead of inheriting `BaseTokenizer`, so an unrecognized content-part type
@@ -21,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same payload, estimate within 0.5% of the full count) and serializes JSON
   (the wire form) instead of Python `repr`, matching how the HuggingFace,
   Mistral, and Estimating tokenizers already inherit the bound.
+=======
+- **proxy:** the savings store now fsyncs its parent directory after the
+  atomic rename, so the most recent `proxy_savings.json` write survives a
+  power-loss or crash. `_save_locked` fsynced the temp file's contents but
+  never the directory entry the rename created, leaving the rename itself
+  non-durable on POSIX. Best-effort — a no-op on Windows and virtual
+  filesystems where directory fsync is unsupported.
+>>>>>>> main
 
 ### Changed
 

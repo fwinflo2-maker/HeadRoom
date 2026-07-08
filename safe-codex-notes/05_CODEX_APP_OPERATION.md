@@ -10,10 +10,11 @@
 - proxy状態確認script
 - proxy停止と一時環境変数削除script
 - Codex Desktop Actions へ登録するコマンド例
+- Codex custom model provider 設定確認
 
 対象外:
 
-- `~/.codex/config.toml` の変更
+- `~/.codex/config.toml` へのAPI key保存や秘密情報の追記
 - `~/.codex/.env` の変更
 - API key の保存
 - Codex Skill 化
@@ -76,6 +77,35 @@ headroom proxy `
     --prompt-cache-retention in_memory
 ~~~
 
+## Codex custom model provider 設定
+
+Phase 9-Bでは、既存の `[model_providers.headroom]` を使い、user-level `~/.codex/config.toml` に top-level provider selection を追加した。
+
+設定方針:
+
+- `model_provider = "headroom"` を使う。
+- 既存 `[model_providers.headroom]` を使う。
+- `base_url` は `http://127.0.0.1:8787/v1` とする。
+- `~/.codex/.env` は変更しない。
+- API key、token、Authorization headerを `config.toml` やdocsへ書かない。
+- 新規 `[model_providers.safe_codex]` は追加しない。既存providerの重複を避けるため。
+
+検証結果:
+
+- `config.toml` に `model_provider = "headroom"` が存在することを確認した。
+- `[model_providers.headroom]` と対象 `base_url` が存在することを確認した。
+- `0.0.0.0`、log / wire debug系、token風文字列がないことを確認した。
+- `safe-codex` proxy は `127.0.0.1:8787` でlistenし、`/health` が `200` を返すことを確認した。
+- `codex exec` は `provider: headroom` を認識した。
+- completion成功はCodex usage limitにより未確認。usage limit解除後に再確認する。
+- prompt本文を含む可能性がある一時stderr artifactは削除した。
+
+注意:
+
+- `codex exec` のstdout / stderrをそのままファイル保存すると、prompt本文が残る場合がある。
+- 接続確認では、prompt本文やresponse本文を保存しない。
+- 失敗時も、error全文ではなく、exit code、provider名、usage limit有無などの事実だけを抽出して記録する。
+
 ## 禁止事項
 
 Codex Desktop Actions へ以下を登録しない。
@@ -133,7 +163,7 @@ scripts\stop-safe-codex-env.ps1 -SkipProcessStop
 
 ## 注意
 
-- このPhaseでは `~/.codex/config.toml` は変更しない。
+- Phase 9-Bでは `~/.codex/config.toml` に provider 選択のみ追加した。API keyやtokenは書かない。
 - このPhaseでは `~/.codex/.env` は変更しない。
 - API key、token、Authorization header、prompt本文、response本文をこの文書やログへ残さない。
 - 実行中proxyを止める最も確実な方法は、起動したPowerShellで `Ctrl+C` を押すこと。

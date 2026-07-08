@@ -9,9 +9,9 @@
 
 | 項目 | 内容 |
 |---|---|
-| 現在の完了Phase | Phase 9-A |
-| 現在の作業前状態 | Phase 9-A完了、Phase 9-B未開始 |
-| 次のPhase | Phase 9-B: Codex custom model provider 検証 |
+| 現在の完了Phase | Phase 9-B（条件付き） |
+| 現在の作業前状態 | Phase 9-B実施中。custom provider設定、proxy到達、provider認識は確認済み。completion成功はusage limitにより未確認 |
+| 次のPhase | Phase 9-C: 成功手順のCodex Skill化。ただしusage limit解除後にcompletion再確認を先行する |
 | current branch | `safe-codex/phase2-safe-profile` |
 | base branch | `safe-codex-base` |
 | base tag | `v0.30.0` |
@@ -37,6 +37,7 @@
 | 7 | 完了 | 100% | ドキュメント整備 |
 | 8 | 完了 | 100% | 総合レビュー |
 | 9-A | 完了 | 100% | Codex Desktop Actions からsafe-codex proxyを起動・確認・停止する |
+| 9-B | 条件付き完了 | 90% | Codex custom model provider を設定し、safe-codex proxy 到達とprovider認識を確認する |
 
 ## Phase 0: upstream固定・環境確認
 
@@ -456,6 +457,79 @@ Codex Desktop Actions から `safe-codex` proxy を起動・確認・停止し�
 - focused test、ruff、format check、diff checkを実行する。
 - local commitまで行う。
 - pushしない。
+## Phase 9-B: Codex custom model provider 検証
+
+状態: 条件付き完了
+
+達成度: 90%
+
+### 目的
+
+`~/.codex/config.toml` に custom model provider を設定し、Codexが `safe-codex` proxy経由のproviderを認識できることを確認する。
+
+### 対象
+
+- user-level `~/.codex/config.toml`
+- 既存 `[model_providers.headroom]`
+- `model_provider = "headroom"`
+- `base_url = "http://127.0.0.1:8787/v1"`
+- `safe-codex` proxy の起動確認
+- Codex側のprovider認識確認
+- `safe-codex-notes/05_CODEX_APP_OPERATION.md`
+- `safe-codex-notes/03_ROADMAP_PROGRESS.md`
+
+### 対象外
+
+- API key の新規保存
+- `~/.codex/.env` の変更
+- Codex Skill 化
+- push
+- 大規模リファクタリング
+
+### 実施内容
+
+- `~/.codex/config.toml` を秘密情報を出さない形で確認した。
+- 既存 `[model_providers.headroom]` に対象 `base_url` があることを確認した。
+- 新規 `[model_providers.safe_codex]` は追加せず、既存providerを使う方針にした。
+- top-level に `model_provider = "headroom"` を追加した。
+- `~/.codex/config.toml` のバックアップを作成した。
+- `safe-codex` proxyが `127.0.0.1:8787` でlistenすることを確認した。
+- `/health` が `200` を返すことを確認した。
+- `codex exec` が `provider: headroom` を認識することを確認した。
+- Codex usage limitによりcompletion成功は未確認。
+- prompt本文を含む可能性があるstderr artifactを削除した。
+
+### 確認済み安全条件
+
+- `0.0.0.0` は含まれていない。
+- `log-messages` / `codex-wire-debug` 系は含まれていない。
+- token風文字列は含まれていない。
+- `~/.codex/.env` は変更していない。
+- API key、token、Authorization headerはdocsに記録していない。
+- prompt本文、response本文は正本Markdownに記録しない。
+
+### 残課題
+
+- Codex usage limit解除後に、prompt本文・response本文を保存しない方法でcompletion成功を再確認する。
+- 再確認後、必要ならPhase 9-Bを100%完了へ更新する。
+- Phase 9-CのCodex Skill化は、completion再確認後に進める。
+
+### Phase 9-Bで判明した主な問題
+
+- `Read-Host` で空Enterを入れると `codex exec` にpromptが渡らず、接続検証にならない。
+- PowerShell 5.1では `codex.exe` のstderr出力が `NativeCommandError` として扱われ、途中停止する場合がある。
+- `codex exec` のstderrには、起動情報やprompt本文が含まれる場合があるため、stderr全文を保存しない。
+- 検証結果は、exit code、provider認識、usage limit有無などの事実だけを抽出して記録する。
+
+### 完了条件
+
+- user-level `~/.codex/config.toml` にprovider選択を追加する。
+- `safe-codex` proxyがloopbackで起動する。
+- Codexが `provider: headroom` を認識する。
+- focused test、ruff、format check、diff checkを実行する。
+- local commitまで行う。
+- pushしない。
+
 ## リスク管理表
 
 | ID | リスク | 影響 | 対策 | 状態 |
@@ -489,6 +563,7 @@ Codex Desktop Actions から `safe-codex` proxy を起動・確認・停止し�
 | 2026-07-05 | 7 | Phase 7完了、safe-codex運用手順、危険オプション、Windows検証手順、切り戻し方法を文書化 |
 | 2026-07-05 | 8 | Phase 8完了、実運用は条件付き可、残リスクと切り戻し確認を反映 |
 | 2026-07-08 | 9-A | Codex Desktop Actions向けのsafe-codex proxy起動・確認・停止手順を追加 |
+| 2026-07-08 | 9-B | Codex custom model provider設定、safe-codex proxy到達、provider認識結果を追加 |
 
 ## Phase 4以降の標準作業フロー
 

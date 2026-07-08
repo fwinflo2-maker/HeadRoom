@@ -6486,41 +6486,101 @@ class OpenAIHandlerMixin:
             try:
                 payload = json.loads(body)
                 model = str(payload.get("model") or "").strip()
-                messages: list[dict[str, Any]] = []
                 if hermes_claude_proxy:
                     raw_messages = payload.get("messages")
-                    if isinstance(raw_messages, list):
-                        messages = [item for item in raw_messages if isinstance(item, dict)]
+                    if isinstance(raw_messages, list) and model:
+                        # Only compress chat messages (user/assistant); preserve
+                        # tool_use, tool_result, system, and other roles as-is.
+                        chat_idxs: list[int] = []
+                        chat_messages: list[dict[str, Any]] = []
+                        for i, item in enumerate(raw_messages):
+                            if isinstance(item, dict) and item.get("role") in ("user", "assistant"):
+                                chat_idxs.append(i)
+                                chat_messages.append(item)
+                        if chat_messages:
+                            from headroom import compress as headroom_compress
+
+                            before_bytes = len(json.dumps(chat_messages, ensure_ascii=False).encode("utf-8"))
+                            result = headroom_compress(messages=chat_messages, model=model, optimize=True)
+                            after_bytes = len(json.dumps(result.messages, ensure_ascii=False).encode("utf-8"))
+                            # Splice compressed chat messages back into the original array
+                            compressed_items = list(result.messages)  # defensive copy
+                            messages_out: list[Any] = []
+                            ci = 0
+                            for i, item in enumerate(raw_messages):
+                                if i in chat_idxs:
+                                    if ci < len(compressed_items):
+                                        messages_out.append(compressed_items[ci])
+                                        ci += 1
+                                    else:
+                                        messages_out.append(item)
+                                else:
+                                    messages_out.append(item)
+                            payload["messages"] = messages_out
+                            body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                            headers["content-length"] = str(len(body))
+                            logger.info(
+                                "Hermes claude-code passthrough compression: %d -> %d bytes (saved %d)",
+                                before_bytes,
+                                after_bytes,
+                                max(0, before_bytes - after_bytes),
+                            )
                 else:
                     raw_input = payload.get("input")
-                    if isinstance(raw_input, list):
-                        messages = [item for item in raw_input if isinstance(item, dict)]
-                    elif isinstance(raw_input, str):
+                    if isinstance(raw_input, list) and model:
+                        # Only compress chat messages (role=user/assistant dict items);
+                        # preserve tool, function, reasoning, system, and non-dict items.
+                        chat_idxs: list[int] = []
+                        chat_messages: list[dict[str, Any]] = []
+                        for i, item in enumerate(raw_input):
+                            if isinstance(item, dict) and item.get("role") in ("user", "assistant"):
+                                chat_idxs.append(i)
+                                chat_messages.append(item)
+                        if chat_messages:
+                            from headroom import compress as headroom_compress
+
+                            before_bytes = len(json.dumps(chat_messages, ensure_ascii=False).encode("utf-8"))
+                            result = headroom_compress(messages=chat_messages, model=model, optimize=True)
+                            after_bytes = len(json.dumps(result.messages, ensure_ascii=False).encode("utf-8"))
+                            # Splice compressed chat messages back into the original array
+                            compressed_items = list(result.messages)
+                            input_out: list[Any] = []
+                            ci = 0
+                            for i, item in enumerate(raw_input):
+                                if i in chat_idxs:
+                                    if ci < len(compressed_items):
+                                        input_out.append(compressed_items[ci])
+                                        ci += 1
+                                    else:
+                                        input_out.append(item)
+                                else:
+                                    input_out.append(item)
+                            payload["input"] = input_out
+                            body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                            headers["content-length"] = str(len(body))
+                            logger.info(
+                                "Hermes codex passthrough compression: %d -> %d bytes (saved %d)",
+                                before_bytes,
+                                after_bytes,
+                                max(0, before_bytes - after_bytes),
+                            )
+                    elif isinstance(raw_input, str) and model:
+                        # Single string input: wrap and compress
                         messages = [{"role": "user", "content": raw_input}]
+                        from headroom import compress as headroom_compress
 
-                if model and messages:
-                    from headroom import compress as headroom_compress
-
-                    before_bytes = len(json.dumps(messages, ensure_ascii=False).encode("utf-8"))
-                    result = headroom_compress(messages=messages, model=model, optimize=True)
-                    after_bytes = len(
-                        json.dumps(result.messages, ensure_ascii=False).encode("utf-8")
-                    )
-                    if hermes_claude_proxy:
-                        payload["messages"] = result.messages
-                    else:
+                        before_bytes = len(raw_input.encode("utf-8"))
+                        result = headroom_compress(messages=messages, model=model, optimize=True)
+                        after_bytes = len(json.dumps(result.messages, ensure_ascii=False).encode("utf-8"))
                         payload["input"] = result.messages
-                    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode(
-                        "utf-8"
-                    )
-                    headers["content-length"] = str(len(body))
-                    logger.info(
-                        "Hermes %s passthrough compression: %d -> %d bytes (saved %d)",
-                        "claude-code" if hermes_claude_proxy else "codex",
-                        before_bytes,
-                        after_bytes,
-                        max(0, before_bytes - after_bytes),
-                    )
+                        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                        headers["content-length"] = str(len(body))
+                        logger.info(
+                            "Hermes codex passthrough compression: %d -> %d bytes (saved %d)",
+                            before_bytes,
+                            after_bytes,
+                            max(0, before_bytes - after_bytes),
+                        )
             except Exception as exc:
                 logger.info("Hermes passthrough compression skipped: %s", exc)
 

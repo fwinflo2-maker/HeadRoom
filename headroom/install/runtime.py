@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
-from headroom._subprocess import pid_alive, run
+from headroom._subprocess import run
 
 from .health import probe_ready
 from .models import DeploymentManifest, InstallPreset, RuntimeKind
@@ -383,4 +383,4 @@ def runtime_status(manifest: DeploymentManifest) -> str:
     # Windows-safe liveness probe: a bare os.kill(pid, 0) here raised WinError 87
     # as a SystemError against the detached agent, crashing status and taking the
     # live proxy down with it (#1544).
-    return "running" if pid_alive(pid) else "stopped"
+    return "running" if _pid_alive(pid) else "stopped"

@@ -553,9 +553,9 @@ def test_start_stop_wait_and_runtime_status_branches(monkeypatch, tmp_path: Path
     assert runtime_status(python_manifest) == "stopped"
 
     _write_pid("default", 125)
-    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
+    monkeypatch.setattr("headroom.install.runtime._pid_alive", lambda pid: True)
     assert runtime_status(python_manifest) == "running"
-    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: False)
+    monkeypatch.setattr("headroom.install.runtime._pid_alive", lambda pid: False)
     assert runtime_status(python_manifest) == "stopped"
 
 
@@ -617,7 +617,7 @@ def test_runtime_status_reads_container_and_pid_state(monkeypatch, tmp_path: Pat
     pid_file = tmp_path / ".headroom" / "deploy" / "default" / "runner.pid"
     pid_file.parent.mkdir(parents=True)
     pid_file.write_text("123", encoding="utf-8")
-    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
+    monkeypatch.setattr("headroom.install.runtime._pid_alive", lambda pid: True)
     python_manifest = DeploymentManifest(
         profile="default",
         preset="persistent-service",
@@ -659,7 +659,7 @@ def test_runtime_status_reports_live_pid_without_terminating(monkeypatch, tmp_pa
         raise AssertionError(f"status must not signal the live proxy (pid={pid}, sig={sig})")
 
     monkeypatch.setattr("headroom.install.runtime.os.kill", fail_kill)
-    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
+    monkeypatch.setattr("headroom.install.runtime._pid_alive", lambda pid: True)
 
     assert runtime_status(_python_service_manifest()) == "running"
     assert pid_file.exists()  # status left the deployment untouched

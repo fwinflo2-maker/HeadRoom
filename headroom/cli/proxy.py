@@ -199,6 +199,15 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--http-proxy",
+    default=None,
+    envvar="HEADROOM_HTTP_PROXY",
+    help=(
+        "HTTP proxy URL for upstream provider requests only "
+        "(HTTPS uses CONNECT; env: HEADROOM_HTTP_PROXY)."
+    ),
+)
+@click.option(
     "--keepalive-expiry",
     "keepalive_expiry",
     default=90.0,
@@ -282,20 +291,25 @@ def dashboard(port: int, no_open: bool) -> None:
     help="Max tokens per minute. Env: HEADROOM_TPM. Default: 100000.",
 )
 @click.option(
-    "--no-ccr-inject-tool",
+    "--no-ccr",
     is_flag=True,
-    envvar="HEADROOM_NO_CCR_INJECT_TOOL",
+    envvar="HEADROOM_NO_CCR",
     help=(
-        "Don't inject the CCR headroom_retrieve tool. Run compression-only — "
-        "for streaming / non-MCP clients that can't resolve the retrieve tool "
-        "and would otherwise error on it. Env: HEADROOM_NO_CCR_INJECT_TOOL."
+        "Disable CCR entirely: no retrieval markers in compressed content AND no "
+        "headroom_retrieve tool injected. Lossy compression with no recovery path "
+        "(maximum savings; also right for streaming / non-MCP clients that can't "
+        "resolve an injected tool). Env: HEADROOM_NO_CCR."
     ),
 )
 @click.option(
-    "--no-ccr-marker",
+    "--lossless",
     is_flag=True,
-    envvar="HEADROOM_NO_CCR_MARKER",
-    help=("Don't add CCR retrieval markers to compressed content. Env: HEADROOM_NO_CCR_MARKER."),
+    envvar="HEADROOM_LOSSLESS",
+    help=(
+        "No-CCR lossless mode: compress tool outputs with format-native lossless "
+        "compaction (and marker-free SmartCrusher) without emitting any CCR "
+        "retrieval marker, so no MCP retrieve tool is needed. Env: HEADROOM_LOSSLESS=1."
+    ),
 )
 @click.option(
     "--no-ccr-proactive-expansion",
@@ -415,6 +429,18 @@ def dashboard(port: int, no_open: bool) -> None:
         "still holds a pre-upstream slot. "
         "Default: 2.0 seconds. "
         "Env: HEADROOM_ANTHROPIC_PRE_UPSTREAM_MEMORY_CONTEXT_TIMEOUT_SECONDS."
+    ),
+)
+@click.option(
+    "--compression-max-workers",
+    type=int,
+    default=None,
+    envvar="HEADROOM_COMPRESSION_MAX_WORKERS",
+    help=(
+        "Bound the dedicated compression threadpool (CPU-bound Kompress work). "
+        "Default (unset): cpu_count or 1. Lower it to reduce CPU "
+        "oversubscription under concurrent sessions; a value < 1 is clamped to 1. "
+        "Env: HEADROOM_COMPRESSION_MAX_WORKERS."
     ),
 )
 @click.option(
@@ -823,6 +849,7 @@ def proxy(
     max_keepalive_connections: int,
     keepalive_expiry: float,
     http2: bool,
+    http_proxy: str | None,
     intercept_tool_results: bool,
     no_optimize: bool,
     no_cache: bool,
@@ -830,8 +857,8 @@ def proxy(
     protect_tool_results: str | None,
     rpm: int | None,
     tpm: int | None,
-    no_ccr_inject_tool: bool,
-    no_ccr_marker: bool,
+    no_ccr: bool,
+    lossless: bool,
     no_ccr_proactive_expansion: bool,
     proxy_extension: tuple[str, ...],
     no_subscription_tracking: bool,
@@ -843,6 +870,7 @@ def proxy(
     anthropic_pre_upstream_concurrency: int | None,
     anthropic_pre_upstream_acquire_timeout_seconds: float | None,
     anthropic_pre_upstream_memory_context_timeout_seconds: float | None,
+    compression_max_workers: int | None,
     log_file: str | None,
     log_messages: bool,
     codex_wire_debug: bool,
@@ -1068,11 +1096,13 @@ def proxy(
         protect_recent=_get_env_int_optional("HEADROOM_PROTECT_RECENT"),
         protect_analysis_context=_get_env_bool_optional("HEADROOM_PROTECT_ANALYSIS_CONTEXT"),
         accuracy_guard=os.environ.get("HEADROOM_ACCURACY_GUARD") or None,
-        # CCR opt-outs for compression-only deployments (streaming / non-MCP
-        # clients that can't resolve the injected retrieve tool). Defaults keep
-        # CCR fully on; each flag flips one dataclass default to False.
-        ccr_inject_tool=not no_ccr_inject_tool,
-        ccr_inject_marker=not no_ccr_marker,
+        # CCR opt-out: --no-ccr disables both halves at once (markers in content
+        # AND the injected retrieve tool). Markers without a tool — or a tool
+        # without markers — are useless, so it is a single switch. Default keeps
+        # CCR fully on.
+        ccr_inject_tool=not no_ccr,
+        ccr_inject_marker=not no_ccr,
+        lossless=lossless,
         ccr_proactive_expansion=not no_ccr_proactive_expansion,
         # Flatten repeat-flag tuple AND any comma-separated values inside it.
         # `--proxy-extension a,b --proxy-extension c` and `HEADROOM_PROXY_EXTENSIONS=a,b,c`
@@ -1101,6 +1131,7 @@ def proxy(
         max_keepalive_connections=max_keepalive_connections,
         keepalive_expiry=keepalive_expiry,
         http2=http2,
+        http_proxy=http_proxy,
         log_file=None if is_stateless else log_file,
         log_full_messages=log_messages
         or os.environ.get("HEADROOM_LOG_MESSAGES", "").lower() in ("true", "1", "yes", "on"),
@@ -1167,6 +1198,7 @@ def proxy(
         # Precedence: CLI > env > auto-compute (click's ``envvar``
         # handles the env-var fallback).
         anthropic_pre_upstream_concurrency=anthropic_pre_upstream_concurrency,
+        compression_max_workers=compression_max_workers,
         anthropic_pre_upstream_acquire_timeout_seconds=(
             anthropic_pre_upstream_acquire_timeout_seconds
             if anthropic_pre_upstream_acquire_timeout_seconds is not None
@@ -1313,31 +1345,16 @@ Memory (Multi-Provider):
     context_tool_line = f"  Context Tool: {_selected_context_tool()}"
 
     # Performance tuning section — only shown when at least one tuning var is active.
-    _stable_turn = _get_env_int_optional("HEADROOM_COMPRESSION_STABLE_AFTER_TURN") or 0
-    _stale_turns = _get_env_int_optional("HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS") or 0
     _embed_socket = os.environ.get("HEADROOM_EMBEDDING_SERVER_SOCKET") or (
         embedding_server and (embedding_server_socket or f"/tmp/headroom-embed-{port}.sock")
     )
     _tuning_lines: list[str] = []
-    if _stable_turn:
-        _tuning_lines.append(
-            f"  Prefix stability:        conservative for first {_stable_turn} turns"
-            f"  (HEADROOM_COMPRESSION_STABLE_AFTER_TURN={_stable_turn})"
-        )
-    if _stale_turns:
-        _tuning_lines.append(
-            f"  Stale read compression:  reads older than {_stale_turns} turns eligible"
-            f"  (HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS={_stale_turns})"
-        )
     if _embed_socket:
         _tuning_lines.append(f"  Embedding sidecar:       {_embed_socket}")
     if _tuning_lines:
         tuning_section = "\nPerformance Tuning:\n" + "\n".join(_tuning_lines)
     else:
-        tuning_section = (
-            "\nPerformance Tuning:  (all defaults — set HEADROOM_COMPRESSION_STABLE_AFTER_TURN"
-            " / HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS to tune)"
-        )
+        tuning_section = ""
 
     click.echo(f"""
 ╔═══════════════════════════════════════════════════════════════════════╗

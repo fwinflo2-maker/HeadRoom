@@ -134,7 +134,6 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
                 continue
         return None
 
-
     def scan_project(
         self, project: ProjectInfo, max_workers: int = 1, include_subagents: bool = True
     ) -> list[SessionData]:

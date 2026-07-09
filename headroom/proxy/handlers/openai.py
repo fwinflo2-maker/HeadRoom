@@ -1070,7 +1070,7 @@ class OpenAIHandlerMixin:
             return base_frozen_count
         final_idx = len(messages) - 1
         if messages[final_idx].get("role") in ("user", "tool", "function"):
-            return max(base_frozen_count, final_idx)
+            return final_idx
         return len(messages)
 
     @staticmethod
@@ -2363,8 +2363,8 @@ class OpenAIHandlerMixin:
 
         openai_frozen_count = openai_prefix_tracker.get_frozen_message_count()
         if is_cache_mode(self.config.mode):
-            openai_frozen_count = self._strict_previous_turn_frozen_count(
-                original_client_messages,
+            openai_frozen_count = OpenAIHandlerMixin._strict_previous_turn_frozen_count(
+                messages,
                 openai_frozen_count,
             )
 
@@ -2399,8 +2399,14 @@ class OpenAIHandlerMixin:
                     # Zone 1: Swap cached compressed versions
                     working_messages = comp_cache.apply_cached(messages)
 
-                    # Re-freeze boundary
-                    openai_frozen_count = comp_cache.compute_frozen_count(messages)
+                    # Re-freeze boundary. Token mode can use the compression
+                    # cache's positional frozen count. Cache mode must keep the
+                    # latest observation mutable even when the compression
+                    # cache has no compressible entry for it yet; otherwise
+                    # OpenAI-compatible tool-call clients freeze the entire
+                    # conversation and report near-zero savings.
+                    if not is_cache_mode(self.config.mode):
+                        openai_frozen_count = comp_cache.compute_frozen_count(messages)
 
                     result = await self._run_compression_in_executor(
                         lambda: self.openai_pipeline.apply(
@@ -2408,7 +2414,14 @@ class OpenAIHandlerMixin:
                             model=model,
                             model_limit=context_limit,
                             context=extract_user_query(working_messages),
-                            frozen_message_count=openai_frozen_count,
+                            frozen_message_count=(
+                                OpenAIHandlerMixin._strict_previous_turn_frozen_count(
+                                    working_messages,
+                                    openai_frozen_count,
+                                )
+                                if is_cache_mode(self.config.mode)
+                                else openai_frozen_count
+                            ),
                             biases=_hook_biases,
                             compression_policy=compression_policy,
                             # Thread the savings-profile knobs (e.g.
@@ -2434,13 +2447,21 @@ class OpenAIHandlerMixin:
                     # so tokens_saved captures both Zone 1 + Zone 2 savings.
                     optimized_tokens = result.tokens_after
                 else:
+                    apply_frozen_count = (
+                        OpenAIHandlerMixin._strict_previous_turn_frozen_count(
+                            messages,
+                            openai_frozen_count,
+                        )
+                        if is_cache_mode(self.config.mode)
+                        else openai_frozen_count
+                    )
                     result = await self._run_compression_in_executor(
                         lambda: self.openai_pipeline.apply(
                             messages=messages,
                             model=model,
                             model_limit=context_limit,
                             context=extract_user_query(messages),
-                            frozen_message_count=openai_frozen_count,
+                            frozen_message_count=apply_frozen_count,
                             biases=_hook_biases,
                             compression_policy=compression_policy,
                             # Same savings-profile threading as the token-mode
@@ -2758,6 +2779,52 @@ class OpenAIHandlerMixin:
         optimized_tokens = tokenizer.count_messages(body["messages"])
         tokens_saved = original_tokens - optimized_tokens
 
+        # Turn hooks (opt-in extensions): a registered hook may rewrite the
+        # outbound tools/messages before we send. Buffered requests only — a
+        # streamed turn can't be re-driven to resolve whatever the model asks to
+        # load. Gated on the registry so it is a no-op when none are registered;
+        # the net tool-schema token delta is recorded so it shows up as a saving.
+        from headroom.proxy.turn_hooks import (
+            TurnContext,
+            registered_turn_hooks,
+            run_request_hooks,
+        )
+
+        if registered_turn_hooks() and not stream:
+            _th_tools_before = body.get("tools")
+            _th_tok_before = (
+                tokenizer.count_text(json.dumps(_th_tools_before, default=str))
+                if _th_tools_before
+                else 0
+            )
+            _th_ctx = TurnContext(
+                provider="openai",
+                model=str(model),
+                messages=body["messages"],
+                tools=_th_tools_before,
+                config=self.config,
+            )
+            run_request_hooks(_th_ctx)
+            # A hook may either replace ctx.messages/ctx.tools or mutate them in
+            # place (the contract allows both). Use object identity only to decide
+            # whether body needs reassignment; measure the saving from the FINAL
+            # tools object regardless, so an in-place shrink is still counted.
+            if _th_ctx.messages is not body["messages"]:
+                optimized_messages = _th_ctx.messages
+                body["messages"] = optimized_messages
+            if _th_ctx.tools is not _th_tools_before:
+                tools = _th_ctx.tools
+                body["tools"] = tools
+            _th_tok_after = (
+                tokenizer.count_text(json.dumps(_th_ctx.tools, default=str)) if _th_ctx.tools else 0
+            )
+            _th_saved = max(0, _th_tok_before - _th_tok_after)
+            if _th_saved > 0:
+                tags["turn_hook_tools_saved_tokens"] = (
+                    int(tags.get("turn_hook_tools_saved_tokens", 0) or 0) + _th_saved
+                )
+                transforms_applied.append(f"turn_hook:tools:{_th_saved}tok")
+
         # Compatibility shim: GPT-5 / o-series chat models REJECT the legacy
         # `max_tokens` ("Unsupported parameter … Use 'max_completion_tokens'
         # instead"); gpt-4o/4.1 accept `max_completion_tokens` too. openai-
@@ -2963,14 +3030,21 @@ class OpenAIHandlerMixin:
                         cache_read_tokens = prompt_details.get("cached_tokens", 0) or 0
 
                     # Bedrock reports cache creation directly. Only infer
-                    # when no explicit count is available.
+                    # when no explicit count is available. Skip inference
+                    # entirely when upstream omitted prompt_tokens.
                     if cache_creation_input_tokens > 0:
                         cache_write_tokens = cache_creation_input_tokens
-                    else:
+                    elif "prompt_tokens" in usage:
                         cache_write_tokens = _infer_openai_cache_write_tokens(
                             total_input_tokens,
                             cache_read_tokens,
                         )
+                    else:
+                        cache_write_tokens = 0
+
+                    uncached_input_tokens = max(
+                        0, total_input_tokens - cache_read_tokens - cache_write_tokens
+                    )
 
                     openai_prefix_tracker.update_from_response(
                         cache_read_tokens=cache_read_tokens,
@@ -2988,6 +3062,9 @@ class OpenAIHandlerMixin:
                             output_tokens=output_tokens,
                             tokens_saved=tokens_saved,
                             attempted_input_tokens=total_input_tokens + tokens_saved,
+                            cache_read_tokens=cache_read_tokens,
+                            cache_write_tokens=cache_write_tokens,
+                            uncached_input_tokens=uncached_input_tokens,
                             total_latency_ms=total_latency,
                             overhead_ms=optimization_latency,
                             pipeline_timing=pipeline_timing,
@@ -3071,6 +3148,54 @@ class OpenAIHandlerMixin:
             else:
                 headers = await apply_copilot_api_auth(headers, url=url)
                 response = await self._retry_request("POST", url, headers, body)
+
+                # Turn hooks: a registered extension may re-drive this turn
+                # (e.g. resolve a tool the model asked to load) before we treat
+                # the response as final. Buffered path only; no-op when no hook
+                # is registered.
+                from headroom.proxy.turn_hooks import (
+                    TurnContext as _TurnContext,
+                )
+                from headroom.proxy.turn_hooks import (
+                    registered_turn_hooks as _registered_turn_hooks,
+                )
+                from headroom.proxy.turn_hooks import (
+                    run_response_hooks,
+                )
+
+                if _registered_turn_hooks() and response.status_code == 200:
+                    try:
+                        _hook_resp_json = response.json()
+                    except (ValueError, json.JSONDecodeError):
+                        _hook_resp_json = None
+                    if isinstance(_hook_resp_json, dict):
+                        _hook_ctx = _TurnContext(
+                            provider="openai",
+                            model=str(model),
+                            messages=body["messages"],
+                            tools=body.get("tools"),
+                            config=self.config,
+                        )
+
+                        async def _hook_call_model(_msgs):
+                            body["messages"] = _msgs
+                            _r = await self._retry_request("POST", url, headers, body)
+                            return _r.json()
+
+                        _hook_final = await run_response_hooks(
+                            _hook_ctx, _hook_resp_json, _hook_call_model
+                        )
+                        if _hook_final is not _hook_resp_json:
+                            response = httpx.Response(
+                                status_code=200,
+                                headers={
+                                    k: v
+                                    for k, v in response.headers.items()
+                                    if k.lower() not in ("content-encoding", "content-length")
+                                },
+                                content=json.dumps(_hook_final).encode(),
+                            )
+
                 self.pipeline_extensions.emit(
                     PipelineStage.POST_SEND,
                     operation="proxy.request",
@@ -3322,6 +3447,7 @@ class OpenAIHandlerMixin:
                         request_id=request_id,
                         provider=openai_chat_outcome_provider,
                         model=model,
+                        status_code=response.status_code,
                         original_tokens=original_tokens,
                         optimized_tokens=total_input_tokens,
                         output_tokens=output_tokens,
@@ -4322,6 +4448,7 @@ class OpenAIHandlerMixin:
                         request_id=request_id,
                         provider="openai",
                         model=model,
+                        status_code=response.status_code,
                         original_tokens=effective_original_tokens,
                         optimized_tokens=effective_optimized_tokens,
                         output_tokens=output_tokens,
@@ -4581,7 +4708,6 @@ class OpenAIHandlerMixin:
             for key, value in upstream_headers.items()
             if key.lower() != _CODEX_RESPONSES_LITE_HEADER
         }
-        _lower_headers = {k.lower(): v for k, v in upstream_headers.items()}
 
         # Build upstream WebSocket URL based on auth mode
         if is_chatgpt_auth:
@@ -4595,6 +4721,12 @@ class OpenAIHandlerMixin:
             base = self.OPENAI_API_URL
             ws_base = base.replace("https://", "wss://").replace("http://", "ws://")
             upstream_url = build_copilot_upstream_url(ws_base, "/v1/responses")
+
+        # Resolve Copilot auth for this upstream FIRST, before any generic
+        # OpenAI-key fallback below -- ensures a real client-supplied Copilot
+        # credential is used/preserved, and Headroom's own credential fetch
+        # only kicks in when the client truly sent none.
+        upstream_headers = await apply_copilot_api_auth(upstream_headers, url=upstream_url)
 
         capture_codex_wire_debug(
             "ws_upstream_handshake",
@@ -4620,7 +4752,10 @@ class OpenAIHandlerMixin:
 
         # Ensure Authorization header is present — fall back to OPENAI_API_KEY env var.
         # Safety net for clients that don't forward auth headers via WebSocket upgrade.
-        if "authorization" not in _lower_headers:
+        # Resolved AFTER apply_copilot_api_auth (moved earlier, see below) so a
+        # real client-supplied Copilot credential is never mistaken for, or
+        # clobbered by, this unrelated OpenAI-key fallback.
+        if not any(k.lower() == "authorization" for k in upstream_headers):
             api_key = os.environ.get("OPENAI_API_KEY")
             if api_key:
                 upstream_headers["Authorization"] = f"Bearer {api_key}"
@@ -4630,8 +4765,6 @@ class OpenAIHandlerMixin:
                     f"[{request_id}] WS: no Authorization header from client and "
                     f"OPENAI_API_KEY not set — upstream will likely reject"
                 )
-
-        upstream_headers = await apply_copilot_api_auth(upstream_headers, url=upstream_url)
 
         # Ensure the required beta header is present — OpenAI returns 500 without it.
         # PR-A6 (P5-50): use the deterministic `merge_openai_beta` helper
@@ -7290,6 +7423,7 @@ class OpenAIHandlerMixin:
                     request_id=request_id,
                     provider=provider,
                     model=_passthrough_model_from_path(path, endpoint_name),
+                    status_code=response.status_code,
                     original_tokens=input_tokens,
                     optimized_tokens=input_tokens,
                     output_tokens=output_tokens,

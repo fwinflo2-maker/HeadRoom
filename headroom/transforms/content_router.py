@@ -50,13 +50,13 @@ from enum import Enum
 from typing import Any
 
 from ..config import (
+    _READ_TOOL_NAMES,
     DEFAULT_EXCLUDE_TOOLS,
     ReadLifecycleConfig,
     RelevanceScorerConfig,
     TransformResult,
     is_tool_excluded,
 )
-from ..config import _READ_TOOL_NAMES
 from ..parser import CCR_RETRIEVAL_MARKER_RE
 from ..tokenizer import Tokenizer
 from .base import Transform
@@ -4723,9 +4723,11 @@ class ContentRouter(Transform):
                                 route_counts["excluded_tool_lossless"] = (
                                     route_counts.get("excluded_tool_lossless", 0) + 1
                                 )
+                                _orig_content = block.get("content")
+                                _orig_len = len(_orig_content) if isinstance(_orig_content, str) else 0
                                 route_counts["graph_narrow_lossless_tokens_saved"] = route_counts.get(
                                     "graph_narrow_lossless_tokens_saved", 0
-                                ) + max(0, (len(block.get("content")) - len(folded)) // 4)
+                                ) + max(0, (_orig_len - len(folded)) // 4)
                             any_compressed = True
                             continue
                         compacted = self._lossless_compact_excluded(block.get("content"))

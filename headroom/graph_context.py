@@ -51,6 +51,7 @@ import re
 import threading
 import time
 from collections import deque
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -156,7 +157,7 @@ def _hash_file(path: Path) -> str | None:
         return None
 
 
-def _iter_source_files(root: Path):
+def _iter_source_files(root: Path) -> Iterator[Path]:
     """Every supported source file under ``root``, any of the languages in
     `SOURCE_EXTENSIONS`, skipping ignored/build/vendor directories.
 
@@ -524,7 +525,7 @@ def load_or_build_graph(root: Path) -> ProjectGraph:
 
 _live_lock = threading.Lock()
 _live_graphs: dict[Path, ProjectGraph] = {}
-_live_watchers: dict[Path, "GraphContextWatcher"] = {}
+_live_watchers: dict[Path, GraphContextWatcher] = {}
 
 _WATCH_DEBOUNCE_SECONDS = 2.0
 # Cap on how many project roots are watched at once. A single proxy normally
@@ -687,18 +688,19 @@ def get_live_graph(root: Path) -> ProjectGraph:
         # direct load, which is at worst one extra hash-check.
         return load_or_build_graph(root)
 
-    started = reserved_watcher.start()
-    if started:
-        with _live_lock:
-            graph = _live_graphs.get(root)
-        if graph is not None:
-            return graph
-    else:
-        with _live_lock:
-            # Only remove if it's still OUR reservation -- a concurrent
-            # `stop_all_watchers()` may have already cleared it.
-            if _live_watchers.get(root) is reserved_watcher:
-                _live_watchers.pop(root, None)
+    if reserved_watcher is not None:
+        started = reserved_watcher.start()
+        if started:
+            with _live_lock:
+                graph = _live_graphs.get(root)
+            if graph is not None:
+                return graph
+        else:
+            with _live_lock:
+                # Only remove if it's still OUR reservation -- a concurrent
+                # `stop_all_watchers()` may have already cleared it.
+                if _live_watchers.get(root) is reserved_watcher:
+                    _live_watchers.pop(root, None)
 
     return load_or_build_graph(root)
 

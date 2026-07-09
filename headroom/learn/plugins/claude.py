@@ -420,9 +420,23 @@ def _greedy_path_decode(base: Path, parts: list[str]) -> Path | None:
         return None
 
     try:
-        children = sorted(child for child in base.iterdir() if child.is_dir())
+        entries = list(base.iterdir())
     except OSError:
         return None
+
+    # Windows profiles routinely contain reparse-point junctions (e.g.
+    # "AppData\Local\Temporary Internet Files") that raise PermissionError on
+    # is_dir(). Skip those entries individually instead of letting one
+    # inaccessible sibling abort the whole listing — and thus every project
+    # path that happens to walk through this directory.
+    children = []
+    for entry in entries:
+        try:
+            if entry.is_dir():
+                children.append(entry)
+        except OSError:
+            continue
+    children.sort()
 
     for child in children:
         for tokenization in _component_tokenizations(child.name):

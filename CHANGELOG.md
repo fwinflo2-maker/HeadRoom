@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
+* **proxy/transforms:** add graph-scoped narrowing layer to compress wide whole-repo discovery commands (grep, glob, ls) based on the agent's BFS import-graph neighborhood, achieving up to 99.9% token savings within the proxy.
 * **transforms:** add opt-in audit-safe mode to `SmartCrusher` — `SmartCrusherConfig(audit_safe=True, protected_patterns=[...], fail_closed_on_protected_loss=True)`. Rows matching a protected pattern are scanned before JSON-array compression and guaranteed to survive the compressed output verbatim afterward (never dropped, never replaced by an opaque `<<ccr:...>>` marker only). Applies on both the `crush_array_json` convenience API and the `_smart_crush_content` path `apply()` uses for real tool-output compression. If a protected row still can't be preserved after the splice-back pass, the crusher fails closed by returning the original uncompressed content (or ships a best-effort result with a warning when `fail_closed_on_protected_loss=False`). Default is `audit_safe=False` — no behavior change for existing callers ([#1705](https://github.com/chopratejas/headroom/issues/1705)).
 
 ### Changed

@@ -1405,7 +1405,7 @@ class HeadroomProxy(
         self.http_client_h1 = (
             self.http_client if not _http2 else httpx.AsyncClient(http2=False, **_client_kwargs)
         )
-        logger.info("Headroom Proxy started")
+        logger.info("Headroom Proxy started (version %s)", __version__)
         logger.info(f"Optimization: {'ENABLED' if self.config.optimize else 'DISABLED'}")
         self.config.mode = normalize_proxy_mode(self.config.mode)
         logger.info(f"Mode: {self.config.mode}")
@@ -2909,6 +2909,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def dashboard():
         """Serve the Headroom dashboard UI."""
         return get_dashboard_html()
+
+    @app.get("/favicon.ico")
+    async def favicon() -> Response:
+        # Registered before register_provider_routes' catch-all passthrough
+        # route so browsers' automatic favicon requests for /dashboard are
+        # answered locally instead of being tunneled to the wrapped upstream
+        # provider (GH #1787).
+        return Response(status_code=204)
 
     DASHBOARD_STATS_CACHE_TTL_SECONDS = 5.0
     _stats_snapshot_lock = asyncio.Lock()

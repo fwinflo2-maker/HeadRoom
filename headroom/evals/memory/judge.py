@@ -201,7 +201,7 @@ def _parse_judge_response(text: str) -> tuple[float, str]:
         Tuple of (score, reasoning).
     """
     reasoning = ""
-    score = None
+    score: float | None = None
     parsed = False
 
     lines = text.strip().split("\n")
@@ -234,6 +234,8 @@ def _parse_judge_response(text: str) -> tuple[float, str]:
             f"Could not parse a score from judge response, defaulting to 0.0 (fail): {text!r}"
         )
         score = 0.0
+
+    assert score is not None
 
     # If no explicit reasoning found, use the whole text
     if not reasoning:

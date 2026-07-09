@@ -143,6 +143,31 @@ def test_detect_claude_code_version_missing_binary_is_none() -> None:
     assert detect_claude_code_version("definitely-not-a-real-binary-xyz") is None
 
 
+def test_detect_claude_code_version_tolerates_proc_without_stdout(monkeypatch) -> None:
+    # Regression (CI test failure on PR #1779): a stubbed subprocess result — a
+    # SimpleNamespace with only returncode, no stdout/stderr — must not raise
+    # AttributeError. detect is best-effort → returns None (version unknown).
+    from types import SimpleNamespace
+
+    import headroom._subprocess as _sub
+
+    monkeypatch.setattr(_sub, "run", lambda *a, **k: SimpleNamespace(returncode=0))
+    assert detect_claude_code_version("claude") is None
+
+
+def test_detect_claude_code_version_parses_wrapper_output(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import headroom._subprocess as _sub
+
+    monkeypatch.setattr(
+        _sub,
+        "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="2.1.196 (Claude Code)\n", stderr=""),
+    )
+    assert detect_claude_code_version("claude") == (2, 1, 196)
+
+
 # ---------------------------------------------------------------------------
 # Sibling co-report (#746 / #1158)
 # ---------------------------------------------------------------------------

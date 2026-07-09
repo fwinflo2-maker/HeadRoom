@@ -201,27 +201,28 @@ def detect_claude_code_version(claude_bin: str | None = None) -> tuple[int, int,
     """Best-effort detection of the installed Claude Code version.
 
     Runs ``claude --version`` and parses it. Returns ``None`` on any failure
-    (binary missing, non-zero exit, timeout, unparseable output) so callers fall
-    back to the version-unknown wording rather than crash. Never raises.
+    (binary missing, non-zero exit, timeout, unparseable or absent output) so
+    callers fall back to the version-unknown wording rather than crash. Never
+    raises. Uses the shared ``headroom._subprocess`` wrapper, which forces
+    ``encoding="utf-8"`` under ``text=True`` (the repo's Windows-cp1252 guard).
     """
     import shutil
     import subprocess
+
+    from headroom._subprocess import run
 
     binary = claude_bin or shutil.which("claude")
     if not binary:
         return None
     try:
-        proc = subprocess.run(
-            [binary, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            encoding="utf-8",
-            errors="replace",
-        )
+        proc = run([binary, "--version"], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return None
-    return parse_claude_code_version(f"{proc.stdout or ''} {proc.stderr or ''}")
+    # getattr, not attribute access: a stubbed CompletedProcess (e.g. a test's
+    # SimpleNamespace) may lack stdout/stderr — degrade to "unknown", never raise.
+    stdout = getattr(proc, "stdout", "") or ""
+    stderr = getattr(proc, "stderr", "") or ""
+    return parse_claude_code_version(f"{stdout} {stderr}")
 
 
 def remote_control_gate_active(

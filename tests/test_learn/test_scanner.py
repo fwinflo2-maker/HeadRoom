@@ -8,6 +8,7 @@ making it impossible to reconstruct names formed from three or more tokens.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Generator
 from pathlib import Path
 from uuid import uuid4
@@ -416,6 +417,25 @@ class TestDecodeProjectPath:
         assert len(projects) == 1
         assert projects[0].name == "work"
         assert str(projects[0].project_path).startswith("C:")
+
+    def test_discover_project_prefers_session_cwd_over_ambiguous_folder_name(
+        self, tmp_path: Path
+    ) -> None:
+        nested = tmp_path / "vibe" / "remote"
+        hyphenated = tmp_path / "vibe-remote"
+        nested.mkdir(parents=True)
+        hyphenated.mkdir()
+
+        claude_dir = tmp_path / ".claude"
+        project_dir = claude_dir / "projects" / "C--Users-rod-work-vibe-remote"
+        project_dir.mkdir(parents=True)
+        (project_dir / "session.jsonl").write_text(json.dumps({"cwd": str(hyphenated)}) + "\n")
+
+        projects = ClaudeCodeScanner(claude_dir=claude_dir).discover_projects()
+
+        assert len(projects) == 1
+        assert projects[0].name == "vibe-remote"
+        assert projects[0].project_path == hyphenated
 
     def test_windows_double_dash_encoding_decodes(self) -> None:
         """Real Claude Code encoding has no leading dash: C:\\Users\\x → C--Users-x (#1849).

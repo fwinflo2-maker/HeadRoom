@@ -96,6 +96,11 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
             if not jsonl_files:
                 continue
 
+            session_project_path = self._project_path_from_session_cwd(jsonl_files)
+            if session_project_path is not None:
+                project_path = session_project_path
+                name = _project_display_name(project_path, entry.name)
+
             projects.append(
                 ProjectInfo(
                     name=name,
@@ -107,6 +112,28 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
             )
 
         return projects
+
+    @staticmethod
+    def _project_path_from_session_cwd(jsonl_files: list[Path]) -> Path | None:
+        for jsonl_path in sorted(jsonl_files):
+            try:
+                with open(jsonl_path, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        cwd = event.get("cwd")
+                        if isinstance(cwd, str) and cwd:
+                            project_path = Path(cwd)
+                            if project_path.exists():
+                                return project_path
+            except (OSError, UnicodeDecodeError):
+                continue
+        return None
+
 
     def scan_project(
         self, project: ProjectInfo, max_workers: int = 1, include_subagents: bool = True

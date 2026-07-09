@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- **learn:** fix three Windows-specific failures in `headroom learn --verbosity`
+  and CLI-backed analysis ([#1624](https://github.com/headroomlabs-ai/headroom/issues/1624)).
+  `verbosity.py` read transcripts and profiles with the platform-default text
+  codec instead of UTF-8, so non-ASCII content raised a silently-caught
+  `UnicodeDecodeError`, producing `Sessions: 0, human turns: 0` for every
+  project. `_greedy_path_decode` listed a directory's children with
+  `is_dir()` inline in the same expression as `iterdir()`, so a single
+  `PermissionError` on an inaccessible sibling (e.g. the
+  `AppData\Local\Temporary Internet Files` junction present on most Windows
+  profiles) aborted the whole listing and silently mis-decoded any project
+  path that walked through it, causing `--project <path>` to report "No
+  matching project" or resolve the wrong directory. `_call_cli_llm` launched
+  CLI backends via `Popen`/`run`, which use `CreateProcess` on Windows and
+  don't apply the shell's `PATHEXT` extension search, so an npm-installed
+  `.cmd` shim (e.g. `claude`, `codex`) raised `FileNotFoundError` even though
+  it was on `PATH`; a `shutil.which`-based retry now resolves the shim.
 - **proxy:** the savings store now fsyncs its parent directory after the
   atomic rename, so the most recent `proxy_savings.json` write survives a
   power-loss or crash. `_save_locked` fsynced the temp file's contents but

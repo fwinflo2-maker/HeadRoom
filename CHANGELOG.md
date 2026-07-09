@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- **code:** fix two `CodeAwareCompressor` AST-reassembly bugs: an exported
+  JS/TS function or class (`export function foo() {`) produced a duplicated
+  `export export` keyword and invalid syntax, because line-based node slicing
+  (used to preserve indentation) pulled in the preceding `export` sibling's
+  text on top of the `export_statement` handler's own prefix reconstruction.
+  Separately, in every supported language, a doc comment immediately above a
+  top-level function, class, or type was detached from its declaration during
+  extraction and re-emitted in a cluster at the end of the compressed output
+  instead of staying attached to what it documents.
 - **proxy:** the savings store now fsyncs its parent directory after the
   atomic rename, so the most recent `proxy_savings.json` write survives a
   power-loss or crash. `_save_locked` fsynced the temp file's contents but

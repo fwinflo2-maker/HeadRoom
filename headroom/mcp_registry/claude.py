@@ -56,6 +56,8 @@ class ClaudeRegistrar(MCPRegistrar):
         # of where the modern config resolved to (CLAUDE_CONFIG_DIR only
         # relocates the modern file, per Claude Code's own behavior).
         self._claude_dir = home / ".claude"
+        self._modern_dir = modern_dir
+        self._isolated_cli_env = home_dir is not None or config_dir is not None
         self._modern_config = modern_dir / ".claude.json"
         self._legacy_config = self._claude_dir / "mcp.json"
         if claude_cli is ...:
@@ -106,6 +108,7 @@ class ClaudeRegistrar(MCPRegistrar):
                 [str(self._claude_cli), "mcp", "remove", server_name, "-s", "user"],
                 capture_output=True,
                 text=True,
+                env=self._claude_cli_env(),
             )
             if result.returncode == 0:
                 removed = True
@@ -131,6 +134,7 @@ class ClaudeRegistrar(MCPRegistrar):
             cmd,
             capture_output=True,
             text=True,
+            env=self._claude_cli_env(),
         )
         if result.returncode == 0:
             return RegisterResult(RegisterStatus.REGISTERED, "via `claude mcp add` (scope: user)")
@@ -202,10 +206,18 @@ class ClaudeRegistrar(MCPRegistrar):
             return None
         return _entry_to_spec(server_name, entry)
 
+    # ----------------------------------------------------------------------
+    # Helpers
+    # ----------------------------------------------------------------------
 
-# ----------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------
+    def _claude_cli_env(self) -> dict[str, str] | None:
+        if not self._isolated_cli_env:
+            return None
+        env = os.environ.copy()
+        # Point the CLI at the directory holding the modern ``.claude.json``
+        # (CLAUDE_CONFIG_DIR relocates that file), not the legacy ``.claude`` dir.
+        env["CLAUDE_CONFIG_DIR"] = str(self._modern_dir)
+        return env
 
 
 def _resolve_claude_config_dir(

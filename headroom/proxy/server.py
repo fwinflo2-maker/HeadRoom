@@ -700,6 +700,7 @@ class HeadroomProxy(
         profile_kwargs = proxy_pipeline_kwargs(config)
         router_config = ContentRouterConfig(
             enable_code_aware=config.code_aware_enabled,
+            prefer_code_aware_for_code=_get_env_bool("HEADROOM_PREFER_CODE_AWARE_FOR_CODE", True),
             tool_profiles=config.tool_profiles,
             read_lifecycle=ReadLifecycleConfig(enabled=config.read_lifecycle),
             smart_crusher_max_items_after_crush=cast(
@@ -875,6 +876,7 @@ class HeadroomProxy(
         # HTTP/1.1-only client for ChatGPT passthrough (Cloudflare challenges
         # our HTTP/2 fingerprint on its sensitive account endpoints).
         self.http_client_h1: httpx.AsyncClient | None = None
+        self._shutdown_event: asyncio.Event | None = None
 
         # Shared cold-start warmup registry (populated by startup()).
         # Holds typed slots with loaded / loading / null / error status for
@@ -1386,6 +1388,7 @@ class HeadroomProxy(
 
     async def startup(self):
         """Initialize async resources."""
+        self._get_shutdown_event().clear()
         self.pipeline_extensions.emit(
             PipelineStage.PRE_START,
             operation="proxy.startup",
@@ -1402,7 +1405,7 @@ class HeadroomProxy(
         self.http_client_h1 = (
             self.http_client if not _http2 else httpx.AsyncClient(http2=False, **_client_kwargs)
         )
-        logger.info("Headroom Proxy started")
+        logger.info("Headroom Proxy started (version %s)", __version__)
         logger.info(f"Optimization: {'ENABLED' if self.config.optimize else 'DISABLED'}")
         self.config.mode = normalize_proxy_mode(self.config.mode)
         logger.info(f"Mode: {self.config.mode}")
@@ -1627,6 +1630,7 @@ class HeadroomProxy(
 
     async def shutdown(self):
         """Cleanup async resources."""
+        self._get_shutdown_event().set()
         if self.http_client_h1 and self.http_client_h1 is not self.http_client:
             await self.http_client_h1.aclose()
         self.http_client_h1 = None
@@ -1727,6 +1731,33 @@ class HeadroomProxy(
 
         return extract_tags(headers)
 
+    def _get_shutdown_event(self) -> asyncio.Event:
+        event = getattr(self, "_shutdown_event", None)
+        if event is None:
+            event = asyncio.Event()
+            self._shutdown_event = event
+        return event
+
+    async def _wait_for_retry_delay_or_shutdown(self, delay_seconds: float) -> bool:
+        try:
+            await asyncio.wait_for(self._get_shutdown_event().wait(), timeout=delay_seconds)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    def _shutdown_retry_response(self, method: str, url: str) -> httpx.Response:
+        return httpx.Response(
+            503,
+            request=httpx.Request(method, url),
+            headers={"content-type": "application/json", "retry-after": "0"},
+            json={
+                "error": {
+                    "type": "shutdown",
+                    "message": "Proxy is shutting down; retry backoff cancelled.",
+                }
+            },
+        )
+
     async def _retry_request(
         self,
         method: str,
@@ -1822,7 +1853,13 @@ class HeadroomProxy(
                             f"Upstream {response.status_code} (attempt {attempt + 1}), "
                             f"retrying in {delay_ms:.0f}ms"
                         )
-                        await asyncio.sleep(delay_ms / 1000)
+                        if await self._wait_for_retry_delay_or_shutdown(delay_ms / 1000):
+                            logger.info(
+                                "Shutdown interrupted retry backoff for %s %s",
+                                method,
+                                path_for_log or "<upstream-url>",
+                            )
+                            return self._shutdown_retry_response(method, url)
                         continue
 
                     # Don't retry other client errors (4xx)
@@ -1839,7 +1876,12 @@ class HeadroomProxy(
 
                     return response
 
-            except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
+            # httpx.TransportError covers ConnectError, the timeout family, and —
+            # crucially — the protocol errors (Local/RemoteProtocolError, e.g. an
+            # HTTP/2 `StreamReset`) that a poisoned shared h2 connection raises on
+            # every in-flight request. Retrying drops the bad connection and
+            # re-sends on a fresh one instead of collapsing to a 502. (#1639)
+            except (httpx.TransportError, httpx.HTTPStatusError) as e:
                 last_error = e
 
                 if not self.config.retry_enabled or attempt >= self.config.retry_max_attempts - 1:
@@ -1855,7 +1897,13 @@ class HeadroomProxy(
                 logger.warning(
                     f"Request failed (attempt {attempt + 1}), retrying in {delay_with_jitter:.0f}ms: {e}"
                 )
-                await asyncio.sleep(delay_with_jitter / 1000)
+                if await self._wait_for_retry_delay_or_shutdown(delay_with_jitter / 1000):
+                    logger.info(
+                        "Shutdown interrupted retry backoff for %s %s",
+                        method,
+                        path_for_log or "<upstream-url>",
+                    )
+                    return self._shutdown_retry_response(method, url)
 
         if last_error is None:
             raise RuntimeError(
@@ -2861,6 +2909,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def dashboard():
         """Serve the Headroom dashboard UI."""
         return get_dashboard_html()
+
+    @app.get("/favicon.ico")
+    async def favicon() -> Response:
+        # Registered before register_provider_routes' catch-all passthrough
+        # route so browsers' automatic favicon requests for /dashboard are
+        # answered locally instead of being tunneled to the wrapped upstream
+        # provider (GH #1787).
+        return Response(status_code=204)
 
     DASHBOARD_STATS_CACHE_TTL_SECONDS = 5.0
     _stats_snapshot_lock = asyncio.Lock()

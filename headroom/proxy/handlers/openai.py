@@ -6500,9 +6500,15 @@ class OpenAIHandlerMixin:
                         if chat_messages:
                             from headroom import compress as headroom_compress
 
-                            before_bytes = len(json.dumps(chat_messages, ensure_ascii=False).encode("utf-8"))
-                            result = headroom_compress(messages=chat_messages, model=model, optimize=True)
-                            after_bytes = len(json.dumps(result.messages, ensure_ascii=False).encode("utf-8"))
+                            before_bytes = len(
+                                json.dumps(chat_messages, ensure_ascii=False).encode("utf-8")
+                            )
+                            result = headroom_compress(
+                                messages=chat_messages, model=model, optimize=True
+                            )
+                            after_bytes = len(
+                                json.dumps(result.messages, ensure_ascii=False).encode("utf-8")
+                            )
                             # Splice compressed chat messages back into the original array
                             compressed_items = list(result.messages)  # defensive copy
                             messages_out: list[Any] = []
@@ -6517,7 +6523,9 @@ class OpenAIHandlerMixin:
                                 else:
                                     messages_out.append(item)
                             payload["messages"] = messages_out
-                            body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                            body = json.dumps(
+                                payload, separators=(",", ":"), ensure_ascii=False
+                            ).encode("utf-8")
                             headers["content-length"] = str(len(body))
                             logger.info(
                                 "Hermes claude-code passthrough compression: %d -> %d bytes (saved %d)",
@@ -6539,9 +6547,15 @@ class OpenAIHandlerMixin:
                         if chat_messages:
                             from headroom import compress as headroom_compress
 
-                            before_bytes = len(json.dumps(chat_messages, ensure_ascii=False).encode("utf-8"))
-                            result = headroom_compress(messages=chat_messages, model=model, optimize=True)
-                            after_bytes = len(json.dumps(result.messages, ensure_ascii=False).encode("utf-8"))
+                            before_bytes = len(
+                                json.dumps(chat_messages, ensure_ascii=False).encode("utf-8")
+                            )
+                            result = headroom_compress(
+                                messages=chat_messages, model=model, optimize=True
+                            )
+                            after_bytes = len(
+                                json.dumps(result.messages, ensure_ascii=False).encode("utf-8")
+                            )
                             # Splice compressed chat messages back into the original array
                             compressed_items = list(result.messages)
                             input_out: list[Any] = []
@@ -6556,7 +6570,9 @@ class OpenAIHandlerMixin:
                                 else:
                                     input_out.append(item)
                             payload["input"] = input_out
-                            body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                            body = json.dumps(
+                                payload, separators=(",", ":"), ensure_ascii=False
+                            ).encode("utf-8")
                             headers["content-length"] = str(len(body))
                             logger.info(
                                 "Hermes codex passthrough compression: %d -> %d bytes (saved %d)",
@@ -6571,9 +6587,13 @@ class OpenAIHandlerMixin:
 
                         before_bytes = len(raw_input.encode("utf-8"))
                         result = headroom_compress(messages=messages, model=model, optimize=True)
-                        after_bytes = len(json.dumps(result.messages, ensure_ascii=False).encode("utf-8"))
+                        after_bytes = len(
+                            json.dumps(result.messages, ensure_ascii=False).encode("utf-8")
+                        )
                         payload["input"] = result.messages
-                        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                        body = json.dumps(
+                            payload, separators=(",", ":"), ensure_ascii=False
+                        ).encode("utf-8")
                         headers["content-length"] = str(len(body))
                         logger.info(
                             "Hermes codex passthrough compression: %d -> %d bytes (saved %d)",

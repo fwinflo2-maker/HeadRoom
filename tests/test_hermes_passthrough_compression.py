@@ -44,7 +44,9 @@ def _make_app(**kwargs: Any):
     return app
 
 
-def _mock_upstream(router: respx.MockRouter, upstream_url: str = "https://api.openai.com") -> dict[str, Any]:
+def _mock_upstream(
+    router: respx.MockRouter, upstream_url: str = "https://api.openai.com"
+) -> dict[str, Any]:
     """Install a mock upstream that captures the forwarded request body."""
     captured: dict[str, Any] = {}
 
@@ -56,7 +58,10 @@ def _mock_upstream(router: respx.MockRouter, upstream_url: str = "https://api.op
         captured["url"] = str(request.url)
         captured["method"] = request.method
         captured["headers"] = dict(request.headers)
-        return httpx.Response(200, json={"id": "resp_1", "output": [], "usage": {"input_tokens": 10, "output_tokens": 1}})
+        return httpx.Response(
+            200,
+            json={"id": "resp_1", "output": [], "usage": {"input_tokens": 10, "output_tokens": 1}},
+        )
 
     # Mock any upstream path
     router.route(method="POST", url__startswith=upstream_url).mock(side_effect=_capture)
@@ -75,7 +80,12 @@ def test_codex_proxy_preserves_tool_and_function_items() -> None:
     original_input: list[Any] = [
         {"role": "system", "content": "You are a coding assistant."},
         {"role": "user", "content": "Write a sort function."},
-        {"type": "function_call", "call_id": "call_1", "name": "read_file", "arguments": '{"path":"/tmp/x.py"}'},
+        {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "read_file",
+            "arguments": '{"path":"/tmp/x.py"}',
+        },
         {"type": "function_call_output", "call_id": "call_1", "output": "def foo(): pass"},
         {"role": "assistant", "content": "I see the file contains a foo function."},
         {"role": "user", "content": "Add error handling."},
@@ -230,18 +240,29 @@ def test_claude_proxy_preserves_tool_use_items() -> None:
         {"role": "user", "content": [{"type": "text", "text": "Read the file."}]},
         {
             "role": "assistant",
-            "content": [{"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "/tmp/x.py"}}],
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "read_file",
+                    "input": {"path": "/tmp/x.py"},
+                }
+            ],
         },
         {
             "role": "user",
-            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "print('hello')"}],
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "print('hello')"}
+            ],
         },
         {"role": "assistant", "content": [{"type": "text", "text": "The file prints hello."}]},
     ]
 
     app = _make_app()
     with TestClient(app) as client:
-        captured = _mock_upstream(respx, upstream_url="https://httpbin.org")  # any URL, overridden by header
+        captured = _mock_upstream(
+            respx, upstream_url="https://httpbin.org"
+        )  # any URL, overridden by header
 
         response = client.post(
             "/api/claude-code-proxy/session-1/v1/messages",

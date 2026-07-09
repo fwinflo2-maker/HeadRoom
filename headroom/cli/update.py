@@ -166,7 +166,7 @@ def _managed_env_guidance() -> str:
 
 
 def _find_core_pyd() -> Path | None:
-    """Localiza o arquivo _core.pyd no site-packages do headroom."""
+    """Locate the _core.pyd file inside the headroom site-packages directory."""
     try:
         import headroom
         headroom_path = Path(headroom.__file__).parent
@@ -177,7 +177,7 @@ def _find_core_pyd() -> Path | None:
 
 
 def _is_pyd_locked(pyd_path: Path) -> bool:
-    """Verifica se o .pyd está bloqueado no Windows tentando abrir em r+b."""
+    """Verify whether the .pyd file is locked on Windows by attempting to open it in r+b mode."""
     try:
         with open(pyd_path, "r+b") as f:
             f.close()
@@ -187,19 +187,19 @@ def _is_pyd_locked(pyd_path: Path) -> bool:
 
 
 def _make_backup(pyd_path: Path) -> Path:
-    """Cria backup do .pyd como .pyd.bak."""
+    """Create a backup of the .pyd file as .pyd.bak."""
     backup_path = pyd_path.with_suffix(pyd_path.suffix + ".bak")
     shutil.copy2(pyd_path, backup_path)
     return backup_path
 
 
 def _restore_backup(pyd_path: Path, backup_path: Path) -> None:
-    """Restaura o .pyd atomicamente (os.replace move backup sobre original)."""
+    """Restore the .pyd file atomically by replacing the original with the backup."""
     os.replace(backup_path, pyd_path)
 
 
 def _test_core_integrity() -> bool:
-    """Testa se headroom._core pode ser importado com sucesso."""
+    """Test if headroom._core can be imported successfully."""
     try:
         result = subprocess.run(
             [sys.executable, "-c", "from headroom._core import hello"],
@@ -213,82 +213,82 @@ def _test_core_integrity() -> bool:
 
 
 def safe_update(argv: list[str]) -> int:
-    """Executa atualização com proteção contra corrupção do .pyd no Windows.
+    """Execute update with protection against .pyd corruption on Windows.
 
-    Detecta se o _core.pyd está bloqueado (indicando que headroom proxy está
-    rodando), faz backup, executa a atualização, testa integridade e restaura
-    em caso de falha.
+    Detects if _core.pyd is locked (indicating that headroom proxy is running),
+    makes a backup, executes the update, tests integrity, and restores the
+    backup in case of failure.
 
-    Retorna 0 se bem-sucedido, código de erro caso contrário.
+    Returns 0 if successful, error code otherwise.
     """
     core_pyd = _find_core_pyd()
     backup_path = None
 
     try:
-        # Windows: backup proativo quando o .pyd está acessível (não bloqueado).
-        # Se bloqueado, pip vai falhar antes de tocar no arquivo — apenas avisar.
-        # Se não bloqueado, pip vai tentar substituí-lo — fazer backup como rede de segurança.
+        # Windows: proactive backup when the .pyd is accessible (not locked).
+        # If locked, pip will fail before touching the file — just warn.
+        # If not locked, pip will attempt to replace it — back it up as a safety net.
         if sys.platform.startswith("win") and core_pyd:
             if _is_pyd_locked(core_pyd):
                 click.secho(
-                    "Aviso: headroom._core está bloqueado (headroom proxy está rodando).",
+                    "Warning: headroom._core is locked (headroom proxy is running).",
                     fg="yellow",
                 )
-                click.echo("Se a atualização falhar, pare o proxy e tente novamente.")
+                click.echo("If the upgrade fails, stop the proxy and try again.")
             else:
-                click.echo("Criando backup de headroom._core antes de atualizar...")
+                click.echo("Creating a backup of headroom._core before upgrading...")
                 try:
                     backup_path = _make_backup(core_pyd)
-                    click.echo(f"Backup criado: {backup_path}")
+                    click.echo(f"Backup created: {backup_path}")
                 except Exception as e:
                     raise click.ClickException(
-                        f"Não foi possível fazer backup de {core_pyd}: {e}"
+                        f"Could not back up {core_pyd}: {e}"
                     ) from None
 
-        # Executar a atualização
+        # Executing the update
         result = subprocess.run(argv)  # noqa: S603
 
         if result.returncode != 0:
-            # Falha na atualização: restaurar backup se disponível
+            # Upgrade failed: restore backup if available
             if backup_path and backup_path.exists():
-                click.secho("Restaurando backup após falha de atualização...", fg="yellow")
+                click.secho("Restoring backup after upgrade failure...", fg="yellow")
                 try:
                     _restore_backup(core_pyd, backup_path)
-                    click.echo("Backup restaurado com sucesso.")
+                    click.echo("Backup restored successfully.")
                 except Exception as e:
                     click.secho(
-                        f"ERRO: Não foi possível restaurar o backup: {e}",
+                        f"ERROR: Could not restore backup: {e}",
                         fg="red",
                     )
             return result.returncode
 
-        # Atualização bem-sucedida: testar integridade
+        # Upgrade successful: test integrity
         if core_pyd:
-            click.echo("Testando integridade do módulo headroom._core...")
+            click.echo("Testing integrity of headroom._core module...")
             if not _test_core_integrity():
                 click.secho(
-                    "ERRO: headroom._core não pode ser importado após atualização.",
+                    "ERROR: headroom._core could not be imported after upgrade.",
                     fg="red",
                 )
                 if backup_path and backup_path.exists():
-                    click.secho("Restaurando backup...", fg="yellow")
+                    click.secho("Restoring backup...", fg="yellow")
                     try:
                         _restore_backup(core_pyd, backup_path)
-                        click.echo("Backup restaurado com sucesso.")
+                        click.echo("Backup restored successfully.")
                     except Exception as e:
                         click.secho(
-                            f"ERRO crítico: Não foi possível restaurar: {e}",
+                            f"CRITICAL ERROR: Could not restore: {e}",
                             fg="red",
                         )
                 return 1
-            click.echo("✓ Módulo testado com sucesso.")
+            click.echo("✓ Module tested successfully.")
 
-        # Limpeza: remover backup se tudo correu bem
+        # Cleanup: remove backup if everything went well
         if backup_path and backup_path.exists():
             try:
                 backup_path.unlink()
             except Exception:
-                pass  # Falha ao deletar backup não é crítica
+                pass  # Failed to delete backup is not critical
 
         return 0
 

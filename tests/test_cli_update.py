@@ -219,7 +219,7 @@ def test_safe_update_passes_through_failure(monkeypatch):
 
 
 def test_safe_update_warns_but_no_backup_when_locked(monkeypatch, tmp_path):
-    """Quando o .pyd está bloqueado, safe_update avisa mas não faz backup."""
+    """When the .pyd is locked, safe_update warns but does not make a backup."""
     fake_pyd = tmp_path / "_core.pyd"
     fake_pyd.write_bytes(b"fake pyd content")
 
@@ -235,7 +235,7 @@ def test_safe_update_warns_but_no_backup_when_locked(monkeypatch, tmp_path):
     result = up.safe_update([sys.executable, "-m", "pip", "install", "-U", "headroom-ai"])
 
     assert result == 1
-    # Backup nunca deve ter sido criado — arquivo bloqueado, pip falha sem corromper
+    # Backup should never be created — file is locked, pip fails without corruption
     assert not (tmp_path / "_core.pyd.bak").exists()
 
 

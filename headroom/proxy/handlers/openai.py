@@ -3992,9 +3992,10 @@ class OpenAIHandlerMixin:
         # a buffered stream:false upstream call so retrieval can be resolved
         # server-side, then reconstruct a minimal SSE stream for the client.
         # Mirrors AnthropicHandler's buffered_stream_ccr decision.
-        _ccr_handler_config = getattr(self.ccr_response_handler, "config", None)
+        _ccr_response_handler = getattr(self, "ccr_response_handler", None)
+        _ccr_handler_config = getattr(_ccr_response_handler, "config", None)
         _ccr_response_handler_enabled = bool(
-            self.ccr_response_handler and getattr(_ccr_handler_config, "enabled", True)
+            _ccr_response_handler and getattr(_ccr_handler_config, "enabled", True)
         )
         buffered_stream_ccr = bool(
             stream
@@ -4109,10 +4110,10 @@ class OpenAIHandlerMixin:
                 # retrieve call never gets treated as an unresolved tool_call
                 # by the memory-tool branch.
                 if (
-                    self.ccr_response_handler
+                    _ccr_response_handler
                     and resp_json
                     and response.status_code == 200
-                    and self.ccr_response_handler.has_ccr_tool_calls(resp_json, "openai_responses")
+                    and _ccr_response_handler.has_ccr_tool_calls(resp_json, "openai_responses")
                 ):
                     logger.info(
                         f"[{request_id}] CCR: Detected retrieval tool call (responses), handling..."
@@ -4164,7 +4165,7 @@ class OpenAIHandlerMixin:
                         return cont_response.json()
 
                     try:
-                        final_resp_json = await self.ccr_response_handler.handle_response(
+                        final_resp_json = await _ccr_response_handler.handle_response(
                             resp_json,
                             _responses_input_to_items(body.get("input")),
                             body.get("tools"),
@@ -4363,7 +4364,7 @@ class OpenAIHandlerMixin:
                         for k, v in response_headers.items()
                         if k.lower() not in ("content-length", "content-type")
                     }
-                    if self.ccr_response_handler and self.ccr_response_handler.has_ccr_tool_calls(
+                    if _ccr_response_handler and _ccr_response_handler.has_ccr_tool_calls(
                         resp_json, "openai_responses"
                     ):
                         # Handling above didn't fully resolve the retrieve

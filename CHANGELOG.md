@@ -15,6 +15,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never the directory entry the rename created, leaving the rename itself
   non-durable on POSIX. Best-effort — a no-op on Windows and virtual
   filesystems where directory fsync is unsupported.
+- **cache:** the fallback session id now keys on the first user turn in
+  addition to the system prompt, so unrelated conversations that ship the
+  same fixed system prompt no longer collide. Clients with a single static
+  "agent constitution" system prompt and no per-conversation system block
+  previously collapsed every conversation onto one `session_id`, sharing a
+  `PrefixCacheTracker` and bleeding frozen-prefix / sticky-header state across
+  unrelated turns — a brand-new conversation could inherit another's
+  frozen-message count and have its leading messages force-frozen (compression
+  silently disabled). #1827 fixed only the case where the *system* content
+  differed between conversations; the first user message is the stable,
+  distinguishing anchor for the identical-system case. Explicit
+  `x-headroom-session-id` still takes priority
+  ([#1808](https://github.com/chopratejas/headroom/issues/1808)).
 
 ### Changed
 

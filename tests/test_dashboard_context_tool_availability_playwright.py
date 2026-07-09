@@ -183,7 +183,12 @@ def test_dashboard_session_view_shows_real_zero_row_when_installed_but_zero() ->
 
         expect(page.get_by_text("RTK 0 this session (0.0%)", exact=True)).to_be_visible()
         expect(page.get_by_text("RTK not installed", exact=True)).to_have_count(0)
-        expect(page.get_by_text("not installed", exact=True)).to_have_count(0)
+        # The Token Usage panel's "not installed" row uses `x-show`, which
+        # toggles CSS display and keeps the node in the DOM (unlike the
+        # ternary-swapped "RTK not installed" text above, which is genuinely
+        # absent). Assert hidden, not absent, matching the repo's existing
+        # `x-show` convention in tests/test_dashboard_cache_lifetime_playwright.py.
+        expect(page.get_by_text("not installed", exact=True)).to_be_hidden()
 
         browser.close()
 

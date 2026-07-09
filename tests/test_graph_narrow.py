@@ -459,3 +459,107 @@ def test_get_live_graph_does_not_start_duplicate_watchers_under_concurrency(
 
     assert start_calls["n"] == 1, f"watcher.start() called {start_calls['n']} times, expected 1"
     assert len(gc._live_watchers) == 1
+
+
+# =============================================================================
+# Regression: kept-line matching must respect path boundaries, not do a raw
+# substring check. Found via deep heuristic stress-testing: a related
+# root-level file (e.g. `util.py`) substring-matched inside an UNRELATED
+# file whose name merely ends with the same characters (`network_util.py`),
+# wrongly keeping its line in the narrowed output.
+# =============================================================================
+
+
+def test_unrelated_file_with_overlapping_suffix_is_not_wrongly_kept(
+    fake_workspace: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`network_util.py` must never be kept just because `util.py` (a
+    related file) is a substring of its name. Requires files at the SAME
+    directory level (root) with no directory prefix to disambiguate --
+    that's exactly the case a naive `f in line` substring check misses.
+    """
+    root = tmp_path / "proj"
+    root.mkdir(parents=True)
+    (root / "main.py").write_text("import util\n", encoding="utf-8")
+    (root / "util.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (root / "network_util.py").write_text("Z = 1\n", encoding="utf-8")
+    monkeypatch.chdir(root)
+
+    router = ContentRouter()
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "main.py"}}
+            ],
+        },
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "r1", "content": "..."}]},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "g1", "name": "Grep", "input": {"pattern": "Z"}}],
+        },
+    ]
+    router._build_tool_name_map(messages)
+
+    lines = [f"noise_{i}.py:{i}: filler line {i}" for i in range(38)]
+    lines.append("main.py:1: import util")
+    lines.append("util.py:1: VALUE = 1")
+    lines.append("network_util.py:1: Z = 1")  # the trap: NOT related, name ends with "util.py"
+    dump = "\n".join(lines)
+
+    narrowed = router._graph_narrow("grep", "g1", dump)
+
+    assert narrowed is not None
+    assert "main.py" in narrowed
+    assert "util.py:1: VALUE" in narrowed
+    assert "network_util.py" not in narrowed
+
+
+def test_known_limitation_bare_filename_without_directory_prefix_may_drop(
+    fake_workspace: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Documents an accepted trade-off, not a bug to fix: a related NESTED
+    file (`pkg/util.py`) shown in the tool output as a bare filename
+    (`util.py`, no `pkg/` prefix -- e.g. a search tool run from within that
+    file's own directory) will NOT be matched by the path-boundary check.
+
+    Matching bare basenames too would reopen the exact suffix-collision
+    false positive the test above guards against (`util.py` would then also
+    match `network_util.py`). Precision (never wrongly keep an unrelated
+    file) was chosen over recall (never miss a related one shown without
+    its directory) -- this test pins that choice down so it doesn't shift
+    silently in either direction later.
+    """
+    root = tmp_path / "proj"
+    (root / "pkg").mkdir(parents=True)
+    (root / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    monkeypatch.chdir(root)
+    (root / "main.py").write_text("from pkg import util\n", encoding="utf-8")
+    (root / "pkg" / "util.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    router = ContentRouter()
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "main.py"}}
+            ],
+        },
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "r1", "content": "..."}]},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "g1", "name": "Grep", "input": {"pattern": "Z"}}],
+        },
+    ]
+    router._build_tool_name_map(messages)
+
+    lines = [f"noise_{i}.py:{i}: filler line {i}" for i in range(38)]
+    lines.append("main.py:1: from pkg import util")
+    lines.append("util.py:1: VALUE = 1")  # bare filename, no "pkg/" prefix
+    dump = "\n".join(lines)
+
+    narrowed = router._graph_narrow("grep", "g1", dump)
+
+    # Only "main.py" clears the 2-line floor, so this currently no-ops --
+    # pinning today's accepted behavior, not asserting it's ideal.
+    assert narrowed is None

@@ -1,11 +1,27 @@
 """Graph-scoped context builder — a Graphify-style proxy in front of the LLM.
 
 Instead of reading every file in a project, this module builds (or loads
-from cache) a directed import graph over the project's Python files — nodes
-are files, edges are internal (project-local) imports extracted via AST.
-From a user-supplied entrypoint, it walks the graph with a depth-bounded BFS
-and concatenates the full contents of every file reached into one context
+from cache) a directed import graph over the project's source files — nodes
+are files, edges are internal (project-local) imports/includes. From a
+user-supplied entrypoint, it walks the graph with a depth-bounded BFS and
+concatenates the full contents of every file reached into one context
 string, ready to be injected into an LLM prompt alongside the user's query.
+
+Python gets full AST-based import resolution (handles relative imports,
+``from X import Y`` submodule-vs-attribute ambiguity, etc.). Every other
+supported language (JS/TS, Rust, C/C++) gets a deliberately simple regex
+scan for its own import/include syntax — good enough to catch the common,
+literal cases (``import x from './y'``, ``mod foo;``, ``#include "foo.h"``)
+but not a real parser. Known unresolved cases, all of which just yield
+*fewer* edges (never wrong ones): JS/TS dynamic ``import('./x')`` and
+bundler path aliases (``@/x``), Rust ``use crate::`` paths (only ``mod``
+declarations are file-graph edges and those are caught), and macro- or
+``<system>``-style C includes. A miss here just means that file's edges
+are incomplete, not wrong — same fail-open philosophy as the Python path's
+entrypoint detection. Note the regex scanners are not comment-aware, so an
+import mentioned inside a comment or a disabled ``#if 0`` block can add a
+spurious edge; that only ever *widens* the neighborhood (keeps an extra
+file), never drops a real one.
 
 External/third-party imports are not resolvable to a project file and are
 simply not added as edges — the graph only ever contains project-internal
@@ -16,9 +32,12 @@ full content of every reachable file is returned verbatim. Bounding total
 size is the caller's (or the LLM API's) responsibility.
 
 The graph is cached under ``headroom.paths.graph_context_cache_dir()``,
-keyed by content hashes of every ``.py`` file under the project root. Any
-file addition, removal, or edit invalidates the cache and triggers a
-rebuild; an unchanged tree is loaded straight from cache.
+keyed by content hashes of every supported source file under the project
+root. Any file addition, removal, or edit invalidates the cache and
+triggers a rebuild; an unchanged tree is loaded straight from cache. Writes
+to that cache file are atomic (temp file + rename) so a reader never
+observes a half-written file, even with multiple Headroom processes
+sharing the same cache path.
 """
 
 from __future__ import annotations
@@ -27,7 +46,10 @@ import ast
 import hashlib
 import json
 import logging
+import os
+import re
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,7 +70,24 @@ _IGNORED_DIRS = {
     ".mypy_cache",
     ".pytest_cache",
     ".ruff_cache",
+    "target",  # Rust/Java build output
+    "dist",
+    "build",
 }
+
+# ---------------------------------------------------------------------------
+# Multi-language support. Python uses real AST parsing (see `_extract_imports`
+# below); every other extension here goes through the regex-based extractors
+# in the "Multi-language regex fallback" section further down. Keep this in
+# sync with the (deliberately separate, lazily-imported) entrypoint-detection
+# regex in `headroom.transforms.content_router` if you add a language here.
+# ---------------------------------------------------------------------------
+PYTHON_EXTENSIONS = frozenset({".py"})
+JS_TS_EXTENSIONS = frozenset({".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"})
+RUST_EXTENSIONS = frozenset({".rs"})
+C_CPP_EXTENSIONS = frozenset({".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"})
+
+SOURCE_EXTENSIONS = PYTHON_EXTENSIONS | JS_TS_EXTENSIONS | RUST_EXTENSIONS | C_CPP_EXTENSIONS
 
 
 @dataclass
@@ -102,19 +141,95 @@ def _cache_path(root: Path) -> Path:
     return graph_context_cache_dir() / f"{_cache_key(root)}.json"
 
 
-def _hash_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def _hash_file(path: Path) -> str | None:
+    """SHA-256 of the file's bytes, or None if it can't be read.
+
+    Returns None (rather than raising) when the file vanished or became
+    unreadable between directory enumeration and this call — a real race
+    when an agent edits/deletes files while the proxy rebuilds the graph.
+    Callers skip a None-hashed file, so a mid-build delete degrades to
+    "that file isn't in this graph revision" instead of crashing the build.
+    """
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
 
 
-def _iter_python_files(root: Path):
-    for path in root.rglob("*.py"):
-        if set(path.relative_to(root).parts) & _IGNORED_DIRS:
-            continue
-        yield path
+def _iter_source_files(root: Path):
+    """Every supported source file under ``root``, any of the languages in
+    `SOURCE_EXTENSIONS`, skipping ignored/build/vendor directories.
+
+    Uses ``os.walk`` (not ``Path.rglob``) for two reasons that matter on the
+    supported Python range (>=3.10):
+
+    * **Symlink safety.** ``os.walk`` defaults to ``followlinks=False`` on
+      every version, so a directory symlink cycle can never make this loop
+      forever. ``Path.rglob("*")`` expands to a ``**`` glob that *does*
+      follow symlinks before Python 3.13 (the ``recurse_symlinks=False``
+      default only exists from 3.13 on) — a symlink loop there would hang
+      the build. ``os.walk`` sidesteps that entirely.
+    * **Pruning.** Ignored/vendor dirs (``node_modules``, ``.git``,
+      ``target``, …) are pruned from ``dirnames`` in place, so the walk
+      never descends into them at all — instead of walking the whole tree
+      and filtering per file. On a real repo with a big ``node_modules``
+      that is the difference between milliseconds and seconds.
+    """
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _IGNORED_DIRS]
+        for name in filenames:
+            if Path(name).suffix.lower() in SOURCE_EXTENSIONS:
+                candidate = Path(dirpath) / name
+                if candidate.is_file():
+                    yield candidate
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """Write ``data`` as JSON to ``path`` without a reader ever seeing a
+    partial file — write to a uniquely-named temp file in the same
+    directory, then rename over the target. `Path.replace` maps to a single
+    atomic filesystem rename on both POSIX and Windows, so concurrent
+    Headroom processes/threads racing to refresh the same cache file always
+    resolve to "last writer wins, but always a complete, valid JSON file" —
+    never a half-written one.
+
+    Verified under real concurrency (many threads racing to refresh the
+    same cache path): Windows' ``MoveFileEx`` (what ``os.replace`` calls)
+    can transiently raise ``PermissionError`` when another thread/process
+    has the target open at the exact same instant, even though the rename
+    itself is atomic once it succeeds — POSIX rename has no such window.
+    Retried a few times with a short backoff before giving up; harmless
+    (never triggers) on POSIX.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
+    try:
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        last_exc: OSError | None = None
+        for attempt in range(5):
+            try:
+                tmp.replace(path)
+                return
+            except PermissionError as exc:
+                last_exc = exc
+                time.sleep(0.02 * (attempt + 1))
+        raise last_exc  # type: ignore[misc]
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _current_hashes(root: Path) -> dict[str, str]:
-    return {f.relative_to(root).as_posix(): _hash_file(f) for f in _iter_python_files(root)}
+    result: dict[str, str] = {}
+    for f in _iter_source_files(root):
+        h = _hash_file(f)
+        if h is not None:  # skip files that vanished mid-scan (see _hash_file)
+            result[f.relative_to(root).as_posix()] = h
+    return result
 
 
 def _file_for(candidate: Path) -> Path | None:
@@ -190,17 +305,180 @@ def _extract_imports(root: Path, file_path: Path) -> list[Path]:
     return resolved
 
 
+# ---------------------------------------------------------------------------
+# Multi-language regex fallback (JS/TS, Rust, C/C++). Deliberately simple:
+# one regex per language's import/include syntax, resolved against the
+# filesystem the same way the Python path does (relative-first, verified by
+# `is_file()` before ever being added as an edge). No bundler alias
+# resolution, no Rust `use crate::` path resolution, no macro expansion —
+# those need real per-language tooling; this catches the literal, common
+# case cheaply, and silently produces fewer edges (not wrong ones) when it
+# can't resolve something.
+# ---------------------------------------------------------------------------
+
+# `import ... from "x"` / `export ... from "x"` / `require("x")` / dynamic
+# `import("x")`. The dynamic-import alternation was added after an audit
+# found `import('./x')` silently dropped; captured into group 3.
+_JS_IMPORT_RE = re.compile(
+    r"""(?:^|[;\s])(?:import|export)(?:[^'";]*?\bfrom\s*)?['"]([^'"]+)['"]"""
+    r"""|require\(\s*['"]([^'"]+)['"]\s*\)"""
+    r"""|import\(\s*['"]([^'"]+)['"]\s*\)""",
+    re.MULTILINE,
+)
+_RUST_MOD_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;", re.MULTILINE)
+_C_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.MULTILINE)
+
+_JS_RESOLVE_SUFFIXES = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+
+# Comment strippers — run before the import/include scan so a spec mentioned
+# inside a comment can't create a spurious edge (an audit found both
+# `// import x from "./dead"` in JS and `#if 0 ... #include "dead.h"` in C
+# producing false edges). Deliberately lightweight, NOT a real lexer:
+# `/* */` uses non-greedy DOTALL, `//` runs to end of line. A `//` sitting
+# inside a string literal would be over-stripped, but that only ever
+# truncates a NON-import tail of the line (a relative import spec never
+# contains `//`), so it can't drop a real edge — same fail-open direction
+# as everything else here.
+_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
+# Best-effort removal of literal `#if 0 ... #endif` blocks (non-nested) so a
+# disabled C include isn't scanned. Nested/`#elif` cases fall through — they
+# only ever add an edge, never drop one.
+_C_IF0_RE = re.compile(r"^\s*#\s*if\s+0\b.*?^\s*#\s*endif\b[^\n]*", re.DOTALL | re.MULTILINE)
+
+
+def _strip_c_like_comments(text: str) -> str:
+    return _LINE_COMMENT_RE.sub("", _BLOCK_COMMENT_RE.sub("", text))
+
+
+def _read_text_lenient(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+
+
+def _resolve_js_import(importer: Path, spec: str) -> Path | None:
+    """Resolve a relative JS/TS import specifier (``./x``, ``../y/z``).
+
+    Bare specifiers (package names, path aliases like ``@/x``) are external
+    or need bundler config to resolve — deliberately not attempted here.
+    """
+    if not spec.startswith("."):
+        return None
+    base = importer.parent / spec
+    if base.is_file():
+        return base
+    for suf in _JS_RESOLVE_SUFFIXES:
+        candidate = base.with_name(base.name + suf)
+        if candidate.is_file():
+            return candidate
+    if base.is_dir():
+        for suf in _JS_RESOLVE_SUFFIXES:
+            candidate = base / f"index{suf}"
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def _extract_js_imports(file_path: Path) -> list[Path]:
+    text = _read_text_lenient(file_path)
+    if text is None:
+        return []
+    text = _strip_c_like_comments(text)  # kill comment-mention false positives
+    resolved: list[Path] = []
+    for match in _JS_IMPORT_RE.finditer(text):
+        spec = match.group(1) or match.group(2) or match.group(3)  # static / require / dynamic
+        if not spec:
+            continue
+        target = _resolve_js_import(file_path, spec)
+        if target is not None:
+            resolved.append(target)
+    return resolved
+
+
+def _resolve_rust_mod(importer: Path, name: str) -> Path | None:
+    """Resolve ``mod name;`` to ``name.rs`` or ``name/mod.rs`` next to the importer.
+
+    This is the actual file-graph edge in Rust (``mod`` is what pulls a file
+    into the crate); ``use`` only imports symbols that a ``mod`` already
+    declared, so it's not a separate edge and isn't scanned for.
+    """
+    sibling = importer.parent / f"{name}.rs"
+    if sibling.is_file():
+        return sibling
+    nested = importer.parent / name / "mod.rs"
+    if nested.is_file():
+        return nested
+    return None
+
+
+def _extract_rust_imports(file_path: Path) -> list[Path]:
+    text = _read_text_lenient(file_path)
+    if text is None:
+        return []
+    resolved = []
+    for match in _RUST_MOD_RE.finditer(text):
+        target = _resolve_rust_mod(file_path, match.group(1))
+        if target is not None:
+            resolved.append(target)
+    return resolved
+
+
+def _resolve_c_include(root: Path, importer: Path, spec: str) -> Path | None:
+    """Resolve ``#include "spec"`` (quoted/local only — ``<system.h>`` skipped)."""
+    local = importer.parent / spec
+    if local.is_file():
+        return local
+    from_root = root / spec
+    if from_root.is_file():
+        return from_root
+    return None
+
+
+def _extract_c_includes(root: Path, file_path: Path) -> list[Path]:
+    text = _read_text_lenient(file_path)
+    if text is None:
+        return []
+    text = _C_IF0_RE.sub("", _strip_c_like_comments(text))  # drop comments + `#if 0` blocks
+    resolved = []
+    for match in _C_INCLUDE_RE.finditer(text):
+        target = _resolve_c_include(root, file_path, match.group(1))
+        if target is not None:
+            resolved.append(target)
+    return resolved
+
+
+def _extract_imports_any(root: Path, file_path: Path) -> list[Path]:
+    """Dispatch to the right extractor for ``file_path``'s extension."""
+    suffix = file_path.suffix.lower()
+    if suffix in PYTHON_EXTENSIONS:
+        return _extract_imports(root, file_path)
+    if suffix in JS_TS_EXTENSIONS:
+        return _extract_js_imports(file_path)
+    if suffix in RUST_EXTENSIONS:
+        return _extract_rust_imports(file_path)
+    if suffix in C_CPP_EXTENSIONS:
+        return _extract_c_includes(root, file_path)
+    return []
+
+
 def build_graph(root: Path) -> ProjectGraph:
-    """Build the import graph for every ``.py`` file under ``root`` (no cache)."""
+    """Build the import graph for every supported source file under ``root`` (no cache)."""
 
     root = root.resolve()
     edges: dict[str, list[str]] = {}
     file_hashes: dict[str, str] = {}
 
-    for file_path in _iter_python_files(root):
+    for file_path in _iter_source_files(root):
+        file_hash = _hash_file(file_path)
+        if file_hash is None:
+            # Vanished between enumeration and hashing (race with an agent
+            # editing the tree) — just omit it from this graph revision.
+            continue
         rel = file_path.relative_to(root).as_posix()
-        file_hashes[rel] = _hash_file(file_path)
-        deps = _extract_imports(root, file_path)
+        file_hashes[rel] = file_hash
+        deps = _extract_imports_any(root, file_path)
         edges[rel] = sorted({d.relative_to(root).as_posix() for d in deps})
 
     return ProjectGraph(root=root, edges=edges, file_hashes=file_hashes)
@@ -222,16 +500,23 @@ def load_or_build_graph(root: Path) -> ProjectGraph:
             return cached
 
     graph = build_graph(root)
-    cache_file.parent.mkdir(parents=True, exist_ok=True)
-    cache_file.write_text(json.dumps(graph.to_dict(), indent=2), encoding="utf-8")
+    try:
+        _atomic_write_json(cache_file, graph.to_dict())
+    except OSError as exc:
+        # The in-memory graph is already correct and returned below either
+        # way -- persisting it is best-effort. A transient write failure
+        # (e.g. a concurrent writer racing for the same path) just means
+        # the NEXT call rebuilds instead of hitting a fresh cache; it must
+        # never fail the caller who only asked for the graph.
+        logger.debug("graph_context: failed to persist cache for %s: %s", root, exc)
     return graph
 
 
 # ---------------------------------------------------------------------------
 # Push-based live graph (proxy usage): a background watchdog observer keeps
 # an in-memory ProjectGraph current, so a long-running process (the proxy)
-# never re-hashes every .py file per request -- it just reads whatever the
-# watcher last cached. Falls back to `load_or_build_graph` (the pull/hash
+# never re-hashes every source file per request -- it just reads whatever
+# the watcher last cached. Falls back to `load_or_build_graph` (the pull/hash
 # model above) when `watchdog` isn't installed or a watcher fails to start.
 # One-shot callers (the CLI) have no use for a background thread and should
 # keep calling `load_or_build_graph`/`assemble_context` directly.
@@ -242,6 +527,15 @@ _live_graphs: dict[Path, ProjectGraph] = {}
 _live_watchers: dict[Path, "GraphContextWatcher"] = {}
 
 _WATCH_DEBOUNCE_SECONDS = 2.0
+# Cap on how many project roots are watched at once. A single proxy normally
+# watches one root (its cwd), but a long-lived process that hops between many
+# projects would otherwise accumulate one background Observer thread per root
+# forever. When the cap is exceeded the oldest watcher is stopped (FIFO —
+# dict preserves insertion order). Overridable via env for unusual setups.
+try:
+    _MAX_LIVE_ROOTS = max(1, int(os.environ.get("HEADROOM_GRAPH_MAX_WATCHED_ROOTS", "16")))
+except ValueError:
+    _MAX_LIVE_ROOTS = 16
 
 
 def _rebuild_live(root: Path) -> None:
@@ -263,9 +557,7 @@ def _rebuild_live(root: Path) -> None:
         _live_graphs[root] = graph
 
     try:
-        cache_file = _cache_path(root)
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
-        cache_file.write_text(json.dumps(graph.to_dict(), indent=2), encoding="utf-8")
+        _atomic_write_json(_cache_path(root), graph.to_dict())
     except OSError as exc:
         logger.debug("graph_context: failed to persist live graph for %s: %s", root, exc)
 
@@ -303,7 +595,7 @@ class GraphContextWatcher:
         class _Handler(FileSystemEventHandler):
             def on_any_event(self, event: Any) -> None:
                 src_path = getattr(event, "src_path", "")
-                if not src_path or not src_path.endswith(".py"):
+                if not src_path or Path(src_path).suffix.lower() not in SOURCE_EXTENSIONS:
                     return
                 if set(Path(src_path).parts) & _IGNORED_DIRS:
                     return
@@ -365,6 +657,7 @@ def get_live_graph(root: Path) -> ProjectGraph:
     # dict insert); the slow part (`watcher.start()`, which hashes/builds
     # the tree) runs OUTSIDE the lock so concurrent callers for OTHER roots
     # are never blocked on it.
+    evicted: list[tuple[Path, GraphContextWatcher]] = []
     with _live_lock:
         cached = _live_graphs.get(root)
         if cached is not None:
@@ -374,6 +667,19 @@ def get_live_graph(root: Path) -> ProjectGraph:
         if existing_watcher is None:
             reserved_watcher = GraphContextWatcher(root)
             _live_watchers[root] = reserved_watcher
+            # Evict oldest roots over the cap (FIFO). Collect victims under
+            # the lock; stop them OUTSIDE it (stop() joins a thread).
+            while len(_live_watchers) > _MAX_LIVE_ROOTS:
+                old_root, old_watcher = next(iter(_live_watchers.items()))
+                if old_root == root:
+                    break  # never evict the one we just reserved
+                _live_watchers.pop(old_root, None)
+                _live_graphs.pop(old_root, None)
+                evicted.append((old_root, old_watcher))
+
+    for old_root, old_watcher in evicted:
+        old_watcher.stop()
+        logger.debug("graph_context: evicted watcher for %s (over cap %d)", old_root, _MAX_LIVE_ROOTS)
 
     if existing_watcher is not None:
         # Another caller already owns this root's watcher (starting or
@@ -456,7 +762,12 @@ def assemble_context(
 
     sections = []
     for rel in files:
-        content = (root / rel).read_text(encoding="utf-8")
+        try:
+            content = (root / rel).read_text(encoding="utf-8")
+        except OSError:
+            # File vanished/unreadable since the graph was built — skip it
+            # rather than fail the whole context assembly.
+            continue
         sections.append(f"---- Arquivo: {rel} ----\n{content}")
 
     return GraphContextResult(
@@ -470,6 +781,11 @@ def assemble_context(
 
 __all__ = [
     "DEFAULT_MAX_DEPTH",
+    "SOURCE_EXTENSIONS",
+    "PYTHON_EXTENSIONS",
+    "JS_TS_EXTENSIONS",
+    "RUST_EXTENSIONS",
+    "C_CPP_EXTENSIONS",
     "ProjectGraph",
     "GraphContextResult",
     "GraphContextWatcher",

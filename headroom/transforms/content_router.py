@@ -70,15 +70,40 @@ logger = logging.getLogger(__name__)
 
 _detect_backend_warned = False
 
-# Matches a plausible Python source path (e.g. ``src/pkg/mod.py``) inside tool
-# args/output, used by ``ContentRouter._detect_graph_entrypoint``.
-_PY_PATH_RE = re.compile(r"[\w./\\-]+\.py")
+# Matches a plausible source path (e.g. ``src/pkg/mod.py``) inside tool
+# args/output, used by ``ContentRouter._detect_graph_entrypoint``. Extension
+# alternation must be kept in sync with `headroom.graph_context.
+# SOURCE_EXTENSIONS` — duplicated (not imported) so this module-level regex
+# doesn't force an eager import of graph_context into every content_router
+# user; graph_context itself is still only ever lazily imported inside the
+# `_graph_narrow*` methods.
+_SOURCE_PATH_RE = re.compile(
+    r"[\w./\\-]+\.(?:py|jsx?|mjs|cjs|tsx?|rs|c|h|cpp|cc|cxx|hpp|hh|hxx)"
+)
 
 
-def _first_py_path(text: str) -> str | None:
-    """First ``.py``-looking path substring in ``text``, or None."""
-    match = _PY_PATH_RE.search(text)
+def _first_source_path(text: str) -> str | None:
+    """First source-file-looking path substring in ``text``, or None."""
+    match = _SOURCE_PATH_RE.search(text)
     return match.group(0) if match else None
+
+
+def _line_mentions_path(line: str, rel_path: str) -> bool:
+    """True if ``line`` references ``rel_path`` as a whole path segment.
+
+    A plain substring check (``rel_path in line``) false-positives whenever
+    one related file's name is a suffix of an unrelated file's name in the
+    SAME directory — e.g. a related root-level ``util.py`` would substring-
+    match inside an unrelated ``network_util.py``, wrongly keeping that
+    line. Requires the match to start at the beginning of the line or right
+    after a path separator, and end at a path separator/delimiter or the
+    end of the line, so ``util.py`` only matches an actual ``util.py``
+    path component, never a filename that merely ends with those
+    characters. Caller is expected to have already normalized ``line`` to
+    forward slashes.
+    """
+    pattern = r"(?:^|[/\\])" + re.escape(rel_path) + r"(?:[:/\\\s]|$)"
+    return re.search(pattern, line) is not None
 _detect_panic_warned = False
 _detect_native_unhealthy = False  # circuit breaker: native detect hung once (#575)
 
@@ -3196,7 +3221,7 @@ class ContentRouter(Transform):
                         if args:
                             args_map[tc_id] = args
                             if name in _READ_TOOL_NAMES:
-                                self._last_read_path = _first_py_path(args) or self._last_read_path
+                                self._last_read_path = _first_source_path(args) or self._last_read_path
                         command = _tool_call_command_text(fn.get("arguments"))
                         if command:
                             commands_map[tc_id] = command
@@ -3214,7 +3239,7 @@ class ContentRouter(Transform):
                             if args:
                                 args_map[tc_id] = args
                                 if name in _READ_TOOL_NAMES:
-                                    self._last_read_path = _first_py_path(args) or self._last_read_path
+                                    self._last_read_path = _first_source_path(args) or self._last_read_path
                             command = _tool_call_command_text(block.get("input"))
                             if command:
                                 commands_map[tc_id] = command
@@ -4240,7 +4265,7 @@ class ContentRouter(Transform):
         except KeyError:
             return None
 
-        kept = [line for line in lines if any(f in line.replace("\\", "/") for f in related)]
+        kept = [line for line in lines if any(_line_mentions_path(line.replace("\\", "/"), f) for f in related)]
         if len(kept) < 2 or len(kept) >= len(lines):
             return None  # nothing to gain, or the filter matched everything
         kept_text = "\n".join(kept)
@@ -4373,7 +4398,7 @@ class ContentRouter(Transform):
         for text in (self._last_read_path or "", self._tool_call_args.get(tool_call_id, "")):
             if not text:
                 continue
-            candidate = _first_py_path(text)
+            candidate = _first_source_path(text)
             if candidate is None:
                 continue
             candidate = candidate.replace("\\", "/").lstrip("./")
@@ -4432,7 +4457,7 @@ class ContentRouter(Transform):
         except KeyError:
             return None
 
-        kept = [line for line in lines if any(f in line.replace("\\", "/") for f in related)]
+        kept = [line for line in lines if any(_line_mentions_path(line.replace("\\", "/"), f) for f in related)]
         if len(kept) < 2 or len(kept) >= len(lines):
             return None  # nothing to gain, or the filter matched everything
 

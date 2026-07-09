@@ -213,3 +213,289 @@ def test_stop_all_watchers_clears_state(fake_workspace: Path, project: Path) -> 
 
     assert gc._live_watchers == {}
     assert gc._live_graphs == {}
+
+
+# =============================================================================
+# Multi-language regex fallback (JS/TS, Rust, C/C++). Python keeps real AST
+# parsing; these three get a deliberately simple regex scan for their own
+# import/include syntax -- see the module docstring for what it does and
+# doesn't resolve.
+# =============================================================================
+
+
+@pytest.fixture
+def multilang_project(tmp_path: Path) -> Path:
+    """A tiny project in 4 languages, each with a main -> util edge and an
+    unrelated sibling file that must never show up in the neighborhood."""
+
+    root = tmp_path / "multilang"
+    root.mkdir(parents=True)
+
+    (root / "main.ts").write_text(
+        'import { value } from "./util";\nconsole.log(value());\n', encoding="utf-8"
+    )
+    (root / "util.ts").write_text("export function value() { return 1; }\n", encoding="utf-8")
+    (root / "unrelated.ts").write_text("export const Z = 1;\n", encoding="utf-8")
+
+    (root / "main.rs").write_text("mod util;\nfn main() { util::value(); }\n", encoding="utf-8")
+    (root / "util.rs").write_text("pub fn value() -> i32 { 1 }\n", encoding="utf-8")
+
+    (root / "main.c").write_text(
+        '#include "util.h"\nint main() { return value(); }\n', encoding="utf-8"
+    )
+    (root / "util.h").write_text("int value();\n", encoding="utf-8")
+
+    return root
+
+
+def test_js_ts_relative_import_becomes_an_edge(multilang_project: Path) -> None:
+    graph = gc.build_graph(multilang_project)
+
+    assert graph.edges["main.ts"] == ["util.ts"]
+    assert "unrelated.ts" not in graph.edges["main.ts"]
+    assert gc.bfs_related_files(graph, "main.ts", max_depth=2) == ["main.ts", "util.ts"]
+
+
+def test_rust_mod_declaration_becomes_an_edge(multilang_project: Path) -> None:
+    graph = gc.build_graph(multilang_project)
+
+    assert graph.edges["main.rs"] == ["util.rs"]
+    assert gc.bfs_related_files(graph, "main.rs", max_depth=2) == ["main.rs", "util.rs"]
+
+
+def test_c_local_include_becomes_an_edge(multilang_project: Path) -> None:
+    graph = gc.build_graph(multilang_project)
+
+    assert graph.edges["main.c"] == ["util.h"]
+    assert gc.bfs_related_files(graph, "main.c", max_depth=2) == ["main.c", "util.h"]
+
+
+def test_js_bare_package_specifier_is_not_resolved(multilang_project: Path) -> None:
+    """`import x from "react"` is a package, not a project file -- must not
+    become an edge (there's nothing on disk to resolve it to anyway)."""
+
+    (multilang_project / "with_package_import.ts").write_text(
+        'import React from "react";\nimport { value } from "./util";\n', encoding="utf-8"
+    )
+    graph = gc.build_graph(multilang_project)
+
+    assert graph.edges["with_package_import.ts"] == ["util.ts"]
+
+
+def test_c_system_include_is_not_resolved(multilang_project: Path) -> None:
+    """`#include <stdio.h>` is a system header -- must not become an edge."""
+
+    (multilang_project / "with_system_include.c").write_text(
+        '#include <stdio.h>\n#include "util.h"\n', encoding="utf-8"
+    )
+    graph = gc.build_graph(multilang_project)
+
+    assert graph.edges["with_system_include.c"] == ["util.h"]
+
+
+def test_project_with_no_python_files_still_builds_a_real_graph(
+    fake_workspace: Path, multilang_project: Path
+) -> None:
+    """Regression guard: before multi-language support, a project with zero
+    `.py` files produced a completely empty graph (0 nodes, 0 edges) --
+    every entrypoint lookup failed and the narrowing feature was silently
+    inert. This is the exact scenario reported as a limitation."""
+
+    graph = gc.load_or_build_graph(multilang_project)
+
+    assert len(graph.edges) > 0
+    assert "main.ts" in graph.edges
+    assert "main.rs" in graph.edges
+    assert "main.c" in graph.edges
+
+
+def test_dynamic_js_import_is_resolved(multilang_project: Path) -> None:
+    """`import('./x')` dynamic imports ARE captured (the regex was extended
+    in the pre-PR audit). Guards against a regression back to dropping them."""
+
+    (multilang_project / "dyn.ts").write_text(
+        "const mod = import('./util');\n", encoding="utf-8"
+    )
+    graph = gc.build_graph(multilang_project)
+
+    assert graph.edges["dyn.ts"] == ["util.ts"]
+
+
+def test_js_import_inside_a_comment_is_not_an_edge(multilang_project: Path) -> None:
+    """Line and block comments are stripped before scanning, so an import
+    mentioned only inside a comment must not create a spurious edge --
+    while a real import with a trailing comment still resolves."""
+
+    (multilang_project / "commented.ts").write_text(
+        '// import { value } from "./util";\n'
+        '/* import { value } from "./util"; */\n'
+        "export const C = 1;\n",
+        encoding="utf-8",
+    )
+    (multilang_project / "trailing.ts").write_text(
+        'import { value } from "./util"; // keep this one\n', encoding="utf-8"
+    )
+    graph = gc.build_graph(multilang_project)
+
+    assert graph.edges["commented.ts"] == []  # comment-only mention -> no edge
+    assert graph.edges["trailing.ts"] == ["util.ts"]  # real import survives
+
+
+def test_c_include_in_disabled_if0_block_is_not_an_edge(tmp_path: Path) -> None:
+    """A `#include` inside a literal `#if 0 ... #endif` block is dropped, but
+    an active include on the same file still resolves."""
+
+    root = tmp_path / "cproj"
+    root.mkdir(parents=True)
+    (root / "main.c").write_text(
+        '#if 0\n#include "disabled.h"\n#endif\n#include "active.h"\nint main(){return 0;}\n',
+        encoding="utf-8",
+    )
+    (root / "disabled.h").write_text("int d();\n", encoding="utf-8")
+    (root / "active.h").write_text("int a();\n", encoding="utf-8")
+
+    graph = gc.build_graph(root)
+
+    assert graph.edges["main.c"] == ["active.h"]  # disabled.h excluded
+
+
+def test_ignored_and_vendor_dirs_are_pruned_from_the_walk(
+    fake_workspace: Path, tmp_path: Path
+) -> None:
+    """A source file inside `node_modules` / `.git` / `target` must never be
+    a node in the graph. This also exercises the os.walk-based pruning that
+    replaced rglob (which avoids descending into huge vendor trees at all)."""
+
+    root = tmp_path / "proj"
+    (root / "node_modules" / "leftpad").mkdir(parents=True)
+    (root / "target" / "debug").mkdir(parents=True)
+    (root / "src").mkdir(parents=True)
+
+    (root / "src" / "main.py").write_text("import os\n", encoding="utf-8")
+    (root / "node_modules" / "leftpad" / "index.js").write_text("module.exports=1\n", encoding="utf-8")
+    (root / "target" / "debug" / "build.rs").write_text("fn main() {}\n", encoding="utf-8")
+
+    graph = gc.build_graph(root)
+
+    assert "src/main.py" in graph.edges
+    assert not any("node_modules" in f for f in graph.edges)
+    assert not any("target" in f for f in graph.edges)
+
+
+def test_build_graph_does_not_follow_directory_symlink_loops(
+    fake_workspace: Path, tmp_path: Path
+) -> None:
+    """A directory symlink pointing back at its own ancestor must not make
+    the tree walk loop forever. os.walk defaults to followlinks=False on
+    every supported Python (the rglob path this replaced followed symlinks
+    before 3.13). Skipped where the OS won't let us create the symlink
+    (Windows without the privilege), since there's nothing to assert then."""
+
+    root = tmp_path / "proj"
+    root.mkdir(parents=True)
+    (root / "main.py").write_text("import os\n", encoding="utf-8")
+    try:
+        (root / "loop").symlink_to(root, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("cannot create directory symlink on this platform/privilege")
+
+    import time as _time
+
+    start = _time.monotonic()
+    graph = gc.build_graph(root)  # must return promptly, not hang
+    assert _time.monotonic() - start < 5.0
+    assert "main.py" in graph.edges
+
+
+# =============================================================================
+# Atomic cache writes under real concurrency (found a genuine Windows-only
+# transient PermissionError here: os.replace/MoveFileEx can fail when
+# another thread has the target file open at the exact rename instant, even
+# though POSIX rename never has that window. Retried with backoff.)
+# =============================================================================
+
+
+def test_atomic_write_survives_many_concurrent_writers(fake_workspace: Path, tmp_path: Path) -> None:
+    import json
+    import threading
+
+    target = tmp_path / "shared_cache.json"
+    errors: list[Exception] = []
+
+    def writer(n: int) -> None:
+        try:
+            gc._atomic_write_json(target, {"writer": n, "edges": {"a.py": ["b.py"]}})
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(25)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    # Whoever wrote last, the file must be a single complete, valid JSON
+    # object -- never a torn/partial write from an interrupted concurrent one.
+    data = json.loads(target.read_text(encoding="utf-8"))
+    assert "writer" in data
+    assert data["edges"] == {"a.py": ["b.py"]}
+
+
+# =============================================================================
+# Robustness fixes from the pre-PR audit: race-delete tolerance and the
+# watched-roots cap.
+# =============================================================================
+
+
+def test_build_graph_tolerates_file_deleted_mid_hash(
+    fake_workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file vanishing between enumeration and hashing (agent editing the
+    tree while the proxy rebuilds) must degrade to "not in this revision",
+    not crash the build."""
+
+    root = tmp_path / "proj"
+    root.mkdir(parents=True)
+    for i in range(5):
+        (root / f"f{i}.py").write_text("import os\n", encoding="utf-8")
+
+    orig = gc._hash_file
+    state = {"done": False}
+
+    def racing_hash(path: Path):
+        if not state["done"]:
+            state["done"] = True
+            for i in range(5):
+                other = root / f"f{i}.py"
+                if other != path and other.exists():
+                    other.unlink()
+                    break
+        return orig(path)
+
+    monkeypatch.setattr(gc, "_hash_file", racing_hash)
+
+    graph = gc.build_graph(root)  # must not raise
+    assert len(graph.edges) == 4  # the deleted one is simply absent
+
+
+def test_watched_roots_are_capped_with_fifo_eviction(
+    fake_workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """More than `_MAX_LIVE_ROOTS` distinct roots must not leak unbounded
+    background watcher threads -- the oldest is stopped when the cap is hit."""
+
+    monkeypatch.setattr(gc, "_MAX_LIVE_ROOTS", 3)
+
+    roots = []
+    for i in range(6):
+        r = tmp_path / f"proj{i}"
+        r.mkdir(parents=True)
+        (r / "main.py").write_text("import os\n", encoding="utf-8")
+        roots.append(r.resolve())
+        gc.get_live_graph(r)
+
+    assert len(gc._live_watchers) <= 3
+    # Oldest three evicted, newest three kept.
+    assert all(roots[i] not in gc._live_watchers for i in range(3))
+    assert all(roots[i] in gc._live_watchers for i in range(3, 6))

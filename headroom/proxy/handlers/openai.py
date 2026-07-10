@@ -403,6 +403,81 @@ def _json_byte_len(value: Any) -> int:
     return len(_json_debug_dumps(value).encode("utf-8", errors="replace"))
 
 
+def _shape_openai_responses_payload(
+    payload: dict[str, Any],
+    *,
+    model: str,
+    request_id: str,
+) -> tuple[list[str], bool]:
+    """Output shaping for a Responses payload (opt-in, HEADROOM_OUTPUT_SHAPER).
+
+    The Responses counterpart of the Anthropic handler's shaping block:
+    conversation-stable holdout assignment, stratum labelling for the
+    output-savings ledger, then verbosity steering on the ``instructions``
+    tail and ``reasoning.effort`` routing on mechanical continuations.
+
+    Returns ``(labels, mutated)``. ``labels`` are carried on the transforms
+    channel for both arms (the control arm's stratum label is what feeds the
+    ledger's live baseline); ``mutated`` is True only when the payload bytes
+    actually changed, so an unshaped control-arm request never forces a
+    re-serialization of byte-faithful client bytes. Never raises — shaping
+    must not be able to break request forwarding.
+    """
+    try:
+        from headroom.proxy import runtime_env
+        from headroom.proxy.output_savings import (
+            assign_arm,
+            conversation_key_from_responses_body,
+            stratum_key,
+            stratum_label,
+        )
+        from headroom.proxy.output_shaper import (
+            OutputShaperSettings,
+            classify_responses_turn,
+            resolve_verbosity_level,
+            shape_responses_request,
+        )
+
+        settings = OutputShaperSettings.from_env()
+        if not settings.enabled:
+            return [], False
+
+        try:
+            holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
+        except ValueError:
+            holdout = 0.0
+        arm = assign_arm(conversation_key_from_responses_body(payload), holdout)
+
+        turn_kind = classify_responses_turn(payload.get("input")).value
+        approx_input_tokens = len(json.dumps(payload)) // 4
+        stratum = stratum_key(
+            turn_kind=turn_kind,
+            input_tokens=approx_input_tokens,
+            model=model or str(payload.get("model", "")),
+            has_tools=bool(payload.get("tools")),
+        )
+        labels = [stratum_label(arm, stratum)]
+
+        if arm != "treatment":
+            return labels, False
+
+        level, src = resolve_verbosity_level(settings)
+        shape_result = shape_responses_request(payload, settings, level_override=level)
+        if shape_result.changed:
+            labels.extend(shape_result.labels or [])
+            logger.info(
+                "[%s] OutputShaper(responses, L%s/%s): %s",
+                request_id,
+                level,
+                src,
+                shape_result.labels,
+            )
+        return labels, shape_result.changed
+    except Exception:  # pragma: no cover - defensive; never break forwarding
+        logger.warning("[%s] OutputShaper(responses) failed; skipping", request_id, exc_info=True)
+        return [], False
+
+
 def _compact_openai_tool_schema_value(
     value: Any,
     _parent_key: str | None = None,
@@ -1597,8 +1672,18 @@ class OpenAIHandlerMixin:
         timing: dict[str, float] = {}
 
         def _compress():  # noqa: ANN202
+            # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER) runs before
+            # compression so the turn classifier sees the client's input as
+            # sent, and the steering/effort mutations ride the same rewrite
+            # path as compression at every call site (HTTP /v1/responses, WS
+            # first frame, WS subsequent frames). Runs inside the executor
+            # closure so the extra payload serialization stays off the event
+            # loop.
+            shape_labels, shape_mutated = _shape_openai_responses_payload(
+                payload, model=model, request_id=request_id
+            )
             try:
-                return self._compress_openai_responses_payload(
+                result = self._compress_openai_responses_payload(
                     payload,
                     model=model,
                     request_id=request_id,
@@ -1607,11 +1692,25 @@ class OpenAIHandlerMixin:
             except TypeError as exc:
                 if "unexpected keyword argument 'timing'" not in str(exc):
                     raise
-                return self._compress_openai_responses_payload(
+                result = self._compress_openai_responses_payload(
                     payload,
                     model=model,
                     request_id=request_id,
                 )
+            if shape_labels:
+                # Carry the shaper labels on the transforms channel so the
+                # outcome funnel feeds the output-savings ledger
+                # (outcome.py record_from_labels). The modified flag is
+                # forced only when shaping actually mutated the payload, so
+                # every call site's rewrite path serializes the shaped bytes.
+                result = (
+                    result[0],
+                    result[1] or shape_mutated,
+                    result[2],
+                    [*shape_labels, *result[3]],
+                    *result[4:],
+                )
+            return result
 
         result = await self._run_compression_in_executor(
             _compress,

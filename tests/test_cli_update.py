@@ -184,6 +184,7 @@ def test_update_upgrade_failure_surfaces_command(monkeypatch):
 # --------------------------------------------------------------------------- #
 def test_safe_update_success(monkeypatch):
     """Test safe_update returns 0 when the command succeeds."""
+
     class _Result:
         returncode = 0
 
@@ -196,6 +197,7 @@ def test_safe_update_success(monkeypatch):
 
 def test_safe_update_handles_missing_pyd(monkeypatch):
     """Test safe_update when _core.pyd doesn't exist."""
+
     class _Result:
         returncode = 0
 
@@ -208,6 +210,7 @@ def test_safe_update_handles_missing_pyd(monkeypatch):
 
 def test_safe_update_passes_through_failure(monkeypatch):
     """Test safe_update returns error code when pip fails."""
+
     class _Result:
         returncode = 1
 

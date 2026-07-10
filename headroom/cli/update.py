@@ -22,6 +22,7 @@ from pathlib import Path
 
 import click
 
+from headroom._subprocess import run as _subprocess_run
 from headroom.update_check import (
     PACKAGE_NAME,
     fetch_latest_version,
@@ -169,6 +170,7 @@ def _find_core_pyd() -> Path | None:
     """Locate the _core.pyd file inside the headroom site-packages directory."""
     try:
         import headroom
+
         headroom_path = Path(headroom.__file__).parent
         core_pyd = headroom_path / "_core.pyd"
         return core_pyd if core_pyd.exists() else None
@@ -201,7 +203,7 @@ def _restore_backup(pyd_path: Path, backup_path: Path) -> None:
 def _test_core_integrity() -> bool:
     """Test if headroom._core can be imported successfully."""
     try:
-        result = subprocess.run(
+        result = _subprocess_run(
             [sys.executable, "-c", "from headroom._core import hello"],
             capture_output=True,
             text=True,
@@ -241,16 +243,14 @@ def safe_update(argv: list[str]) -> int:
                     backup_path = _make_backup(core_pyd)
                     click.echo(f"Backup created: {backup_path}")
                 except Exception as e:
-                    raise click.ClickException(
-                        f"Could not back up {core_pyd}: {e}"
-                    ) from None
+                    raise click.ClickException(f"Could not back up {core_pyd}: {e}") from None
 
         # Executing the update
         result = subprocess.run(argv)  # noqa: S603
 
         if result.returncode != 0:
             # Upgrade failed: restore backup if available
-            if backup_path and backup_path.exists():
+            if core_pyd and backup_path and backup_path.exists():
                 click.secho("Restoring backup after upgrade failure...", fg="yellow")
                 try:
                     _restore_backup(core_pyd, backup_path)
@@ -293,14 +293,14 @@ def safe_update(argv: list[str]) -> int:
         return 0
 
     except FileNotFoundError:
-        if backup_path and backup_path.exists():
+        if core_pyd and backup_path and backup_path.exists():
             try:
                 _restore_backup(core_pyd, backup_path)
             except Exception:
                 pass
         raise
     except click.ClickException:
-        if backup_path and backup_path.exists():
+        if core_pyd and backup_path and backup_path.exists():
             try:
                 _restore_backup(core_pyd, backup_path)
             except Exception:
@@ -474,9 +474,7 @@ def update(check_only: bool, assume_yes: bool, allow_pre: bool, extras: str | No
         ) from None
 
     if returncode != 0:
-        raise click.ClickException(
-            f"Upgrade failed (exit {returncode}). Run manually: {cmd_str}"
-        )
+        raise click.ClickException(f"Upgrade failed (exit {returncode}). Run manually: {cmd_str}")
 
     # ASCII-only output — emoji can raise UnicodeEncodeError on some Windows consoles.
     click.echo(f"Headroom upgraded to {latest}.")

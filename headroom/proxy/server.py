@@ -4368,7 +4368,9 @@ def _configure_windows_uvicorn_loop(uvicorn_kwargs: dict[str, Any]) -> None:
     if hasattr(_uvicorn.config.Config, "get_loop_factory"):
         uvicorn_kwargs["loop"] = "asyncio:SelectorEventLoop"
     else:
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        policy_cls = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
+        if policy_cls is not None:
+            asyncio.set_event_loop_policy(policy_cls())
 
 
 def run_server(

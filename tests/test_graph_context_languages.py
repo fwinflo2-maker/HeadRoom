@@ -1,0 +1,268 @@
+"""Tests for the tree-sitter-backed language extractors in
+``headroom.graph_context`` (Go, Java, C#, Ruby, PHP, Kotlin, Scala, Dart,
+Lua, Zig).
+
+Requires the optional ``[code]`` extra (``tree-sitter-language-pack``) --
+every extractor is fail-open without it (see `test_missing_tree_sitter_*`
+below), so these tests are skipped rather than failed when it isn't
+installed.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from headroom import graph_context as gc
+
+pytest.importorskip("tree_sitter_language_pack")
+
+
+@pytest.fixture(autouse=True)
+def _stop_watchers_between_tests():
+    yield
+    gc.stop_all_watchers()
+
+
+def test_go_resolves_internal_package_directory_not_stdlib(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    (root / "pkg" / "util").mkdir(parents=True)
+    (root / "go.mod").write_text("module myproj\n\ngo 1.21\n", encoding="utf-8")
+    (root / "main.go").write_text(
+        'package main\n\nimport (\n\t"fmt"\n\t"myproj/pkg/util"\n)\n', encoding="utf-8"
+    )
+    (root / "pkg" / "util" / "util.go").write_text("package util\nvar X = 1\n", encoding="utf-8")
+    (root / "pkg" / "util" / "other.go").write_text("package util\nvar Y = 2\n", encoding="utf-8")
+
+    graph = gc.build_graph(root)
+
+    # A Go import resolves to every file in the PACKAGE (directory), not one file.
+    assert set(graph.edges["main.go"]) == {"pkg/util/util.go", "pkg/util/other.go"}
+
+
+def test_go_import_without_go_mod_is_unresolved(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    root.mkdir(parents=True)
+    (root / "main.go").write_text('package main\nimport "fmt"\n', encoding="utf-8")
+
+    graph = gc.build_graph(root)
+
+    assert graph.edges["main.go"] == []
+
+
+def test_java_resolves_qualified_import_to_unique_file(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    (root / "com" / "acme" / "pkg").mkdir(parents=True)
+    (root / "Main.java").write_text("import com.acme.pkg.Util;\nclass Main {}\n", encoding="utf-8")
+    (root / "com" / "acme" / "pkg" / "Util.java").write_text(
+        "package com.acme.pkg;\nclass Util {}\n", encoding="utf-8"
+    )
+
+    graph = gc.build_graph(root)
+
+    assert graph.edges["Main.java"] == ["com/acme/pkg/Util.java"]
+
+
+def test_java_external_jdk_import_is_unresolved(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    root.mkdir(parents=True)
+    (root / "Main.java").write_text("import java.util.List;\nclass Main {}\n", encoding="utf-8")
+
+    graph = gc.build_graph(root)
+
+    assert graph.edges["Main.java"] == []
+
+
+def test_java_static_import_member_access_does_not_resolve_wrong(tmp_path: Path) -> None:
+    """`import static a.b.Other.thing;` must not resolve to a nonexistent
+    `Other/thing.java` -- the trailing member segment isn't a file.
+    """
+    root = tmp_path / "proj"
+    (root / "a" / "b").mkdir(parents=True)
+    (root / "Main.java").write_text(
+        "import static a.b.Other.thing;\nclass Main {}\n", encoding="utf-8"
+    )
+    (root / "a" / "b" / "Other.java").write_text("package a.b;\nclass Other {}\n", encoding="utf-8")
+
+    graph = gc.build_graph(root)
+
+    assert graph.edges["Main.java"] == []
+
+
+def test_java_ambiguous_qualified_name_across_two_files_does_not_resolve(tmp_path: Path) -> None:
+    """A dotted name matching MORE THAN ONE file must resolve to neither --
+    never wrong, only fewer edges.
+    """
+    root = tmp_path / "proj"
+    (root / "a" / "pkg").mkdir(parents=True)
+    (root / "b" / "pkg").mkdir(parents=True)
+    (root / "Main.java").write_text("import pkg.Util;\nclass Main {}\n", encoding="utf-8")
+    (root / "a" / "pkg" / "Util.java").write_text("package pkg;\nclass Util {}\n", encoding="utf-8")
+    (root / "b" / "pkg" / "Util.java").write_text("package pkg;\nclass Util {}\n", encoding="utf-8")
+
+    graph = gc.build_graph(root)
+
+    assert graph.edges["Main.java"] == []
+
+
+def test_csharp_resolves_using_namespace_to_every_file_in_directory(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    (root / "Services").mkdir(parents=True)
+    (root / "Program.cs").write_text("using Services;\nclass Program {}\n", encoding="utf-8")
+    (root / "Services" / "Thing.cs").write_text(
+        "namespace Services { class Thing {} }\n", encoding="utf-8"
+    )
+    (root / "Services" / "Other.cs").write_text(
+        "namespace Services { class Other {} }\n", encoding="utf-8"
+    )
+
+    graph = gc.build_graph(root)
+
+    assert set(graph.edges["Program.cs"]) == {"Services/Thing.cs", "Services/Other.cs"}
+
+
+def test_csharp_using_static_and_alias_are_skipped(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    (root / "Services").mkdir(parents=True)
+    (root / "Program.cs").write_text(
+        "using static Services.Thing;\nusing S = Services;\nclass Program {}\n", encoding="utf-8"
+    )
+    (root / "Services" / "Thing.cs").write_text(
+        "namespace Services { class Thing {} }\n", encoding="utf-8"
+    )
+
+    graph = gc.build_graph(root)
+
+    assert graph.edges["Program.cs"] == []
+
+
+def test_ruby_resolves_require_relative_but_not_bare_require(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    (root / "lib").mkdir(parents=True)
+    (root / "main.rb").write_text(
+        'require "json"\nrequire_relative "lib/helper"\n', encoding="utf-8"
+    )
+    (root / "lib" / "helper.rb").write_text("def helper; end\n", encoding="utf-8")
+
+    graph = gc.build_graph(root)
+
+    assert graph.edges["main.rb"] == ["lib/helper.rb"]
+
+
+def test_php_resolves_require_but_not_use_namespace(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    (root / "lib").mkdir(parents=True)
+    (root / "App" / "Services").mkdir(parents=True)
+    (root / "main.php").write_text(
+        '<?php\nuse App\\Services\\Thing;\nrequire_once __DIR__ . "/lib/helper.php";\n',
+        encoding="utf-8",
+    )
+    (root / "lib" / "helper.php").write_text("<?php\nfunction helper() {}\n", encoding="utf-8")
+    (root / "App" / "Services" / "Thing.php").write_text("<?php\nclass Thing {}\n", encoding="utf-8")
+
+    graph = gc.build_graph(root)
+
+    # `require_once __DIR__ . "/lib/helper.php"` resolves; `use` (PSR-4) does not.
+    assert graph.edges["main.php"] == ["lib/helper.php"]
+
+
+def test_kotlin_resolves_qualified_import(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    (root / "com" / "acme" / "pkg").mkdir(parents=True)
+    (root / "Main.kt").write_text("import com.acme.pkg.Util\n", encoding="utf-8")
+    (root / "com" / "acme" / "pkg" / "Util.kt").write_text(
+        "package com.acme.pkg\nclass Util\n", encoding="utf-8"
+    )
+
+    graph = gc.build_graph(root)
+
+    assert graph.edges["Main.kt"] == ["com/acme/pkg/Util.kt"]
+
+
+def test_scala_brace_multi_import_expands_and_wildcard_is_skipped(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    (root / "com" / "acme" / "pkg").mkdir(parents=True)
+    (root / "Main.scala").write_text(
+        "import com.acme.pkg.{Other, Thing}\nimport com.acme.pkg._\n", encoding="utf-8"
+    )
+    (root / "com" / "acme" / "pkg" / "Other.scala").write_text(
+        "package com.acme.pkg\nclass Other\n", encoding="utf-8"
+    )
+    (root / "com" / "acme" / "pkg" / "Thing.scala").write_text(
+        "package com.acme.pkg\nclass Thing\n", encoding="utf-8"
+    )
+
+    graph = gc.build_graph(root)
+
+    assert set(graph.edges["Main.scala"]) == {"com/acme/pkg/Other.scala", "com/acme/pkg/Thing.scala"}
+
+
+def test_dart_resolves_relative_import_without_dot_prefix(tmp_path: Path) -> None:
+    """Idiomatic Dart writes relative imports WITHOUT `./` (unlike JS/TS)."""
+    root = tmp_path / "proj"
+    (root / "lib").mkdir(parents=True)
+    (root / "main.dart").write_text(
+        'import "lib/helper.dart";\nimport "package:foo/bar.dart";\n', encoding="utf-8"
+    )
+    (root / "lib" / "helper.dart").write_text("void helper() {}\n", encoding="utf-8")
+
+    graph = gc.build_graph(root)
+
+    assert graph.edges["main.dart"] == ["lib/helper.dart"]
+
+
+def test_lua_resolves_dotted_require_and_relative_require(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    (root / "foo").mkdir(parents=True)
+    (root / "main.lua").write_text('local bar = require("foo.bar")\n', encoding="utf-8")
+    (root / "foo" / "bar.lua").write_text("return {}\n", encoding="utf-8")
+
+    graph = gc.build_graph(root)
+
+    assert graph.edges["main.lua"] == ["foo/bar.lua"]
+
+
+def test_zig_resolves_relative_import_but_not_std(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    root.mkdir(parents=True)
+    (root / "main.zig").write_text(
+        'const std = @import("std");\nconst foo = @import("./foo.zig");\n', encoding="utf-8"
+    )
+    (root / "foo.zig").write_text("pub const X = 1;\n", encoding="utf-8")
+
+    graph = gc.build_graph(root)
+
+    assert graph.edges["main.zig"] == ["foo.zig"]
+
+
+def test_swift_and_elixir_are_not_source_extensions() -> None:
+    """Module-based imports with no reliable file-level resolution are not
+    attempted at all -- documented accepted gap, not an oversight.
+    """
+    assert ".swift" not in gc.SOURCE_EXTENSIONS
+    assert ".ex" not in gc.SOURCE_EXTENSIONS
+
+
+def test_new_languages_degrade_to_zero_edges_without_tree_sitter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail-open contract: with the `[code]` extra unavailable, files in the
+    ten new languages still become graph nodes but contribute no edges --
+    never a crash, matching every other extractor in this module.
+    """
+    from headroom.transforms import code_compressor
+
+    monkeypatch.setattr(code_compressor, "_tree_sitter_importable", lambda: False)
+
+    root = tmp_path / "proj"
+    (root / "com" / "acme" / "pkg").mkdir(parents=True)
+    (root / "Main.java").write_text("import com.acme.pkg.Util;\nclass Main {}\n", encoding="utf-8")
+    (root / "com" / "acme" / "pkg" / "Util.java").write_text(
+        "package com.acme.pkg;\nclass Util {}\n", encoding="utf-8"
+    )
+
+    graph = gc.build_graph(root)
+
+    assert "Main.java" in graph.edges  # still a node
+    assert graph.edges["Main.java"] == []  # but no edges without tree-sitter

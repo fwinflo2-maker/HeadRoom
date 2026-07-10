@@ -78,7 +78,8 @@ _detect_backend_warned = False
 # user; graph_context itself is still only ever lazily imported inside the
 # `_graph_narrow*` methods.
 _SOURCE_PATH_RE = re.compile(
-    r"[\w./\\-]+\.(?:py|jsx?|mjs|cjs|tsx?|rs|c|h|cpp|cc|cxx|hpp|hh|hxx)"
+    r"[\w./\\-]+\.(?:py|jsx?|mjs|cjs|tsx?|rs|c|h|cpp|cc|cxx|hpp|hh|hxx"
+    r"|go|java|cs|rb|php|kts?|scala|dart|lua|zig)"
 )
 
 

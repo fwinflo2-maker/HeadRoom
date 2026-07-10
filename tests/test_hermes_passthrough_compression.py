@@ -25,6 +25,10 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from headroom.providers.hermes import (  # noqa: E402
+    compress_scoped_passthrough_body,
+    is_scoped_coding_agent_path,
+)
 from headroom.proxy.loopback_guard import require_loopback  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
@@ -388,3 +392,42 @@ def test_non_hermes_routes_not_affected() -> None:
     assert response.status_code == 200
     # Normal passthrough: body should just have "messages"
     assert "messages" in captured["body"]
+
+
+def test_hermes_adapter_ignores_non_hermes_paths() -> None:
+    assert not is_scoped_coding_agent_path("/v1/responses")
+    assert not is_scoped_coding_agent_path("/api/codex-proxy/session/v1/chat/completions")
+    assert is_scoped_coding_agent_path("/api/codex-proxy/session/v1/responses")
+    assert is_scoped_coding_agent_path("/api/claude-code-proxy/session/v1/messages")
+
+
+def test_hermes_adapter_preserves_structured_messages_when_compressor_changes_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_compress(*, messages: list[dict[str, Any]], **_: Any):
+        class Result:
+            pass
+
+        result = Result()
+        result.messages = [{**message, "content": "compressed"} for message in messages]
+        return result
+
+    monkeypatch.setattr("headroom.compress", fake_compress)
+    original = {
+        "model": "claude-sonnet-4-5-20250929",
+        "messages": [
+            {"role": "user", "content": "compress this"},
+            {"role": "assistant", "content": [{"type": "tool_use", "name": "read_file"}]},
+            {"role": "user", "content": [{"type": "tool_result", "content": "secret"}]},
+        ],
+    }
+    body = json.dumps(original).encode()
+
+    transformed = compress_scoped_passthrough_body(
+        "/api/claude-code-proxy/session/v1/messages", body, optimize=True, bypass=False
+    )
+
+    messages = json.loads(transformed)["messages"]
+    assert messages[0]["content"] == "compressed"
+    assert messages[1] == original["messages"][1]
+    assert messages[2] == original["messages"][2]

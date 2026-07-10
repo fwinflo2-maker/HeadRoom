@@ -4468,7 +4468,14 @@ def run_server(
         # ProactorEventLoop can close the listening socket on transient
         # AcceptEx failures (for example WinError 64 from keep-alive RSTs).
         # The selector loop keeps accept errors scoped to the connection.
-        uvicorn_kwargs["loop"] = "asyncio:SelectorEventLoop"
+        # uvicorn's `loop=` is a lookup key into LOOP_SETUPS ("none"/"auto"/
+        # "asyncio"/"uvloop"), not an import path -- "asyncio:SelectorEventLoop"
+        # raises KeyError in Config.setup_event_loop(). Also, uvicorn's own
+        # asyncio_setup() only forces WindowsSelectorEventLoopPolicy when
+        # use_subprocess=True (reload or workers>1), so routing through
+        # `loop=` wouldn't cover the default single-worker path anyway. Set
+        # the policy directly instead.
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     if workers > 1:
         # CompressionCache and PrefixTracker are always per-worker instance vars.
         # Python CompressionStore defaults to InMemoryBackend (per-process), so

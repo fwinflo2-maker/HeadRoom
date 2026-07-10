@@ -1086,6 +1086,78 @@ def test_wrap_codex_injects_rtk_globally_without_changing_project_agents(
     assert wrap_mod._RTK_MARKER.encode() in global_agents.read_bytes()
 
 
+def test_wrap_codex_exposes_managed_rtk_as_bare_command(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    local_bin = tmp_path / ".local" / "bin"
+    local_bin.mkdir(parents=True)
+    monkeypatch.setenv("PATH", str(local_bin))
+
+    rtk_path = tmp_path / ".headroom" / "bin" / "rtk"
+    rtk_path.parent.mkdir(parents=True)
+    rtk_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    rtk_path.chmod(0o755)
+
+    with patch(
+        "headroom.cli.wrap._ensure_rtk_binary",
+        return_value=rtk_path,
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "codex",
+                "--prepare-only",
+                "--no-mcp",
+                "--no-serena",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    exposed = local_bin / "rtk"
+    assert exposed.exists()
+    assert exposed.resolve() == rtk_path
+
+
+def test_wrap_codex_restores_provider_config_after_launch(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".codex" / "config.toml"
+    config_file.parent.mkdir(parents=True)
+    original = 'model = "gpt-5"\n'
+    config_file.write_text(original, encoding="utf-8")
+
+    def assert_wrapped_then_exit(**kwargs: object) -> None:
+        del kwargs
+        content = config_file.read_text(encoding="utf-8")
+        assert 'model_provider = "headroom"' in content
+        raise SystemExit(0)
+
+    with (
+        patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None),
+        patch("headroom.cli.wrap._ensure_proxy", return_value=(None, 8787)),
+        patch("headroom.cli.wrap.shutil.which", return_value="/usr/local/bin/codex"),
+        patch("headroom.cli.wrap._launch_tool", side_effect=assert_wrapped_then_exit),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "codex",
+                "--no-mcp",
+                "--no-serena",
+                "--port",
+                "8787",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert config_file.read_text(encoding="utf-8") == original
+    assert not (tmp_path / ".codex" / "config.toml.headroom-backup").exists()
+
+
 def test_unwrap_codex_without_codex_home_warns_on_ambiguous_noop(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

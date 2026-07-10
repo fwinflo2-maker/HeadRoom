@@ -1707,6 +1707,43 @@ def _ensure_rtk_binary(verbose: bool = False) -> Path | None:
     return None
 
 
+def _expose_rtk_on_path(rtk_path: Path, verbose: bool = False) -> bool:
+    """Make Headroom-managed rtk available as a bare ``rtk`` command.
+
+    Codex consumes RTK through instructions in ``~/.codex/AGENTS.md``. Unlike
+    Claude hooks, those instructions ask the agent to run ``rtk`` directly, so
+    the binary must live in a directory Codex already has on PATH. Avoid
+    overwriting a user-managed ``rtk``; if one exists, leave it alone.
+    """
+    existing = shutil.which("rtk")
+    if existing:
+        if verbose:
+            click.echo(f"  rtk already available on PATH at {existing}")
+        return True
+
+    home = Path.home()
+    target_dir = home / ".local" / "bin" if (home / ".local").exists() else home / "bin"
+    target = target_dir / ("rtk.exe" if sys.platform == "win32" else "rtk")
+
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        if target.exists() or target.is_symlink():
+            if target.resolve() == rtk_path.resolve():
+                return True
+            click.echo(f"  Warning: {target} already exists; not replacing it")
+            return False
+        try:
+            target.symlink_to(rtk_path)
+        except OSError:
+            shutil.copy2(rtk_path, target)
+        if verbose:
+            click.echo(f"  rtk exposed on PATH at {target}")
+        return True
+    except Exception as e:
+        click.echo(f"  Warning: could not expose rtk on PATH: {e}")
+        return False
+
+
 def _prepare_wrap_rtk(verbose: bool = False, *, label: str | None = None) -> Path | None:
     """Ensure rtk is present for host-bridged wrap flows without host-specific setup."""
     if label:
@@ -4639,6 +4676,7 @@ def codex(
             click.echo("  Setting up rtk for Codex...")
             rtk_path = _ensure_rtk_binary(verbose=verbose)
             if rtk_path:
+                _expose_rtk_on_path(rtk_path, verbose=verbose)
                 # Keep RTK guidance local to the user's Codex configuration.
                 global_agents = _codex_home_dir() / "AGENTS.md"
                 _inject_rtk_instructions(global_agents, verbose=verbose)
@@ -4861,6 +4899,11 @@ def codex(
             region=region,
         )
     finally:
+        try:
+            _restore_codex_provider_config()
+        except Exception as e:
+            click.echo(f"  Warning: could not restore Codex config after wrap: {e}")
+
         # _launch_tool's internal cleanup unregisters this client marker,
         # but doesn't know about the proxy we started.  Terminate it when
         # no other clients remain.

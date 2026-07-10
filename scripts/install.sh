@@ -797,6 +797,41 @@ run_claude_rtk_init() {
   fi
 }
 
+expose_rtk_on_path() {
+  local rtk_bin="${HEADROOM_HOST_HOME}/.headroom/bin/rtk"
+  local target_dir
+  local target
+
+  if [[ ! -x "${rtk_bin}" ]]; then
+    warn "rtk was not installed at ${rtk_bin}; Codex PATH setup was skipped"
+    return
+  fi
+
+  if command -v rtk >/dev/null 2>&1; then
+    return
+  fi
+
+  if [[ -d "${HEADROOM_HOST_HOME}/.local" ]]; then
+    target_dir="${HEADROOM_HOST_HOME}/.local/bin"
+  else
+    target_dir="${HEADROOM_HOST_HOME}/bin"
+  fi
+  target="${target_dir}/rtk"
+
+  mkdir -p "${target_dir}"
+  if [[ -e "${target}" || -L "${target}" ]]; then
+    if [[ "$(readlink "${target}" 2>/dev/null || true)" == "${rtk_bin}" ]]; then
+      return
+    fi
+    warn "${target} already exists; not replacing it"
+    return
+  fi
+
+  if ! ln -s "${rtk_bin}" "${target}"; then
+    warn "Failed to expose rtk at ${target}; Codex may not find bare rtk commands"
+  fi
+}
+
 selected_context_tool() {
   local value="${HEADROOM_CONTEXT_TOOL:-rtk}"
   value="${value,,}"
@@ -1537,6 +1572,8 @@ main() {
 
       if [[ "${no_rtk}" -eq 0 && "${context_tool}" == "lean-ctx" ]]; then
         run_lean_ctx_init "${tool}"
+      elif [[ "${no_rtk}" -eq 0 && "${context_tool}" == "rtk" && "${tool}" == "codex" ]]; then
+        expose_rtk_on_path
       fi
 
       case "${tool}" in
@@ -1547,7 +1584,12 @@ main() {
           ANTHROPIC_BASE_URL="http://127.0.0.1:${port}" run_host_tool claude "${host_args[@]}"
           ;;
         codex)
+          set +e
           OPENAI_BASE_URL="http://127.0.0.1:${port}/v1" run_host_tool codex "${host_args[@]}"
+          local codex_status=$?
+          set -e
+          run_headroom unwrap codex --no-stop-proxy >/dev/null || warn "Failed to restore Codex config after wrap"
+          return "${codex_status}"
           ;;
         aider)
           OPENAI_API_BASE="http://127.0.0.1:${port}/v1" \

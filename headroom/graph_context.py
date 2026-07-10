@@ -612,7 +612,9 @@ class GraphContextWatcher:
             return False
 
         self._observer = observer
-        logger.info("graph_context: live-watching %s (debounce=%.1fs)", self.root, self.debounce_seconds)
+        logger.info(
+            "graph_context: live-watching %s (debounce=%.1fs)", self.root, self.debounce_seconds
+        )
         return True
 
     def _schedule_rebuild(self) -> None:
@@ -680,7 +682,9 @@ def get_live_graph(root: Path) -> ProjectGraph:
 
     for old_root, old_watcher in evicted:
         old_watcher.stop()
-        logger.debug("graph_context: evicted watcher for %s (over cap %d)", old_root, _MAX_LIVE_ROOTS)
+        logger.debug(
+            "graph_context: evicted watcher for %s (over cap %d)", old_root, _MAX_LIVE_ROOTS
+        )
 
     if existing_watcher is not None:
         # Another caller already owns this root's watcher (starting or
@@ -701,6 +705,16 @@ def get_live_graph(root: Path) -> ProjectGraph:
                 # `stop_all_watchers()` may have already cleared it.
                 if _live_watchers.get(root) is reserved_watcher:
                     _live_watchers.pop(root, None)
+                    # `start()` runs its synchronous initial `_rebuild_live`
+                    # BEFORE it ever imports/starts watchdog, so a failure
+                    # here (watchdog missing, Observer.start() raising) can
+                    # still have populated `_live_graphs[root]`. Clear it too
+                    # -- otherwise the fast path at the top of this function
+                    # would keep serving that one-shot snapshot on every later
+                    # call instead of falling through to the hash-checked pull
+                    # model below, which is what actually notices file changes
+                    # without a live watcher.
+                    _live_graphs.pop(root, None)
 
     return load_or_build_graph(root)
 

@@ -204,6 +204,49 @@ def test_get_live_graph_falls_back_to_pull_model_when_watcher_cannot_start(
     assert graph.edges["main.py"] == ["pkg/util.py"]
 
 
+def test_get_live_graph_does_not_serve_stale_graph_after_watcher_start_failure(
+    fake_workspace: Path, project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the real `GraphContextWatcher.start()` runs its synchronous
+    initial `_rebuild_live()` (which populates `_live_graphs[root]`) BEFORE it
+    ever imports/starts watchdog -- so a failure there (watchdog missing,
+    `Observer.start()` raising) can still leave `_live_graphs[root]` behind
+    even though `start()` returns False. Without clearing it, every later
+    `get_live_graph()` call would hit the in-memory fast path at the top of
+    the function and serve that one-shot snapshot forever, instead of falling
+    through to the hash-checked `load_or_build_graph` pull model -- so a file
+    change made after the failed start would never be observed.
+
+    The existing `..._falls_back_to_pull_model...` test above stubs `start`
+    with a bare `lambda self: False` that never calls `_rebuild_live`, so it
+    doesn't reproduce this: `_live_graphs[root]` stays empty either way. This
+    test's stub matches the real method's actual sequence.
+    """
+    root = project.resolve()
+
+    def _rebuild_then_fail(self: gc.GraphContextWatcher) -> bool:
+        gc._rebuild_live(self.root)  # what the real start() does before the watchdog import
+        return False  # simulate watchdog unavailable / Observer.start() failure
+
+    monkeypatch.setattr(gc.GraphContextWatcher, "start", _rebuild_then_fail)
+
+    first = gc.get_live_graph(root)
+    assert first.edges["main.py"] == ["pkg/util.py"]
+    assert root not in gc._live_watchers  # failed reservation was cleaned up
+    assert root not in gc._live_graphs  # and so was the leftover in-memory graph
+
+    (project / "pkg" / "new_module.py").write_text(
+        "from . import helper\n\nVALUE = helper.CONST\n", encoding="utf-8"
+    )
+
+    second = gc.get_live_graph(root)
+
+    assert "pkg/new_module.py" in second.edges, (
+        "get_live_graph served a stale in-memory graph instead of falling "
+        "through to load_or_build_graph after the watcher failed to start"
+    )
+
+
 def test_stop_all_watchers_clears_state(fake_workspace: Path, project: Path) -> None:
     root = project.resolve()
     gc.get_live_graph(root)
@@ -313,9 +356,7 @@ def test_dynamic_js_import_is_resolved(multilang_project: Path) -> None:
     """`import('./x')` dynamic imports ARE captured (the regex was extended
     in the pre-PR audit). Guards against a regression back to dropping them."""
 
-    (multilang_project / "dyn.ts").write_text(
-        "const mod = import('./util');\n", encoding="utf-8"
-    )
+    (multilang_project / "dyn.ts").write_text("const mod = import('./util');\n", encoding="utf-8")
     graph = gc.build_graph(multilang_project)
 
     assert graph.edges["dyn.ts"] == ["util.ts"]
@@ -372,7 +413,9 @@ def test_ignored_and_vendor_dirs_are_pruned_from_the_walk(
     (root / "src").mkdir(parents=True)
 
     (root / "src" / "main.py").write_text("import os\n", encoding="utf-8")
-    (root / "node_modules" / "leftpad" / "index.js").write_text("module.exports=1\n", encoding="utf-8")
+    (root / "node_modules" / "leftpad" / "index.js").write_text(
+        "module.exports=1\n", encoding="utf-8"
+    )
     (root / "target" / "debug" / "build.rs").write_text("fn main() {}\n", encoding="utf-8")
 
     graph = gc.build_graph(root)
@@ -415,7 +458,9 @@ def test_build_graph_does_not_follow_directory_symlink_loops(
 # =============================================================================
 
 
-def test_atomic_write_survives_many_concurrent_writers(fake_workspace: Path, tmp_path: Path) -> None:
+def test_atomic_write_survives_many_concurrent_writers(
+    fake_workspace: Path, tmp_path: Path
+) -> None:
     import json
     import threading
 

@@ -49,7 +49,9 @@ def test_opencode_config_paths_from_env(tmp_path: Path, monkeypatch: pytest.Monk
     assert backup_file == tmp_path / "custom" / "opencode.json.headroom-backup"
 
 
-def test_opencode_config_paths_default_jsonc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_opencode_config_paths_default_jsonc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Default config path resolves to opencode.jsonc when it exists."""
     _set_test_home(monkeypatch, tmp_path)
     base_dir = tmp_path / ".config" / "opencode"
@@ -62,7 +64,9 @@ def test_opencode_config_paths_default_jsonc(tmp_path: Path, monkeypatch: pytest
     assert backup_file == base_dir / "opencode.jsonc.headroom-backup"
 
 
-def test_opencode_config_paths_env_overrides_jsonc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_opencode_config_paths_env_overrides_jsonc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """OPENCODE_CONFIG takes precedence even if opencode.jsonc exists."""
     _set_test_home(monkeypatch, tmp_path)
     base_dir = tmp_path / ".config" / "opencode"

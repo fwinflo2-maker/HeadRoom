@@ -127,12 +127,28 @@ function restoreTrackedFiles() {
   }
 }
 
-function rewriteOpenClawReleaseDependency() {
+function relativeFileSpec(fromDir, targetPath) {
+  let relativePath = path.relative(fromDir, targetPath).split(path.sep).join("/");
+  if (!relativePath.startsWith(".")) {
+    relativePath = `./${relativePath}`;
+  }
+  return `file:${relativePath}`;
+}
+
+function rewriteOpenClawDependency(spec) {
   const packageJsonPath = path.join(openClawDir, "package.json");
   const pkg = readJson(packageJsonPath);
   pkg.dependencies = pkg.dependencies || {};
-  pkg.dependencies["headroom-ai"] = `^${version}`;
+  pkg.dependencies["headroom-ai"] = spec;
   writeJson(packageJsonPath, pkg);
+}
+
+function rewriteOpenClawLocalDependency(sdkTarballPath) {
+  rewriteOpenClawDependency(relativeFileSpec(openClawDir, sdkTarballPath));
+}
+
+function rewriteOpenClawReleaseDependency() {
+  rewriteOpenClawDependency(`^${version}`);
 }
 
 function assertTarballBuilt(name) {
@@ -154,10 +170,15 @@ try {
   runNpm(["pack", "--pack-destination", assetsDir], sdkDir);
   const sdkTarballPath = assertTarballBuilt("headroom-ai");
 
+  rewriteOpenClawLocalDependency(sdkTarballPath);
   if (!flags.has("--skip-install")) {
-    runNpm(["ci"], openClawDir);
+    runNpm(
+      ["install", "--package-lock=false", "--no-audit", "--no-fund", "--ignore-scripts"],
+      openClawDir,
+    );
+  } else {
+    runNpm(["install", "--no-save", "--package-lock=false", sdkTarballPath], openClawDir);
   }
-  runNpm(["install", "--no-save", "--package-lock=false", sdkTarballPath], openClawDir);
   runNpm(["run", "build"], openClawDir);
   runNpm(["version", version, "--no-git-tag-version", "--allow-same-version"], openClawDir);
   rewriteOpenClawReleaseDependency();

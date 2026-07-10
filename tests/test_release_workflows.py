@@ -600,6 +600,35 @@ def test_npm_release_builder_regenerates_openclaw_dist_metadata_after_rewrite() 
     assert rewrite < prepare_dist < pack < verify
 
 
+def test_npm_release_builder_installs_openclaw_against_local_sdk_tarball() -> None:
+    """The OpenClaw build must not require the release SDK to exist on npm."""
+    builder = (ROOT / "scripts" / "build_npm_release_assets.mjs").read_text(encoding="utf-8")
+
+    local_dependency = builder.index("rewriteOpenClawLocalDependency(sdkTarballPath);")
+    install = builder.index(
+        '["install", "--package-lock=false", "--no-audit", "--no-fund", "--ignore-scripts"]',
+        local_dependency,
+    )
+    build = builder.index('runNpm(["run", "build"], openClawDir);', install)
+    release_dependency = builder.index("rewriteOpenClawReleaseDependency();", build)
+
+    assert local_dependency < install < build < release_dependency
+    assert 'runNpm(["ci"], openClawDir)' not in builder
+
+
+def test_openclaw_source_dependency_matches_lockfile_registry_range() -> None:
+    """The source checkout must remain npm-ci installable before a release exists."""
+    import json
+
+    package_json = json.loads((ROOT / "plugins" / "openclaw" / "package.json").read_text())
+    package_lock = json.loads((ROOT / "plugins" / "openclaw" / "package-lock.json").read_text())
+
+    source_range = package_json["dependencies"]["headroom-ai"]
+    lock_range = package_lock["packages"][""]["dependencies"]["headroom-ai"]
+
+    assert source_range == lock_range == "^0.22.3"
+
+
 def test_python_release_smoke_imports_installed_wheel_outside_source_tree() -> None:
     """The wheel smoke must not import the checkout package by accident."""
     script = (ROOT / "scripts" / "build_python_release_smoke.py").read_text(encoding="utf-8")

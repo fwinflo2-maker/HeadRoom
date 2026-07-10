@@ -360,3 +360,117 @@ def test_graph_narrow_fires_for_wrapped_and_nested_bash_command_forms(
 
     assert narrowed is not None, f"command {command!r} did not trigger graph_narrow"
     assert related_rel in narrowed
+
+
+def test_mixed_language_conversation_tracks_the_most_recent_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Read a Java file, then a Kotlin file in the same conversation --
+    `_last_read_path` (and therefore the graph-narrow entrypoint) must
+    track the MOST RECENT read regardless of which language it is, not get
+    stuck on whichever language was seen first.
+    """
+    root = tmp_path / "proj"
+    (root / "com" / "acme").mkdir(parents=True)
+    (root / "Main.java").write_text("class Main {}\n", encoding="utf-8")
+    (root / "Other.kt").write_text("import com.acme.Util\n", encoding="utf-8")
+    (root / "com" / "acme" / "Util.kt").write_text("package com.acme\nclass Util\n", encoding="utf-8")
+    monkeypatch.chdir(root)
+
+    router = ContentRouter()
+    messages = [
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "Main.java"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "r1", "content": "..."}]},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "r2", "name": "Read", "input": {"file_path": "Other.kt"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "r2", "content": "..."}]},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "g1", "name": "Grep", "input": {"pattern": "Util"}}]},
+    ]
+    router._build_tool_name_map(messages)
+
+    assert router._last_read_path == "Other.kt"
+
+    dump = _wide_dump("Other.kt", "com/acme/Util.kt")
+    narrowed = router._graph_narrow("grep", "g1", dump)
+
+    assert narrowed is not None
+    assert "com/acme/Util.kt" in narrowed
+
+
+def test_java_graph_narrow_composes_with_downstream_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors the Python-only regression test in test_graph_narrow.py for a
+    non-Python language: graph_narrow must be a pre-filter that still lets
+    the downstream compressor (relevance_split/SearchCompressor) run on the
+    narrowed remainder, not a short-circuit that finalizes the message
+    itself.
+    """
+    from headroom.providers import OpenAIProvider
+    from headroom.tokenizer import Tokenizer
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    monkeypatch.chdir(root)
+    entry_rel, related_rel = _java_setup(root)
+
+    tokenizer = Tokenizer(OpenAIProvider().get_token_counter("gpt-4o"), "gpt-4o")
+    router = ContentRouter(ContentRouterConfig(min_section_tokens=10, protect_recent_reads_fraction=0.3))
+
+    wide_lines = [f"unrelated_{i}.java:{i}: Z = 1 some noise padding text here" for i in range(100)]
+    wide_lines += [f"{entry_rel}:{i}: match number {i} padding text" for i in range(30)]
+    wide_lines += [f"{related_rel}:{i}: match number {i} more padding text" for i in range(30)]
+    wide_dump = "\n".join(wide_lines)
+
+    messages = [
+        *_read_then_grep_messages(entry_rel),
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_grep", "content": wide_dump}]},
+    ]
+    for k in range(10):
+        messages.append({"role": "assistant", "content": f"ok turn {k}"})
+        messages.append({"role": "user", "content": f"next question {k}"})
+
+    calls: list[str] = []
+    original = ContentRouter._compress_block_content
+
+    def _spy(self, *, content, **kwargs):  # noqa: ANN001
+        calls.append(content)
+        return original(self, content=content, **kwargs)
+
+    router._compress_block_content = _spy.__get__(router, ContentRouter)
+    result = router.apply(messages, tokenizer)
+
+    assert "router:graph_narrow" in result.transforms_applied
+    assert calls, "downstream compressor was never reached -- narrowing pre-empted the pipeline"
+    assert "unrelated_0.java" not in calls[0]
+    assert len(calls[0]) < len(wide_dump)
+
+
+@pytest.mark.parametrize("case", _CASES, ids=[c.id for c in _CASES])
+def test_real_tokenizer_savings_exceed_90_percent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: _LangCase
+) -> None:
+    """The len//4 heuristic used by the other tests in this file is a
+    proxy -- this measures ACTUAL token count via the same tiktoken-backed
+    counter the proxy uses in production (`OpenAIProvider`/gpt-4o encoding),
+    confirming the savings claim holds on real tokens, not characters.
+    """
+    from headroom.providers import OpenAIProvider
+    from headroom.tokenizer import Tokenizer
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    monkeypatch.chdir(root)
+    entry_rel, related_rel = case.setup(root)
+
+    router = ContentRouter()
+    router._build_tool_name_map(_read_then_grep_messages(entry_rel))
+    dump = _wide_dump(entry_rel, related_rel)
+    narrowed = router._graph_narrow("grep", "call_grep", dump)
+    assert narrowed is not None
+
+    tokenizer = Tokenizer(OpenAIProvider().get_token_counter("gpt-4o"), "gpt-4o")
+    before = tokenizer.count_text(dump)
+    after = tokenizer.count_text(narrowed)
+
+    savings = 1 - (after / before)
+    assert savings > 0.9, f"{case.id}: only {savings:.1%} real-token savings (before={before}, after={after})"

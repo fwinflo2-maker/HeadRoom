@@ -385,3 +385,92 @@ def test_go_package_directory_with_a_space_in_its_name_resolves(tmp_path: Path) 
     graph = gc.build_graph(root)
 
     assert graph.edges["main.go"] == ["my pkg/util.go"]
+
+
+# =============================================================================
+# BFS traversal correctness for the new languages: transitivity, cycles,
+# case-sensitivity, package-glob depth accounting, and the end-to-end
+# assemble_context() builder -- not just single-hop edge resolution.
+# =============================================================================
+
+
+def test_java_transitive_bfs_reaches_second_hop_at_depth_two(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    (root / "com" / "acme").mkdir(parents=True)
+    (root / "A.java").write_text("import com.acme.B;\nclass A {}\n", encoding="utf-8")
+    (root / "com" / "acme" / "B.java").write_text(
+        "package com.acme;\nimport com.acme.C;\nclass B {}\n", encoding="utf-8"
+    )
+    (root / "com" / "acme" / "C.java").write_text("package com.acme;\nclass C {}\n", encoding="utf-8")
+
+    graph = gc.build_graph(root)
+
+    assert set(gc.bfs_related_files(graph, "A.java", max_depth=2)) == {
+        "A.java",
+        "com/acme/B.java",
+        "com/acme/C.java",
+    }
+    assert set(gc.bfs_related_files(graph, "A.java", max_depth=1)) == {"A.java", "com/acme/B.java"}
+
+
+def test_kotlin_circular_import_terminates(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    (root / "com" / "acme").mkdir(parents=True)
+    (root / "com" / "acme" / "A.kt").write_text("package com.acme\nimport com.acme.B\n", encoding="utf-8")
+    (root / "com" / "acme" / "B.kt").write_text("package com.acme\nimport com.acme.A\n", encoding="utf-8")
+
+    graph = gc.build_graph(root)
+
+    reached = gc.bfs_related_files(graph, "com/acme/A.kt", max_depth=5)
+    assert set(reached) == {"com/acme/A.kt", "com/acme/B.kt"}
+
+
+def test_java_case_sensitive_mismatch_does_not_resolve(tmp_path: Path) -> None:
+    """Import references the wrong case (`util` vs `Util.java`) -- must fail
+    to resolve, never crash, never guess a case-insensitive match.
+    """
+    root = tmp_path / "proj"
+    (root / "com" / "acme").mkdir(parents=True)
+    (root / "Main.java").write_text("import com.acme.util;\nclass Main {}\n", encoding="utf-8")
+    (root / "com" / "acme" / "Util.java").write_text("package com.acme;\nclass Util {}\n", encoding="utf-8")
+
+    graph = gc.build_graph(root)
+
+    assert graph.edges["Main.java"] == []
+
+
+def test_go_package_glob_files_all_land_at_depth_one(tmp_path: Path) -> None:
+    """Importing a Go package with several files must count as ONE BFS hop
+    for all of them, not force a caller to raise max_depth to reach later
+    files in the same package.
+    """
+    root = tmp_path / "proj"
+    (root / "pkg").mkdir(parents=True)
+    (root / "go.mod").write_text("module myproj\n", encoding="utf-8")
+    (root / "main.go").write_text('package main\nimport "myproj/pkg"\n', encoding="utf-8")
+    (root / "pkg" / "a.go").write_text("package pkg\nvar X = 1\n", encoding="utf-8")
+    (root / "pkg" / "b.go").write_text("package pkg\nvar Y = 2\n", encoding="utf-8")
+    (root / "pkg" / "c.go").write_text("package pkg\nvar Z = 3\n", encoding="utf-8")
+
+    graph = gc.build_graph(root)
+
+    assert set(gc.bfs_related_files(graph, "main.go", max_depth=1)) == {
+        "main.go",
+        "pkg/a.go",
+        "pkg/b.go",
+        "pkg/c.go",
+    }
+
+
+def test_assemble_context_includes_new_language_files_verbatim(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    (root / "lib").mkdir(parents=True)
+    (root / "main.rb").write_text('require_relative "lib/helper"\nputs "hi"\n', encoding="utf-8")
+    (root / "lib" / "helper.rb").write_text("def helper\n  42\nend\n", encoding="utf-8")
+
+    result = gc.assemble_context(root, "main.rb", query="what does helper do?")
+
+    assert "def helper" in result.context
+    assert 'puts "hi"' in result.context
+    assert "lib/helper.rb" in result.context
+    assert set(result.files) == {"main.rb", "lib/helper.rb"}

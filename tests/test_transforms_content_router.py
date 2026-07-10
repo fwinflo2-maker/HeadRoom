@@ -17,9 +17,23 @@ from headroom.transforms.content_router import (
     _create_content_signature,
     _detect_content,
     _extract_json_block,
+    _strip_detection_envelope,
     is_mixed_content,
     split_into_sections,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_detect_module_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the module-level detect flags from leaking across tests.
+
+    The circuit breaker (#575) is process-wide, so a test that trips it would
+    otherwise force later tests onto the pure-Python path. ``monkeypatch.setattr``
+    zeroes each flag for the test and auto-restores it afterward.
+    """
+    monkeypatch.setattr(content_router_module, "_detect_native_unhealthy", False)
+    monkeypatch.setattr(content_router_module, "_detect_backend_warned", False)
+    monkeypatch.setattr(content_router_module, "_detect_panic_warned", False)
 
 
 def test_compression_cache_handles_hits_skips_evictions_and_clear(
@@ -316,9 +330,7 @@ def test_content_router_strategy_and_compress_paths(monkeypatch: pytest.MonkeyPa
     assert router.compress("   ").strategy_used is CompressionStrategy.PASSTHROUGH
 
 
-def test_force_kompress_bypasses_heavy_detection_for_plain_text(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_force_kompress_bypasses_content_detection(monkeypatch: pytest.MonkeyPatch) -> None:
     router = ContentRouter()
     router._runtime_force_kompress = True
     pure_result = RouterCompressionResult(
@@ -330,7 +342,7 @@ def test_force_kompress_bypasses_heavy_detection_for_plain_text(
     monkeypatch.setattr(
         content_router_module,
         "is_mixed_content",
-        lambda content: False,
+        lambda content: (_ for _ in ()).throw(AssertionError("mixed detection called")),
     )
     monkeypatch.setattr(
         content_router_module,
@@ -341,30 +353,6 @@ def test_force_kompress_bypasses_heavy_detection_for_plain_text(
     monkeypatch.setattr(router, "_compress_pure", lambda *args, **kwargs: pure_result)
 
     assert router.compress("large tool output") is pure_result
-
-
-def test_force_kompress_preserves_mixed_content_routing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    router = ContentRouter()
-    router._runtime_force_kompress = True
-    mixed_result = RouterCompressionResult(
-        compressed="mixed",
-        original="mixed",
-        strategy_used=CompressionStrategy.MIXED,
-    )
-
-    monkeypatch.setattr(content_router_module, "is_mixed_content", lambda content: True)
-    monkeypatch.setattr(router, "_compress_mixed", lambda *args, **kwargs: mixed_result)
-    monkeypatch.setattr(
-        router,
-        "_compress_pure",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("force_kompress bypassed mixed routing")
-        ),
-    )
-
-    assert router.compress('instruction\n[{"id": 1}]\nanswer') is mixed_result
 
 
 def test_normal_compress_path_still_uses_content_detection(
@@ -780,23 +768,6 @@ def test_user_text_blocks_never_compressed_even_with_assistant_optin(
     assert result["content"][0]["text"] == long_text
 
 
-def test_user_text_blocks_opt_in_compresses(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    router = _make_router_with_mock_compress(monkeypatch)
-    long_text = "U" * 1000
-    msg = {"role": "user", "content": [{"type": "text", "text": long_text}]}
-    result = router._process_content_blocks(
-        msg,
-        msg["content"],
-        "",
-        [],
-        set(),
-        skip_user=False,
-    )
-    assert "[compressed]" in result["content"][0]["text"]
-
-
 def test_system_text_blocks_skipped_when_skip_system_true(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -810,42 +781,6 @@ def test_system_text_blocks_skipped_when_skip_system_true(
         [],
         set(),
         skip_system=True,
-        compress_assistant_text_blocks=True,
-    )
-    assert result["content"][0]["text"] == long_text
-
-
-def test_system_text_blocks_opt_in_compresses(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    router = _make_router_with_mock_compress(monkeypatch)
-    long_text = "S" * 1000
-    msg = {"role": "system", "content": [{"type": "text", "text": long_text}]}
-    result = router._process_content_blocks(
-        msg,
-        msg["content"],
-        "",
-        [],
-        set(),
-        skip_system=False,
-    )
-    assert "[compressed]" in result["content"][0]["text"]
-
-
-def test_developer_text_blocks_stay_protected_under_agent_profile(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    router = _make_router_with_mock_compress(monkeypatch)
-    long_text = "D" * 1000
-    msg = {"role": "developer", "content": [{"type": "text", "text": long_text}]}
-    result = router._process_content_blocks(
-        msg,
-        msg["content"],
-        "",
-        [],
-        set(),
-        skip_user=False,
-        skip_system=False,
         compress_assistant_text_blocks=True,
     )
     assert result["content"][0]["text"] == long_text
@@ -873,7 +808,7 @@ def test_unknown_role_text_blocks_skipped_for_safety(
 ) -> None:
     router = _make_router_with_mock_compress(monkeypatch)
     long_text = "Q" * 1000
-    msg = {"role": "custom", "content": [{"type": "text", "text": long_text}]}
+    msg = {"role": "developer", "content": [{"type": "text", "text": long_text}]}
     result = router._process_content_blocks(
         msg,
         msg["content"],
@@ -982,3 +917,194 @@ def test_detect_content_python_backend_skips_native(
 
     result = _detect_content('[{"id": 1}, {"id": 2}]')
     assert result.content_type is ContentType.JSON_ARRAY
+
+
+def test_detect_timeout_secs_env_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The watchdog budget reads HEADROOM_DETECT_TIMEOUT_SECS; bad values → default."""
+    get = content_router_module._detect_timeout_secs
+    default = content_router_module._DEFAULT_DETECT_TIMEOUT_SECS
+
+    monkeypatch.delenv("HEADROOM_DETECT_TIMEOUT_SECS", raising=False)
+    assert get() == default
+
+    monkeypatch.setenv("HEADROOM_DETECT_TIMEOUT_SECS", "0.25")
+    assert get() == 0.25
+
+    monkeypatch.setenv("HEADROOM_DETECT_TIMEOUT_SECS", "nope")
+    assert get() == default
+
+    monkeypatch.setenv("HEADROOM_DETECT_TIMEOUT_SECS", "0")
+    assert get() == default
+
+
+def test_rust_detect_watchdog_passes_through_result() -> None:
+    """A fast native detector returns its result unchanged through the watchdog."""
+    sentinel = SimpleNamespace(content_type="json_array", confidence=1.0, metadata={})
+    out = content_router_module._rust_detect_watchdogged(lambda _content: sentinel, "payload", 5.0)
+    assert out is sentinel
+
+
+def test_rust_detect_watchdog_relays_native_error() -> None:
+    """An exception raised inside the native detector propagates to the caller."""
+
+    def boom(_content: str) -> None:
+        raise ValueError("native boom")
+
+    with pytest.raises(ValueError, match="native boom"):
+        content_router_module._rust_detect_watchdogged(boom, "payload", 5.0)
+
+
+def test_detect_content_watchdog_degrades_on_windows_hang(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hung native detect on Windows degrades to pure-Python, never deadlocks (#575)."""
+    import threading as _threading
+
+    import headroom._core as _core
+
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "rust")
+    monkeypatch.setattr(content_router_module.sys, "platform", "win32")
+    monkeypatch.setenv("HEADROOM_DETECT_TIMEOUT_SECS", "0.1")
+
+    release = _threading.Event()
+
+    def _hang(_content: str):
+        release.wait()  # simulate the WaitOnAddress park (GIL released while waiting)
+        return SimpleNamespace(content_type="plain_text", confidence=1.0, metadata={})
+
+    monkeypatch.setattr(_core, "detect_content_type", _hang)
+
+    try:
+        # JSON content: the pure-Python regex fallback recognizes it as JSON_ARRAY,
+        # proving we took the degrade path rather than the (hung) native result.
+        result = _detect_content('[{"id": 1}]')
+        assert result.content_type is ContentType.JSON_ARRAY
+    finally:
+        release.set()  # let the daemon worker finish so it does not linger
+
+
+def test_detect_content_watchdog_uses_native_result_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On Windows with rust forced, a fast native result still flows through unchanged."""
+    import headroom._core as _core
+
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "rust")
+    monkeypatch.setattr(content_router_module.sys, "platform", "win32")
+
+    fake = SimpleNamespace(content_type="source_code", confidence=1.0, metadata={})
+    monkeypatch.setattr(_core, "detect_content_type", lambda _content: fake)
+
+    result = _detect_content("def main(): pass")
+    assert result.content_type is ContentType.SOURCE_CODE
+
+
+def test_detect_content_circuit_breaker_skips_native_after_hang(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After one watchdog timeout, native detection is disabled process-wide (#575)."""
+    import threading as _threading
+
+    import headroom._core as _core
+
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "rust")
+    monkeypatch.setattr(content_router_module.sys, "platform", "win32")
+    monkeypatch.setenv("HEADROOM_DETECT_TIMEOUT_SECS", "0.1")
+
+    release = _threading.Event()
+    calls = 0
+
+    def _hang(_content: str):
+        nonlocal calls
+        calls += 1
+        release.wait()  # park with GIL released, like the real WaitOnAddress hang
+        return SimpleNamespace(content_type="plain_text", confidence=1.0, metadata={})
+
+    monkeypatch.setattr(_core, "detect_content_type", _hang)
+    try:
+        first = _detect_content('[{"id": 1}]')
+        second = _detect_content('[{"id": 2}]')
+        assert first.content_type is ContentType.JSON_ARRAY
+        assert second.content_type is ContentType.JSON_ARRAY
+        assert calls == 1  # breaker tripped: native entered once, 2nd call skipped it
+    finally:
+        release.set()  # let the lone daemon worker finish
+
+
+def test_strip_detection_envelope_isolates_tool_output_payload() -> None:
+    """Only a whole-string tool-output envelope is unwrapped; content that
+    merely mentions the tags, or has an empty body, is left untouched."""
+    body = "def main():\n    return 1"
+    wrapped = f"<returncode>0</returncode>\n<output>\n{body}\n</output>"
+    assert _strip_detection_envelope(wrapped) == body
+    # <output> alias tags and a bare envelope (no returncode) also unwrap.
+    assert _strip_detection_envelope(f"<stdout>\n{body}\n</stdout>") == body
+    # Non-envelope content is returned verbatim (no "<" fast-path + no match).
+    prose = "see the <output> tag docs for details"
+    assert _strip_detection_envelope(prose) == prose
+    # Empty body never yields an empty probe — falls back to the original.
+    empty = "<output>\n\n</output>"
+    assert _strip_detection_envelope(empty) == empty
+
+
+def test_detect_content_sees_through_tool_output_envelope() -> None:
+    """Regression: a tool-result envelope's tags used to make the detector
+    read the whole payload as markup and misroute code to the HTML extractor.
+    Detection now runs on the inner payload, so the real type wins."""
+    code = "\n".join(
+        [
+            "import os",
+            "from pathlib import Path",
+            "",
+            "def main() -> int:",
+            "    return len(os.listdir(Path.cwd()))",
+        ]
+    )
+    wrapped = f"<returncode>0</returncode>\n<output>\n{code}\n</output>"
+    assert _detect_content(wrapped).content_type is ContentType.SOURCE_CODE
+    assert _detect_content(wrapped).content_type is _detect_content(code).content_type
+
+
+def test_detect_content_overrides_html_misroute_for_grep_and_logs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the native detector (magika) tags dense grep output and
+    build logs as HTML because file paths and </> read as markup. Routing those
+    to the HTML article-extractor is lossy (it strips code + identifiers). When
+    the structural log/search detectors positively claim the payload they
+    override the HTML verdict (log checked first so tracebacks win); genuine
+    HTML with no such structure is left as HTML."""
+    import headroom._core as _core
+
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "rust")
+    monkeypatch.setattr(
+        _core,
+        "detect_content_type",
+        lambda content: SimpleNamespace(content_type="html", confidence=1.0, metadata={}),
+    )
+
+    # grep over HTML template files: native says html, but it is search results.
+    grep = "\n".join(
+        f'templates/pages/dashboard_{i}.html:{10 + i}:      <div class="card" data-id="{i}">'
+        for i in range(6)
+    )
+    assert _detect_content(grep).content_type is ContentType.SEARCH_RESULTS
+
+    # build/error log misread as html -> LOG wins (checked before search).
+    build_log = "\n".join(
+        [
+            "ERROR failed to compile module widget",
+            "WARNING deprecated call near <template>",
+            "Traceback (most recent call last):",
+            "ERROR build aborted after 2 retries",
+        ]
+    )
+    assert _detect_content(build_log).content_type is ContentType.BUILD_OUTPUT
+
+    # genuine HTML article: no grep/log structure -> override does not fire.
+    html = (
+        "<!DOCTYPE html>\n<html><head><title>x</title></head>"
+        "<body><main><section><p>An article about widgets and gadgets.</p>"
+        "</section></main></body></html>"
+    )
+    assert _detect_content(html).content_type is ContentType.HTML

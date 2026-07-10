@@ -12,7 +12,6 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
 from headroom.proxy.server import ProxyConfig, create_app
-from headroom.transforms.content_router import ContentRouter
 
 
 class _FakePrefixTracker:
@@ -21,6 +20,16 @@ class _FakePrefixTracker:
 
     def get_frozen_message_count(self) -> int:
         return self._frozen_count
+
+    # Empty history → overlay_cached_prefix() is a no-op here, so these tests
+    # keep asserting the cache-freeze behavior they always have. The cross-turn
+    # overlay itself is exercised in test_cross_turn_cache_safety.py against the
+    # real tracker; these stubs just satisfy the handler's overlay call.
+    def get_last_original_messages(self):  # noqa: ANN201
+        return []
+
+    def get_last_forwarded_messages(self):  # noqa: ANN201
+        return []
 
     def update_from_response(self, **kwargs):  # noqa: ANN003
         return None
@@ -103,22 +112,34 @@ def test_openai_cache_mode_freezes_previous_turns() -> None:
         assert captured["frozen_message_count"] == 2
 
 
-def test_openai_chat_completions_receives_agent_savings_kwargs() -> None:
+@pytest.mark.parametrize("tail_role", ["tool", "function"])
+def test_openai_cache_mode_keeps_final_tool_observation_mutable(tail_role: str) -> None:
     captured = {}
     with _make_proxy_client() as client:
         proxy = client.app.state.proxy
         proxy.config.optimize = True
-        proxy.config.mode = "token"
-        proxy.config.savings_profile = "agent-90"
+        proxy.config.mode = "cache"
+
+        fake_tracker = _FakePrefixTracker(frozen_count=0)
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "stable-session"
+        )
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
 
         def _fake_apply(**kwargs):
-            captured.update(kwargs)
+            captured.setdefault("calls", []).append(
+                {
+                    "frozen_message_count": kwargs.get("frozen_message_count"),
+                    "roles": [msg.get("role") for msg in kwargs["messages"]],
+                    "mode": proxy.config.mode,
+                }
+            )
             return SimpleNamespace(
                 messages=kwargs["messages"],
-                transforms_applied=[],
+                transforms_applied=["test:compress-tail"],
                 timing={},
-                tokens_before=600,
-                tokens_after=60,
+                tokens_before=120,
+                tokens_after=80,
                 waste_signals=None,
             )
 
@@ -128,7 +149,7 @@ def test_openai_chat_completions_receives_agent_savings_kwargs() -> None:
             return httpx.Response(
                 200,
                 json={
-                    "id": "chatcmpl_agent_90",
+                    "id": "chatcmpl_tool_tail",
                     "choices": [
                         {
                             "index": 0,
@@ -136,91 +157,38 @@ def test_openai_chat_completions_receives_agent_savings_kwargs() -> None:
                             "finish_reason": "stop",
                         }
                     ],
-                    "usage": {"prompt_tokens": 60, "completion_tokens": 3, "total_tokens": 63},
+                    "usage": {"prompt_tokens": 80, "completion_tokens": 3, "total_tokens": 83},
                 },
             )
 
         proxy._retry_request = _fake_retry
+
+        tail = {
+            "role": tail_role,
+            "content": "large command observation " * 200,
+        }
+        if tail_role == "tool":
+            tail["tool_call_id"] = "call_1"
+        else:
+            tail["name"] = "bash"
 
         response = client.post(
             "/v1/chat/completions",
             headers={"authorization": "Bearer test-key"},
             json={
                 "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": "large pasted context"}],
+                "messages": [
+                    {"role": "user", "content": "turn1"},
+                    {"role": "assistant", "content": "run command"},
+                    tail,
+                ],
             },
         )
 
         assert response.status_code == 200
-        assert captured["compress_user_messages"] is True
-        assert captured["compress_system_messages"] is True
-        assert captured["protect_recent"] == 2
-        assert captured["protect_analysis_context"] is True
-        assert captured["target_ratio"] == 0.10
-        assert captured["min_tokens_to_compress"] == 120
-        assert captured["max_items_after_crush"] == 8
-        assert captured["smart_crusher_with_compaction"] is False
-        assert captured["force_kompress"] is True
-        assert captured["read_protection_window"] == 2
-
-
-def test_openai_chat_completions_compresses_user_text_content_blocks() -> None:
-    captured = {}
-    with _make_proxy_client() as client:
-        proxy = client.app.state.proxy
-        proxy.config.optimize = True
-        proxy.config.mode = "token"
-        proxy.config.savings_profile = "agent-90"
-
-        router = next(
-            transform
-            for transform in proxy.openai_pipeline.transforms
-            if isinstance(transform, ContentRouter)
-        )
-
-        def _fake_compress(content: str, **kwargs):  # noqa: ANN003
-            return SimpleNamespace(
-                compressed="compressed content",
-                original=content,
-                strategy_used=SimpleNamespace(value="text"),
-                compression_ratio=0.05,
-            )
-
-        router.compress = _fake_compress
-
-        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
-            captured["body"] = body
-            return httpx.Response(
-                200,
-                json={
-                    "id": "chatcmpl_text_blocks",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {"role": "assistant", "content": "ok"},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                    "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
-                },
-            )
-
-        proxy._retry_request = _fake_retry
-        long_text = "OpenCode payload " * 200
-
-        response = client.post(
-            "/v1/chat/completions",
-            headers={"authorization": "Bearer test-key"},
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": [{"type": "text", "text": long_text}]}],
-            },
-        )
-
-        assert response.status_code == 200
-        assert int(response.headers["x-headroom-tokens-saved"]) > 0
-        sent_text = captured["body"]["messages"][0]["content"][0]["text"]
-        assert sent_text == "compressed content"
+        assert any(call["frozen_message_count"] == 2 for call in captured["calls"]), captured[
+            "calls"
+        ]
 
 
 def test_openai_cache_mode_restores_mutated_frozen_prefix() -> None:

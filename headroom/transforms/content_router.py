@@ -1203,9 +1203,19 @@ class ContentRouterConfig:
     # narrowed to lines whose file sits within `graph_narrow_max_depth` import
     # hops of a detected entrypoint, instead of being lossy-compressed or
     # passed through in full. See ``_graph_narrow``.
+    #
+    # Harnesses without dedicated discovery tools (e.g. opencode) shell the
+    # same wide dumps out through `bash_tool_names` instead (`find`, `ls -R`,
+    # `grep -r`, …). `graph_narrow_bash_commands` is the matching whitelist
+    # for THAT path — checked against the parsed program name (see
+    # `_bash_command_is_search`) whenever a bash-family tool call's own name
+    # isn't already in `graph_narrow_tool_names`.
     enable_graph_narrow: bool = True
     graph_narrow_tool_names: frozenset[str] = frozenset(
         {"glob", "grep", "rg", "ripgrep", "ls", "list_directory", "list_dir", "search_files"}
+    )
+    graph_narrow_bash_commands: frozenset[str] = frozenset(
+        {"grep", "egrep", "fgrep", "rg", "ripgrep", "ag", "ack", "find", "ls"}
     )
     graph_narrow_max_depth: int = 2
     # Below this many lines a discovery result isn't "wide" enough to bother
@@ -4206,6 +4216,23 @@ class ContentRouter(Transform):
             timing=compressor_timing,
         )
 
+    def _is_graph_narrow_candidate(self, tool_name: str, tool_call_id: str) -> bool:
+        """True when this call's output is a wide discovery dump graph-narrow should see.
+
+        Two ways in: the harness's own dedicated tool name (Grep/Glob/LS, per
+        `graph_narrow_tool_names`), or a bash-family tool call whose parsed
+        program is a discovery command (`grep -r`, `find`, `ls -R`, …, per
+        `graph_narrow_bash_commands`) — the path harnesses like opencode use
+        when they shell out instead of calling a structured discovery tool.
+        """
+        name = tool_name.lower()
+        if name in self.config.graph_narrow_tool_names:
+            return True
+        if name not in self.config.bash_tool_names:
+            return False
+        command = self._tool_call_commands.get(tool_call_id, "")
+        return bool(command) and _bash_command_is_search(command, self.config.graph_narrow_bash_commands)
+
     def _graph_narrow_lossless(
         self, tool_name: str, tool_call_id: str, content: Any
     ) -> tuple[str, str] | None:
@@ -4230,7 +4257,7 @@ class ContentRouter(Transform):
         """
         if not self.config.enable_graph_narrow:
             return None
-        if not isinstance(content, str) or tool_name.lower() not in self.config.graph_narrow_tool_names:
+        if not isinstance(content, str) or not self._is_graph_narrow_candidate(tool_name, tool_call_id):
             return None
         lines = content.splitlines()
         if len(lines) < self.config.graph_narrow_min_lines:
@@ -4407,7 +4434,8 @@ class ContentRouter(Transform):
         return None
 
     def _graph_narrow(self, tool_name: str, tool_call_id: str, content: Any) -> str | None:
-        """Narrow a whole-repo Glob/Grep/LS dump to its import-graph neighborhood.
+        """Narrow a whole-repo Glob/Grep/LS (or bash `find`/`ls -R`/`grep -r`) dump
+        to its import-graph neighborhood.
 
         Headroom's native, Graphify-style proxy behavior (``headroom.
         graph_context``): rather than shipping every matched line/path to the
@@ -4423,7 +4451,7 @@ class ContentRouter(Transform):
         """
         if not self.config.enable_graph_narrow:
             return None
-        if not isinstance(content, str) or tool_name.lower() not in self.config.graph_narrow_tool_names:
+        if not isinstance(content, str) or not self._is_graph_narrow_candidate(tool_name, tool_call_id):
             return None
         lines = content.splitlines()
         if len(lines) < self.config.graph_narrow_min_lines:

@@ -128,6 +128,83 @@ def test_noop_for_non_discovery_tool(fake_workspace: None, project: Path) -> Non
     assert router._graph_narrow("bash", "call_grep", _wide_grep_dump()) is None
 
 
+# =============================================================================
+# Bash-shelled discovery (issue #1925 follow-up): harnesses without dedicated
+# Grep/Glob/LS tools (e.g. opencode) shell the same wide dumps out through a
+# generic bash tool instead. `_graph_narrow`/`_graph_narrow_lossless` must
+# reach those too, gated on the *parsed shell command* (`find`, `ls -R`,
+# `grep -r`, …), not just the harness's own tool name.
+# =============================================================================
+
+
+def _read_then_bash_messages(command: str) -> list[dict]:
+    return [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "call_read",
+                    "name": "Read",
+                    "input": {"file_path": "main.py"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "call_read", "content": "from pkg import util"}
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "call_bash",
+                    "name": "bash",
+                    "input": {"command": command},
+                }
+            ],
+        },
+    ]
+
+
+@pytest.mark.parametrize("command", ["grep -r Z .", "find . -name '*.py'", "ls -R"])
+def test_narrows_wide_bash_search_dump_to_files_reachable_from_last_read(
+    fake_workspace: None, project: Path, command: str
+) -> None:
+    router = ContentRouter()
+    router._build_tool_name_map(_read_then_bash_messages(command))
+    assert router._last_read_path == "main.py"
+
+    narrowed = router._graph_narrow("bash", "call_bash", _wide_grep_dump())
+
+    assert narrowed is not None
+    assert "main.py" in narrowed
+    assert "pkg/util.py" in narrowed
+    assert "unrelated.py" not in narrowed
+
+
+def test_noop_for_bash_command_that_is_not_a_discovery_command(
+    fake_workspace: None, project: Path
+) -> None:
+    """Documents an accepted gap, not a bug: `cat`/`sed` reads of a SINGLE
+    already-known file aren't a repo-wide discovery dump with a candidate
+    list of paths to filter, so graph-narrow has nothing to do there --
+    unlike `grep -r`/`find`/`ls -R`, whose output IS a list of paths.
+    """
+    router = ContentRouter()
+    router._build_tool_name_map(_read_then_bash_messages("cat -n main.py"))
+    assert router._graph_narrow("bash", "call_bash", _wide_grep_dump()) is None
+
+
+def test_noop_for_bash_call_with_no_recorded_command(fake_workspace: None, project: Path) -> None:
+    router = ContentRouter()
+    router._build_tool_name_map(_read_then_grep_messages())  # no bash call recorded at all
+    assert router._graph_narrow("bash", "call_grep", _wide_grep_dump()) is None
+
+
 def test_noop_below_min_lines_threshold(fake_workspace: None, project: Path) -> None:
     router = ContentRouter()
     router._build_tool_name_map(_read_then_grep_messages())

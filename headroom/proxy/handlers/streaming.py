@@ -95,9 +95,7 @@ class StreamingMixin:
         self._mid_turn_queues[session_key].put_nowait(body)
         return {"status": 202, "event": "headroom_queued"}
 
-    def _should_queue_mid_turn(
-        self, session_key: str, explicit_session_header: str | None
-    ) -> bool:
+    def _should_queue_mid_turn(self, session_key: str, explicit_session_header: str | None) -> bool:
         """Return True only when a follow-up should be queued as a mid-turn message.
 
         Mid-turn steering is a private Headroom protocol: a queued message is

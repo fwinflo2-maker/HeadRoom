@@ -1030,7 +1030,15 @@ def build_graph(root: Path) -> ProjectGraph:
         if rel not in file_hashes:
             continue  # vanished mid-scan, see the hashing pass above
         deps = _extract_imports_any(root, file_path, ctx)
-        edges[rel] = sorted({d.relative_to(root).as_posix() for d in deps})
+        # Self-edges are never meaningful (a file is never a dependency of
+        # itself) and are excluded here rather than per-extractor: most
+        # extractors resolve one specific file and can't produce one by
+        # construction, but Go/C# resolve to every file in a package/
+        # namespace DIRECTORY, which — if the importer happens to sit in
+        # that same directory — would otherwise include the importer itself.
+        edges[rel] = sorted(
+            {d.relative_to(root).as_posix() for d in deps} - {file_path.relative_to(root).as_posix()}
+        )
 
     return ProjectGraph(root=root, edges=edges, file_hashes=file_hashes)
 

@@ -41,6 +41,40 @@ def test_go_resolves_internal_package_directory_not_stdlib(tmp_path: Path) -> No
     assert set(graph.edges["main.go"]) == {"pkg/util/util.go", "pkg/util/other.go"}
 
 
+def test_go_package_import_excludes_the_importer_itself(tmp_path: Path) -> None:
+    """A file's own package can never be a real dependency of itself in
+    valid Go, but the directory-glob resolution (`_extract_go_imports`)
+    would otherwise include the importer if it happens to sit in the
+    resolved package directory -- `build_graph` filters self-edges
+    regardless of which extractor produced them.
+    """
+    root = tmp_path / "proj"
+    root.mkdir(parents=True)
+    (root / "go.mod").write_text("module myproj\n", encoding="utf-8")
+    (root / "root.go").write_text("package main\n", encoding="utf-8")
+    (root / "main.go").write_text('package main\nimport "myproj"\n', encoding="utf-8")
+
+    graph = gc.build_graph(root)
+
+    assert graph.edges["main.go"] == ["root.go"]  # not main.go itself
+
+
+def test_csharp_namespace_import_excludes_the_importer_itself(tmp_path: Path) -> None:
+    """A redundant `using` of one's own namespace (legal, if pointless, C#)
+    would otherwise include the importer via the directory glob -- must not.
+    """
+    root = tmp_path / "proj"
+    (root / "Self").mkdir(parents=True)
+    (root / "Self" / "Program.cs").write_text(
+        "using Self;\nclass Program {}\n", encoding="utf-8"
+    )
+    (root / "Self" / "Other.cs").write_text("namespace Self { class Other {} }\n", encoding="utf-8")
+
+    graph = gc.build_graph(root)
+
+    assert graph.edges["Self/Program.cs"] == ["Self/Other.cs"]  # not Self/Program.cs itself
+
+
 def test_go_import_without_go_mod_is_unresolved(tmp_path: Path) -> None:
     root = tmp_path / "proj"
     root.mkdir(parents=True)

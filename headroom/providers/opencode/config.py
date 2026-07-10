@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 from pathlib import Path
@@ -68,14 +67,6 @@ def headroom_provider_entry(port: int) -> dict[str, Any]:
         "options": {"baseURL": f"http://127.0.0.1:{port}/v1"},
         "models": HEADROOM_OPENCODE_MODELS,
     }
-
-
-def _opencode_home_dir() -> Path:
-    """Return the OpenCode home/config directory."""
-    env_path = os.environ.get("OPENCODE_HOME", "").strip()
-    if env_path:
-        return Path(env_path).expanduser()
-    return Path.home() / ".config" / "opencode"
 
 
 def opencode_config_paths() -> tuple[Path, Path]:

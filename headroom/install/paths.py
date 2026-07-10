@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 import sys
 from pathlib import Path
@@ -124,11 +123,11 @@ def openclaw_config_path() -> Path:
 def opencode_config_path() -> Path:
     """Return the OpenCode config path.
 
-    Resolves ``~/.config/opencode/opencode.json`` when ``OPENCODE_CONFIG``
-    is unset; otherwise the value of that environment variable.
+    Resolves ``OPENCODE_CONFIG`` env var when set; otherwise derives from
+    ``OPENCODE_HOME`` (or ``HEADROOM_OPENCODE_BIN`` basename, or ``~/.config/opencode``).
     """
+    from headroom.providers.opencode._shared import (
+        _opencode_config_path,  # lazy — avoids import cycle
+    )
 
-    env_path = os.environ.get("OPENCODE_CONFIG", "").strip()
-    if env_path:
-        return Path(env_path).expanduser()
-    return Path.home() / ".config" / "opencode" / "opencode.json"
+    return _opencode_config_path()

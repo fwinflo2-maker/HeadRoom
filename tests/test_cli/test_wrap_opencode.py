@@ -24,6 +24,7 @@ def _set_test_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("USERPROFILE", home)
     monkeypatch.delenv("OPENCODE_HOME", raising=False)
     monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENCODE_BIN", raising=False)
 
 
 # ---------------------------------------------------------------------------

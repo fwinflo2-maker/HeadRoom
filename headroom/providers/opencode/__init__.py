@@ -1,5 +1,10 @@
 """OpenCode-specific provider helpers."""
 
+from ._shared import (  # noqa: F401
+    _get_opencode_bin,
+    _opencode_config_path,
+    _opencode_home_dir,
+)
 from .config import (
     _MCP_MARKER_END,
     _MCP_MARKER_START,

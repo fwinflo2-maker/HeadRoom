@@ -117,6 +117,7 @@ from headroom.providers.openclaw import (
     normalize_gateway_provider_ids as _normalize_openclaw_gateway_provider_ids_impl,
 )
 from headroom.providers.opencode import build_launch_env as _build_opencode_launch_env
+from headroom.providers.opencode._shared import _get_opencode_bin, _opencode_home_dir
 from headroom.providers.opencode.config import (
     _MCP_MARKER_END,  # noqa: F401
     _MCP_MARKER_START,
@@ -6018,9 +6019,10 @@ def opencode(
         inject_opencode_provider_config(port)
         return
 
-    opencode_bin = shutil.which("opencode")
+    bin_name = _get_opencode_bin()
+    opencode_bin = shutil.which(bin_name)
     if not opencode_bin:
-        click.echo("Error: 'opencode' not found in PATH.")
+        click.echo(f"Error: '{bin_name}' not found in PATH.")
         click.echo("Install OpenCode: https://opencode.ai")
         raise SystemExit(1)
 
@@ -6093,14 +6095,6 @@ def opencode(
                     _opencode_proxy.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     _opencode_proxy.kill()
-
-
-def _opencode_home_dir() -> Path:
-    """Return the OpenCode home/config directory."""
-    env_path = os.environ.get("OPENCODE_HOME", "").strip()
-    if env_path:
-        return Path(env_path).expanduser()
-    return Path.home() / ".config" / "opencode"
 
 
 # =============================================================================

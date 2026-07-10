@@ -2,14 +2,20 @@
 
 OpenCode stores MCP server configuration in ``~/.config/opencode/opencode.json``
 under the top-level ``mcp`` key. This registrar edits that JSON file directly.
-"""
 
+All mutations are **atomic** (temp-file + rename) and acquire an advisory
+``flock`` on ``opencode.json.lock`` to prevent data corruption from
+concurrent headroom processes.
+"""
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import logging
 import os
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -18,20 +24,17 @@ from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 logger = logging.getLogger(__name__)
 
 
-def _opencode_home_dir() -> Path:
-    """Return the OpenCode home/config directory."""
-    env_path = os.environ.get("OPENCODE_HOME", "").strip()
-    if env_path:
-        return Path(env_path).expanduser()
-    return Path.home() / ".config" / "opencode"
-
-
 def _opencode_config_path() -> Path:
     """Return the active OpenCode config path."""
-    env_path = os.environ.get("OPENCODE_CONFIG", "").strip()
-    if env_path:
-        return Path(env_path).expanduser()
-    return _opencode_home_dir() / "opencode.json"
+    from headroom.providers.opencode._shared import (
+        _opencode_config_path as _shared_config_path,  # lazy
+    )
+    return _shared_config_path()
+
+
+def _lock_path(config_path: Path) -> Path:
+    """Return the companion lock-file path for *config_path*."""
+    return config_path.with_suffix(config_path.suffix + ".lock")
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -49,11 +52,57 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+    """Atomically write JSON data using temp-file + rename.
 
+    Writes to a temp file in the same directory, then calls ``os.replace()``
+    so the target file is never observed in a partially-written state — even
+    if the process crashes mid-write the original file stays intact.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        prefix=".headroom-", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+# ── file-level advisory locking (POSIX) ────────────────────────────
+
+@contextlib.contextmanager
+def _locked_config(config_path: Path):
+    """Exclusive advisory lock on the companion ``.lock`` file.
+
+    Acquires a ``fcntl.FLOCK_EX`` lock, then yields.  Nesting reads/writes
+    inside the block are safe from concurrent mutation by another locked
+    writer (or this same process if the lock is re-entered — note that
+    ``fcntl.flock`` is NOT reentrant when called from separate fd's).
+
+    On platforms without ``fcntl`` this is a no-op.
+    """
+    lock_path = _lock_path(config_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    # Open for read/write; create if absent (never truncated).
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+# ── spec helpers ───────────────────────────────────────────────────
 
 def _entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec:
     command_value = entry.get("command")
@@ -103,8 +152,14 @@ def _diff_specs(existing: ServerSpec, requested: ServerSpec) -> str:
     return "; ".join(parts)
 
 
+# ── registrar ──────────────────────────────────────────────────────
+
 class OpencodeRegistrar(MCPRegistrar):
-    """Register MCP servers with OpenCode."""
+    """Register MCP servers with OpenCode.
+
+    Mutations are serialised via an advisory ``flock`` on a companion
+    ``.lock`` file and written atomically via temp-file + rename.
+    """
 
     name = "opencode"
     display_name = "OpenCode"
@@ -112,13 +167,19 @@ class OpencodeRegistrar(MCPRegistrar):
     def __init__(self, *, config_path: Path | None = None) -> None:
         self._config_path = config_path or _opencode_config_path()
 
+    # ── detection ───────────────────────────────────────────────
+
     def detect(self) -> bool:
-        if shutil.which("opencode"):
+        from headroom.providers.opencode._shared import _get_opencode_bin  # lazy — avoids cycle
+        if shutil.which(_get_opencode_bin()):
             return True
         return self._config_path.parent.is_dir()
 
+    # ── server CRUD ─────────────────────────────────────────────
+
     def get_server(self, server_name: str) -> ServerSpec | None:
-        data = _read_json(self._config_path)
+        with _locked_config(self._config_path):
+            data = _read_json(self._config_path)
         mcp = data.get("mcp", {})
         if not isinstance(mcp, dict):
             return None
@@ -128,51 +189,44 @@ class OpencodeRegistrar(MCPRegistrar):
         return _entry_to_spec(server_name, entry)
 
     def register_server(self, spec: ServerSpec, *, force: bool = False) -> RegisterResult:
-        existing = self.get_server(spec.name)
-
-        if existing is not None and _specs_equivalent(existing, spec):
-            return RegisterResult(RegisterStatus.ALREADY, "matches current configuration")
-
-        if existing is not None and not force:
-            return RegisterResult(
-                RegisterStatus.MISMATCH,
-                _diff_specs(existing, spec),
-            )
-
-        if existing is not None and force:
-            # Remove the existing entry before rewriting.
-            self.unregister_server(spec.name)
-
-        return self._write_entry(spec)
-
-    def unregister_server(self, server_name: str) -> bool:
-        data = _read_json(self._config_path)
-        mcp = data.get("mcp", {})
-        if not isinstance(mcp, dict):
-            return False
-        if server_name not in mcp:
-            return False
-        del mcp[server_name]
-        if not mcp:
-            data.pop("mcp", None)
-        try:
-            _write_json(self._config_path, data)
-        except OSError:
-            return False
-        return True
-
-    def _write_entry(self, spec: ServerSpec) -> RegisterResult:
-        try:
-            self._config_path.parent.mkdir(parents=True, exist_ok=True)
+        with _locked_config(self._config_path):
             data = _read_json(self._config_path)
             mcp = data.setdefault("mcp", {})
             if not isinstance(mcp, dict):
                 mcp = {}
                 data["mcp"] = mcp
+            existing_entry = mcp.get(spec.name)
+
+            if existing_entry is not None:
+                existing_spec = _entry_to_spec(spec.name, existing_entry)
+                if _specs_equivalent(existing_spec, spec):
+                    return RegisterResult(RegisterStatus.ALREADY, "matches current configuration")
+                if not force:
+                    return RegisterResult(
+                        RegisterStatus.MISMATCH,
+                        _diff_specs(existing_spec, spec),
+                    )
+
             mcp[spec.name] = _spec_to_entry(spec)
-            _write_json(self._config_path, data)
-        except OSError as exc:
-            return RegisterResult(
-                RegisterStatus.FAILED, f"could not write {self._config_path}: {exc}"
-            )
-        return RegisterResult(RegisterStatus.REGISTERED, f"wrote to {self._config_path}")
+            try:
+                _write_json(self._config_path, data)
+            except OSError as exc:
+                return RegisterResult(
+                    RegisterStatus.FAILED, f"could not write {self._config_path}: {exc}"
+                )
+            return RegisterResult(RegisterStatus.REGISTERED, f"wrote to {self._config_path}")
+
+    def unregister_server(self, server_name: str) -> bool:
+        with _locked_config(self._config_path):
+            data = _read_json(self._config_path)
+            mcp = data.get("mcp", {})
+            if not isinstance(mcp, dict) or server_name not in mcp:
+                return False
+            del mcp[server_name]
+            if not mcp:
+                data.pop("mcp", None)
+            try:
+                _write_json(self._config_path, data)
+            except OSError:
+                return False
+            return True

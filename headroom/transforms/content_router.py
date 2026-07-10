@@ -77,9 +77,17 @@ _detect_backend_warned = False
 # doesn't force an eager import of graph_context into every content_router
 # user; graph_context itself is still only ever lazily imported inside the
 # `_graph_narrow*` methods.
+#
+# NOTE: alternation order matters here -- `re` tries alternatives
+# left-to-right and takes the first that matches, not the longest, so any
+# extension that is a strict prefix of another (`c` of `cs`/`cpp`/`cc`/`cxx`,
+# `h` of `hpp`/`hh`/`hxx`) MUST be listed after the longer one it prefixes,
+# or the longer extension gets silently truncated (`Program.cs` -> matched
+# as `Program.c`, then fails the `is_file()` check downstream and the
+# entrypoint is silently never detected).
 _SOURCE_PATH_RE = re.compile(
-    r"[\w./\\-]+\.(?:py|jsx?|mjs|cjs|tsx?|rs|c|h|cpp|cc|cxx|hpp|hh|hxx"
-    r"|go|java|cs|rb|php|kts?|scala|dart|lua|zig)"
+    r"[\w./\\-]+\.(?:py|jsx?|mjs|cjs|tsx?|rs|cpp|cc|cxx|cs|c|hpp|hh|hxx|h"
+    r"|go|java|rb|php|kts?|scala|dart|lua|zig)"
 )
 
 

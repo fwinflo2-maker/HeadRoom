@@ -300,3 +300,88 @@ def test_new_languages_degrade_to_zero_edges_without_tree_sitter(
 
     assert "Main.java" in graph.edges  # still a node
     assert graph.edges["Main.java"] == []  # but no edges without tree-sitter
+
+
+# =============================================================================
+# Robustness battery: malformed/empty input, dedup, cache invalidation, and
+# unusual-but-legal paths must not crash `build_graph` or silently misbehave.
+# =============================================================================
+
+
+def test_truncated_java_file_does_not_crash_build_graph(tmp_path: Path) -> None:
+    """Mid-write/truncated source is a realistic live-agent scenario (a file
+    the watcher observes between an agent's write() and a syntactically
+    complete save). tree-sitter is error-tolerant; this pins that
+    `build_graph` never raises on it, whatever it manages to resolve.
+    """
+    root = tmp_path / "proj"
+    (root / "com" / "acme").mkdir(parents=True)
+    (root / "Main.java").write_text("import com.acme.Util;\nclass Main { void x(", encoding="utf-8")
+    (root / "com" / "acme" / "Util.java").write_text("package com.acme;\nclass Util {}\n", encoding="utf-8")
+
+    graph = gc.build_graph(root)  # must not raise
+
+    assert "Main.java" in graph.edges
+
+
+@pytest.mark.parametrize(
+    "ext", [".go", ".java", ".cs", ".rb", ".php", ".kt", ".scala", ".dart", ".lua", ".zig"]
+)
+def test_empty_file_does_not_crash_and_has_no_edges(tmp_path: Path, ext: str) -> None:
+    root = tmp_path / "proj"
+    root.mkdir(parents=True)
+    if ext == ".go":
+        (root / "go.mod").write_text("module myproj\n", encoding="utf-8")
+    (root / f"empty{ext}").write_text("", encoding="utf-8")
+
+    graph = gc.build_graph(root)
+
+    assert graph.edges[f"empty{ext}"] == []
+
+
+def test_duplicate_import_statements_dedupe_to_one_edge(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    (root / "com" / "acme").mkdir(parents=True)
+    (root / "Main.java").write_text(
+        "import com.acme.Util;\nimport com.acme.Util;\nclass Main {}\n", encoding="utf-8"
+    )
+    (root / "com" / "acme" / "Util.java").write_text("package com.acme;\nclass Util {}\n", encoding="utf-8")
+
+    graph = gc.build_graph(root)
+
+    assert graph.edges["Main.java"] == ["com/acme/Util.java"]
+
+
+def test_editing_an_import_invalidates_the_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`load_or_build_graph`'s content-hash cache must notice a NEW-language
+    file's import changing, not just its existence -- editing `Main.java` to
+    add an import must produce a fresh graph on the next call, not the
+    stale cached one.
+    """
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "_ws"))
+    root = tmp_path / "proj"
+    (root / "com" / "acme").mkdir(parents=True)
+    (root / "Main.java").write_text("class Main {}\n", encoding="utf-8")
+    (root / "com" / "acme" / "Util.java").write_text("package com.acme;\nclass Util {}\n", encoding="utf-8")
+
+    before = gc.load_or_build_graph(root)
+    assert before.edges["Main.java"] == []
+
+    (root / "Main.java").write_text("import com.acme.Util;\nclass Main {}\n", encoding="utf-8")
+    after = gc.load_or_build_graph(root)
+
+    assert after.edges["Main.java"] == ["com/acme/Util.java"]
+
+
+def test_go_package_directory_with_a_space_in_its_name_resolves(tmp_path: Path) -> None:
+    root = tmp_path / "proj"
+    (root / "my pkg").mkdir(parents=True)
+    (root / "go.mod").write_text("module myproj\n", encoding="utf-8")
+    (root / "main.go").write_text('package main\nimport "myproj/my pkg"\n', encoding="utf-8")
+    (root / "my pkg" / "util.go").write_text("package pkg\nvar X = 1\n", encoding="utf-8")
+
+    graph = gc.build_graph(root)
+
+    assert graph.edges["main.go"] == ["my pkg/util.go"]

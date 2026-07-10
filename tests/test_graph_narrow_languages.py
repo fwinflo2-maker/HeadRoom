@@ -298,3 +298,65 @@ def test_graph_narrow_telemetry_records_real_tokens_saved_for_a_new_language(
     assert spy.route_counts is not None
     saved = spy.route_counts.get("graph_narrow_lossless_tokens_saved", 0)
     assert saved > 0, "no token savings recorded for a new-language (Java) graph-narrow pass"
+
+
+def test_graph_narrow_lossless_roundtrip_retrieves_exact_original_for_new_language(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_graph_narrow_lossless` (the FRESH/still-protected path) must be
+    byte-exactly recoverable via its CCR hash for a new language too, not
+    just the drop-and-summarize `_graph_narrow` path already covered above.
+    """
+    import re
+
+    from headroom.cache.compression_store import get_compression_store, reset_compression_store
+
+    reset_compression_store()
+    root = tmp_path / "proj"
+    root.mkdir()
+    monkeypatch.chdir(root)
+    entry_rel, related_rel = _java_setup(root)
+
+    router = ContentRouter()
+    router._build_tool_name_map(_read_then_grep_messages(entry_rel))
+    dump = _wide_dump(entry_rel, related_rel)
+
+    folded = router._graph_narrow_lossless("grep", "call_grep", dump)
+
+    assert folded is not None
+    text, kind = folded
+    assert kind == "graph_narrow"
+    match = re.search(r"hash=([0-9a-f]+)", text)
+    assert match is not None
+    entry = get_compression_store().retrieve(match.group(1))
+    assert entry is not None
+    assert entry.original_content == dump
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["git grep Util .", 'sh -c "grep -r Util ."', "timeout 30 grep -r Util .", "cd . && grep -r Util ."],
+    ids=["git-grep", "sh-c-wrapped", "timeout-wrapped", "cd-prefix"],
+)
+def test_graph_narrow_fires_for_wrapped_and_nested_bash_command_forms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    """`_bash_command_is_search` (reused unchanged from the #1925 bash-search
+    lossless fold) already peels `git grep`, `sh -c "..."`, wrapper commands
+    (`timeout N ...`), and `cd X && ...` prefixes -- confirm graph_narrow
+    still fires through each of those forms for a new language, not just
+    the bare `grep -r` case the other tests use.
+    """
+    root = tmp_path / "proj"
+    root.mkdir()
+    monkeypatch.chdir(root)
+    entry_rel, related_rel = _java_setup(root)
+
+    router = ContentRouter()
+    router._build_tool_name_map(_read_then_bash_messages(entry_rel, command))
+    dump = _wide_dump(entry_rel, related_rel)
+
+    narrowed = router._graph_narrow("bash", "call_bash", dump)
+
+    assert narrowed is not None, f"command {command!r} did not trigger graph_narrow"
+    assert related_rel in narrowed

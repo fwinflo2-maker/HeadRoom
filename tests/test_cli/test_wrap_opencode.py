@@ -223,7 +223,7 @@ def test_wrap_opencode_injects_rtk_into_agents_md(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """RTK instructions are injected into global and project AGENTS.md."""
+    """RTK instructions are injected into global AGENTS.md only (not project)."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
     _set_test_home(monkeypatch, tmp_path)
@@ -237,9 +237,8 @@ def test_wrap_opencode_injects_rtk_into_agents_md(
     global_agents = tmp_path / ".config" / "opencode" / "AGENTS.md"
     project_agents = tmp_path / "AGENTS.md"
     assert global_agents.exists(), "Global AGENTS.md should be created"
-    assert project_agents.exists(), "Project AGENTS.md should be created"
+    assert not project_agents.exists(), "Project AGENTS.md should NOT be created (like Codex)"
     assert wrap_mod._RTK_MARKER in global_agents.read_text(encoding="utf-8")
-    assert wrap_mod._RTK_MARKER in project_agents.read_text(encoding="utf-8")
 
 
 def test_wrap_opencode_idempotent_no_duplicate_block(
@@ -247,7 +246,7 @@ def test_wrap_opencode_idempotent_no_duplicate_block(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Running wrap twice must not duplicate the RTK block in AGENTS.md."""
+    """Running wrap twice must not duplicate the RTK block in global AGENTS.md."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
     _set_test_home(monkeypatch, tmp_path)
@@ -258,8 +257,8 @@ def test_wrap_opencode_idempotent_no_duplicate_block(
                 runner.invoke(main, ["wrap", "opencode", "--port", "9000", "--no-mcp"])
                 runner.invoke(main, ["wrap", "opencode", "--port", "9000", "--no-mcp"])
 
-    project_agents = tmp_path / "AGENTS.md"
-    content = project_agents.read_text(encoding="utf-8")
+    global_agents = tmp_path / ".config" / "opencode" / "AGENTS.md"
+    content = global_agents.read_text(encoding="utf-8")
     assert content.count(wrap_mod._RTK_MARKER) == 1
 
 
@@ -457,13 +456,15 @@ def test_wrap_opencode_rtk_preserves_existing_agents_md(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """RTK injection appends to AGENTS.md without removing existing content."""
+    """RTK injection appends to global AGENTS.md without removing existing content."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
     _set_test_home(monkeypatch, tmp_path)
 
+    global_agents_dir = tmp_path / ".config" / "opencode"
+    global_agents_dir.mkdir(parents=True, exist_ok=True)
     existing_content = "# My custom rules\nUse spaces, not tabs."
-    (tmp_path / "AGENTS.md").write_text(existing_content)
+    (global_agents_dir / "AGENTS.md").write_text(existing_content)
 
     with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
         with patch.object(wrap_mod, "_launch_tool", side_effect=SystemExit(0)):
@@ -471,7 +472,7 @@ def test_wrap_opencode_rtk_preserves_existing_agents_md(
                 result = runner.invoke(main, ["wrap", "opencode", "--port", "9000", "--no-mcp"])
 
     assert result.exit_code == 0, result.output
-    content = (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
+    content = (global_agents_dir / "AGENTS.md").read_text(encoding="utf-8")
     assert existing_content in content
     assert wrap_mod._RTK_MARKER in content
 
@@ -481,13 +482,15 @@ def test_wrap_opencode_no_rtk_leaves_agents_md_untouched(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`--no-rtk` flag leaves existing AGENTS.md untouched."""
+    """`--no-rtk` flag leaves global AGENTS.md untouched."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
     _set_test_home(monkeypatch, tmp_path)
 
+    global_agents_dir = tmp_path / ".config" / "opencode"
+    global_agents_dir.mkdir(parents=True, exist_ok=True)
     existing_content = "# My custom rules\nUse spaces, not tabs."
-    (tmp_path / "AGENTS.md").write_text(existing_content)
+    (global_agents_dir / "AGENTS.md").write_text(existing_content)
 
     with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
         with patch.object(wrap_mod, "_launch_tool", side_effect=SystemExit(0)):
@@ -497,7 +500,7 @@ def test_wrap_opencode_no_rtk_leaves_agents_md_untouched(
                 )
 
     assert result.exit_code == 0, result.output
-    content = (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
+    content = (global_agents_dir / "AGENTS.md").read_text(encoding="utf-8")
     assert content == existing_content, "--no-rtk modified AGENTS.md"
     assert wrap_mod._RTK_MARKER not in content
 

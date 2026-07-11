@@ -5977,10 +5977,9 @@ def opencode(
             click.echo("  Setting up rtk for OpenCode...")
             rtk_path = _ensure_rtk_binary(verbose=verbose)
             if rtk_path:
-                # Inject into project AGENTS.md
-                project_agents = Path.cwd() / "AGENTS.md"
-                _inject_rtk_instructions(project_agents, verbose=verbose)
-                # Inject into global OpenCode AGENTS.md
+                # Inject only into global OpenCode AGENTS.md (like Codex).
+                # Project AGENTS.md is intentionally left alone — it is a
+                # tracked team file and should not be modified by a wrapper.
                 global_agents = _opencode_home_dir() / "AGENTS.md"
                 _inject_rtk_instructions(global_agents, verbose=verbose)
 

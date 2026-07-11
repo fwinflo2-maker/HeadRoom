@@ -2968,38 +2968,7 @@ def _ensure_proxy(
                 running_config = helpers._proxy_health_config(health_payload)
                 if running_config is None:
                     running_config = helpers._query_proxy_config(port)
-                if helpers._proxy_needs_version_restart(health_payload):
-                    running_version = helpers._proxy_version(health_payload) or "unknown"
-                    active_sessions = helpers._proxy_active_session_count(health_payload)
-                    other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
-                    if active_sessions > 0 or other_wrappers:
-                        detail = (
-                            f"{active_sessions} active session(s)"
-                            if active_sessions > 0
-                            else f"{len(other_wrappers)} attached wrapper(s)"
-                        )
-                        click.echo(
-                            f"  Proxy on port {port} is running Headroom {running_version}; "
-                            f"current CLI is {_HEADROOM_VERSION}."
-                        )
-                        click.echo(
-                            f"  Leaving it running because {detail} "
-                            "are still attached; it will be restarted when idle."
-                        )
-                        return None, port
-                    if helpers._restart_persistent_proxy(manifest, port):
-                        return None, port
-                    raise click.ClickException(
-                        f"Persistent deployment '{manifest.profile}' on port {port} "
-                        f"is running stale Headroom {running_version} and could not be restarted."
-                    )
-                # Check if the running proxy has the features we need.
-                # Without this, a persistent deployment started for one use case
-                # (e.g. --backend anthropic) would be silently reused for another
-                # (e.g. --subscription --provider-type openai) causing auth failures.
-                running_config = helpers._proxy_health_config(health_payload)
-                if running_config is None:
-                    running_config = helpers._query_proxy_config(port)
+                incompatible_targets = []
                 if running_config is not None:
                     missing = []
                     if memory and not running_config.get("memory"):
@@ -3032,10 +3001,35 @@ def _ensure_proxy(
                             f"incompatible with requested {flags_str}. Use a different port or "
                             "stop the persistent proxy before wrapping this client."
                         )
-                    if not missing:
-                        click.echo(f"  Proxy already running on port {port}")
-                        click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
+                if helpers._proxy_needs_version_restart(health_payload):
+                    running_version = helpers._proxy_version(health_payload) or "unknown"
+                    active_sessions = helpers._proxy_active_session_count(health_payload)
+                    other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
+                    if active_sessions > 0 or other_wrappers:
+                        detail = (
+                            f"{active_sessions} active session(s)"
+                            if active_sessions > 0
+                            else f"{len(other_wrappers)} attached wrapper(s)"
+                        )
+                        click.echo(
+                            f"  Proxy on port {port} is running Headroom {running_version}; "
+                            f"current CLI is {_HEADROOM_VERSION}."
+                        )
+                        click.echo(
+                            f"  Leaving it running because {detail} "
+                            "are still attached; it will be restarted when idle."
+                        )
                         return None, port
+                    if helpers._restart_persistent_proxy(manifest, port):
+                        return None, port
+                    raise click.ClickException(
+                        f"Persistent deployment '{manifest.profile}' on port {port} "
+                        f"is running stale Headroom {running_version} and could not be restarted."
+                    )
+                if running_config is not None and not missing:
+                    click.echo(f"  Proxy already running on port {port}")
+                    click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
+                    return None, port
                 # Features mismatch or config unavailable — fall through to
                 # the non-persistent path which handles proxy restart.
             else:
@@ -3116,12 +3110,42 @@ def _ensure_proxy(
             running_config = helpers._proxy_health_config(health_payload)
             if running_config is None:
                 running_config = helpers._query_proxy_config(port)
+            target_mismatch_flags = []
+            if running_config is not None:
+                if openai_api_url:
+                    running_openai_url = _normalize_proxy_api_url(
+                        running_config.get("openai_api_url")
+                    )
+                    requested_openai_url = _normalize_proxy_api_url(openai_api_url)
+                    if running_openai_url != requested_openai_url:
+                        target_mismatch_flags.append("openai-api-url")
+                if anthropic_api_url:
+                    running_anthropic_url = _normalize_proxy_api_url(
+                        running_config.get("anthropic_api_url")
+                    )
+                    requested_anthropic_url = _normalize_proxy_api_url(anthropic_api_url)
+                    if running_anthropic_url != requested_anthropic_url:
+                        target_mismatch_flags.append("anthropic-api-url")
 
             if helpers._proxy_needs_version_restart(health_payload):
                 running_version = helpers._proxy_version(health_payload) or "unknown"
                 active_sessions = helpers._proxy_active_session_count(health_payload)
                 other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
                 if active_sessions > 0 or other_wrappers:
+                    if target_mismatch_flags:
+                        flags_str = ", ".join(
+                            f"--{flag.replace('_', '-')}" for flag in target_mismatch_flags
+                        )
+                        detail = (
+                            f"{active_sessions} active session(s)"
+                            if active_sessions > 0
+                            else f"{len(other_wrappers)} other wrapper(s)"
+                        )
+                        raise click.ClickException(
+                            f"Proxy on port {port} is missing {flags_str} and cannot be reused "
+                            f"because {detail} are attached. Use a different port or stop the "
+                            "existing proxy before wrapping this client."
+                        )
                     # active_sessions only counts Codex WebSocket relay; the
                     # marker list also covers HTTP wrap clients. Either means a
                     # live session is attached, so don't restart the shared
@@ -3159,7 +3183,7 @@ def _ensure_proxy(
                 needs_restart = True
 
             if running_config is not None:
-                missing = []
+                missing = list(target_mismatch_flags)
                 if memory and not running_config.get("memory"):
                     missing.append("memory")
                 if learn and not running_config.get("learn"):
@@ -3172,20 +3196,6 @@ def _ensure_proxy(
                     and running_config.get("savings_profile") != expected_savings_profile
                 ):
                     missing.append("savings-profile")
-                if openai_api_url:
-                    running_openai_url = _normalize_proxy_api_url(
-                        running_config.get("openai_api_url")
-                    )
-                    requested_openai_url = _normalize_proxy_api_url(openai_api_url)
-                    if running_openai_url != requested_openai_url:
-                        missing.append("openai-api-url")
-                if anthropic_api_url:
-                    running_anthropic_url = _normalize_proxy_api_url(
-                        running_config.get("anthropic_api_url")
-                    )
-                    requested_anthropic_url = _normalize_proxy_api_url(anthropic_api_url)
-                    if running_anthropic_url != requested_anthropic_url:
-                        missing.append("anthropic-api-url")
                 if vertex_api_url or clear_vertex_api_url:
                     running_vertex_url = _normalize_proxy_api_url(
                         running_config.get("vertex_api_url")

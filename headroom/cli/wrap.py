@@ -157,6 +157,7 @@ _CONTEXT_1M_SUFFIX = "[1m]"
 # Only used when no model is otherwise selected (no ANTHROPIC_MODEL set). The
 # current default Opus; the suffix logic preserves any model the user did set.
 _DEFAULT_1M_MODEL = "claude-opus-4-8"
+_OPENCLAUDE_INSTRUCTIONS_FILE = "CONVENTIONS.md"
 
 
 def _resolve_1m_model(current: str | None) -> str:
@@ -4123,13 +4124,19 @@ def openclaude(
         headroom wrap openclaude -- --model gpt-4o       # Pass args to openclaude
         headroom wrap openclaude --no-context-tool       # Skip CLI context-tool setup
     """
+    openclaude_instructions: Path | None = (
+        Path.cwd() / _OPENCLAUDE_INSTRUCTIONS_FILE if not no_rtk else None
+    )
     if not no_rtk:
-        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
-            click.echo("  Setting up lean-ctx for openclaude...")
-            _setup_lean_ctx_agent("openclaude", verbose=verbose)
-        else:
-            click.echo("  Setting up rtk for openclaude...")
-            _ensure_rtk_binary(verbose=verbose)
+        _setup_context_tool_for_agent(
+            agent="openclaude",
+            agent_display="OpenClaude",
+            marker_path=openclaude_instructions,
+            on_rtk_ready=lambda _rtk: _inject_rtk_instructions(
+                cast(Path, openclaude_instructions), verbose=verbose
+            ),
+            verbose=verbose,
+        )
 
     if prepare_only:
         return

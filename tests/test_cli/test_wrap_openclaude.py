@@ -9,7 +9,13 @@ from urllib.parse import quote
 import pytest
 from click.testing import CliRunner
 
+import headroom.cli.wrap as wrap_cli
 from headroom.cli.main import main
+
+OPENCLAUDE_BINARY = "openclaude"
+OPENCLAUDE_INSTRUCTIONS_FILE = "CONVENTIONS.md"
+OPENCLAUDE_MODEL_ARG = "gpt-4o"
+RTK_BINARY = "rtk"
 
 
 def _expected_project_prefix() -> str:
@@ -30,11 +36,11 @@ def test_wrap_openclaude_routes_proxy_envs(
     def fake_launch_tool(**kwargs):  # noqa: ANN003
         captured.update(kwargs)
 
-    with patch("headroom.cli.wrap.shutil.which", return_value="openclaude"):
+    with patch("headroom.cli.wrap.shutil.which", return_value=OPENCLAUDE_BINARY):
         with patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool):
             result = runner.invoke(
                 main,
-                ["wrap", "openclaude", "--no-rtk", "--", "--model", "gpt-4o"],
+                ["wrap", "openclaude", "--no-rtk", "--", "--model", OPENCLAUDE_MODEL_ARG],
             )
 
     assert result.exit_code == 0, result.output
@@ -45,7 +51,26 @@ def test_wrap_openclaude_routes_proxy_envs(
     assert env["ANTHROPIC_BASE_URL"] == f"http://127.0.0.1:8787{prefix}"
     assert captured["tool_label"] == "OPENCLAUDE"
     assert captured["agent_type"] == "openclaude"
-    assert captured["args"] == ("--model", "gpt-4o")
+    assert captured["args"] == ("--model", OPENCLAUDE_MODEL_ARG)
+
+
+def test_wrap_openclaude_default_rtk_injects_instructions(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    def fake_launch_tool(**_kwargs):  # noqa: ANN003
+        return None
+
+    with patch("headroom.cli.wrap.shutil.which", return_value=OPENCLAUDE_BINARY):
+        with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=tmp_path / RTK_BINARY):
+            with patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool):
+                result = runner.invoke(main, ["wrap", "openclaude"])
+
+    instructions = tmp_path / OPENCLAUDE_INSTRUCTIONS_FILE
+    assert result.exit_code == 0, result.output
+    assert instructions.exists()
+    assert wrap_cli._RTK_MARKER in instructions.read_text(encoding="utf-8")
 
 
 def test_wrap_openclaude_missing_binary_errors(

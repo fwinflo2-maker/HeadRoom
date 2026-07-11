@@ -2362,6 +2362,16 @@ class ContentRouter(Transform):
             if compressor:
                 if not compressor.is_ready():
                     compressor.ensure_background_load()
+                    # Surface: warn once per ContentRouter instance so operators
+                    # know compression is degraded — model not cached, or
+                    # HuggingFace unreachable (corporate firewall, SSL, etc.).
+                    if not getattr(self, "_kompress_warned", False):
+                        logger.warning(
+                            "Kompress model not ready; requests will not be "
+                            "compressed. Check HuggingFace connectivity or "
+                            "pre-download: headroom-ai[ml] + first-run warmup."
+                        )
+                        self._kompress_warned = True
                 else:
                     try:
                         result = compressor.compress(
@@ -2699,8 +2709,23 @@ class ContentRouter(Transform):
         if self.config.enable_kompress:
             compressor = self._get_kompress()
             if compressor:
-                logger.info("Kompress native loading deferred until first use")
-                status["kompress"] = "deferred"
+                if not hasattr(compressor, "preload"):
+                    status["kompress"] = "enabled"
+                    status["kompress_backend"] = "unknown"
+                else:
+                    try:
+                        backend = compressor.preload(allow_download=False)
+                    except KompressModelNotCached:
+                        logger.warning(
+                            "Kompress model not cached; compression disabled "
+                            "until model is downloaded. Ensure HuggingFace is "
+                            "accessible or pre-download with headroom-ai[ml]."
+                        )
+                        status["kompress"] = "deferred"
+                    else:
+                        logger.info("Kompress model pre-loaded at startup backend=%s", backend)
+                        status["kompress"] = "enabled"
+                        status["kompress_backend"] = str(backend)
             else:
                 status["kompress"] = "unavailable"
 

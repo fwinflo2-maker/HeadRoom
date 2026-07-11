@@ -3632,7 +3632,17 @@ class AnthropicHandlerMixin:
             request_id=None,
         )
 
-        body = await request.body()
+        from starlette.requests import ClientDisconnect
+
+        try:
+            body = await request.body()
+        except ClientDisconnect:
+            logger.debug(
+                "Client disconnected during body read for anthropic batch passthrough: %s %s",
+                request.method,
+                request.url.path,
+            )
+            return Response(status_code=204)
 
         response = await self.http_client.request(  # type: ignore[union-attr]
             method=request.method,

@@ -1,4 +1,5 @@
 """Shared OpenCode utilities — zero internal dependencies, safe to import from anywhere."""
+
 from __future__ import annotations
 
 import os

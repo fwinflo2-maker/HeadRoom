@@ -7,6 +7,7 @@ All mutations are **atomic** (temp-file + rename) and acquire an advisory
 ``flock`` on ``opencode.json.lock`` to prevent data corruption from
 concurrent headroom processes.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -29,6 +30,7 @@ def _opencode_config_path() -> Path:
     from headroom.providers.opencode._shared import (
         _opencode_config_path as _shared_config_path,  # lazy
     )
+
     return _shared_config_path()
 
 
@@ -59,9 +61,7 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
     if the process crashes mid-write the original file stays intact.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_fd, tmp_path = tempfile.mkstemp(
-        prefix=".headroom-", suffix=".tmp", dir=path.parent
-    )
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix=".headroom-", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -76,6 +76,7 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
 
 
 # ── file-level advisory locking (POSIX) ────────────────────────────
+
 
 @contextlib.contextmanager
 def _locked_config(config_path: Path):
@@ -103,6 +104,7 @@ def _locked_config(config_path: Path):
 
 
 # ── spec helpers ───────────────────────────────────────────────────
+
 
 def _entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec:
     command_value = entry.get("command")
@@ -154,6 +156,7 @@ def _diff_specs(existing: ServerSpec, requested: ServerSpec) -> str:
 
 # ── registrar ──────────────────────────────────────────────────────
 
+
 class OpencodeRegistrar(MCPRegistrar):
     """Register MCP servers with OpenCode.
 
@@ -171,6 +174,7 @@ class OpencodeRegistrar(MCPRegistrar):
 
     def detect(self) -> bool:
         from headroom.providers.opencode._shared import _get_opencode_bin  # lazy — avoids cycle
+
         if shutil.which(_get_opencode_bin()):
             return True
         return self._config_path.parent.is_dir()

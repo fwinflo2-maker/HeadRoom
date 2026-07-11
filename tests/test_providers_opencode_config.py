@@ -41,7 +41,9 @@ def test_opencode_config_paths_default(tmp_path: Path, monkeypatch: pytest.Monke
     assert backup_file == tmp_path / ".config" / "opencode" / "opencode.json.headroom-backup"
 
 
-def test_opencode_config_paths_prefers_jsonc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_opencode_config_paths_prefers_jsonc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """When opencode.jsonc exists, it is preferred over opencode.json."""
     _set_test_home(monkeypatch, tmp_path)
     base_dir = tmp_path / ".config" / "opencode"

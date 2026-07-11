@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # ── helpers ──
 
+
 def test(name):
     def dec(fn):
         def wrapper():
@@ -33,58 +34,76 @@ def test(name):
             except Exception as e:
                 print(f"  💥 {name}: {type(e).__name__}: {e}")
                 return False
+
         return wrapper
+
     return dec
+
 
 def assert_eq(a, b, msg=""):
     assert a == b, f"{msg} expected={b!r}, got={a!r}"
 
+
 # ── test 1: _get_opencode_bin() ──
+
 
 @test("_get_opencode_bin() — unset → 'opencode'")
 def t1():
     os.environ.pop("HEADROOM_OPENCODE_BIN", None)
     from headroom.providers.opencode._shared import _get_opencode_bin
+
     assert_eq(_get_opencode_bin(), "opencode")
+
 
 @test("_get_opencode_bin() — set to 'my-oc'")
 def t2():
     os.environ["HEADROOM_OPENCODE_BIN"] = "my-oc"
     from headroom.providers.opencode._shared import _get_opencode_bin
+
     assert_eq(_get_opencode_bin(), "my-oc")
     os.environ.pop("HEADROOM_OPENCODE_BIN", None)
+
 
 @test("_get_opencode_bin() — empty string fallback")
 def t3():
     os.environ["HEADROOM_OPENCODE_BIN"] = ""
     from headroom.providers.opencode._shared import _get_opencode_bin
+
     assert_eq(_get_opencode_bin(), "opencode")
     os.environ.pop("HEADROOM_OPENCODE_BIN", None)
+
 
 @test("_get_opencode_bin() — path basename extraction")
 def t4():
     os.environ["HEADROOM_OPENCODE_BIN"] = "/opt/bin/my-opencode"
     from headroom.providers.opencode._shared import _get_opencode_bin
+
     assert_eq(_get_opencode_bin(), "/opt/bin/my-opencode")
     os.environ.pop("HEADROOM_OPENCODE_BIN", None)
 
+
 # ── test 2: _opencode_home_dir() ──
+
 
 @test("_opencode_home_dir() — default ~/.config/opencode")
 def t5():
     os.environ.pop("OPENCODE_HOME", None)
     os.environ.pop("HEADROOM_OPENCODE_BIN", None)
     from headroom.providers.opencode._shared import _opencode_home_dir
+
     assert _opencode_home_dir().name == "opencode", f"got {_opencode_home_dir()}"
+
 
 @test("_opencode_home_dir() — OPENCODE_HOME wins")
 def t6():
     os.environ["OPENCODE_HOME"] = "/custom/oc-home"
     os.environ["HEADROOM_OPENCODE_BIN"] = "my-oc"
     from headroom.providers.opencode._shared import _opencode_home_dir
+
     assert_eq(str(_opencode_home_dir()), "/custom/oc-home")
     os.environ.pop("OPENCODE_HOME", None)
     os.environ.pop("HEADROOM_OPENCODE_BIN", None)
+
 
 @test("_opencode_home_dir() — HEADROOM_OPENCODE_BIN does NOT affect home dir")
 def t7():
@@ -92,10 +111,15 @@ def t7():
     os.environ.pop("OPENCODE_HOME", None)
     os.environ["HEADROOM_OPENCODE_BIN"] = "/opt/bin/my-oc"
     from headroom.providers.opencode._shared import _opencode_home_dir
-    assert _opencode_home_dir().name == "opencode", f"_opencode_home_dir should stay 'opencode', got {_opencode_home_dir().name}"
+
+    assert _opencode_home_dir().name == "opencode", (
+        f"_opencode_home_dir should stay 'opencode', got {_opencode_home_dir().name}"
+    )
     os.environ.pop("HEADROOM_OPENCODE_BIN", None)
 
+
 # ── test 3: _opencode_config_path() ──
+
 
 @test("_opencode_config_path() — OPENCODE_CONFIG wins")
 def t8():
@@ -103,9 +127,11 @@ def t8():
     os.environ["OPENCODE_HOME"] = "/should-be-ignored"
     os.environ.pop("HEADROOM_OPENCODE_BIN", None)
     from headroom.providers.opencode._shared import _opencode_config_path
+
     assert_eq(str(_opencode_config_path()), "/tmp/custom-config.json")
     os.environ.pop("OPENCODE_CONFIG", None)
     os.environ.pop("OPENCODE_HOME", None)
+
 
 @test("_opencode_config_path() — fallback to _opencode_home_dir")
 def t9():
@@ -113,11 +139,14 @@ def t9():
     os.environ.pop("OPENCODE_HOME", None)
     os.environ.pop("HEADROOM_OPENCODE_BIN", None)
     from headroom.providers.opencode._shared import _opencode_config_path
+
     p = _opencode_config_path()
     assert p.name == "opencode.json"
     assert ".config/opencode/opencode.json" in str(p)
 
+
 # ── test 4: lazy import safety ──
+
 
 @test("install/paths.py — lazy import of opencode_config_path")
 def t10():
@@ -128,9 +157,11 @@ def t10():
     os.environ.pop("OPENCODE_HOME", None)
     os.environ.pop("HEADROOM_OPENCODE_BIN", None)
     from headroom.install.paths import opencode_config_path
+
     # It should return a Path ending in opencode.json
     result = opencode_config_path()
     assert result.name == "opencode.json", f"got {result}"
+
 
 @test("mcp_registry/opencode.py — lazy import of OpencodeRegistrar")
 def t11():
@@ -138,9 +169,11 @@ def t11():
     os.environ.pop("OPENCODE_HOME", None)
     os.environ.pop("HEADROOM_OPENCODE_BIN", None)
     from headroom.mcp_registry.opencode import OpencodeRegistrar
+
     r = OpencodeRegistrar()
     assert r.name == "opencode"
     assert r._config_path.name == "opencode.json"
+
 
 @test("mcp_registry detect() — with HEADROOM_OPENCODE_BIN")
 def t12():
@@ -156,11 +189,13 @@ def t12():
         os.environ["HEADROOM_OPENCODE_BIN"] = "my-oc"
 
         from headroom.mcp_registry.opencode import OpencodeRegistrar
+
         r = OpencodeRegistrar()
         assert r.detect() is True, "detect() should find my-oc"
 
         os.environ["PATH"] = old_path
         os.environ.pop("HEADROOM_OPENCODE_BIN", None)
+
 
 @test("mcp_registry detect() — HEADROOM_OPENCODE_BIN=not-exist")
 def t13():
@@ -172,13 +207,16 @@ def t13():
         os.environ["HOME"] = td  # simulate clean home without ~/.config/opencode
 
         from headroom.mcp_registry.opencode import OpencodeRegistrar
+
         r = OpencodeRegistrar()
         assert r.detect() is False, "detect() should be False — no binary and no config dir"
 
         os.environ.pop("HEADROOM_OPENCODE_BIN", None)
         os.environ["HOME"] = old_home
 
+
 # ── test 5: end-to-end wrap simulation ──
+
 
 @test("E2E: shutil.which with HEADROOM_OPENCODE_BIN")
 def t14():
@@ -202,11 +240,13 @@ def t14():
 
         # Verify home dir is always ~/.config/opencode (not my-opencode)
         from headroom.providers.opencode._shared import _opencode_home_dir
+
         home = _opencode_home_dir()
         assert home.name == "opencode", f"home dir should stay 'opencode', got {home.name}"
 
         os.environ["PATH"] = old_path
         os.environ.pop("HEADROOM_OPENCODE_BIN", None)
+
 
 @test("E2E: error message when binary not found")
 def t15():
@@ -215,6 +255,7 @@ def t15():
     os.environ["PATH"] = "/nonexistent"
 
     from headroom.providers.opencode._shared import _get_opencode_bin
+
     bin_name = _get_opencode_bin()
     resolved = shutil.which(bin_name)
 
@@ -222,6 +263,7 @@ def t15():
     assert "nowhere-binary" in bin_name
 
     os.environ.pop("HEADROOM_OPENCODE_BIN", None)
+
 
 # ── run ──
 

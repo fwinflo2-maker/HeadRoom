@@ -4,6 +4,7 @@
 HEADROOM_OPENCODE_BIN controls which binary headroom resolves.
 Config path is always ~/.config/opencode/ unless OPENCODE_HOME is set.
 """
+
 import json
 import os
 import shutil

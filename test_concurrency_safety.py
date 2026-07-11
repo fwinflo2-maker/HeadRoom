@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Verify atomic writes and file locking in mcp_registry/opencode.py."""
+
 import json
 import os
 import sys
@@ -21,11 +22,14 @@ GREEN = "\033[32m"
 RED = "\033[31m"
 RESET = "\033[0m"
 results = []
+
+
 def check(name, ok, detail=""):
     results.append((name, ok, detail))
     print(f"  {GREEN}✓{RESET} {name}" if ok else f"  {RED}✗{RESET} {name}")
     if not ok and detail:
         print(f"    {RED}└─ {detail}{RESET}")
+
 
 # ── Test 1: atomic write — interrupted write leaves original intact ──
 print("=== 1. Atomic write integrity ===")
@@ -46,9 +50,11 @@ with tempfile.TemporaryDirectory() as td:
 
     # Original file should be intact
     read_back = _read_json(path)
-    check("interrupted write → original preserved",
-          read_back == original,
-          f"expected {original}, got {read_back}")
+    check(
+        "interrupted write → original preserved",
+        read_back == original,
+        f"expected {original}, got {read_back}",
+    )
 
     # Normal write succeeds
     _write_json(path, {"key": "new-value"})
@@ -60,6 +66,7 @@ print("\n=== 2. Concurrent registration ===")
 results_lock = []
 errors = []
 
+
 def register_worker(td: str, idx: int) -> None:
     config_path = Path(td) / f"config-{idx}.json"
     registrar = OpencodeRegistrar(config_path=config_path)
@@ -70,19 +77,24 @@ def register_worker(td: str, idx: int) -> None:
     except Exception as e:
         errors.append((idx, str(e)))
 
+
 with tempfile.TemporaryDirectory() as td:
-    threads = [threading.Thread(target=register_worker, args=(td, i))
-               for i in range(20)]
+    threads = [threading.Thread(target=register_worker, args=(td, i)) for i in range(20)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
 
-    check("20 concurrent registrations → no errors", len(errors) == 0,
-          f"{len(errors)} errors: {errors[:3]}")
-    check("20 concurrent registrations → 20 registered",
-          len([r for r in results_lock if r[1] == "registered"]) == 20,
-          f"got {len(results_lock)} results: {results_lock[:5]}")
+    check(
+        "20 concurrent registrations → no errors",
+        len(errors) == 0,
+        f"{len(errors)} errors: {errors[:3]}",
+    )
+    check(
+        "20 concurrent registrations → 20 registered",
+        len([r for r in results_lock if r[1] == "registered"]) == 20,
+        f"got {len(results_lock)} results: {results_lock[:5]}",
+    )
 
 # ── Test 3: lock serialises writes to same file ──
 print("\n=== 3. Lock serialisation ===")
@@ -104,9 +116,11 @@ with tempfile.TemporaryDirectory() as td:
         t.join()
 
     final = _read_json(path)
-    check("10 serialised writes → all 10 entries present",
-          len(final.get("sequence", [])) == 10,
-          f"got {len(final.get('sequence', []))} entries: {final.get('sequence', [])}")
+    check(
+        "10 serialised writes → all 10 entries present",
+        len(final.get("sequence", [])) == 10,
+        f"got {len(final.get('sequence', []))} entries: {final.get('sequence', [])}",
+    )
 
 # ── Test 4: unregister under lock ──
 print("\n=== 4. Unregister under lock ===")
@@ -118,8 +132,7 @@ with tempfile.TemporaryDirectory() as td:
 
     ok = registrar.unregister_server("test")
     check("unregister returns True", ok)
-    check("unregister removes entry",
-          registrar.get_server("test") is None)
+    check("unregister removes entry", registrar.get_server("test") is None)
 
     ok2 = registrar.unregister_server("nonexistent")
     check("unregister non-existent returns False", not ok2)
@@ -136,12 +149,13 @@ with tempfile.TemporaryDirectory() as td:
     with _locked_config(config_path):
         check("lock present during use", lock_path.exists())
 
-    check("lock still present after release (normal for flock)",
-          lock_path.exists())  # flock doesn't delete the file
+    check(
+        "lock still present after release (normal for flock)", lock_path.exists()
+    )  # flock doesn't delete the file
 
 # ── Summary ──
 print()
 passed = sum(1 for _, ok, _ in results if ok)
 failed = len(results) - passed
-print(f"{'ALL PASSED' if failed==0 else 'FAILURES'}: {passed}/{len(results)}")
+print(f"{'ALL PASSED' if failed == 0 else 'FAILURES'}: {passed}/{len(results)}")
 sys.exit(0 if failed == 0 else 1)

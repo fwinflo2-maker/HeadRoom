@@ -3179,6 +3179,13 @@ def _ensure_proxy(
                     requested_openai_url = _normalize_proxy_api_url(openai_api_url)
                     if running_openai_url != requested_openai_url:
                         missing.append("openai-api-url")
+                if anthropic_api_url:
+                    running_anthropic_url = _normalize_proxy_api_url(
+                        running_config.get("anthropic_api_url")
+                    )
+                    requested_anthropic_url = _normalize_proxy_api_url(anthropic_api_url)
+                    if running_anthropic_url != requested_anthropic_url:
+                        missing.append("anthropic-api-url")
                 if vertex_api_url or clear_vertex_api_url:
                     running_vertex_url = _normalize_proxy_api_url(
                         running_config.get("vertex_api_url")

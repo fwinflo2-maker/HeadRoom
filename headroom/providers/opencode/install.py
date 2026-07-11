@@ -45,7 +45,7 @@ def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None
         # Strip any prior Headroom-managed blocks before re-injecting
         # (mirrors inject_opencode_provider_config).
         if _PROVIDER_MARKER_START in content or _MCP_MARKER_START in content:
-            content = strip_opencode_headroom_blocks(content)
+            content = strip_opencode_headroom_blocks(content, remove_mcp=False)
         data = _parse_json_loose(content)
     else:
         data = {}

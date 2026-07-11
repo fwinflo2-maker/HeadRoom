@@ -17,6 +17,7 @@ import logging
 import os
 import shutil
 import tempfile
+from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 
@@ -79,7 +80,7 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
 
 
 @contextlib.contextmanager
-def _locked_config(config_path: Path):
+def _locked_config(config_path: Path) -> Generator[None, None, None]:
     """Exclusive advisory lock on the companion ``.lock`` file.
 
     Acquires a ``fcntl.FLOCK_EX`` lock, then yields.  Nesting reads/writes

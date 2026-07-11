@@ -134,6 +134,7 @@ _WRAP_PROXY_TIMEOUT_ENV = "HEADROOM_WRAP_PROXY_TIMEOUT"
 _WRAP_PROXY_TIMEOUT_DEFAULT_SECONDS = 45
 _WRAP_PROXY_TIMEOUT_ML_DEFAULT_SECONDS = 90
 _WRAP_PROXY_TIMEOUT_ML_MODULES = ("torch", "sentence_transformers", "spacy")
+_UTF8_ENCODING = "utf-8"
 
 # Issue #746: Claude Code disables on-demand tool loading (deferral) when
 # ANTHROPIC_BASE_URL is a custom host and ENABLE_TOOL_SEARCH is unset, which
@@ -1704,17 +1705,17 @@ def _inject_rtk_instructions(file_path: Path, verbose: bool = False) -> bool:
     Returns True if instructions were written.
     """
     if file_path.exists():
-        existing = file_path.read_text()
+        existing = file_path.read_text(encoding=_UTF8_ENCODING)
         if _RTK_MARKER in existing:
             if verbose:
                 click.echo(f"  rtk instructions already in {file_path.name}")
             return True
         # Append to existing file
-        with open(file_path, "a") as f:
+        with open(file_path, "a", encoding=_UTF8_ENCODING) as f:
             f.write("\n\n" + RTK_INSTRUCTIONS_BLOCK)
     else:
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(RTK_INSTRUCTIONS_BLOCK)
+        file_path.write_text(RTK_INSTRUCTIONS_BLOCK, encoding=_UTF8_ENCODING)
 
     click.echo(f"  rtk instructions injected into {file_path}")
     return True

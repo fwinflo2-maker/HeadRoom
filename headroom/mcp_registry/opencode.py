@@ -61,7 +61,7 @@ def _read_json(path: Path) -> dict[str, Any]:
         try:
             raw = path.read_text(encoding="utf-8")
             # Strip // line comments (JSONC) and retry.
-            cleaned = re.sub(r"^\s*//[^\n]*\n", "", raw, flags=re.MULTILINE)
+            cleaned = re.sub(r"^\s*//[^\n]*", "", raw, flags=re.MULTILINE)
             cleaned = re.sub(r",\s*//[^\n]*", ",", cleaned)
             data = json.loads(cleaned)
         except (OSError, json.JSONDecodeError):

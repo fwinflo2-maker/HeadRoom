@@ -134,7 +134,7 @@ def _parse_json_loose(text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         pass
     # Pass 1: remove lines that are ONLY a comment.
-    cleaned = re.sub(r"^\s*//[^\n]*\n", "", text, flags=re.MULTILINE)
+    cleaned = re.sub(r"^\s*//[^\n]*", "", text, flags=re.MULTILINE)
     # Pass 2: remove inline trailing comments (", // comment").
     cleaned = re.sub(r",\s*//[^\n]*", ",", cleaned)
     try:

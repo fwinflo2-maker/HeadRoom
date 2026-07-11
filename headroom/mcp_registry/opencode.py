@@ -11,7 +11,6 @@ concurrent headroom processes.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import logging
 import os
@@ -20,6 +19,11 @@ import tempfile
 from collections.abc import Generator
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover — Windows
+    fcntl = None  # type: ignore[assignment]
 
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 
@@ -90,6 +94,10 @@ def _locked_config(config_path: Path) -> Generator[None, None, None]:
 
     On platforms without ``fcntl`` this is a no-op.
     """
+    if fcntl is None:  # Windows — no-op
+        yield
+        return
+
     lock_path = _lock_path(config_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     # Open for read/write; create if absent (never truncated).

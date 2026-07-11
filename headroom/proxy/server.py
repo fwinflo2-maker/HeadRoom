@@ -2320,6 +2320,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 url=_upstream_check_cache["url"],
                 error=_upstream_check_cache["error"],
             ),
+            "kompress": _component_health(
+                enabled=not config.disable_kompress,
+                ready=proxy.warmup.kompress.status == "loaded",
+                backend=proxy.warmup.kompress.info.get("backend", None),
+            ),
         }
 
     def _runtime_payload() -> dict[str, Any]:

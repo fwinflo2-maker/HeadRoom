@@ -94,7 +94,7 @@ rayon = "1"
 # `config/pipeline.toml`. The defaults embed via `include_str!` so a
 # stock binary needs no external file; production deployments override
 # by loading their own TOML at startup.
-toml = "0.8"
+toml = "1.1"
 # `blake3` powers `ccr::compute_key`. BLAKE3 is faster than SHA-256 on
 # every hot path the proxy hits (large diff/log/tool_result payloads)
 # and produces collision-resistant 24-char prefixes for the CCR
@@ -122,7 +122,7 @@ redis = { version = "0.27", optional = true, default-features = false }
 # cycling through the proxy crate. Tiny crate (no I/O, just types).
 http = "1"
 
-[target.'cfg(not(any(windows, all(target_os = "macos", target_arch = "x86_64"))))'.dependencies]
+[target.'cfg(all(not(windows), not(all(target_os = "macos", target_arch = "x86_64"))))'.dependencies]
 fastembed = { version = "5", default-features = false, features = [
     "hf-hub-rustls-tls",
     "ort-download-binaries-rustls-tls",
@@ -130,8 +130,11 @@ fastembed = { version = "5", default-features = false, features = [
 ] }
 
 [target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
-# ort-sys ships no prebuilt binary for x86_64-apple-darwin (#941); load ORT
-# dynamically instead, same as Windows above.
+# `ort-sys 2.0.0-rc.12` does not ship prebuilt ONNX Runtime binaries for
+# `x86_64-apple-darwin`. Building ORT from source in CI would add CMake and
+# several minutes per wheel. Load the pip `onnxruntime` dylib at runtime
+# instead (same approach as Windows below). `headroom/_ort.py` pins
+# `ORT_DYLIB_PATH` before `headroom._core` imports.
 fastembed = { version = "5", default-features = false, features = [
     "hf-hub-rustls-tls",
     "ort-load-dynamic",

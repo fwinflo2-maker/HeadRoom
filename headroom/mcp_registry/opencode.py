@@ -91,7 +91,7 @@ def _locked_config(config_path: Path):
     lock_path = _lock_path(config_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     # Open for read/write; create if absent (never truncated).
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:

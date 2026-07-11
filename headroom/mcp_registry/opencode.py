@@ -14,6 +14,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 from collections.abc import Generator
@@ -45,14 +46,26 @@ def _lock_path(config_path: Path) -> Path:
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    """Read a JSON file, returning empty dict if absent or unparseable."""
+    """Read a JSON file, falling back to empty dict on any error.
+
+    Handles JSONC-style ``//`` comments by stripping them when strict
+    JSON parsing fails, so the registrar can safely operate on config
+    files that were written by a fork or manually edited with comments.
+    """
     if not path.exists():
         return {}
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
-        return {}
+        try:
+            raw = path.read_text(encoding="utf-8")
+            # Strip // line comments (JSONC) and retry.
+            cleaned = re.sub(r"^\s*//[^\n]*\n", "", raw, flags=re.MULTILINE)
+            cleaned = re.sub(r",\s*//[^\n]*", ",", cleaned)
+            data = json.loads(cleaned)
+        except (OSError, json.JSONDecodeError):
+            return {}
     if not isinstance(data, dict):
         return {}
     return data

@@ -38,7 +38,7 @@ def render_setup_lines(port: int, project: str | None = None) -> list[str]:
         "  Headroom proxy is running. Configure Grok Build:",
         "",
         "  ~/.grok/config.toml has been updated with:",
-        f"    [model.grok-build]",
+        "    [model.grok-build]",
         f'    base_url = "{target.base_url}"',
         "",
         "  Start Grok Build in this project directory:",

@@ -31,9 +31,7 @@ def test_detect_false_when_grok_dir_missing(tmp_path: Path) -> None:
     assert _make_registrar(tmp_path).detect() is False
 
 
-def test_register_uses_grok_home_env(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_register_uses_grok_home_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     grok_home = tmp_path / "custom-grok-home"
     monkeypatch.setenv("GROK_HOME", str(grok_home))
 

@@ -85,11 +85,7 @@ def test_grok_build_config_inject_and_restore_round_trip(tmp_path: Path, monkeyp
 
 
 def test_grok_build_config_strip_preserves_user_content() -> None:
-    original = (
-        "[models]\n"
-        'default = "grok-build"\n\n'
-        f"{render_headroom_block(8787)}"
-    )
+    original = f'[models]\ndefault = "grok-build"\n\n{render_headroom_block(8787)}'
     cleaned = strip_grok_headroom_blocks(original)
 
     assert "[models]" in cleaned
@@ -125,15 +121,9 @@ def test_grok_build_inject_updates_existing_user_table_without_duplicate(
 
 
 def test_grok_build_redirect_existing_base_url_is_idempotent() -> None:
-    original = (
-        "[model.grok-build]\n"
-        'base_url = "http://127.0.0.1:8787/v1"\n'
-        "temperature = 0.2\n"
-    )
+    original = '[model.grok-build]\nbase_url = "http://127.0.0.1:8787/v1"\ntemperature = 0.2\n'
 
-    updated, changed = redirect_existing_grok_build_base_url(
-        original, "http://127.0.0.1:8787/v1"
-    )
+    updated, changed = redirect_existing_grok_build_base_url(original, "http://127.0.0.1:8787/v1")
 
     assert changed is False
     assert updated == original

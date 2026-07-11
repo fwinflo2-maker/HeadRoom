@@ -105,12 +105,7 @@ def redirect_existing_grok_build_base_url(content: str, base_url: str) -> tuple[
 def render_headroom_block(port: int, project: str | None = None) -> str:
     """Render the Headroom-managed ``[model.grok-build]`` override block."""
     target = build_proxy_targets(port, project)
-    return (
-        f"{_MARKER_START}\n"
-        "[model.grok-build]\n"
-        f'base_url = "{target.base_url}"\n'
-        f"{_MARKER_END}\n"
-    )
+    return f'{_MARKER_START}\n[model.grok-build]\nbase_url = "{target.base_url}"\n{_MARKER_END}\n'
 
 
 def inject_grok_provider_config(port: int, project: str | None = None) -> Path:

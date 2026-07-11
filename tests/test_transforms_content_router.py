@@ -630,7 +630,7 @@ def test_log_strategy_does_not_fallback_to_kompress_when_log_is_noop(
 #     never modified, regardless of role/type.
 #   * assistant text blocks are part of the cache prefix in subsequent
 #     turns; default-skipped, opt-in via compress_assistant_text_blocks.
-#   * user/system text blocks are the prompt; default-skipped unless opted in.
+#   * user/system text blocks are the prompt; never modified.
 #   * tool/function text blocks are tool outputs; freely compressed.
 #   * min_chars threshold gates short blocks.
 # ---------------------------------------------------------------------------

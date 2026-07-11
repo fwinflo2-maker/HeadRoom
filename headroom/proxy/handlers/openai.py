@@ -116,6 +116,16 @@ def _header_get(headers: dict[str, str], name: str) -> str | None:
     return None
 
 
+def _sanitize_forwarded_response_headers(
+    headers: httpx.Headers | dict[str, str],
+    *extra_names: str,
+) -> dict[str, str]:
+    cleaned = dict(headers)
+    for name in ("content-encoding", "content-length", "server", *extra_names):
+        cleaned.pop(name, None)
+    return cleaned
+
+
 def _custom_base_passthrough_telemetry(method: str, path: str, base_url: str) -> tuple[str, str]:
     """Return passthrough telemetry metadata for narrow custom-base exceptions."""
     # OpenCode Zen sends provider-prefixed OpenAI-compatible traffic through
@@ -650,6 +660,60 @@ def _responses_input_to_items(input_data: Any) -> list[dict[str, Any]]:
     if isinstance(input_data, str) and input_data:
         return [{"role": "user", "content": input_data}]
     return []
+
+
+def _dedup_responses_output_items(
+    items: list[dict[str, Any]],
+    output_types: frozenset[str],
+    count_tokens: Any = None,
+) -> tuple[int, int]:
+    """Cross-turn verbatim de-dup over Responses tool-output items (mutates in place).
+
+    A file re-read on the Responses path (e.g. Codex) comes back as a repeated
+    ``function_call_output`` whose ``output`` string carries the same file body
+    under per-call-varying ``Chunk ID`` / ``Wall time`` headers. Per-unit
+    compression cannot fold that — it is inherently cross-item. This collects the
+    tool-output ``.output`` strings in request order and runs the SAME
+    prefix-monotonic, keep-earliest ``dedup_blocks`` the chat path uses: the
+    earliest copy stays verbatim (it is the in-context reference and lives in the
+    cached prefix), later duplicates fold to a one-line pointer. Longest-span
+    matching folds the identical body and leaves the varying header intact.
+
+    Returns ``(spans_folded, tokens_saved)`` — ``tokens_saved`` is 0 when no
+    ``count_tokens`` callable is given. Never raises on malformed input.
+    """
+    try:
+        from headroom.transforms.cross_turn_dedup import DedupBlock, dedup_blocks
+    except Exception:
+        return 0, 0
+
+    locs: list[int] = []
+    blocks: list[DedupBlock] = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict) or item.get("type") not in output_types:
+            continue
+        out = item.get("output")
+        if isinstance(out, str) and out:
+            locs.append(i)
+            blocks.append(DedupBlock(text=out, turn=i, protected=False))
+    if len(blocks) < 2:
+        return 0, 0
+
+    deduped, stats = dedup_blocks(blocks)
+    if not stats.get("spans_folded"):
+        return 0, 0
+
+    tokens_saved = 0
+    for idx, orig, new in zip(locs, blocks, deduped):
+        if new.text == orig.text:
+            continue
+        if count_tokens is not None:
+            try:
+                tokens_saved += max(0, int(count_tokens(orig.text)) - int(count_tokens(new.text)))
+            except Exception:
+                pass
+        items[idx]["output"] = new.text
+    return int(stats["spans_folded"]), tokens_saved
 
 
 def _openai_responses_to_sse(response: dict[str, Any]) -> list[bytes]:
@@ -1645,6 +1709,23 @@ class OpenAIHandlerMixin:
             if "router:excluded:lossless" not in transforms:
                 transforms.append("router:excluded:lossless")
 
+        # Cross-turn dedup over tool-output slots (Codex/Responses re-reads): a
+        # repeated function_call_output.output folds to a one-line pointer to the
+        # earlier copy. Per-unit compression above can't do this — it is
+        # inherently cross-item. Keep-earliest + prefix-monotonic: the earlier
+        # (cached-prefix) copy is never rewritten, so appending a turn does not
+        # change cached bytes. Runs on the post-per-unit forms, mirroring the
+        # chat path (ContentRouter._cross_turn_dedup_messages runs last there too).
+        if getattr(router, "_cross_turn_dedup_enabled", False):
+            dd_folded, dd_saved = _dedup_responses_output_items(
+                updated_items, self.OPENAI_RESPONSES_OUTPUT_TYPES, tokenizer.count_text
+            )
+            if dd_folded:
+                modified = True
+                tokens_saved_total += dd_saved
+                if "router:responses_cross_turn_dedup" not in transforms:
+                    transforms.append("router:responses_cross_turn_dedup")
+
         _log(
             "codex_compression_payload_result",
             modified=modified,
@@ -2123,6 +2204,12 @@ class OpenAIHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("content-length", None)
+        # The parsed body was already content-decoded upstream, so the bytes we
+        # forward are plain JSON. A stale content-encoding makes OpenAI try to
+        # decompress already-decoded JSON and reject it with HTTP 400 (#1542 —
+        # same fix the /v1/responses path already carries).
+        headers.pop("content-encoding", None)
+        headers.pop("transfer-encoding", None)
         # Strip accept-encoding so httpx negotiates its own encoding.
         # Cloudflare Workers forward "br, zstd" which OpenAI may honor;
         # if httpx lacks brotli support the response body is undecipherable → 502.
@@ -2285,9 +2372,7 @@ class OpenAIHandlerMixin:
                 )
 
                 # Remove compression headers from cached response
-                response_headers = dict(cached.response_headers)
-                response_headers.pop("content-encoding", None)
-                response_headers.pop("content-length", None)
+                response_headers = _sanitize_forwarded_response_headers(cached.response_headers)
 
                 return Response(content=cached.response_body, headers=response_headers)
 
@@ -3501,9 +3586,7 @@ class OpenAIHandlerMixin:
                     )
 
                 # Remove compression headers since httpx already decompressed the response
-                response_headers = dict(response.headers)
-                response_headers.pop("content-encoding", None)
-                response_headers.pop("content-length", None)  # Length changed after decompression
+                response_headers = _sanitize_forwarded_response_headers(response.headers)
 
                 # Inject Headroom compression metrics (for SaaS metering)
                 response_headers["x-headroom-tokens-before"] = str(original_tokens)
@@ -3556,9 +3639,9 @@ class OpenAIHandlerMixin:
         from fastapi import HTTPException
         from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+        from headroom.proxy.body_forwarding import BodyMutationTracker
         from headroom.proxy.helpers import (
             MAX_REQUEST_BODY_SIZE,
-            BodyMutationTracker,
             read_request_json_with_bytes,
         )
         from headroom.tokenizers import get_tokenizer
@@ -4504,9 +4587,7 @@ class OpenAIHandlerMixin:
                 get_codex_rate_limit_state().update_from_headers(dict(response.headers))
 
                 # Remove compression headers
-                response_headers = dict(response.headers)
-                response_headers.pop("content-encoding", None)
-                response_headers.pop("content-length", None)
+                response_headers = _sanitize_forwarded_response_headers(response.headers)
 
                 if buffered_stream_ccr and response.status_code == 200 and resp_json:
                     sse_headers = {
@@ -6963,10 +7044,8 @@ class OpenAIHandlerMixin:
         # is always synthesized from the WebSocket frame so the body is
         # treated as mutated; we still go through the canonical path so
         # numeric precision and UTF-8 are preserved.
-        from headroom.proxy.helpers import (
-            log_outbound_request,
-            prepare_outbound_body_bytes,
-        )
+        from headroom.proxy.body_forwarding import prepare_outbound_body_bytes
+        from headroom.proxy.helpers import log_outbound_request
 
         outbound_bytes, outbound_source = prepare_outbound_body_bytes(
             body=http_body,
@@ -7237,19 +7316,21 @@ class OpenAIHandlerMixin:
             )
         except TimeoutError:
             logger.warning(
-                "Compression timed out after %.0fs (payload too large)",
+                "Compression timed out after %.0fs; failing open with original messages",
                 COMPRESSION_TIMEOUT_SECONDS,
             )
             return JSONResponse(
-                status_code=503,
                 content={
-                    "error": {
-                        "type": "compression_timeout",
-                        "message": (
-                            "Compression exceeded "
-                            f"{COMPRESSION_TIMEOUT_SECONDS:.0f}s; payload too large."
-                        ),
-                    }
+                    "messages": messages,
+                    "tokens_before": 0,
+                    "tokens_after": 0,
+                    "tokens_saved": 0,
+                    "compression_ratio": 1.0,
+                    "transforms_applied": [],
+                    "transforms_summary": {},
+                    "ccr_hashes": [],
+                    "compression_skipped": True,
+                    "skip_reason": "compression_timeout",
                 },
             )
         except Exception as e:
@@ -7401,9 +7482,7 @@ class OpenAIHandlerMixin:
             )
 
         # Remove compression headers since httpx already decompressed the response
-        response_headers = dict(response.headers)
-        response_headers.pop("content-encoding", None)
-        response_headers.pop("content-length", None)  # Length changed after decompression
+        response_headers = _sanitize_forwarded_response_headers(response.headers)
         response_content = response.content
 
         if provider == "anthropic" and endpoint_name == "models":
@@ -7547,11 +7626,11 @@ class OpenAIHandlerMixin:
                 media_type="application/json",
             )
 
-        response_headers = dict(upstream_response.headers)
-        response_headers.pop("content-length", None)
-        response_headers.pop("transfer-encoding", None)
-        response_headers.pop("connection", None)
-        response_headers.pop("content-encoding", None)
+        response_headers = _sanitize_forwarded_response_headers(
+            upstream_response.headers,
+            "transfer-encoding",
+            "connection",
+        )
 
         if upstream_response.status_code >= 400:
             try:

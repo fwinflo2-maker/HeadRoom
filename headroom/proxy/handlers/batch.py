@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from fastapi.responses import Response
 
 from headroom.proxy.auth_mode import classify_client
-from headroom.proxy.helpers import extract_tags
+from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS, extract_tags
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
@@ -161,11 +161,18 @@ class BatchHandlerMixin:
                 )
 
                 # Use OpenAI pipeline (similar message format after conversion)
-                result = self.openai_pipeline.apply(
-                    messages=messages,
-                    model=model,
-                    model_limit=context_limit,
-                    context=extract_user_query(messages),
+                # Offload off the event loop (#1701): inline apply() blocks
+                # every other request; timeouts fall to the except below.
+                result = await self._run_compression_in_executor(
+                    lambda messages=messages, model=model, context_limit=context_limit: (
+                        self.openai_pipeline.apply(
+                            messages=messages,
+                            model=model,
+                            model_limit=context_limit,
+                            context=extract_user_query(messages),
+                        )
+                    ),
+                    timeout=COMPRESSION_TIMEOUT_SECONDS,
                 )
 
                 optimized_messages = result.messages
@@ -378,11 +385,12 @@ class BatchHandlerMixin:
         # Byte-faithful body bytes (PR-A3, fixes P0-2). When ``body`` is
         # None we forward the original bytes verbatim; otherwise the dict
         # has been synthesized by Headroom and is canonically serialized.
-        from headroom.proxy.helpers import (
-            log_outbound_request,
+        from headroom.proxy.body_forwarding import (
+            get_python_forwarder_mode,
             prepare_outbound_body_bytes,
             serialize_body_canonical,
         )
+        from headroom.proxy.helpers import log_outbound_request
 
         if body is None:
             body_content = await request.body()
@@ -404,8 +412,6 @@ class BatchHandlerMixin:
         )
         # ``prepare_outbound_body_bytes`` is consulted only for the legacy
         # operator opt-in path so we honor the env-var override here too.
-        from headroom.proxy.helpers import get_python_forwarder_mode
-
         if get_python_forwarder_mode() == "legacy_json_kwarg" and body is not None:
             outbound_bytes, _ = prepare_outbound_body_bytes(
                 body=body,
@@ -914,10 +920,8 @@ class BatchHandlerMixin:
             # batch_body is synthesized by Headroom (compressed file_id +
             # metadata), so it is treated as mutated and goes through the
             # canonical serializer.
-            from headroom.proxy.helpers import (
-                log_outbound_request,
-                prepare_outbound_body_bytes,
-            )
+            from headroom.proxy.body_forwarding import prepare_outbound_body_bytes
+            from headroom.proxy.helpers import log_outbound_request
 
             outbound_bytes, outbound_source = prepare_outbound_body_bytes(
                 body=batch_body,
@@ -1078,11 +1082,18 @@ class BatchHandlerMixin:
                 if self.config.optimize:
                     try:
                         context_limit = self.openai_provider.get_context_limit(model)
-                        result = self.openai_pipeline.apply(
-                            messages=messages,
-                            model=model,
-                            model_limit=context_limit,
-                            context=extract_user_query(messages),
+                        # Offload off the event loop (#1701); timeouts fall to
+                        # the except below and pass the line through.
+                        result = await self._run_compression_in_executor(
+                            lambda messages=messages, model=model, context_limit=context_limit: (
+                                self.openai_pipeline.apply(
+                                    messages=messages,
+                                    model=model,
+                                    model_limit=context_limit,
+                                    context=extract_user_query(messages),
+                                )
+                            ),
+                            timeout=COMPRESSION_TIMEOUT_SECONDS,
                         )
                         compressed_messages = result.messages
                         # Use pipeline's token counts for consistency with pipeline logs
@@ -1158,12 +1169,12 @@ class BatchHandlerMixin:
         """
         from fastapi.responses import Response
 
+        from headroom.proxy.body_forwarding import prepare_outbound_body_bytes
         from headroom.proxy.helpers import (
             _read_request_body_bytes,
             _strip_internal_headers,
             log_outbound_headers,
             log_outbound_request,
-            prepare_outbound_body_bytes,
         )
 
         headers = dict(request.headers.items())

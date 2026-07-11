@@ -3129,7 +3129,7 @@ def _ensure_proxy(
                 running_config = helpers._proxy_health_config(health_payload)
                 if running_config is None:
                     running_config = helpers._query_proxy_config(port)
-                incompatible_targets = []
+                incompatible_targets: list[str] = []
                 if running_config is not None:
                     missing = []
                     if memory and not running_config.get("memory"):

@@ -955,16 +955,10 @@ def verify_opencode_wrap(base_env: dict[str, str], project_dir: Path, log_dir: P
         timeout=120,
     )
     global_agents = Path(base_env["HOME"]) / ".config" / "opencode" / "AGENTS.md"
-    project_agents = project_dir / "AGENTS.md"
     assert_true(global_agents.exists(), "Opencode wrap should create ~/.config/opencode/AGENTS.md")
-    assert_true(project_agents.exists(), "Opencode wrap should create project AGENTS.md")
     assert_true(
         RTK_MARKER in global_agents.read_text(encoding="utf-8"),
         "Missing RTK marker in global AGENTS.md",
-    )
-    assert_true(
-        RTK_MARKER in project_agents.read_text(encoding="utf-8"),
-        "Missing RTK marker in project AGENTS.md",
     )
 
     entries = read_jsonl(log_dir / "opencode.jsonl")

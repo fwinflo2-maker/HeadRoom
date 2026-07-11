@@ -117,7 +117,7 @@ def _locked_config(config_path: Path) -> Generator[None, None, None]:
 
 def _entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec:
     command_value = entry.get("command")
-    if isinstance(command_value, list):
+    if isinstance(command_value, list) and command_value:
         args = tuple(str(x) for x in command_value[1:])
         command = str(command_value[0])
     else:

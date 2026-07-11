@@ -448,13 +448,14 @@ def test_ensure_proxy_restarts_ephemeral_proxy_for_anthropic_api_url_mismatch(mo
         lambda *args, **kwargs: calls.append(("start", args, kwargs)),
     )
 
-    result = wrap_cli._ensure_proxy(
+    proc, actual_port = wrap_cli._ensure_proxy(
         8787,
         False,
         anthropic_api_url="https://anthropic.foundry.example/v1",
     )
 
-    assert result is None
+    assert proc is None
+    assert actual_port == 8787
     assert calls[0] == ("kill", 12345, 8787)
     assert calls[1][0] == "start"
     assert calls[1][2]["anthropic_api_url"] == "https://anthropic.foundry.example/v1"
@@ -757,8 +758,8 @@ def test_ensure_proxy_restarts_for_flags_when_no_other_wrapper(monkeypatch) -> N
     assert calls[1][0] == "start"
 
 
-def test_ensure_proxy_restarts_persistent_deployment_for_feature_mismatch(monkeypatch) -> None:
-    """Persistent deployment should restart when requested features differ from running config."""
+def test_ensure_proxy_rejects_persistent_deployment_for_target_mismatch(monkeypatch) -> None:
+    """Persistent deployment should reject incompatible target URLs instead of restarting."""
     calls: list[object] = []
     health = {
         "version": wrap_cli._HEADROOM_VERSION,
@@ -789,19 +790,14 @@ def test_ensure_proxy_restarts_persistent_deployment_for_feature_mismatch(monkey
         lambda *args, **kwargs: calls.append(("start", args, kwargs)),
     )
 
-    # Request openai_api_url that differs from running config (None)
-    proc, actual_port = wrap_cli._ensure_proxy(
-        8787,
-        False,
-        openai_api_url="https://api.githubcopilot.com",
-    )
+    with pytest.raises(click.ClickException, match="Use a different port"):
+        wrap_cli._ensure_proxy(
+            8787,
+            False,
+            openai_api_url="https://api.githubcopilot.com",
+        )
 
-    assert proc is None
-    assert actual_port == 8787
-    # Proxy should be killed and restarted due to openai_api_url mismatch
-    assert calls[0] == ("kill", 12345, 8787)
-    assert calls[1][0] == "start"
-    assert calls[1][2]["openai_api_url"] == "https://api.githubcopilot.com"
+    assert calls == []
 
 
 def test_ensure_proxy_restarts_persistent_deployment_for_memory_mismatch(monkeypatch) -> None:

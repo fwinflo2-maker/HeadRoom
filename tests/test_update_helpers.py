@@ -130,6 +130,36 @@ def test_format_cmd_windows(monkeypatch):
     assert "Program Files" in out and out.endswith("-m pip")
 
 
+def test_windows_pip_update_needs_handoff(monkeypatch):
+    monkeypatch.setattr(up.sys, "platform", "win32")
+    assert up._windows_pip_update_needs_handoff(
+        up.InstallMethod(kind="pip", can_self_update=True, argv=["python"])
+    )
+    assert up._windows_pip_update_needs_handoff(
+        up.InstallMethod(kind="pip-user", can_self_update=True, argv=["python"])
+    )
+    assert not up._windows_pip_update_needs_handoff(
+        up.InstallMethod(kind="pipx", can_self_update=True, argv=["pipx"])
+    )
+
+
+def test_windows_pip_update_handoff_false_off_windows(monkeypatch):
+    monkeypatch.setattr(up.sys, "platform", "linux")
+    assert not up._windows_pip_update_needs_handoff(
+        up.InstallMethod(kind="pip", can_self_update=True, argv=["python"])
+    )
+
+
+def test_build_windows_handoff_argv(monkeypatch):
+    monkeypatch.setattr(up.sys, "platform", "win32")
+    argv = up._build_windows_handoff_argv(
+        [r"C:\\Program Files\\Python\\python.exe", "-m", "pip", "install", "-U", "headroom-ai"]
+    )
+    assert argv[:2] == ["cmd.exe", "/c"]
+    assert "ping -n 2 127.0.0.1 >nul" in argv[2]
+    assert "Program Files" in argv[2]
+
+
 def test_externally_managed_true(tmp_path, monkeypatch):
     (tmp_path / "EXTERNALLY-MANAGED").write_text("[externally-managed]")
     monkeypatch.setattr(sysconfig, "get_path", lambda key: str(tmp_path))

@@ -126,6 +126,7 @@ def test_update_runs_upgrade_with_yes(monkeypatch):
     monkeypatch.setattr(up, "installed_version", lambda: "0.26.0")
     monkeypatch.setattr(up, "fetch_latest_version", lambda **k: "0.27.0")
     monkeypatch.setattr(up, "_in_virtualenv", lambda: True)
+    monkeypatch.setattr(up.sys, "platform", "linux")
     monkeypatch.setattr(up, "_find_core_pyd", lambda: None)  # Skip integrity checks
 
     class _Result:
@@ -140,6 +141,71 @@ def test_update_runs_upgrade_with_yes(monkeypatch):
     assert res.exit_code == 0
     assert calls["argv"][:4] == [sys.executable, "-m", "pip", "install"]
     assert "upgraded to 0.27.0" in res.output
+
+
+def test_update_windows_pip_handoff_uses_popen(monkeypatch):
+    calls = {}
+
+    monkeypatch.setattr(up, "installed_version", lambda: "0.26.0")
+    monkeypatch.setattr(up, "fetch_latest_version", lambda **k: "0.27.0")
+    monkeypatch.setattr(up.sys, "platform", "win32")
+    monkeypatch.setattr(
+        up,
+        "detect_install_method",
+        lambda extras=None: up.InstallMethod(
+            kind="pip",
+            can_self_update=True,
+            argv=[r"C:\Python313\python.exe", "-m", "pip", "install", "-U", "headroom-ai"],
+        ),
+    )
+
+    def _run(*a, **k):
+        raise AssertionError("Windows pip handoff must not call subprocess.run")
+
+    def _popen(argv, *a, **k):
+        calls["argv"] = argv
+        return object()
+
+    monkeypatch.setattr(up.subprocess, "run", _run)
+    monkeypatch.setattr(up.subprocess, "Popen", _popen)
+    res = CliRunner().invoke(main, ["update", "--yes"])
+    assert res.exit_code == 0
+    assert calls["argv"][:2] == ["cmd.exe", "/c"]
+    assert "ping -n 2 127.0.0.1 >nul" in calls["argv"][2]
+    assert "headroom.exe" in res.output
+
+
+def test_update_windows_non_pip_path_stays_synchronous(monkeypatch):
+    calls = {}
+
+    monkeypatch.setattr(up, "installed_version", lambda: "0.26.0")
+    monkeypatch.setattr(up, "fetch_latest_version", lambda **k: "0.27.0")
+    monkeypatch.setattr(up.sys, "platform", "win32")
+    monkeypatch.setattr(
+        up,
+        "detect_install_method",
+        lambda extras=None: up.InstallMethod(
+            kind="pipx",
+            can_self_update=True,
+            argv=["pipx", "upgrade", "headroom-ai"],
+        ),
+    )
+
+    class _Result:
+        returncode = 0
+
+    def _run(argv, *a, **k):
+        calls["run"] = argv
+        return _Result()
+
+    def _popen(*a, **k):
+        raise AssertionError("pipx must stay on the synchronous path")
+
+    monkeypatch.setattr(up.subprocess, "run", _run)
+    monkeypatch.setattr(up.subprocess, "Popen", _popen)
+    res = CliRunner().invoke(main, ["update", "--yes"])
+    assert res.exit_code == 0
+    assert calls["run"] == ["pipx", "upgrade", "headroom-ai"]
 
 
 def test_update_refuses_in_checkout(monkeypatch):
@@ -168,6 +234,7 @@ def test_update_upgrade_failure_surfaces_command(monkeypatch):
     monkeypatch.setattr(up, "installed_version", lambda: "0.26.0")
     monkeypatch.setattr(up, "fetch_latest_version", lambda **k: "0.27.0")
     monkeypatch.setattr(up, "_in_virtualenv", lambda: True)
+    monkeypatch.setattr(up.sys, "platform", "linux")
     monkeypatch.setattr(up, "_find_core_pyd", lambda: None)  # Skip file operations in test
 
     class _Result:

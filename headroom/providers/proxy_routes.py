@@ -400,11 +400,7 @@ async def _handle_chatgpt_model_metadata(
     try:
         body = await request.body()
     except ClientDisconnect:
-        logger.debug(
-            "Client disconnected during body read for passthrough: %s %s",
-            request.method,
-            request.url.path,
-        )
+        logger.debug("Client disconnected during body read for passthrough")
         return Response(status_code=204)
     try:
         assert proxy.http_client is not None
@@ -450,11 +446,7 @@ async def _handle_chatgpt_codex_images(
     try:
         body = await request.body()
     except ClientDisconnect:
-        logger.debug(
-            "Client disconnected during body read for passthrough: %s %s",
-            request.method,
-            request.url.path,
-        )
+        logger.debug("Client disconnected during body read for passthrough")
         return Response(status_code=204)
     try:
         client = getattr(proxy, "http_client_h1", None) or getattr(proxy, "http_client", None)
@@ -619,11 +611,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         try:
             body = await request.body()
         except ClientDisconnect:
-            logger.debug(
-                "Client disconnected during body read for codex responses: %s %s",
-                request.method,
-                sub_path,
-            )
+            logger.debug("Client disconnected during body read for codex responses passthrough")
             return Response(status_code=204)
         try:
             assert proxy.http_client is not None

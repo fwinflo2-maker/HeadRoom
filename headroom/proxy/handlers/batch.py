@@ -398,11 +398,7 @@ class BatchHandlerMixin:
             try:
                 body_content = await request.body()
             except ClientDisconnect:
-                logger.debug(
-                    "Client disconnected during body read for google batch passthrough: %s %s",
-                    request.method,
-                    request.url.path,
-                )
+                logger.debug("Client disconnected during body read for google batch passthrough")
                 return Response(status_code=204)
             outbound_source = "passthrough"
             body_mutated = False
@@ -517,11 +513,7 @@ class BatchHandlerMixin:
         try:
             body = await request.body()
         except ClientDisconnect:
-            logger.debug(
-                "Client disconnected during body read for gemini passthrough: %s %s",
-                request.method,
-                path,
-            )
+            logger.debug("Client disconnected during body read for gemini passthrough")
             return Response(status_code=204)
 
         response = await self.http_client.request(  # type: ignore[union-attr]

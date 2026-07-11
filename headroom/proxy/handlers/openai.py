@@ -7405,11 +7405,7 @@ class OpenAIHandlerMixin:
         try:
             body = await request.body()
         except ClientDisconnect:
-            logger.debug(
-                "Client disconnected during body read for passthrough: %s %s",
-                request.method,
-                path,
-            )
+            logger.debug("Client disconnected during body read for passthrough")
             return Response(status_code=204)
 
         headers = await apply_copilot_api_auth(headers, url=url)
@@ -7590,11 +7586,7 @@ class OpenAIHandlerMixin:
         try:
             body = await request.body()
         except ClientDisconnect:
-            logger.debug(
-                "Client disconnected during body read for streaming passthrough: %s %s",
-                request.method,
-                path,
-            )
+            logger.debug("Client disconnected during body read for streaming passthrough")
             return Response(status_code=204)
         headers = await apply_copilot_api_auth(headers, url=url)
         request_id = await self._next_request_id()

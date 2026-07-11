@@ -1885,58 +1885,29 @@ class TestCodexProjectHeaderConfig:
 
 
 # ---------------------------------------------------------------------------
-# Regression: codex delegates port resolution to _ensure_proxy
+# Regression: codex preserves the requested port through the session-scoped runner
 # ---------------------------------------------------------------------------
 
 
 class TestCodexPortResolution:
-    """codex() uses _ensure_proxy() to resolve ports (not early _find_available_port).
+    """codex() hands the requested port to the session-scoped wrap runner.
 
-    Regression for headroom#1406 round 2 review: codex() must follow
-    the same selected-port contract as other wrappers (aider, copilot, etc.)
-    so that a healthy existing proxy on the requested port is reused instead
-    of skipped by a blind socket probe.
+    Regression for headroom#1406 round 2 review: the codex command must keep
+    the selected-port contract intact after the session-home refactor instead
+    of silently dropping or rewriting the requested port before the shared
+    launch path handles proxy reuse and fallback.
     """
 
-    def test_delegates_to_ensure_proxy(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """codex() calls _ensure_proxy and uses the returned port."""
+    def test_delegates_to_session_runner(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """codex() passes the requested port through to _run_codex_wrap."""
         _set_test_home(monkeypatch, Path("/tmp/test_headroom_codex"))
 
-        captured_port: list[int] = []
+        call_kw: dict = {}
 
-        # Mock _ensure_proxy to capture the requested port
-        def mock_ensure_proxy(port: int, no_proxy: bool, **kwargs: object) -> tuple[None, int]:
-            captured_port.append(port)
-            # Simulate port fallback: requested 8787, actual 8788
-            return None, 8788
+        def mock_run_codex_wrap(**kwargs: object) -> None:
+            call_kw.update(kwargs)
 
-        monkeypatch.setattr(wrap_mod, "_ensure_proxy", mock_ensure_proxy)
-
-        # Mock all heavy dependencies
-        monkeypatch.setattr(
-            wrap_mod, "_codex_config_paths", lambda: (Path("/dev/null"), Path("/dev/null"))
-        )
-        monkeypatch.setattr(wrap_mod, "_snapshot_codex_config_if_unwrapped", lambda *a, **kw: None)
-        monkeypatch.setattr(wrap_mod, "_ensure_rtk_binary", lambda *a, **kw: None)
-        monkeypatch.setattr(wrap_mod, "_setup_lean_ctx_agent", lambda *a, **kw: None)
-        monkeypatch.setattr(wrap_mod, "_inject_rtk_instructions", lambda *a, **kw: None)
-        monkeypatch.setattr(wrap_mod, "_codex_home_dir", lambda: Path("/tmp"))
-        monkeypatch.setattr(wrap_mod, "_setup_headroom_mcp", lambda *a, **kw: None)
-        monkeypatch.setattr(wrap_mod, "_setup_serena_mcp", lambda *a, **kw: None)
-        monkeypatch.setattr(wrap_mod, "_disable_serena_mcp", lambda *a, **kw: None)
-        monkeypatch.setattr("shutil.which", lambda x: "/usr/bin/codex" if x == "codex" else None)
-        monkeypatch.setattr(wrap_mod, "_build_codex_launch_env", lambda port, env: ({}, []))
-        monkeypatch.setattr(wrap_mod, "_inject_codex_provider_config", lambda port: None)
-        monkeypatch.setattr(wrap_mod, "_project_name_from_cwd", lambda: None)
-        monkeypatch.setattr(wrap_mod, "_live_proxy_clients", lambda *a, **kw: [])
-
-        # Intercept _launch_tool to verify port propagation
-        launch_kw: dict = {}
-
-        def mock_launch_tool(**kwargs: object) -> None:
-            launch_kw.update(kwargs)
-
-        monkeypatch.setattr(wrap_mod, "_launch_tool", mock_launch_tool)
+        monkeypatch.setattr(wrap_mod, "_run_codex_wrap", mock_run_codex_wrap)
 
         runner = CliRunner()
         result = runner.invoke(
@@ -1945,10 +1916,6 @@ class TestCodexPortResolution:
         )
 
         assert result.exit_code == 0, f"CLI failed: {result.output}"
-        assert captured_port == [8787], (
-            f"_ensure_proxy called with {captured_port}, expected [8787]"
-        )
-        assert launch_kw.get("port") == 8788, (
-            f"_launch_tool port={launch_kw.get('port')}, expected 8788 "
-            "(the actual_port from _ensure_proxy fallback)"
-        )
+        assert call_kw.get("port") == 8787
+        assert call_kw.get("no_proxy") is False
+        assert call_kw.get("prepare_only") is False

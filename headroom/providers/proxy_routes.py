@@ -395,7 +395,17 @@ async def _handle_chatgpt_model_metadata(
     if request.url.query:
         url = f"{url}?{request.url.query}"
 
-    body = await request.body()
+    from starlette.requests import ClientDisconnect
+
+    try:
+        body = await request.body()
+    except ClientDisconnect:
+        logger.debug(
+            "Client disconnected during body read for passthrough: %s %s",
+            request.method,
+            request.url.path,
+        )
+        return Response(status_code=204)
     try:
         assert proxy.http_client is not None
         resp = await proxy.http_client.request(
@@ -435,7 +445,17 @@ async def _handle_chatgpt_codex_images(
     if request.url.query:
         url = f"{url}?{request.url.query}"
 
-    body = await request.body()
+    from starlette.requests import ClientDisconnect
+
+    try:
+        body = await request.body()
+    except ClientDisconnect:
+        logger.debug(
+            "Client disconnected during body read for passthrough: %s %s",
+            request.method,
+            request.url.path,
+        )
+        return Response(status_code=204)
     try:
         client = getattr(proxy, "http_client_h1", None) or getattr(proxy, "http_client", None)
         if client is None:
@@ -594,7 +614,17 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         if request.url.query:
             url = f"{url}?{request.url.query}"
 
-        body = await request.body()
+        from starlette.requests import ClientDisconnect
+
+        try:
+            body = await request.body()
+        except ClientDisconnect:
+            logger.debug(
+                "Client disconnected during body read for codex responses: %s %s",
+                request.method,
+                sub_path,
+            )
+            return Response(status_code=204)
         try:
             assert proxy.http_client is not None
             resp = await proxy.http_client.request(

@@ -532,10 +532,10 @@ class AnthropicHandlerMixin:
         from headroom.cache.compression_store import get_compression_store
         from headroom.ccr import CCRToolInjector
         from headroom.providers.anthropic import sanitize_anthropic_model_id
+        from headroom.proxy.body_forwarding import BodyMutationTracker
         from headroom.proxy.helpers import (
             MAX_MESSAGE_ARRAY_LENGTH,
             MAX_REQUEST_BODY_SIZE,
-            BodyMutationTracker,
             _get_image_compressor,
             compute_turn_id,
             read_request_json_with_bytes,
@@ -775,6 +775,13 @@ class AnthropicHandlerMixin:
             headers = dict(request.headers.items())
             headers.pop("host", None)
             headers.pop("content-length", None)
+            # read_request_json_with_bytes already content-decoded the inbound
+            # body (zstd/gzip/deflate/br), so the bytes we forward are plain.
+            # A stale content-encoding makes the upstream try to decompress
+            # already-decoded JSON and reject it with HTTP 400 (#1542 — same
+            # fix the /v1/responses path already carries).
+            headers.pop("content-encoding", None)
+            headers.pop("transfer-encoding", None)
             # Strip accept-encoding so httpx negotiates its own encoding.
             # Edge proxies (Cloudflare Workers, etc.) may forward "br, zstd" which
             # the upstream can honor; if httpx lacks brotli support the response
@@ -1673,7 +1680,13 @@ class AnthropicHandlerMixin:
                         )
                 except Exception:  # advisory hint only — must never fail a request
                     pass
-            ccr_workspace_key = ccr_workspace_label = None
+            # Initialize before the gated block so the proactive-expansion
+            # gate below (which references ``ccr_workspace_key`` regardless of
+            # the inject flags) does not raise ``UnboundLocalError`` when the
+            # block is skipped — e.g. ``--no-ccr-inject-tool`` with the default
+            # ``ccr_inject_system_instructions=False``, or when ``_bypass`` is
+            # set. The downstream uses already treat falsy as "unresolved".
+            ccr_workspace_key, ccr_workspace_label = None, None
             if (
                 self.config.ccr_inject_tool or self.config.ccr_inject_system_instructions
             ) and not _bypass:
@@ -2397,12 +2410,16 @@ class AnthropicHandlerMixin:
                             )
                         except Exception:
                             attempted_input_tokens = original_tokens
-                        # Backend (Bedrock / Vertex) non-streaming.
-                        # Cache metrics aren't extracted from the backend
-                        # response here yet — that's a follow-up. The
-                        # funnel passes 0s for the cache fields, which
-                        # is the same observable behaviour as the
-                        # pre-refactor code (which also omitted them).
+
+                        cr_tokens = usage.get("cache_read_input_tokens", 0)
+                        cw_tokens = usage.get("cache_creation_input_tokens", 0)
+                        cw_5m_tokens, cw_1h_tokens = self._extract_anthropic_cache_ttl_metrics(
+                            usage
+                        )
+                        uncached_input_tokens = max(
+                            0, attempted_input_tokens - cr_tokens - cw_tokens
+                        )
+
                         await self._record_request_outcome(
                             RequestOutcome(
                                 request_id=request_id,
@@ -2413,6 +2430,11 @@ class AnthropicHandlerMixin:
                                 output_tokens=output_tokens,
                                 tokens_saved=tokens_saved,
                                 attempted_input_tokens=attempted_input_tokens,
+                                cache_read_tokens=cr_tokens,
+                                cache_write_tokens=cw_tokens,
+                                cache_write_5m_tokens=cw_5m_tokens,
+                                cache_write_1h_tokens=cw_1h_tokens,
+                                uncached_input_tokens=uncached_input_tokens,
                                 total_latency_ms=total_latency,
                                 overhead_ms=optimization_latency,
                                 pipeline_timing=pipeline_timing,
@@ -2748,10 +2770,10 @@ class AnthropicHandlerMixin:
                             # continuation body is synthesized by Headroom
                             # so it is treated as mutated and goes through
                             # the canonical serializer.
-                            from headroom.proxy.helpers import (
-                                log_outbound_request,
+                            from headroom.proxy.body_forwarding import (
                                 prepare_outbound_body_bytes,
                             )
+                            from headroom.proxy.helpers import log_outbound_request
 
                             ccr_outbound_bytes, ccr_outbound_source = prepare_outbound_body_bytes(
                                 body=continuation_body,
@@ -3048,6 +3070,7 @@ class AnthropicHandlerMixin:
                             request_id=request_id,
                             provider=provider_name,
                             model=model,
+                            status_code=response.status_code,
                             original_tokens=original_tokens,
                             optimized_tokens=optimized_tokens,
                             output_tokens=output_tokens,
@@ -3503,6 +3526,7 @@ class AnthropicHandlerMixin:
                     request_id=request_id,
                     provider="anthropic",
                     model="batch",
+                    status_code=response.status_code,
                     original_tokens=total_original_tokens,
                     optimized_tokens=total_optimized_tokens,
                     output_tokens=0,
@@ -3627,6 +3651,7 @@ class AnthropicHandlerMixin:
                 request_id=request_id,
                 provider="anthropic",
                 model="passthrough:batches",
+                status_code=response.status_code,
                 original_tokens=0,
                 optimized_tokens=0,
                 output_tokens=0,

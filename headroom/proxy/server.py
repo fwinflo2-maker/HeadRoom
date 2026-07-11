@@ -1791,10 +1791,8 @@ class HeadroomProxy(
         construct their body from scratch, so canonical serialization is
         correct and original bytes do not exist).
         """
-        from headroom.proxy.helpers import (
-            log_outbound_request,
-            prepare_outbound_body_bytes,
-        )
+        from headroom.proxy.body_forwarding import prepare_outbound_body_bytes
+        from headroom.proxy.helpers import log_outbound_request
 
         last_error = None
         reasons = list(mutation_reasons or [])
@@ -1885,6 +1883,16 @@ class HeadroomProxy(
                 last_error = e
 
                 if not self.config.retry_enabled or attempt >= self.config.retry_max_attempts - 1:
+                    # On exhaustion, preserve the upstream 5xx status (e.g. 503
+                    # Service Unavailable, 500, 502, 504) so the client can apply
+                    # its own retry/backoff. Collapsing every exhausted 5xx into a
+                    # generic 502 hides the retryable signal and makes clients give
+                    # up. The 429/529 overload statuses are already returned
+                    # verbatim by the RETRYABLE_OVERLOAD_STATUSES branch above and
+                    # never reach here. ConnectError/TimeoutException carry no
+                    # response, so those still raise.
+                    if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+                        return e.response
                     raise
 
                 # Exponential backoff with jitter

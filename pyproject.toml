@@ -279,7 +279,7 @@ dev = [
     "numpy>=1.24.0",
     "openpyxl>=3.1.0",  # exercises spreadsheet_ingest (.xlsx) in the test suite
 ]
-# All optional dependencies (everything you need)
+# All optional dependencies (everything supported on your platform)
 #
 # `benchmark` is deliberately EXCLUDED from `[all]`. It installs the
 # EleutherAI lm-evaluation-harness (lm-eval), which headroom invokes as an
@@ -290,7 +290,8 @@ dev = [
 # need the accuracy harness opt in explicitly with `pip install
 # headroom-ai[benchmark]`.
 all = [
-    "headroom-ai[proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,mcp,spreadsheet]",
+    "headroom-ai[proxy,code,relevance,image,reports,otel,html,mcp,spreadsheet]",
+    "headroom-ai[ml,memory,evals,voice]; sys_platform != 'darwin' or platform_machine != 'x86_64'",
 ]
 
 [project.scripts]

@@ -32,7 +32,7 @@ The core package includes the `compress()` function, SmartCrusher, CacheAligner,
 
 ### Extras
 
-Install only what you need, or grab everything with `[all]`:
+Install only what you need, or grab everything supported on your platform with `[all]`:
 
 ```bash
 pip install "headroom-ai[all]"
@@ -55,7 +55,9 @@ pip install "headroom-ai[all]"
 | `agno` | Agno `HeadroomAgnoModel` wrapper | `pip install "headroom-ai[agno]"` |
 | `evals` | Evaluation framework (GSM8K, SQuAD, BFCL benchmarks) | `pip install "headroom-ai[evals]"` |
 | `pytorch-mps` | Apple-GPU (MPS) memory-embedder offload — **macOS only**, not in `[all]` (torch + sentence-transformers); opt in with `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps` | `pip install "headroom-ai[pytorch-mps]"` |
-| `all` | Everything above | `pip install "headroom-ai[all]"` |
+| `all` | Everything supported on your platform | `pip install "headroom-ai[all]"` |
+
+On Intel macOS, `[all]` skips the torch-bearing `ml`, `memory`, `evals`, and `voice` extras because upstream torch wheels are unavailable there.
 
 You can combine extras:
 

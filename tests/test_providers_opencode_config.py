@@ -491,7 +491,9 @@ def test_build_launch_env_with_project(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert env["HEADROOM_PROJECT"] == "test-proj"
     # Plugin loaded → its proxy target is exported for self-configuration.
     assert env["HEADROOM_PROXY_URL"] == "http://127.0.0.1:8787"
-    assert str(plugin) in env["OPENCODE_CONFIG_CONTENT"]
+    # Parse JSON so platform-native backslash escapes don't break the assertion.
+    config_in_env = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+    assert config_in_env["plugin"] == [str(plugin)]
     assert f"plugin={HEADROOM_OPENCODE_PLUGIN}" in display
     assert "OPENAI_BASE_URL" not in env
     assert "ANTHROPIC_BASE_URL" not in env

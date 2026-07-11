@@ -51,6 +51,11 @@ def _read_json(path: Path) -> dict[str, Any]:
     Handles JSONC-style ``//`` comments by stripping them when strict
     JSON parsing fails, so the registrar can safely operate on config
     files that were written by a fork or manually edited with comments.
+
+    Safe for READ-ONLY callers only. Do NOT use before a full-file rewrite:
+    an unparseable existing file returns ``{}`` here, and writing that back
+    would destroy the user's other config. Use :func:`_read_json_for_write`
+    on the write path instead.
     """
     if not path.exists():
         return {}
@@ -68,6 +73,37 @@ def _read_json(path: Path) -> dict[str, Any]:
             return {}
     if not isinstance(data, dict):
         return {}
+    return data
+
+
+class _MalformedConfigError(Exception):
+    """The target config file exists but is not a parseable JSON object.
+
+    Raised on the write path so we refuse to clobber a config we can't safely
+    merge into, rather than silently overwriting the user's other settings.
+    """
+
+
+def _read_json_for_write(path: Path) -> dict[str, Any]:
+    """Read a JSON object for a subsequent full-file rewrite.
+
+    Returns ``{}`` only when the file is absent or empty (safe to start fresh).
+    If the file exists with content but does not parse as a JSON object, raise
+    :class:`_MalformedConfigError` so the caller aborts instead of overwriting
+    unrelated user config — ``opencode.json`` holds ``theme``/``model``/
+    ``provider``/other MCP servers alongside the ``mcp`` block.
+    """
+    if not path.exists():
+        return {}
+    raw = path.read_text(encoding="utf-8")  # OSError propagates to the caller
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise _MalformedConfigError(str(exc)) from exc
+    if not isinstance(data, dict):
+        raise _MalformedConfigError("top-level JSON is not an object")
     return data
 
 
@@ -125,12 +161,9 @@ def _locked_config(config_path: Path) -> Generator[None, None, None]:
         os.close(fd)
 
 
-# ── spec helpers ───────────────────────────────────────────────────
-
-
 def _entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec:
     command_value = entry.get("command")
-    if isinstance(command_value, list) and command_value:
+    if isinstance(command_value, list):
         args = tuple(str(x) for x in command_value[1:])
         command = str(command_value[0])
     else:
@@ -176,9 +209,6 @@ def _diff_specs(existing: ServerSpec, requested: ServerSpec) -> str:
     return "; ".join(parts)
 
 
-# ── registrar ──────────────────────────────────────────────────────
-
-
 class OpencodeRegistrar(MCPRegistrar):
     """Register MCP servers with OpenCode.
 
@@ -192,16 +222,12 @@ class OpencodeRegistrar(MCPRegistrar):
     def __init__(self, *, config_path: Path | None = None) -> None:
         self._config_path = config_path or _opencode_config_path()
 
-    # ── detection ───────────────────────────────────────────────
-
     def detect(self) -> bool:
         from headroom.providers.opencode._shared import _get_opencode_bin  # lazy — avoids cycle
 
         if shutil.which(_get_opencode_bin()):
             return True
         return self._config_path.parent.is_dir()
-
-    # ── server CRUD ─────────────────────────────────────────────
 
     def get_server(self, server_name: str) -> ServerSpec | None:
         with _locked_config(self._config_path):
@@ -215,38 +241,30 @@ class OpencodeRegistrar(MCPRegistrar):
         return _entry_to_spec(server_name, entry)
 
     def register_server(self, spec: ServerSpec, *, force: bool = False) -> RegisterResult:
-        with _locked_config(self._config_path):
-            data = _read_json(self._config_path)
-            mcp = data.setdefault("mcp", {})
-            if not isinstance(mcp, dict):
-                mcp = {}
-                data["mcp"] = mcp
-            existing_entry = mcp.get(spec.name)
+        existing = self.get_server(spec.name)
 
-            if existing_entry is not None:
-                existing_spec = _entry_to_spec(spec.name, existing_entry)
-                if _specs_equivalent(existing_spec, spec):
-                    return RegisterResult(RegisterStatus.ALREADY, "matches current configuration")
-                if not force:
-                    return RegisterResult(
-                        RegisterStatus.MISMATCH,
-                        _diff_specs(existing_spec, spec),
-                    )
+        if existing is not None and _specs_equivalent(existing, spec):
+            return RegisterResult(RegisterStatus.ALREADY, "matches current configuration")
 
-            mcp[spec.name] = _spec_to_entry(spec)
-            try:
-                _write_json(self._config_path, data)
-            except OSError as exc:
-                return RegisterResult(
-                    RegisterStatus.FAILED, f"could not write {self._config_path}: {exc}"
-                )
-            return RegisterResult(RegisterStatus.REGISTERED, f"wrote to {self._config_path}")
+        if existing is not None and not force:
+            return RegisterResult(
+                RegisterStatus.MISMATCH,
+                _diff_specs(existing, spec),
+            )
+
+        if existing is not None and force:
+            # Remove the existing entry before rewriting.
+            self.unregister_server(spec.name)
+
+        return self._write_entry(spec)
 
     def unregister_server(self, server_name: str) -> bool:
         with _locked_config(self._config_path):
             data = _read_json(self._config_path)
             mcp = data.get("mcp", {})
-            if not isinstance(mcp, dict) or server_name not in mcp:
+            if not isinstance(mcp, dict):
+                return False
+            if server_name not in mcp:
                 return False
             del mcp[server_name]
             if not mcp:
@@ -256,3 +274,28 @@ class OpencodeRegistrar(MCPRegistrar):
             except OSError:
                 return False
             return True
+
+    def _write_entry(self, spec: ServerSpec) -> RegisterResult:
+        with _locked_config(self._config_path):
+            try:
+                self._config_path.parent.mkdir(parents=True, exist_ok=True)
+                data = _read_json_for_write(self._config_path)
+                mcp = data.setdefault("mcp", {})
+                if not isinstance(mcp, dict):
+                    mcp = {}
+                    data["mcp"] = mcp
+                mcp[spec.name] = _spec_to_entry(spec)
+                _write_json(self._config_path, data)
+            except _MalformedConfigError as exc:
+                # Refuse to overwrite: opencode.json holds theme/model/provider and
+                # other MCP servers that a blind rewrite would wipe.
+                return RegisterResult(
+                    RegisterStatus.FAILED,
+                    f"{self._config_path} exists but is not valid JSON ({exc}); "
+                    "refusing to overwrite. Fix or remove the file, then re-run.",
+                )
+            except OSError as exc:
+                return RegisterResult(
+                    RegisterStatus.FAILED, f"could not write {self._config_path}: {exc}"
+                )
+            return RegisterResult(RegisterStatus.REGISTERED, f"wrote to {self._config_path}")

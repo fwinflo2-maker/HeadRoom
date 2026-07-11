@@ -11,6 +11,8 @@ from headroom.install.models import ConfigScope, DeploymentManifest, ManagedMuta
 from headroom.install.paths import opencode_config_path
 
 from .config import (
+    _MCP_MARKER_START,
+    _PROVIDER_MARKER_START,
     _inject_key_into_json,
     _parse_json_loose,
     snapshot_opencode_config_if_unwrapped,
@@ -40,6 +42,10 @@ def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None
 
     if config_file.exists():
         content = fsutil.read_text(config_file)
+        # Strip any prior Headroom-managed blocks before re-injecting
+        # (mirrors inject_opencode_provider_config).
+        if _PROVIDER_MARKER_START in content or _MCP_MARKER_START in content:
+            content = strip_opencode_headroom_blocks(content)
         data = _parse_json_loose(content)
     else:
         data = {}

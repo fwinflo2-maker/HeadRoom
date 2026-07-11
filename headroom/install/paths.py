@@ -124,7 +124,7 @@ def opencode_config_path() -> Path:
     """Return the OpenCode config path.
 
     Resolves ``OPENCODE_CONFIG`` env var when set; otherwise derives from
-    ``OPENCODE_HOME`` (or ``HEADROOM_OPENCODE_BIN`` basename, or ``~/.config/opencode``).
+    ``OPENCODE_HOME`` (or ``~/.config/opencode``).
     """
     from headroom.providers.opencode._shared import (
         _opencode_config_path,  # lazy — avoids import cycle

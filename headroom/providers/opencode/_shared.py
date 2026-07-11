@@ -29,9 +29,13 @@ def _opencode_home_dir() -> Path:
 def _opencode_config_path() -> Path:
     """Return the opencode config file path.
 
-    Priority: OPENCODE_CONFIG > _opencode_home_dir()/opencode.json
+    Priority: OPENCODE_CONFIG > opencode.jsonc (if exists) > opencode.json
     """
     env_path = os.environ.get("OPENCODE_CONFIG", "").strip()
     if env_path:
         return Path(env_path).expanduser()
-    return _opencode_home_dir() / "opencode.json"
+    home_dir = _opencode_home_dir()
+    jsonc = home_dir / "opencode.jsonc"
+    if jsonc.exists():
+        return jsonc
+    return home_dir / "opencode.json"

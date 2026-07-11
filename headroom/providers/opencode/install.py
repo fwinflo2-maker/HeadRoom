@@ -37,7 +37,7 @@ def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None
     config_file.parent.mkdir(parents=True, exist_ok=True)
 
     snapshot_opencode_config_if_unwrapped(
-        config_file, config_file.with_suffix(".json.headroom-backup")
+        config_file, config_file.with_name(config_file.name + ".headroom-backup")
     )
 
     if config_file.exists():
@@ -77,7 +77,7 @@ def revert_provider_scope(mutation: ManagedMutation, manifest: DeploymentManifes
     if not mutation.path:
         return
     path = Path(mutation.path)
-    backup_file = path.with_suffix(".json.headroom-backup")
+    backup_file = path.with_name(path.name + ".headroom-backup")
     if backup_file.exists():
         try:
             shutil.copy2(backup_file, path)

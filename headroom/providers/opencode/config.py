@@ -72,7 +72,7 @@ def headroom_provider_entry(port: int) -> dict[str, Any]:
 def opencode_config_paths() -> tuple[Path, Path]:
     """Return ``(config_file, backup_file)`` for OpenCode."""
     config_file = opencode_config_path()
-    backup_file = config_file.with_suffix(".json.headroom-backup")
+    backup_file = config_file.with_name(config_file.name + ".headroom-backup")
     return config_file, backup_file
 
 

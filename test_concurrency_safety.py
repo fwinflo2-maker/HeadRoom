@@ -1,20 +1,31 @@
 #!/usr/bin/env python3
 """Verify atomic writes and file locking in mcp_registry/opencode.py."""
-import json, os, random, sys, tempfile, threading, time
+import json
+import os
+import sys
+import tempfile
+import threading
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from headroom.mcp_registry.opencode import (
-    OpencodeRegistrar, _read_json, _write_json, _locked_config,
-)
 from headroom.mcp_registry.base import ServerSpec
+from headroom.mcp_registry.opencode import (
+    OpencodeRegistrar,
+    _locked_config,
+    _read_json,
+    _write_json,
+)
 
-GREEN = "\033[32m"; RED = "\033[31m"; RESET = "\033[0m"
+GREEN = "\033[32m"
+RED = "\033[31m"
+RESET = "\033[0m"
 results = []
 def check(name, ok, detail=""):
     results.append((name, ok, detail))
     print(f"  {GREEN}✓{RESET} {name}" if ok else f"  {RED}✗{RESET} {name}")
-    if not ok and detail: print(f"    {RED}└─ {detail}{RESET}")
+    if not ok and detail:
+        print(f"    {RED}└─ {detail}{RESET}")
 
 # ── Test 1: atomic write — interrupted write leaves original intact ──
 print("=== 1. Atomic write integrity ===")
@@ -62,8 +73,10 @@ def register_worker(td: str, idx: int) -> None:
 with tempfile.TemporaryDirectory() as td:
     threads = [threading.Thread(target=register_worker, args=(td, i))
                for i in range(20)]
-    for t in threads: t.start()
-    for t in threads: t.join()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
     check("20 concurrent registrations → no errors", len(errors) == 0,
           f"{len(errors)} errors: {errors[:3]}")
@@ -85,8 +98,10 @@ with tempfile.TemporaryDirectory() as td:
             sequence.append(idx)
 
     threads = [threading.Thread(target=serial_worker, args=(i,)) for i in range(10)]
-    for t in threads: t.start()
-    for t in threads: t.join()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
     final = _read_json(path)
     check("10 serialised writes → all 10 entries present",
@@ -114,13 +129,13 @@ print("\n=== 5. Lock file handling ===")
 with tempfile.TemporaryDirectory() as td:
     config_path = Path(td) / "oc.json"
     lock_path = config_path.with_suffix(config_path.suffix + ".lock")
-    
+
     # Lock file should exist only while locked
     check("lock absent before use", not lock_path.exists())
-    
+
     with _locked_config(config_path):
         check("lock present during use", lock_path.exists())
-    
+
     check("lock still present after release (normal for flock)",
           lock_path.exists())  # flock doesn't delete the file
 

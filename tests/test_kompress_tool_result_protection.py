@@ -8,20 +8,17 @@ missing files, etc. — that agents act on as fact.
 
 from __future__ import annotations
 
-import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from headroom.transforms.kompress_compressor import KompressCompressor
-from headroom.config import TransformResult
-
 
 GREP_OUTPUT = (
-    "headroom/transforms/kompress_compressor.py:1375:            if role in (\"tool\", \"assistant\"):\n"
-    "headroom/transforms/smart_crusher.py:1010:            if msg.get(\"role\") == \"tool\":\n"
-    "headroom/transforms/content_router.py:2653:            if role == \"tool\":\n"
-    "headroom/proxy/handlers/anthropic.py:44:                elif block.get(\"type\") == \"tool_result\":\n"
-    "headroom/cache/prefix_tracker.py:88:            if message.get(\"role\") == \"tool\":\n"
-    "headroom/proxy/helpers.py:102:        if msg.get(\"role\") == \"tool\":\n"
+    'headroom/transforms/kompress_compressor.py:1375:            if role in ("tool", "assistant"):\n'
+    'headroom/transforms/smart_crusher.py:1010:            if msg.get("role") == "tool":\n'
+    'headroom/transforms/content_router.py:2653:            if role == "tool":\n'
+    'headroom/proxy/handlers/anthropic.py:44:                elif block.get("type") == "tool_result":\n'
+    'headroom/cache/prefix_tracker.py:88:            if message.get("role") == "tool":\n'
+    'headroom/proxy/helpers.py:102:        if msg.get("role") == "tool":\n'
 )
 
 LS_OUTPUT = (
@@ -42,20 +39,25 @@ LONG_ASSISTANT = " ".join([f"word{i}" for i in range(200)])  # >10 words, compre
 def _make_compressor_with_mock() -> tuple[KompressCompressor, MagicMock]:
     """Return a KompressCompressor whose .compress() is mocked to track calls."""
     compressor = KompressCompressor.__new__(KompressCompressor)
-    mock_compress = MagicMock(return_value=MagicMock(
-        compressed="[KOMPRESS OUTPUT — WOULD BE LOSSY]",
-        compression_ratio=0.3,
-    ))
+    mock_compress = MagicMock(
+        return_value=MagicMock(
+            compressed="[KOMPRESS OUTPUT — WOULD BE LOSSY]",
+            compression_ratio=0.3,
+        )
+    )
     compressor.compress = mock_compress
     return compressor, mock_compress
 
 
 class _StubTokenizer:
     """Minimal tokenizer stub — word-count approximation, no model needed."""
+
     def count_text(self, text: str) -> int:
         return len(str(text).split())
+
     def count_messages(self, messages: list) -> int:
         return sum(self.count_text(str(m.get("content", ""))) for m in messages)
+
 
 def _tokenizer() -> _StubTokenizer:
     return _StubTokenizer()

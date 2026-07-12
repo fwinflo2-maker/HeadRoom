@@ -5213,11 +5213,11 @@ def grok_build(
             agent="grok_build",
             agent_display="Grok Build",
             marker_path=agents_md,
-            on_rtk_ready=lambda _rtk: _inject_rtk_instructions(
-                cast(Path, agents_md), verbose=verbose
-            )
-            if agents_md is not None
-            else None,
+            on_rtk_ready=lambda _rtk: (
+                _inject_rtk_instructions(cast(Path, agents_md), verbose=verbose)
+                if agents_md is not None
+                else None
+            ),
             verbose=verbose,
         )
 

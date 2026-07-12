@@ -41,6 +41,7 @@ def _load_timeout_seconds() -> float:
     except (TypeError, ValueError):
         return 10.0
 
+
 # Model to encoding mapping
 MODEL_TO_ENCODING = {
     # GPT-4o family (o200k_base)
@@ -116,9 +117,7 @@ def _get_encoding(encoding_name: str):
     import tiktoken
 
     if encoding_name in _load_failed:
-        raise TiktokenLoadError(
-            f"tiktoken encoding {encoding_name!r} previously failed to load"
-        )
+        raise TiktokenLoadError(f"tiktoken encoding {encoding_name!r} previously failed to load")
 
     box: dict[str, Any] = {}
 
@@ -128,9 +127,7 @@ def _get_encoding(encoding_name: str):
         except BaseException as exc:  # noqa: BLE001 - re-raised in the calling thread
             box["err"] = exc
 
-    worker = threading.Thread(
-        target=_load, name=f"tiktoken-load-{encoding_name}", daemon=True
-    )
+    worker = threading.Thread(target=_load, name=f"tiktoken-load-{encoding_name}", daemon=True)
     worker.start()
     worker.join(_load_timeout_seconds())
 
@@ -237,7 +234,15 @@ class TiktokenCounter(BaseTokenizer):
         """
         if not text:
             return 0
-        return len(self.encoding.encode(text))
+        try:
+            return len(self.encoding.encode(text))
+        except ValueError:
+            # Passthrough content can legitimately contain strings that look
+            # like tiktoken special tokens (e.g. "<|endoftext|>" or FIM markers
+            # in code/tool output). Treat them as ordinary text instead of
+            # raising, which would otherwise abort token counting for the whole
+            # request. Matches AnthropicTokenCounter.count_text.
+            return len(self.encoding.encode(text, disallowed_special=()))
 
     def count_messages(self, messages: list[dict[str, Any]]) -> int:
         """Count tokens in messages using OpenAI's exact formula.
@@ -314,7 +319,13 @@ class TiktokenCounter(BaseTokenizer):
         Returns:
             List of token IDs.
         """
-        return self.encoding.encode(text)
+        try:
+            return self.encoding.encode(text)
+        except ValueError:
+            # See count_text: literal special-token strings in passthrough
+            # content must be encoded as ordinary text, not rejected. The
+            # round-trip through decode() is unaffected.
+            return self.encoding.encode(text, disallowed_special=())
 
     def decode(self, tokens: list[int]) -> str:
         """Decode token IDs to text.

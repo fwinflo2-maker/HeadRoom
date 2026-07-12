@@ -210,7 +210,7 @@ def test_ccr_inject_marker_false_suppresses_opaque_blob_markers(fresh_toin):
 
     # Distinct >256-byte string cells trigger the opaque-blob path.
     payload = json.dumps(
-        [{"id": i, "name": f"row{i}", "blob": f"sentinel{i}_" + "x" * 400} for i in range(60)]
+        [{"id": i, "name": f"row{i}", "blob": f"sentinel{i}_" + "x" * 2200} for i in range(60)]
     )
 
     on = SmartCrusher(

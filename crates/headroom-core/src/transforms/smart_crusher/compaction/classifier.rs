@@ -45,10 +45,30 @@ pub enum CellClass {
 /// builder if a workload has different characteristics (e.g. an API
 /// that always emits 500-char status descriptions shouldn't have those
 /// CCR-substituted).
+///
+/// # Two-tier threshold design
+///
+/// [`opaque_min_bytes`](Self::opaque_min_bytes) and
+/// [`ccr_min_bytes`](Self::ccr_min_bytes) look similar but answer
+/// different questions:
+///
+/// - `opaque_min_bytes` — "is this string *shaped* like an opaque blob
+///   at all" (base64/HTML/long-plain-text detection heuristic). Kept
+///   low (256 B) so [`CellClass::Opaque`] sub-kind detection (used by
+///   telemetry and by the `ccr_min_bytes` gate below) stays accurate
+///   on modest fixtures.
+/// - `ccr_min_bytes` — "is this opaque blob *big enough to be worth*
+///   CCR-substituting" (issue #3: fields around ~1 KB were getting
+///   replaced by `<<ccr:...>>` markers even though the round-trip
+///   overhead of a `headroom_retrieve` call outweighs the tokens
+///   saved). This is the floor callers should raise/lower per
+///   workload; default 2 KB.
 #[derive(Debug, Clone)]
 pub struct ClassifyConfig {
     /// Strings strictly longer than this become candidates for opaque
-    /// classification. Default: 256 bytes.
+    /// classification. Default: 256 bytes. See "Two-tier threshold
+    /// design" above — this is a shape-detection heuristic, not the
+    /// CCR-substitution policy floor.
     pub opaque_min_bytes: usize,
     /// Base64-alphabet ratio threshold. Strings whose chars are at
     /// least this fraction in `[A-Za-z0-9+/=_-]` and longer than 64
@@ -57,6 +77,18 @@ pub struct ClassifyConfig {
     /// `<` count above which a long string is considered HTML-ish.
     /// Default: 3.
     pub html_min_open_brackets: usize,
+    /// Minimum byte length for an already-[`CellClass::Opaque`]-classified
+    /// string to actually be replaced by a `<<ccr:...>>` marker. Below
+    /// this floor the value is rendered verbatim even though it's
+    /// opaque-shaped — the retrieval round-trip isn't worth it for a
+    /// ~1 KB field. Default: 2048 bytes (2 KB); operators may raise to
+    /// 4 KB for workloads with many small-but-opaque fields. Wired
+    /// end-to-end via `SmartCrusherConfig::opaque_min_bytes`. Orthogonal
+    /// to `emit_opaque_markers` below: that's a global on/off toggle
+    /// checked at classification time; this is a size floor checked at
+    /// substitution time by callers (`cell_from_value`, `process_string`,
+    /// the document walker) once a cell is already `CellClass::Opaque`.
+    pub ccr_min_bytes: usize,
     /// When false, long strings are NOT classified as opaque — they stay
     /// `Scalar` and render verbatim, so output is marker-free and
     /// guaranteed-lossless. Mirrors the row-drop path's `enable_ccr_marker`
@@ -70,6 +102,7 @@ impl Default for ClassifyConfig {
             opaque_min_bytes: 256,
             base64_alphabet_ratio: 0.95,
             html_min_open_brackets: 3,
+            ccr_min_bytes: 2048,
             emit_opaque_markers: true,
         }
     }

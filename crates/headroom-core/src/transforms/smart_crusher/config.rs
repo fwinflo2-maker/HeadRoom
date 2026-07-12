@@ -77,9 +77,23 @@ pub struct SmartCrusherConfig {
     ///
     /// Scope: gates only the `crush_array` row-drop path. Stage-3c.2
     /// opaque-string CCR substitutions (in `walker::process_value`)
-    /// still emit always; they have no Python equivalent and no
-    /// production caller has asked for them to be suppressed.
+    /// still emit always, subject to the size floor below
+    /// (`opaque_min_bytes`).
     pub enable_ccr_marker: bool,
+    /// Minimum byte length an opaque-shaped string (base64/HTML/long
+    /// plain text) must clear before it's actually replaced by a
+    /// `<<ccr:...>>` marker. Below this floor the value renders
+    /// verbatim — the `headroom_retrieve` round-trip isn't worth it
+    /// for a small field. Wired into
+    /// [`ClassifyConfig::ccr_min_bytes`](super::compaction::ClassifyConfig::ccr_min_bytes)
+    /// at every substitution site (top-level opaque string fields and
+    /// table cells alike). Default: 2048 bytes (2 KB). Rust-only, no
+    /// Python counterpart — issue #3 fix (fields around ~1 KB were
+    /// getting CCR-substituted on their very first, same-turn read).
+    /// Orthogonal to `lossless_only` below: that's a global on/off
+    /// switch, this is a size floor that applies whenever markers are
+    /// otherwise allowed.
+    pub opaque_min_bytes: usize,
     /// Strict lossless mode. When `true`, lossless tabular compaction
     /// still applies, but any path that would otherwise need a CCR
     /// marker — the lossy row-drop sentinel AND opaque-blob offload —
@@ -113,14 +127,16 @@ pub struct SmartCrusherConfig {
 impl SmartCrusherConfig {
     /// Whether opaque blobs should be offloaded to a `<<ccr:…>>` marker.
     ///
-    /// Single source of truth for the opaque-marker gate. Markers are
-    /// emitted only when CCR markers are enabled AND strict lossless
+    /// Single source of truth for the opaque-marker on/off gate. Markers
+    /// are emitted only when CCR markers are enabled AND strict lossless
     /// mode is off — `lossless_only` forbids any offload because the
     /// marker would break the marker-free / byte-recoverable guarantee.
     /// Both compaction-stage construction (`new` /
     /// `with_compaction_format`) and the top-level `process_string` path
     /// derive `ClassifyConfig::emit_opaque_markers` from this method so
-    /// the three call sites can never drift apart.
+    /// the call sites can never drift apart. This does not cover the
+    /// size floor — see `opaque_min_bytes` /
+    /// `ClassifyConfig::ccr_min_bytes`, checked separately downstream.
     pub fn opaque_markers_enabled(&self) -> bool {
         self.enable_ccr_marker && !self.lossless_only
     }
@@ -150,6 +166,7 @@ impl Default for SmartCrusherConfig {
             relevance_threshold: 0.3,
             lossless_min_savings_ratio: 0.15,
             enable_ccr_marker: true,
+            opaque_min_bytes: 2048,
             lossless_only: false,
             compaction_core_field_fraction: 0.8,
             compaction_heterogeneous_core_ratio: 0.6,
@@ -188,6 +205,7 @@ mod tests {
         assert_eq!(c.relevance_threshold, 0.3);
         assert_eq!(c.lossless_min_savings_ratio, 0.15);
         assert!(c.enable_ccr_marker);
+        assert_eq!(c.opaque_min_bytes, 2048);
         assert!(!c.lossless_only);
         assert_eq!(c.compaction_core_field_fraction, 0.8);
         assert_eq!(c.compaction_heterogeneous_core_ratio, 0.6);

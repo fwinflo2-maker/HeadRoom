@@ -138,8 +138,11 @@ def _windows_pip_update_needs_handoff(method: InstallMethod) -> bool:
 
 
 def _build_windows_handoff_argv(argv: list[str]) -> list[str]:
-    delayed = f"ping -n 2 127.0.0.1 >nul & {_format_cmd(argv)}"
-    return ["cmd.exe", "/c", delayed]
+    helper = (
+        "import subprocess,sys,time; time.sleep(1); "
+        "raise SystemExit(subprocess.run([sys.executable,*sys.argv[1:]], check=False).returncode)"
+    )
+    return [sys.executable, "-c", helper, *argv[1:]]
 
 
 def _is_externally_managed() -> bool:
@@ -478,7 +481,7 @@ def update(check_only: bool, assume_yes: bool, allow_pre: bool, extras: str | No
     if _windows_pip_update_needs_handoff(method):
         handoff_argv = _build_windows_handoff_argv(method.argv)
         try:
-            subprocess.Popen(handoff_argv)  # noqa: S603 - fixed allowlist plus quoted argv
+            subprocess.Popen(handoff_argv)  # noqa: S603 - fixed allowlist plus helper argv
         except FileNotFoundError:
             raise click.ClickException(
                 f"`{handoff_argv[0]}` was not found on PATH. Upgrade manually: {cmd_str}"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata as md
+import sys
 import sysconfig
 
 import pytest
@@ -150,14 +151,24 @@ def test_windows_pip_update_handoff_false_off_windows(monkeypatch):
     )
 
 
-def test_build_windows_handoff_argv(monkeypatch):
+@pytest.mark.parametrize("operator", ["&", "|", ">"])
+def test_build_windows_handoff_argv_preserves_pip_argv(monkeypatch, operator):
     monkeypatch.setattr(up.sys, "platform", "win32")
-    argv = up._build_windows_handoff_argv(
-        [r"C:\\Program Files\\Python\\python.exe", "-m", "pip", "install", "-U", "headroom-ai"]
-    )
-    assert argv[:2] == ["cmd.exe", "/c"]
-    assert "ping -n 2 127.0.0.1 >nul" in argv[2]
-    assert "Program Files" in argv[2]
+    pip_argv = [
+        r"C:\\Program Files\\Python\\python.exe",
+        "-m",
+        "pip",
+        "install",
+        "-U",
+        f"headroom-ai[foo{operator}calc]",
+    ]
+
+    handoff_argv = up._build_windows_handoff_argv(pip_argv)
+
+    assert handoff_argv[:2] == [sys.executable, "-c"]
+    assert "subprocess.run" in handoff_argv[2]
+    assert "cmd.exe" not in handoff_argv
+    assert handoff_argv[3:] == pip_argv[1:]
 
 
 def test_externally_managed_true(tmp_path, monkeypatch):

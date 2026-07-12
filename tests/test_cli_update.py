@@ -149,15 +149,23 @@ def test_update_windows_pip_handoff_uses_popen(monkeypatch):
     monkeypatch.setattr(up, "installed_version", lambda: "0.26.0")
     monkeypatch.setattr(up, "fetch_latest_version", lambda **k: "0.27.0")
     monkeypatch.setattr(up.sys, "platform", "win32")
-    monkeypatch.setattr(
-        up,
-        "detect_install_method",
-        lambda extras=None: up.InstallMethod(
+
+    def _detect(extras=None):
+        calls["extras"] = extras
+        return up.InstallMethod(
             kind="pip",
             can_self_update=True,
-            argv=[r"C:\Python313\python.exe", "-m", "pip", "install", "-U", "headroom-ai"],
-        ),
-    )
+            argv=[
+                r"C:\Python313\python.exe",
+                "-m",
+                "pip",
+                "install",
+                "-U",
+                "headroom-ai[foo&calc]",
+            ],
+        )
+
+    monkeypatch.setattr(up, "detect_install_method", _detect)
 
     def _run(*a, **k):
         raise AssertionError("Windows pip handoff must not call subprocess.run")
@@ -168,10 +176,18 @@ def test_update_windows_pip_handoff_uses_popen(monkeypatch):
 
     monkeypatch.setattr(up.subprocess, "run", _run)
     monkeypatch.setattr(up.subprocess, "Popen", _popen)
-    res = CliRunner().invoke(main, ["update", "--yes"])
+    res = CliRunner().invoke(main, ["update", "--yes", "--extras", "foo&calc"])
     assert res.exit_code == 0
-    assert calls["argv"][:2] == ["cmd.exe", "/c"]
-    assert "ping -n 2 127.0.0.1 >nul" in calls["argv"][2]
+    assert calls["extras"] == "foo&calc"
+    assert calls["argv"][:2] == [sys.executable, "-c"]
+    assert "subprocess.run" in calls["argv"][2]
+    assert calls["argv"][3:] == [
+        "-m",
+        "pip",
+        "install",
+        "-U",
+        "headroom-ai[foo&calc]",
+    ]
     assert "headroom.exe" in res.output
 
 
@@ -191,21 +207,14 @@ def test_update_windows_non_pip_path_stays_synchronous(monkeypatch):
         ),
     )
 
-    class _Result:
-        returncode = 0
-
-    def _run(argv, *a, **k):
-        calls["run"] = argv
-        return _Result()
-
     def _popen(*a, **k):
         raise AssertionError("pipx must stay on the synchronous path")
 
-    monkeypatch.setattr(up.subprocess, "run", _run)
+    monkeypatch.setattr(up, "safe_update", lambda argv: calls.setdefault("safe_update", argv) and 0)
     monkeypatch.setattr(up.subprocess, "Popen", _popen)
     res = CliRunner().invoke(main, ["update", "--yes"])
     assert res.exit_code == 0
-    assert calls["run"] == ["pipx", "upgrade", "headroom-ai"]
+    assert calls["safe_update"] == ["pipx", "upgrade", "headroom-ai"]
 
 
 def test_update_refuses_in_checkout(monkeypatch):

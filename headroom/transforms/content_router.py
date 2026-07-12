@@ -93,7 +93,7 @@ def _tool_call_args_text(raw: Any) -> str:
     if isinstance(raw, str):
         text = raw
     elif isinstance(raw, dict):
-        text = " ".join(str(v) for v in raw.values() if isinstance(v, (str, int, float, bool)))
+        text = " ".join(str(v) for v in raw.values() if isinstance(v, str | int | float | bool))
     else:
         return ""
     return " ".join(text.split())[:300]
@@ -2713,19 +2713,8 @@ class ContentRouter(Transform):
                     status["kompress"] = "enabled"
                     status["kompress_backend"] = "unknown"
                 else:
-                    try:
-                        backend = compressor.preload(allow_download=False)
-                    except KompressModelNotCached:
-                        logger.warning(
-                            "Kompress model not cached; compression disabled "
-                            "until model is downloaded. Ensure HuggingFace is "
-                            "accessible or pre-download with headroom-ai[ml]."
-                        )
-                        status["kompress"] = "deferred"
-                    else:
-                        logger.info("Kompress model pre-loaded at startup backend=%s", backend)
-                        status["kompress"] = "enabled"
-                        status["kompress_backend"] = str(backend)
+                    logger.info("Kompress model preload deferred until first request")
+                    status["kompress"] = "deferred"
             else:
                 status["kompress"] = "unavailable"
 

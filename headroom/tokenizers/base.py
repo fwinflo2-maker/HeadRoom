@@ -159,6 +159,13 @@ class BaseTokenizer(ABC):
                     content = part.get("content", "")
                     if isinstance(content, str):
                         total += self.count_text(content)
+                    elif isinstance(content, list):
+                        # Recurse into nested content blocks so images inside a
+                        # tool_result hit the pixel-based estimate above instead
+                        # of having their base64 json.dumps'd and counted as
+                        # text (a ~500KB screenshot would count as ~170K fake
+                        # tokens; Claude Code screenshots arrive exactly here).
+                        total += self._count_content_parts(content)
                     else:
                         total += self._count_serialized(content)
                 elif part_type == "tool_use":

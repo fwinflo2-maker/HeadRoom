@@ -616,3 +616,54 @@ class TestLargeToolBlobEstimation:
             cur = cur["n"]
         cur["leaf"] = "x" * 60_000
         assert EstimatingTokenCounter()._count_serialized(deep) >= 0
+
+
+class TestNestedToolResultImageCounting:
+    """Images nested inside a tool_result content list get the pixel-based
+    estimate, not base64-counted-as-text (Claude Code screenshots arrive as
+    tool_result -> image; a ~500KB screenshot counted as text is ~170K fake
+    tokens)."""
+
+    def test_tool_result_nested_image_uses_fixed_image_cost(self):
+        tok = EstimatingTokenCounter()
+        base64_blob = "A" * 400_000  # ~300KB screenshot as base64
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_01",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": base64_blob,
+                                },
+                            },
+                            {"type": "text", "text": "screenshot captured"},
+                        ],
+                    }
+                ],
+            }
+        ]
+        count = tok.count_messages(messages)
+        # Fixed image estimate (1600) + sibling text + overhead — nowhere near
+        # the ~100K tokens the blob counts as when serialized as text.
+        assert 1600 <= count < 2000
+
+    def test_tool_result_non_list_content_still_serialized(self):
+        tok = EstimatingTokenCounter()
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "content": {"exit_code": 0}}],
+            }
+        ]
+        import json
+
+        expected = tok._count_serialized({"exit_code": 0})
+        assert tok.count_messages(messages) >= expected
+        assert expected == tok.count_text(json.dumps({"exit_code": 0}))

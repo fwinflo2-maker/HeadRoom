@@ -3,7 +3,7 @@
 Regression for https://github.com/headroomlabs-ai/headroom/issues/1368:
 pip install headroom-ai[all] aborted the entire install on machines without
 a C++ compiler because hnswlib (pulled in by [memory]) requires compilation.
-The fix: hnswlib moved to [memory-hnsw]; [memory] and [all] now install without
+The fix: hnswlib moved to [vector]; [memory] and [all] now install without
 a compiler.  The code already handles hnswlib absence gracefully (lazy import).
 """
 

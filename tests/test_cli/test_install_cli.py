@@ -600,6 +600,16 @@ def test_deploy_prefers_gpu_docker_when_available(monkeypatch) -> None:
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
     monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda deployment: "stopped")
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def fake_lock(profile):
+        yield True
+
+    monkeypatch.setattr("headroom.cli.install.acquire_runtime_start_lock", fake_lock)
     monkeypatch.setattr("headroom.cli.install.start_persistent_docker", lambda deployment: None)
     monkeypatch.setattr(
         "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True

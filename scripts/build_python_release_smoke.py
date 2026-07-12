@@ -97,15 +97,12 @@ def verify_wheel(wheel: Path, expected_version: str) -> None:
         native_members = [
             name
             for name in names
-            if name.startswith("headroom/_core")
-            and Path(name).suffix.lower() in {".pyd", ".so"}
+            if name.startswith("headroom/_core") and Path(name).suffix.lower() in {".pyd", ".so"}
         ]
         if not native_members:
             raise SystemExit(f"{wheel.name} does not contain headroom/_core native extension")
 
-        metadata_members = [
-            name for name in names if name.endswith(".dist-info/METADATA")
-        ]
+        metadata_members = [name for name in names if name.endswith(".dist-info/METADATA")]
         if len(metadata_members) != 1:
             raise SystemExit(
                 f"{wheel.name} should contain exactly one dist-info/METADATA, "

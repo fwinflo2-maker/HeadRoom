@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install stable toolchain
         # Pin action code to @stable (latest fixes), toolchain version
         # via input. The @1.95.0 ref shipped action code that errors on
@@ -66,7 +66,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # Use the repo-pinned stable toolchain (rust-toolchain.toml). Codecov
       # gates on lcov *line* coverage, which is already 100% on stable — the one
       # genuinely-unreachable serialize-error edge sits on an executed line. The
@@ -93,6 +93,25 @@ jobs:
           # coverage *gate* lives in codecov.yml's `rust` flag status.
           fail_ci_if_error: false
 
+  simulator-e2e:
+    name: simulator e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+      - name: cargo test simulator-backed proxy e2e
+        run: cargo test -p headroom-proxy --test e2e_simulators
+
   wheels:
     name: wheels (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -113,7 +132,7 @@ jobs:
         # Intel macOS uses `ort-load-dynamic` (no prebuilt ORT from ort-sys);
         # Apple Silicon bundles ORT via `ort-download-binaries-rustls-tls`.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
@@ -138,7 +157,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
@@ -160,7 +179,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0

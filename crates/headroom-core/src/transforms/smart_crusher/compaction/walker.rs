@@ -34,7 +34,7 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 use super::classifier::{classify_cell, CellClass};
-use super::compactor::{compact, CompactConfig};
+use super::compactor::{compact_with_ccr, CompactConfig};
 use super::formatter::{CsvSchemaFormatter, Formatter};
 use super::ir::OpaqueKind;
 use crate::ccr::CcrStore;
@@ -117,7 +117,7 @@ fn walk_array(items: Vec<Value>, ctx: &DocumentCompactor) -> Value {
     let inner: Vec<Value> = items.into_iter().map(|i| walk(i, ctx)).collect();
 
     // Then try the array as a whole.
-    let c = compact(&inner, &ctx.config);
+    let c = compact_with_ccr(&inner, &ctx.config, ctx.ccr_store.as_ref());
     if c.was_compacted() {
         Value::String(ctx.formatter.format(&c))
     } else {
@@ -393,5 +393,41 @@ mod tests {
         let doc = json!({"payload": "{not valid json"});
         let out = dc().compact(doc.clone());
         assert_eq!(out, doc);
+    }
+
+    #[test]
+    fn opaque_table_cell_with_ccr_store_is_retrievable_end_to_end() {
+        // Regression for issue #2, exercised through the real
+        // production entry point (`DocumentCompactor` with a wired CCR
+        // store — what `SmartCrusher`/live-zone actually use), not just
+        // the lower-level `compact_with_ccr` unit test. An array of
+        // objects where a field is a long opaque string gets tabulated;
+        // the opaque cell must be retrievable from the store by the
+        // hash embedded in its `<<ccr:HASH,KIND,SIZE>>` marker.
+        use crate::ccr::backends::InMemoryCcrStore;
+
+        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+        let doc = json!([
+            {"id": 1, "blob": big.clone()},
+            {"id": 2, "blob": big.clone()},
+        ]);
+        let store: Arc<dyn CcrStore> = Arc::new(InMemoryCcrStore::new());
+        let compactor = DocumentCompactor::new().with_ccr_store(store.clone());
+        let out = compactor.compact(doc);
+
+        let rendered = out.as_str().expect("array compacted to a rendered string");
+        let hash = extract_table_cell_hash(rendered).expect("marker must embed hash");
+        let retrieved = store
+            .get(&hash)
+            .expect("opaque table cell must be retrievable from the CCR store");
+        assert_eq!(retrieved, big);
+    }
+
+    /// Pull the hash out of a `<<ccr:HASH,KIND,SIZE>>` table-cell marker.
+    fn extract_table_cell_hash(s: &str) -> Option<String> {
+        let i = s.find("<<ccr:")?;
+        let after = &s[i + 6..];
+        let end = after.find(',')?;
+        Some(after[..end].to_string())
     }
 }

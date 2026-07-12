@@ -30,7 +30,7 @@ pub mod ir;
 pub mod walker;
 
 pub use classifier::{classify_cell, CellClass, ClassifyConfig};
-pub use compactor::{compact, CompactConfig};
+pub use compactor::{compact, compact_with_ccr, CompactConfig};
 pub use formatter::{CsvSchemaFormatter, Formatter, JsonFormatter, MarkdownKvFormatter};
 pub use ir::{Bucket, CellValue, Compaction, FieldSpec, OpaqueKind, Row, Schema};
 pub use walker::{
@@ -101,7 +101,19 @@ impl CompactionStage {
     /// [`Compaction`] tree (so callers can inspect kept/total row
     /// counts) alongside the rendered bytes.
     pub fn run(&self, items: &[serde_json::Value]) -> (Compaction, String) {
-        let c = compact(items, &self.config);
+        self.run_with_ccr(items, None)
+    }
+
+    /// Same as [`Self::run`], but opaque table cells are also stashed in
+    /// `store` so they're retrievable by hash later (see
+    /// [`compact_with_ccr`]). Production callers that own a CCR store
+    /// should use this instead of [`Self::run`].
+    pub fn run_with_ccr(
+        &self,
+        items: &[serde_json::Value],
+        store: Option<&std::sync::Arc<dyn crate::ccr::CcrStore>>,
+    ) -> (Compaction, String) {
+        let c = compact_with_ccr(items, &self.config, store);
         let rendered = self.formatter.format(&c);
         (c, rendered)
     }

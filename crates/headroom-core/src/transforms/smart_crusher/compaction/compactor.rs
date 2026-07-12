@@ -40,12 +40,14 @@
 //! [`CellClass::Opaque`]: super::classifier::CellClass::Opaque
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::classifier::{classify_cell, CellClass, ClassifyConfig};
 use super::ir::{Bucket, CellValue, Compaction, FieldSpec, Row, Schema};
+use crate::ccr::CcrStore;
 
 /// Config for the compactor.
 #[derive(Debug, Clone)]
@@ -94,8 +96,36 @@ impl Default for CompactConfig {
     }
 }
 
-/// Top-level compaction entry point.
+/// Top-level compaction entry point. No CCR store — opaque table cells
+/// still emit `<<ccr:HASH,KIND,SIZE>>` markers (hash is content-derived,
+/// so it's stable either way) but nothing is stashed for retrieval. Kept
+/// for callers that don't need retrieval (most existing tests, offline
+/// formatting previews). Production callers that want retrievable
+/// opaque cells should use [`compact_with_ccr`].
 pub fn compact(items: &[Value], cfg: &CompactConfig) -> Compaction {
+    compact_inner(items, cfg, None)
+}
+
+/// Same as [`compact`], but opaque table cells (long strings/base64/html
+/// blobs that land inside a tabulated array-of-objects row) are also
+/// stashed in `store` keyed by the same hash embedded in their marker —
+/// mirrors what [`super::walker::emit_opaque_ccr_marker`] already does
+/// for top-level opaque string fields. Without this, cell-level opaque
+/// values were unrecoverable: `compact()` had no store parameter at all,
+/// so their markers pointed at hashes nothing ever wrote (issue #2).
+pub fn compact_with_ccr(
+    items: &[Value],
+    cfg: &CompactConfig,
+    store: Option<&Arc<dyn CcrStore>>,
+) -> Compaction {
+    compact_inner(items, cfg, store)
+}
+
+fn compact_inner(
+    items: &[Value],
+    cfg: &CompactConfig,
+    store: Option<&Arc<dyn CcrStore>>,
+) -> Compaction {
     if items.len() < cfg.min_items {
         return Compaction::Untouched(Value::Array(items.to_vec()));
     }
@@ -117,14 +147,14 @@ pub fn compact(items: &[Value], cfg: &CompactConfig) -> Compaction {
 
     if core_ratio < cfg.heterogeneous_core_ratio {
         if let Some(disc) = detect_discriminator(items, &key_freqs, cfg) {
-            return bucket_by(items, &disc, cfg);
+            return bucket_by(items, &disc, cfg, store);
         }
         // No clean discriminator — fall through to a sparse Table
         // rather than refusing. A sparse table is still better than
         // letting the lossy path drop fields wholesale.
     }
 
-    build_homogeneous_table(items, &key_freqs, cfg)
+    build_homogeneous_table(items, &key_freqs, cfg, store)
 }
 
 fn compute_key_freqs(items: &[Value]) -> BTreeMap<String, usize> {
@@ -143,6 +173,7 @@ fn build_homogeneous_table(
     items: &[Value],
     key_freqs: &BTreeMap<String, usize>,
     cfg: &CompactConfig,
+    store: Option<&Arc<dyn CcrStore>>,
 ) -> Compaction {
     // Order: descending frequency, then alphabetical for stability.
     let mut keys: Vec<(&String, &usize)> = key_freqs.iter().collect();
@@ -165,7 +196,7 @@ fn build_homogeneous_table(
 
     let mut rows: Vec<Row> = items
         .iter()
-        .map(|item| build_row(item, &ordered_keys, cfg))
+        .map(|item| build_row(item, &ordered_keys, cfg, store))
         .collect();
 
     flatten_uniform_nested(&mut field_specs, &mut rows, cfg);
@@ -179,7 +210,12 @@ fn build_homogeneous_table(
     }
 }
 
-fn build_row(item: &Value, ordered_keys: &[String], cfg: &CompactConfig) -> Row {
+fn build_row(
+    item: &Value,
+    ordered_keys: &[String],
+    cfg: &CompactConfig,
+    store: Option<&Arc<dyn CcrStore>>,
+) -> Row {
     let obj = match item.as_object() {
         Some(o) => o,
         None => return Row::new(vec![]),
@@ -188,13 +224,13 @@ fn build_row(item: &Value, ordered_keys: &[String], cfg: &CompactConfig) -> Row 
         .iter()
         .map(|k| match obj.get(k) {
             None => CellValue::Missing,
-            Some(v) => cell_from_value(v, cfg),
+            Some(v) => cell_from_value(v, cfg, store),
         })
         .collect();
     Row::new(cells)
 }
 
-fn cell_from_value(v: &Value, cfg: &CompactConfig) -> CellValue {
+fn cell_from_value(v: &Value, cfg: &CompactConfig, store: Option<&Arc<dyn CcrStore>>) -> CellValue {
     match classify_cell(v, &cfg.classify) {
         CellClass::Scalar => CellValue::Scalar(v.clone()),
         CellClass::JsonObject => CellValue::Scalar(v.clone()), // flatten pass may promote
@@ -202,7 +238,7 @@ fn cell_from_value(v: &Value, cfg: &CompactConfig) -> CellValue {
             // Recurse if the inner array is array-of-objects; else scalar.
             if let Value::Array(items) = v {
                 if items.iter().all(|i| matches!(i, Value::Object(_))) && items.len() >= 2 {
-                    return CellValue::Nested(Box::new(compact(items, cfg)));
+                    return CellValue::Nested(Box::new(compact_inner(items, cfg, store)));
                 }
             }
             CellValue::Scalar(v.clone())
@@ -212,19 +248,26 @@ fn cell_from_value(v: &Value, cfg: &CompactConfig) -> CellValue {
             // store the parsed value as a Scalar (un-escapes for free).
             if let Value::Array(items) = &parsed {
                 if items.iter().all(|i| matches!(i, Value::Object(_))) && items.len() >= 2 {
-                    return CellValue::Nested(Box::new(compact(items, cfg)));
+                    return CellValue::Nested(Box::new(compact_inner(items, cfg, store)));
                 }
             }
             CellValue::Scalar(parsed)
         }
         CellClass::Opaque(kind) => {
-            let bytes = match v {
-                Value::String(s) => s.as_bytes(),
+            let s = match v {
+                Value::String(s) => s,
                 _ => return CellValue::Scalar(v.clone()),
             };
+            let hash = hash_opaque(s.as_bytes());
+            if let Some(store) = store {
+                // Stash the original string so `headroom_retrieve(hash)`
+                // can recover it later — without this the marker points
+                // at a hash nothing ever wrote (issue #2).
+                store.put(&hash, s);
+            }
             CellValue::OpaqueRef {
-                ccr_hash: hash_opaque(bytes),
-                byte_size: bytes.len(),
+                ccr_hash: hash,
+                byte_size: s.len(),
                 kind,
             }
         }
@@ -451,7 +494,12 @@ fn detect_discriminator(
     best.map(|(k, _)| k)
 }
 
-fn bucket_by(items: &[Value], discriminator: &str, cfg: &CompactConfig) -> Compaction {
+fn bucket_by(
+    items: &[Value],
+    discriminator: &str,
+    cfg: &CompactConfig,
+    store: Option<&Arc<dyn CcrStore>>,
+) -> Compaction {
     let mut groups: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     for item in items {
         let key = item
@@ -465,7 +513,7 @@ fn bucket_by(items: &[Value], discriminator: &str, cfg: &CompactConfig) -> Compa
     let buckets: Vec<Bucket> = groups
         .into_iter()
         .map(|(key, group_items)| {
-            let inner = compact(&group_items, cfg);
+            let inner = compact_inner(&group_items, cfg, store);
             match inner {
                 Compaction::Table { schema, rows, .. } => Bucket {
                     key: Value::String(key),
@@ -729,5 +777,69 @@ mod tests {
         assert_eq!(h1, h2);
         assert_ne!(h1, h3);
         assert_eq!(h1.len(), 12);
+    }
+
+    #[test]
+    fn opaque_table_cell_with_ccr_store_persists_original_payload() {
+        // Regression for issue #2: a long opaque string that lands as a
+        // table CELL (inside an array-of-objects tabulated by the
+        // compactor) must be retrievable from the CCR store by the same
+        // hash embedded in its `<<ccr:HASH,KIND,SIZE>>` marker. Before
+        // this fix, `compact()` had no store parameter at all, so
+        // cell-level opaque strings emitted a marker whose hash was
+        // never written anywhere — permanently unrecoverable.
+        use crate::ccr::backends::InMemoryCcrStore;
+        use crate::ccr::CcrStore;
+        use std::sync::Arc;
+
+        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+        let items = vec![
+            json!({"id": 1, "blob": big.clone()}),
+            json!({"id": 2, "blob": big.clone()}),
+        ];
+        let store: Arc<dyn CcrStore> = Arc::new(InMemoryCcrStore::new());
+
+        match compact_with_ccr(&items, &cfg(), Some(&store)) {
+            Compaction::Table { rows, schema, .. } => {
+                let blob_idx = schema
+                    .fields
+                    .iter()
+                    .position(|f| f.name == "blob")
+                    .expect("blob col");
+                match &rows[0].0[blob_idx] {
+                    CellValue::OpaqueRef { ccr_hash, .. } => {
+                        let retrieved = store
+                            .get(ccr_hash)
+                            .expect("opaque table cell must be stashed in the CCR store");
+                        assert_eq!(retrieved, big, "retrieved payload must match original");
+                    }
+                    other => panic!("expected OpaqueRef, got {other:?}"),
+                }
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compact_without_store_still_works_and_stores_nothing() {
+        // `compact()` (no store) must keep producing markers — just
+        // without a place to retrieve from. Back-compat contract for
+        // the many existing callers that pass no store.
+        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+        let items = vec![
+            json!({"id": 1, "blob": big.clone()}),
+            json!({"id": 2, "blob": big.clone()}),
+        ];
+        match compact(&items, &cfg()) {
+            Compaction::Table { rows, schema, .. } => {
+                let blob_idx = schema
+                    .fields
+                    .iter()
+                    .position(|f| f.name == "blob")
+                    .expect("blob col");
+                assert!(matches!(&rows[0].0[blob_idx], CellValue::OpaqueRef { .. }));
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
     }
 }

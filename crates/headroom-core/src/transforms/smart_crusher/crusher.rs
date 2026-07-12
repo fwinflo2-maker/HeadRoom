@@ -616,7 +616,7 @@ impl SmartCrusher {
         // ship it — nothing dropped, no CCR retrieval needed.
         // Otherwise fall through to the lossy path.
         if let Some(stage) = &self.compaction {
-            let (c, rendered) = stage.run(items);
+            let (c, rendered) = stage.run_with_ccr(items, self.ccr_store.as_ref());
             if c.was_compacted() {
                 let input_bytes = estimate_array_bytes(&item_strings);
                 let savings_ratio = if input_bytes > 0 {

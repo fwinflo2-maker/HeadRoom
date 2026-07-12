@@ -130,7 +130,7 @@ def test_apply_codex_provider_scope_replaces_existing_managed_block(
         'name = "Headroom persistent proxy"\n'
         'base_url = "http://127.0.0.1:1111/v1"\n'
         "requires_openai_auth = true\n"
-        "supports_websockets = true\n"
+        "supports_websockets = false\n"
         "# --- end Headroom persistent provider ---\n"
     )
     monkeypatch.setattr("headroom.providers.codex.install.codex_config_path", lambda: config_path)

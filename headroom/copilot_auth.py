@@ -936,6 +936,10 @@ def build_copilot_upstream_url(base_url: str, path: str) -> str:
     normalized_path = path if path.startswith("/") else f"/{path}"
     if is_copilot_api_url(normalized_base) and normalized_path.startswith("/v1/"):
         normalized_path = normalized_path[3:]
+    # Avoid double /v1 when the base URL already ends with /v1
+    # (e.g. custom upstream https://nexusmmo.store/api/v1 + /v1/responses)
+    if normalized_base.endswith("/v1") and normalized_path.startswith("/v1/"):
+        normalized_path = normalized_path[3:]
     return f"{normalized_base}{normalized_path}"
 
 

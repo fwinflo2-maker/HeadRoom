@@ -77,7 +77,7 @@ def build_provider_section(
         "[model_providers.headroom]\n"
         f'name = "{name}"\n'
         f'base_url = "{proxy_base_url(port)}"\n'
-        "supports_websockets = true\n"
+        "supports_websockets = false\n"
     )
     if requires_openai_auth:
         body += "requires_openai_auth = true\n"

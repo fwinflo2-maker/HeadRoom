@@ -1929,7 +1929,7 @@ def _inject_codex_provider_config(port: int) -> str | None:
         "[model_providers.headroom]\n"
         'name = "OpenAI via Headroom proxy"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
-        f"supports_websockets = true\n"
+        f"supports_websockets = false\n"
         f"{requires_openai_auth}"
         # Inline table keeps the key inside this section so
         # _strip_codex_headroom_blocks removes it with the rest of the block.

@@ -193,8 +193,8 @@ def _verify_codex_local(ctx: CaseContext) -> None:
         raise AssertionError(
             "Codex local init must NOT inject requires_openai_auth into the headroom provider block"
         )
-    if "supports_websockets = true" not in config:
-        raise AssertionError("Codex local init missing 'supports_websockets = true'")
+    if "supports_websockets = false" not in config:
+        raise AssertionError("Codex local init missing 'supports_websockets = false'")
     if config.count("[features]") != 1:
         raise AssertionError("Codex config should keep a single [features] table")
     _expect_codex_hooks_feature(config)
@@ -234,8 +234,8 @@ def _verify_codex_global(ctx: CaseContext) -> None:
         raise AssertionError(
             "Codex global init must NOT inject requires_openai_auth into the headroom provider block"
         )
-    if "supports_websockets = true" not in config:
-        raise AssertionError("Codex global init missing 'supports_websockets = true'")
+    if "supports_websockets = false" not in config:
+        raise AssertionError("Codex global init missing 'supports_websockets = false'")
     _expect_codex_hooks_feature(config)
     hooks = json.loads((ctx.home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     _expect_hook_command(

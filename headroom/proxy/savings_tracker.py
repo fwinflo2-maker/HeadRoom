@@ -414,6 +414,15 @@ def _normalize_projects(raw: Any) -> dict[str, dict[str, Any]]:
         last_activity = _parse_timestamp(entry.get("last_activity_at"))
         normalized["last_activity_at"] = _to_utc_iso(last_activity) if last_activity else None
         projects[cleaned_name] = normalized
+    if len(projects) > DEFAULT_MAX_PROJECTS:
+        # Oversized persisted maps (hand-edited or future versions) would
+        # otherwise shrink only one entry per recorded request.
+        kept = sorted(
+            projects.items(),
+            key=lambda item: (item[1]["tokens_saved"], item[1]["last_activity_at"] or ""),
+            reverse=True,
+        )[:DEFAULT_MAX_PROJECTS]
+        projects = dict(kept)
     return projects
 
 
@@ -431,9 +440,7 @@ def _normalize_by_model(raw: Any) -> dict[str, dict[str, Any]]:
         normalized["compression_savings_usd"] = round(
             _coerce_float(entry.get("compression_savings_usd")), 6
         )
-        normalized["total_input_tokens"] = _coerce_int(
-            entry.get("total_input_tokens")
-        )
+        normalized["total_input_tokens"] = _coerce_int(entry.get("total_input_tokens"))
         normalized["total_input_cost_usd"] = round(
             _coerce_float(entry.get("total_input_cost_usd")), 6
         )
@@ -856,9 +863,7 @@ class SavingsTracker:
             view = dict(entry)
             total_before = entry["tokens_saved"] + entry["total_input_tokens"]
             view["savings_percent"] = round(
-                (entry["tokens_saved"] / total_before * 100)
-                if total_before > 0
-                else 0.0,
+                (entry["tokens_saved"] / total_before * 100) if total_before > 0 else 0.0,
                 2,
             )
             result[model] = view

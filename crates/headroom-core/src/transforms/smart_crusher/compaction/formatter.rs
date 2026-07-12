@@ -681,7 +681,7 @@ mod tests {
 
     #[test]
     fn csv_formatter_emits_ccr_marker() {
-        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(32);
         let items = vec![
             json!({"id": 1, "blob": big.clone()}),
             json!({"id": 2, "blob": big.clone()}),
@@ -865,7 +865,7 @@ mod tests {
 
     #[test]
     fn markdown_kv_emits_ccr_marker() {
-        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(32);
         let items = vec![
             json!({"id": 1, "blob": big.clone()}),
             json!({"id": 2, "blob": big.clone()}),

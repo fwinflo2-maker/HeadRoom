@@ -643,6 +643,46 @@ pub fn compress_anthropic_live_zone(
 pub fn compress_anthropic_live_zone_with_ccr(
     body_raw: &[u8],
     frozen_message_count: usize,
+    auth_mode: AuthMode,
+    model: &str,
+    ccr_store: Option<&dyn CcrStore>,
+) -> Result<LiveZoneOutcome, LiveZoneError> {
+    compress_anthropic_live_zone_with_ccr_and_freshness(
+        body_raw,
+        frozen_message_count,
+        0,
+        auth_mode,
+        model,
+        ccr_store,
+    )
+}
+
+/// Same as [`compress_anthropic_live_zone_with_ccr`], but also exempts
+/// the most-recent `fresh_message_count` messages (counted from the
+/// tail of `messages`) from compression entirely — regardless of size.
+///
+/// # Why
+///
+/// The live zone's `target_idx` (the latest user message) is, by
+/// construction, always the message that was *just appended* for this
+/// exact request — the in-flight turn's content the model is about to
+/// read for the very first time. Compressing it on sight forces an
+/// immediate `headroom_retrieve` round-trip just to read data the
+/// model hasn't had a chance to engage with yet (issue #3). Since
+/// every request resends the full conversation history, a message
+/// that's exempt here (fresh) becomes eligible on the *next* request
+/// once something else has been appended after it — at that point it's
+/// no longer in-flight, just accumulated context weight, and normal
+/// compression applies.
+///
+/// `fresh_message_count = 0` (what [`compress_anthropic_live_zone_with_ccr`]
+/// passes) preserves the pre-fix behavior byte-for-byte — this is an
+/// additive, opt-in parameter so existing callers are unaffected.
+/// Production wiring (the proxy) should pass `1`.
+pub fn compress_anthropic_live_zone_with_ccr_and_freshness(
+    body_raw: &[u8],
+    frozen_message_count: usize,
+    fresh_message_count: usize,
     _auth_mode: AuthMode,
     model: &str,
     ccr_store: Option<&dyn CcrStore>,
@@ -662,8 +702,14 @@ pub fn compress_anthropic_live_zone_with_ccr(
     let messages_total = messages.len();
     let messages_below_frozen_floor = frozen_message_count.min(messages_total);
 
-    // Latest user message index, restricted to the live zone (>= floor).
-    let latest_user_message_index = find_latest_user_message_index(messages, frozen_message_count);
+    // Latest user message index, restricted to the live zone (>= floor)
+    // AND to the non-fresh window (< messages_total - fresh_message_count).
+    // Narrowing the search window (rather than filtering the result)
+    // means a fresh-but-not-latest-user message correctly falls back to
+    // an older, aged user message instead of bailing out entirely.
+    let fresh_ceiling = messages_total.saturating_sub(fresh_message_count);
+    let latest_user_message_index =
+        find_latest_user_message_index(&messages[..fresh_ceiling], frozen_message_count);
 
     let Some(target_idx) = latest_user_message_index else {
         return Ok(LiveZoneOutcome::NoChange {

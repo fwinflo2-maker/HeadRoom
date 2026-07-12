@@ -258,6 +258,12 @@ fn cell_from_value(v: &Value, cfg: &CompactConfig, store: Option<&Arc<dyn CcrSto
                 Value::String(s) => s,
                 _ => return CellValue::Scalar(v.clone()),
             };
+            // Below the CCR-substitution floor: opaque-shaped, but too
+            // small to be worth the retrieval round-trip (issue #3).
+            // Render verbatim rather than mint an unnecessary marker.
+            if s.len() < cfg.classify.ccr_min_bytes {
+                return CellValue::Scalar(v.clone());
+            }
             let hash = hash_opaque(s.as_bytes());
             if let Some(store) = store {
                 // Stash the original string so `headroom_retrieve(hash)`
@@ -661,7 +667,7 @@ mod tests {
 
     #[test]
     fn opaque_cell_becomes_ccr_ref() {
-        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(32);
         let items = vec![
             json!({"id": 1, "blob": big.clone()}),
             json!({"id": 2, "blob": big.clone()}),
@@ -792,7 +798,7 @@ mod tests {
         use crate::ccr::CcrStore;
         use std::sync::Arc;
 
-        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(32);
         let items = vec![
             json!({"id": 1, "blob": big.clone()}),
             json!({"id": 2, "blob": big.clone()}),
@@ -825,7 +831,7 @@ mod tests {
         // `compact()` (no store) must keep producing markers — just
         // without a place to retrieve from. Back-compat contract for
         // the many existing callers that pass no store.
-        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(32);
         let items = vec![
             json!({"id": 1, "blob": big.clone()}),
             json!({"id": 2, "blob": big.clone()}),

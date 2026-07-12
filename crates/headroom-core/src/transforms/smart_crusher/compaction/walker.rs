@@ -139,9 +139,13 @@ fn walk_string(s: String, ctx: &DocumentCompactor) -> Value {
 
     // Long opaque blob: substitute with CCR marker (and stash the
     // original in the store if one is configured, so retrieval works).
+    // Below `ccr_min_bytes`, the value is opaque-shaped but too small
+    // to be worth the retrieval round-trip — render verbatim (issue #3).
     if let CellClass::Opaque(kind) = classify_cell(&Value::String(s.clone()), &ctx.config.classify)
     {
-        return Value::String(emit_opaque_ccr_marker(&s, &kind, ctx.ccr_store.as_ref()));
+        if s.len() >= ctx.config.classify.ccr_min_bytes {
+            return Value::String(emit_opaque_ccr_marker(&s, &kind, ctx.ccr_store.as_ref()));
+        }
     }
 
     Value::String(s)
@@ -290,7 +294,7 @@ mod tests {
 
     #[test]
     fn long_opaque_string_at_top_level_becomes_ccr_marker() {
-        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(32);
         let out = dc().compact(Value::String(big));
         match out {
             Value::String(s) => assert!(
@@ -302,8 +306,24 @@ mod tests {
     }
 
     #[test]
+    fn opaque_string_below_ccr_floor_passes_through_verbatim() {
+        // Regression for issue #3, DocumentCompactor path: a ~1 KB
+        // opaque-shaped string (above the 256 B shape threshold, below
+        // the 2 KB ccr_min_bytes floor) must render verbatim.
+        let one_kb = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(15);
+        assert!(one_kb.len() > 256 && one_kb.len() < 2048);
+        let doc = json!({"id": 1, "blob": one_kb.clone()});
+        let out = dc().compact(doc);
+        assert_eq!(
+            out.pointer("/blob").and_then(|v| v.as_str()),
+            Some(one_kb.as_str()),
+            "sub-floor opaque field must pass through unchanged"
+        );
+    }
+
+    #[test]
     fn long_opaque_string_inside_object_field_becomes_ccr_marker() {
-        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(32);
         let doc = json!({"id": 1, "blob": big});
         let out = dc().compact(doc);
         let blob = out.pointer("/blob").and_then(|v| v.as_str()).unwrap();
@@ -406,7 +426,7 @@ mod tests {
         // hash embedded in its `<<ccr:HASH,KIND,SIZE>>` marker.
         use crate::ccr::backends::InMemoryCcrStore;
 
-        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(32);
         let doc = json!([
             {"id": 1, "blob": big.clone()},
             {"id": 2, "blob": big.clone()},

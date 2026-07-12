@@ -404,6 +404,16 @@ impl TransformComparator for SmartCrusherComparator {
                 .get("enable_ccr_marker")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(defaults.enable_ccr_marker),
+            // Rust-only issue-#3 knob — legacy fixtures predate the
+            // ccr_min_bytes floor and their expected outputs assume
+            // opaque strings substitute unconditionally once
+            // classified Opaque (equivalent to floor = 0), not the
+            // new 2 KB default.
+            opaque_min_bytes: config
+                .get("opaque_min_bytes")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(0),
         };
 
         // Use without_compaction so the legacy fixtures (recorded

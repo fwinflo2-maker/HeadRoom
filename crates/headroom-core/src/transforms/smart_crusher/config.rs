@@ -74,9 +74,20 @@ pub struct SmartCrusherConfig {
     ///
     /// Scope: gates only the `crush_array` row-drop path. Stage-3c.2
     /// opaque-string CCR substitutions (in `walker::process_value`)
-    /// still emit always; they have no Python equivalent and no
-    /// production caller has asked for them to be suppressed.
+    /// still emit always, subject to the size floor below
+    /// (`opaque_min_bytes`).
     pub enable_ccr_marker: bool,
+    /// Minimum byte length an opaque-shaped string (base64/HTML/long
+    /// plain text) must clear before it's actually replaced by a
+    /// `<<ccr:...>>` marker. Below this floor the value renders
+    /// verbatim — the `headroom_retrieve` round-trip isn't worth it
+    /// for a small field. Wired into
+    /// [`ClassifyConfig::ccr_min_bytes`](super::compaction::ClassifyConfig::ccr_min_bytes)
+    /// at every substitution site (top-level opaque string fields and
+    /// table cells alike). Default: 2048 bytes (2 KB). Rust-only, no
+    /// Python counterpart — issue #3 fix (fields around ~1 KB were
+    /// getting CCR-substituted on their very first, same-turn read).
+    pub opaque_min_bytes: usize,
 }
 
 impl Default for SmartCrusherConfig {
@@ -103,6 +114,7 @@ impl Default for SmartCrusherConfig {
             relevance_threshold: 0.3,
             lossless_min_savings_ratio: 0.30,
             enable_ccr_marker: true,
+            opaque_min_bytes: 2048,
         }
     }
 }
@@ -135,5 +147,6 @@ mod tests {
         assert_eq!(c.relevance_threshold, 0.3);
         assert_eq!(c.lossless_min_savings_ratio, 0.30);
         assert!(c.enable_ccr_marker);
+        assert_eq!(c.opaque_min_bytes, 2048);
     }
 }

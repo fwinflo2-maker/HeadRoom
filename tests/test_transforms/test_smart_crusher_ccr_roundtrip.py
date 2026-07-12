@@ -267,7 +267,7 @@ def test_opaque_blob_in_object_emits_marker_and_stores_native() -> None:
     from headroom._core import SmartCrusher
 
     crusher = SmartCrusher()
-    big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=" * 8
+    big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=" * 32
     raw = json.dumps({"id": 1, "blob": big})
 
     result = crusher.crush(raw, "", 1.0)
@@ -290,7 +290,7 @@ def test_compact_document_json_via_pyo3() -> None:
 
     crusher = SmartCrusher()
     starting = crusher.ccr_len()
-    big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=" * 8
+    big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=" * 32
     doc = {"id": 1, "blob": big}
 
     out = crusher.compact_document_json(json.dumps(doc))

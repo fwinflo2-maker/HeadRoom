@@ -48,7 +48,7 @@ def test_wrap_codebuddy_no_context_tool(runner: CliRunner) -> None:
     with (
         patch("headroom.cli.wrap._setup_rtk_for_codebuddy") as setup_rtk,
         patch("headroom.cli.wrap._setup_lean_ctx_agent") as setup_lean,
-        patch("headroom.cli.wrap._ensure_proxy", return_value=fake_proxy),
+        patch("headroom.cli.wrap._ensure_proxy", return_value=(fake_proxy, 8787)),
         patch("headroom.cli.wrap._setup_headroom_mcp"),
         patch(
             "headroom.cli.wrap._codebuddy_proxy_base_url", return_value="http://127.0.0.1:8787/v2"
@@ -70,7 +70,7 @@ def test_wrap_codebuddy_with_rtk(runner: CliRunner) -> None:
 
     with (
         patch("headroom.cli.wrap._setup_rtk_for_codebuddy") as setup_rtk,
-        patch("headroom.cli.wrap._ensure_proxy", return_value=fake_proxy),
+        patch("headroom.cli.wrap._ensure_proxy", return_value=(fake_proxy, 8787)),
         patch("headroom.cli.wrap._setup_headroom_mcp"),
         patch(
             "headroom.cli.wrap._codebuddy_proxy_base_url", return_value="http://127.0.0.1:8787/v2"
@@ -92,7 +92,7 @@ def test_wrap_codebuddy_no_mcp(runner: CliRunner) -> None:
 
     with (
         patch("headroom.cli.wrap._setup_rtk_for_codebuddy"),
-        patch("headroom.cli.wrap._ensure_proxy", return_value=fake_proxy),
+        patch("headroom.cli.wrap._ensure_proxy", return_value=(fake_proxy, 8787)),
         patch("headroom.cli.wrap._setup_headroom_mcp") as register_mcp,
         patch(
             "headroom.cli.wrap._codebuddy_proxy_base_url", return_value="http://127.0.0.1:8787/v2"
@@ -114,7 +114,7 @@ def test_wrap_codebuddy_no_serena(runner: CliRunner) -> None:
 
     with (
         patch("headroom.cli.wrap._setup_rtk_for_codebuddy"),
-        patch("headroom.cli.wrap._ensure_proxy", return_value=fake_proxy),
+        patch("headroom.cli.wrap._ensure_proxy", return_value=(fake_proxy, 8787)),
         patch("headroom.cli.wrap._setup_headroom_mcp"),
         patch("headroom.cli.wrap._setup_serena_mcp") as register_serena,
         patch(

@@ -257,9 +257,8 @@ headroom proxy --mode cache
 | `--no-code-aware` | off | Disable AST-aware code compression |
 | `--code-aware` | off | Enable code-aware compression in the proxy (env: HEADROOM_CODE_AWARE_ENABLED) |
 | `--no-read-lifecycle` | off | Disable stale/superseded read compression |
-| `--no-intelligent-context` | off | Disable intelligent context manager |
-| `--no-intelligent-scoring` | off | Disable multi-factor importance scoring |
-| `--no-compress-first` | off | Disable deep compression before dropping messages |
+| `--no-ccr` | off | Disable CCR entirely — no retrieval markers in content and no injected `headroom_retrieve` tool (lossy, no recovery path) |
+| `--no-ccr-proactive-expansion` | off | Disable proactive CCR context expansion |
 | `--memory` | off | Enable persistent user memory |
 | `--memory-db-path` | `""` | Override memory DB path (help text: `{cwd}/.headroom/memory.db`) |
 | `--no-memory-tools` | off | Disable automatic memory tool injection |
@@ -408,7 +407,7 @@ headroom memory list -q "budget"
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--db-path` | `headroom_memory.db` | Memory database path |
+| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--limit`, `-n` | `50` | Maximum memories to show |
 | `--session`, `-s` | unset | Filter by session ID |
 | `--scope` | unset | `USER`, `SESSION`, `AGENT`, or `TURN` |
@@ -425,7 +424,7 @@ headroom memory show 1234abcd --json
 | Argument / option | Default | Meaning |
 |---|---|---|
 | `memory_id` | required | Full or partial memory ID |
-| `--db-path` | `headroom_memory.db` | Memory database path |
+| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--json` | off | Emit raw JSON |
 
 ### `headroom memory stats`
@@ -436,7 +435,7 @@ headroom memory stats
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--db-path` | `headroom_memory.db` | Memory database path |
+| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 
 ### `headroom memory edit <memory_id>`
 
@@ -448,7 +447,7 @@ headroom memory edit 1234abcd --importance 0.9
 | Argument / option | Default | Meaning |
 |---|---|---|
 | `memory_id` | required | Full or partial memory ID |
-| `--db-path` | `headroom_memory.db` | Memory database path |
+| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--content`, `-c` | unset | New memory content |
 | `--importance`, `-i` | unset | New importance score (`0.0` to `1.0`) |
 
@@ -464,7 +463,7 @@ headroom memory delete 1234abcd --force
 | Argument / option | Default | Meaning |
 |---|---|---|
 | `memory_ids...` | required | One or more memory IDs |
-| `--db-path` | `headroom_memory.db` | Memory database path |
+| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--force`, `-f` | off | Skip confirmation |
 
 ### `headroom memory prune`
@@ -476,7 +475,7 @@ headroom memory prune --scope SESSION --force
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--db-path` | `headroom_memory.db` | Memory database path |
+| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--older-than` | unset | Age threshold |
 | `--scope` | unset | Scope filter: `USER`, `SESSION`, `AGENT`, `TURN` |
 | `--low-importance` | unset | Importance cutoff |
@@ -494,7 +493,7 @@ headroom memory purge --confirm
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--db-path` | `headroom_memory.db` | Memory database path |
+| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--confirm` | off | Required confirmation flag |
 
 ### `headroom memory export`
@@ -506,7 +505,7 @@ headroom memory export --output export.json
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--db-path` | `headroom_memory.db` | Memory database path |
+| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--output`, `-o` | stdout | Output path |
 
 ### `headroom memory import <file>`
@@ -519,7 +518,7 @@ headroom memory import export.json --force
 | Argument / option | Default | Meaning |
 |---|---|---|
 | `file` | required | JSON file containing exported memories |
-| `--db-path` | `headroom_memory.db` | Memory database path |
+| `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--force`, `-f` | off | Skip confirmation |
 
 The import expects a JSON array. Malformed entries are skipped.

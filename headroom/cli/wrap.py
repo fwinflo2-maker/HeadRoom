@@ -3769,7 +3769,10 @@ def unwrap() -> None:
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @click.option(
     # no "-p" short alias here: claude's own -p/--print must fall through to CLAUDE_ARGS
-    "--port", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+    "--port",
+    default=8787,
+    type=click.IntRange(1, 65535),
+    help="Proxy port (default: 8787)",
 )
 @click.option(
     "--no-context-tool",

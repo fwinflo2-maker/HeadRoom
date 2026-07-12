@@ -288,7 +288,7 @@ def dashboard(port: int, no_open: bool) -> None:
         "In token mode, this also resets protect_recent_reads_fraction "
         "from 0.3 (only recent ~30% of results protected) to 0.0 (all "
         "results protected indefinitely), which prevents older Read/Glob/"
-        "Grep/Edit tool results from being silently compressed. "
+        "Grep/Write/Edit tool results from being silently compressed. "
         "Env: HEADROOM_PROTECT_TOOL_RESULTS."
     ),
 )

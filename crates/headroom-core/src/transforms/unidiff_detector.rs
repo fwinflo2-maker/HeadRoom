@@ -62,6 +62,15 @@ pub fn is_diff(content: &str) -> bool {
         return false;
     }
 
+    // `unidiff` 0.4.0 does not return `Err` on every malformed input — a
+    // `+++ ` target line with no preceding `--- ` source line makes it
+    // `unwrap()` a `None` and panic (lib.rs:665). Inputs of that shape are
+    // common (`set -x` xtrace, partial diffs quoted out of context). This
+    // detector runs inside a thread-pool worker on the Python side, where a
+    // native panic surfaces as an uncaught `PanicException` and 500s the whole
+    // request. Contain any parser panic here and treat the fragment as "not a
+    // diff" — consistent with the workspace's no-`panic = "abort"` policy of
+    // surviving bad input rather than taking the process down.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut patch = PatchSet::new();
         if patch.parse(content).is_err() {
@@ -297,5 +306,17 @@ mod tests {
         assert_eq!(detect_diff("not a diff"), None);
         assert_eq!(detect_diff("{}"), None);
         assert_eq!(detect_diff(""), None);
+    }
+
+    #[test]
+    fn orphaned_target_line_does_not_panic() {
+        // `unidiff` 0.4.0 panics (unwrap on `None`) when it meets a
+        // `+++ ` target line with no preceding `--- ` source line.
+        // That shape is common in `set -x` xtrace output and partial
+        // diffs quoted out of context. It must degrade to "not a diff",
+        // never abort the caller.
+        assert!(!is_diff("+++ x"));
+        assert_eq!(detect_diff("+++ x"), None);
+        assert!(!is_diff("some prose\n+++ target without a source\nmore"));
     }
 }

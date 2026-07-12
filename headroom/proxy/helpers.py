@@ -24,9 +24,9 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from headroom import paths as _paths
 from headroom._subprocess import run
-from headroom.proxy import query_log_policy, request_limit_policy
 from headroom.proxy import (
     diagnostic_decode_policy,
+    query_log_policy,
     request_limit_policy,
     sse_byte_buffer_policy,
     wire_debug_format_policy,

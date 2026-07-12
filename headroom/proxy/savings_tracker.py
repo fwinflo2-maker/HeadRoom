@@ -1192,6 +1192,7 @@ class SavingsTracker:
                 "display_session": self._state["display_session"],
                 "history": self._state["history"],
                 "projects": self._state.get("projects", {}),
+                "by_model": self._state.get("by_model", {}),
             }
             json_data = json.dumps(payload, indent=2)
 

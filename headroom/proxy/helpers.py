@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from headroom import paths as _paths
 from headroom._subprocess import run
-from headroom.proxy import request_limit_policy
+from headroom.proxy import request_limit_policy, sse_byte_buffer_policy, wire_debug_redaction_policy
 from headroom.proxy.body_forwarding import (
     BodyMutationTracker as BodyMutationTracker,  # noqa: F401 - compatibility export
 )
@@ -38,7 +38,19 @@ from headroom.proxy.body_forwarding import (
     prepare_outbound_body_bytes as prepare_outbound_body_bytes,  # noqa: F401 - compatibility export
 )
 from headroom.proxy.body_forwarding import serialize_body_canonical
+from headroom.proxy.ccr_golden_policy import (
+    create_fresh_ccr_tool_definition,
+    replay_golden_ccr_tool_definition,
+)
 from headroom.proxy.ccr_session_tracker import SessionCcrTracker as _SessionCcrTracker
+from headroom.proxy.internal_header_policy import (
+    INTERNAL_HEADER_PREFIX,
+    STRIP_INTERNAL_HEADERS_DEFAULT,
+    STRIP_INTERNAL_HEADERS_ENV,
+    StripInternalHeadersMode,
+    resolve_strip_internal_headers_mode,
+    strip_internal_headers,
+)
 from headroom.proxy.tool_injection_config import (
     ToolInjectionStickyMode,
 )
@@ -54,6 +66,8 @@ from headroom.proxy.tool_injection_logging import (
 from headroom.proxy.tool_injection_logging import (
     log_tool_injection_decision as _log_tool_injection_decision,
 )
+from headroom.proxy.tool_injection_tracker import SessionToolTracker as _SessionToolTracker
+from headroom.proxy.tool_name_policy import extract_tool_name
 
 if TYPE_CHECKING:
     import httpx
@@ -63,24 +77,8 @@ logger = logging.getLogger("headroom.proxy")
 
 _CODEX_WIRE_DEBUG_ENV = "HEADROOM_CODEX_WIRE_DEBUG"
 _CODEX_WIRE_DEBUG_DIR_ENV = "HEADROOM_CODEX_WIRE_DEBUG_DIR"
-_CODEX_WIRE_REDACTED = "[REDACTED]"
-_CODEX_WIRE_SECRET_KEYS = (
-    "authorization",
-    "cookie",
-    "set-cookie",
-    "api-key",
-    "x-api-key",
-    "openai-api-key",
-    "anthropic-api-key",
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "bearer",
-    "password",
-    "secret",
-    "token",
-    "credential",
-)
+_CODEX_WIRE_REDACTED = wire_debug_redaction_policy.WIRE_DEBUG_REDACTED
+_CODEX_WIRE_SECRET_KEYS = wire_debug_redaction_policy.WIRE_DEBUG_SECRET_KEYS
 
 
 def codex_wire_debug_enabled() -> bool:
@@ -102,33 +100,16 @@ def _codex_wire_debug_dir() -> Path:
 
 
 def _should_redact_key(key: str) -> bool:
-    normalized = key.lower().replace("-", "_")
-    if normalized in {marker.replace("-", "_") for marker in _CODEX_WIRE_SECRET_KEYS}:
-        return True
-    return (
-        normalized.endswith("_api_key")
-        or normalized.endswith("_secret")
-        or normalized.endswith("_password")
-        or normalized.endswith("_access_token")
-        or normalized.endswith("_refresh_token")
-    )
+    return wire_debug_redaction_policy.should_redact_key(key)
 
 
 def _redact_value(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            k: (_CODEX_WIRE_REDACTED if _should_redact_key(str(k)) else _redact_value(v))
-            for k, v in value.items()
-        }
-    if isinstance(value, list):
-        return [_redact_value(item) for item in value]
-    return value
+    return wire_debug_redaction_policy.redact_for_wire_debug(value)
 
 
 def redact_for_wire_debug(value: Any) -> Any:
     """Redact obvious secrets while preserving request/response shape."""
-
-    return _redact_value(value)
+    return wire_debug_redaction_policy.redact_for_wire_debug(value)
 
 
 def _safe_event_name(event: str) -> str:
@@ -564,22 +545,12 @@ def get_body_too_large_status() -> int:
     )
 
 
-# SSE byte-buffer helper supports LF and CRLF event separators. Per the SSE
-# spec the default event name is "message"; we return ``None`` so callers can
-# decide whether to apply that default.
-_SSE_EVENT_TERMINATORS = (b"\n\n", b"\r\n\r\n")
+_SSE_EVENT_TERMINATORS = sse_byte_buffer_policy.SSE_EVENT_TERMINATORS
 
 
 def _find_sse_event_terminator(buf: bytearray) -> tuple[int, int] | None:
     """Return the earliest complete SSE event terminator in ``buf``."""
-    matches = [
-        (idx, len(terminator))
-        for terminator in _SSE_EVENT_TERMINATORS
-        if (idx := buf.find(terminator)) != -1
-    ]
-    if not matches:
-        return None
-    return min(matches, key=lambda match: match[0])
+    return sse_byte_buffer_policy.find_sse_event_terminator(buf)
 
 
 _SSE_EVENT_LINE_PREFIX = b"event:"
@@ -626,36 +597,7 @@ def parse_sse_events_from_byte_buffer(
     ``decode("utf-8", errors="ignore")`` on a partial buffer; UTF-8
     multi-byte characters split across TCP reads will corrupt content.
     """
-    events: list[tuple[str | None, str]] = []
-    while True:
-        terminator_match = _find_sse_event_terminator(buf)
-        if terminator_match is None:
-            break
-        idx, terminator_len = terminator_match
-        event_bytes = bytes(buf[:idx])
-        # Drain the event + the trailing terminator from the buffer.
-        del buf[: idx + terminator_len]
-        # Decoding the COMPLETE event must succeed. If it doesn't, the
-        # upstream emitted invalid UTF-8 mid-stream — surface loudly.
-        event_text = event_bytes.decode("utf-8")
-        event_name: str | None = None
-        data_lines: list[str] = []
-        for line in event_text.splitlines():
-            if not line:
-                continue
-            # SSE comment line — ignored per spec.
-            if line.startswith(":"):
-                continue
-            if line.startswith("event:"):
-                event_name = line[len("event:") :].lstrip()
-            elif line.startswith("data:"):
-                data_lines.append(line[len("data:") :].lstrip())
-        # Per SSE spec, multiple `data:` lines join with newline. We
-        # preserve that here even though OpenAI/Anthropic emit one
-        # `data:` per event.
-        if data_lines:
-            events.append((event_name, "\n".join(data_lines)))
-    return events
+    return sse_byte_buffer_policy.parse_sse_events_from_byte_buffer(buf)
 
 
 # Maximum message array length (prevents DoS from deeply nested payloads)
@@ -1513,16 +1455,9 @@ def is_anthropic_auth(headers: dict[str, str]) -> bool:
 # tell its client about its own work. This helper only filters
 # request-side headers.
 
-_INTERNAL_HEADER_PREFIX = "x-headroom-"
-
-# Operator opt-in env var. ``enabled`` (default) strips internal
-# ``x-headroom-*`` headers from every upstream-bound forwarder.
-# ``disabled`` is an explicit operator opt-in for diagnostic shadow
-# tracing — NOT a fallback. Per realignment build constraint #4 the
-# behaviour is loud, configurable, and never silent.
-_STRIP_INTERNAL_HEADERS_ENV = "HEADROOM_STRIP_INTERNAL_HEADERS"
-StripInternalHeadersMode = Literal["enabled", "disabled"]
-_STRIP_INTERNAL_HEADERS_DEFAULT: StripInternalHeadersMode = "enabled"
+_INTERNAL_HEADER_PREFIX = INTERNAL_HEADER_PREFIX
+_STRIP_INTERNAL_HEADERS_ENV = STRIP_INTERNAL_HEADERS_ENV
+_STRIP_INTERNAL_HEADERS_DEFAULT = STRIP_INTERNAL_HEADERS_DEFAULT
 
 
 def get_strip_internal_headers_mode() -> StripInternalHeadersMode:
@@ -1532,14 +1467,7 @@ def get_strip_internal_headers_mode() -> StripInternalHeadersMode:
     restart. Unknown values raise loudly per the no-silent-fallback
     build constraint.
     """
-    raw = os.environ.get(_STRIP_INTERNAL_HEADERS_ENV, "").strip().lower()
-    if not raw:
-        return _STRIP_INTERNAL_HEADERS_DEFAULT
-    if raw in ("enabled", "disabled"):
-        return cast(StripInternalHeadersMode, raw)
-    raise ValueError(
-        f"Invalid {_STRIP_INTERNAL_HEADERS_ENV}={raw!r}; expected 'enabled' or 'disabled'"
-    )
+    return resolve_strip_internal_headers_mode(os.environ.get(_STRIP_INTERNAL_HEADERS_ENV))
 
 
 def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -1555,11 +1483,7 @@ def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
     is set, returns a shallow copy unchanged. That mode is for diagnostic
     shadow tracing only and is documented as a per-deploy choice.
     """
-    mode = get_strip_internal_headers_mode()
-    if mode == "disabled":
-        # Always return a copy so callers can mutate without surprise.
-        return dict(headers)
-    return {k: v for k, v in headers.items() if not k.lower().startswith(_INTERNAL_HEADER_PREFIX)}
+    return strip_internal_headers(headers, mode=get_strip_internal_headers_mode())
 
 
 def log_outbound_headers(
@@ -1972,133 +1896,13 @@ def serialize_tool_definition_canonical(tool_definition: dict[str, Any]) -> byte
     return serialize_body_canonical(tool_definition)
 
 
-class SessionToolTracker:
-    """Bounded LRU tracker recording per-session memory-tool injection state.
-
-    Once memory injects tool definitions into a session, future requests
-    in that session always inject the byte-equal same definitions —
-    never toggling on/off mid-session (guide §6.3 #2). The first turn's
-    canonical bytes are stored as the golden definition; subsequent
-    turns reuse those bytes verbatim.
-
-    State per session: ordered list of (tool_name → golden_bytes)
-    pairs. Order is preserved so the rebuilt tool list matches the
-    original injection order.
-
-    Bounded by ``max_sessions`` (default 1000) via ``OrderedDict`` LRU
-    eviction: hits move-to-end; overflow pops oldest. Reentrant lock so
-    future callers from inside another locked method don't self-deadlock
-    (mirrors `SessionBetaTracker` / `CompressionCache` pattern).
-
-    The tracker is provider-aware: the same ``session_id`` for Anthropic
-    and OpenAI keeps independent state (the tool schemas differ in
-    format).
-    """
+class SessionToolTracker(_SessionToolTracker):
+    """Env-aware compatibility wrapper for the pure session tool tracker."""
 
     def __init__(self, max_sessions: int | None = None) -> None:
         if max_sessions is None:
             max_sessions = get_tool_tracker_max_sessions()
-        if max_sessions <= 0:
-            raise ValueError("max_sessions must be > 0")
-        self._max_sessions: int = max_sessions
-        self._lock = threading.RLock()
-        # Value is an OrderedDict[tool_name -> golden_definition_bytes].
-        # Storing per-tool bytes (not the entire tools list) keeps the
-        # tracker resilient to non-memory tool list changes by the client
-        # (which are the client's responsibility, not ours to gate).
-        self._sessions: OrderedDict[tuple[str, str], OrderedDict[str, bytes]] = OrderedDict()
-
-    @property
-    def active_sessions(self) -> int:
-        with self._lock:
-            return len(self._sessions)
-
-    def _key(self, provider: str, session_id: str) -> tuple[str, str]:
-        return (provider, session_id)
-
-    def should_inject(self, provider: str, session_id: str) -> bool:
-        """Return True iff this session has previously injected memory tools.
-
-        Used by the sticky-on path: when memory is disabled this turn but
-        the session previously injected, we still inject the golden bytes.
-        """
-        if not provider:
-            raise ValueError("provider must be non-empty")
-        if not session_id:
-            raise ValueError("session_id must be non-empty")
-        with self._lock:
-            entry = self._sessions.get(self._key(provider, session_id))
-            if entry is None:
-                return False
-            # LRU touch on read so the carry-over decision keeps the
-            # session in the hot set.
-            self._sessions.move_to_end(self._key(provider, session_id))
-            return len(entry) > 0
-
-    def get_golden_definitions(
-        self, provider: str, session_id: str
-    ) -> list[tuple[str, bytes]] | None:
-        """Return the previously-recorded (name, bytes) pairs for the session.
-
-        Returns ``None`` when the session has never injected memory tools.
-        Callers replay the bytes verbatim into ``body["tools"]``.
-        """
-        if not provider:
-            raise ValueError("provider must be non-empty")
-        if not session_id:
-            raise ValueError("session_id must be non-empty")
-        with self._lock:
-            entry = self._sessions.get(self._key(provider, session_id))
-            if entry is None:
-                return None
-            self._sessions.move_to_end(self._key(provider, session_id))
-            # Snapshot — never expose internal storage directly.
-            return [(name, golden_bytes) for name, golden_bytes in entry.items()]
-
-    def record_injection(
-        self,
-        provider: str,
-        session_id: str,
-        tool_name: str,
-        tool_definition_bytes: bytes,
-    ) -> None:
-        """Record the golden bytes for a single memory tool in this session.
-
-        First-write wins: re-recording the same ``tool_name`` for an
-        existing session is a no-op (prevents drift if the canonical
-        serialization output changed between deploys mid-session). For
-        a *new* session, record fresh. LRU bound applies on every write.
-        """
-        if not provider:
-            raise ValueError("provider must be non-empty")
-        if not session_id:
-            raise ValueError("session_id must be non-empty")
-        if not tool_name:
-            raise ValueError("tool_name must be non-empty")
-        if not tool_definition_bytes:
-            raise ValueError("tool_definition_bytes must be non-empty")
-
-        key = self._key(provider, session_id)
-
-        with self._lock:
-            entry = self._sessions.get(key)
-            if entry is None:
-                entry = OrderedDict()
-                self._sessions[key] = entry
-
-            # First-write wins: only record if not already pinned.
-            if tool_name not in entry:
-                entry[tool_name] = tool_definition_bytes
-
-            # LRU touch + bound enforcement.
-            self._sessions.move_to_end(key)
-            while len(self._sessions) > self._max_sessions:
-                self._sessions.popitem(last=False)
-
-    def reset(self) -> None:
-        """Clear all session state (test helper)."""
-        with self._lock:
-            self._sessions.clear()
+        super().__init__(max_sessions=max_sessions)
 
 
 # Process-wide singleton. Lazily replaced by tests via
@@ -2162,19 +1966,7 @@ def _extract_tool_name(tool_definition: dict[str, Any]) -> str | None:
       * Anthropic native: ``{"type": "memory_20250818", "name": "memory"}``
       * OpenAI function: ``{"type": "function", "function": {"name": "memory_save", ...}}``
     """
-    name = tool_definition.get("name")
-    if isinstance(name, str) and name:
-        return name
-    fn = tool_definition.get("function")
-    if isinstance(fn, dict):
-        fn_name = fn.get("name")
-        if isinstance(fn_name, str) and fn_name:
-            return fn_name
-    # Native memory tool with no explicit name uses ``type`` as its identifier.
-    type_val = tool_definition.get("type")
-    if isinstance(type_val, str) and type_val:
-        return type_val
-    return None
+    return extract_tool_name(tool_definition)
 
 
 def apply_session_sticky_memory_tools(
@@ -2504,7 +2296,7 @@ def apply_session_sticky_ccr_tool(
     Returns ``(updated_tools, was_injected)``. ``updated_tools`` is a
     fresh list (caller-safe).
     """
-    from headroom.ccr.tool_injection import CCR_TOOL_NAME, create_ccr_tool_definition
+    from headroom.ccr.tool_injection import CCR_TOOL_NAME
 
     if provider not in ("anthropic", "openai", "google"):
         raise ValueError(f"unsupported provider: {provider!r}")
@@ -2538,14 +2330,13 @@ def apply_session_sticky_ccr_tool(
                 request_id=request_id,
             )
             return tools_out, False
-        tool_def = create_ccr_tool_definition(provider)
-        canonical = serialize_tool_definition_canonical(tool_def)
-        tools_out.append(tool_def)
+        replay = create_fresh_ccr_tool_definition(provider)
+        tools_out.append(replay.tool_definition)
         log_tool_injection_decision(
             provider=provider,
             session_id=None,
             decision="inject_first_time",
-            tool_definition_bytes_count=len(canonical),
+            tool_definition_bytes_count=len(replay.canonical_bytes),
             request_id=request_id,
         )
         return tools_out, True
@@ -2562,13 +2353,13 @@ def apply_session_sticky_ccr_tool(
         golden = tracker.get_golden_tool_bytes(provider, session_id)
         if golden is not None:
             try:
-                tool_def = json.loads(golden.decode("utf-8"))
-                tools_out.append(tool_def)
+                replay = replay_golden_ccr_tool_definition(golden)
+                tools_out.append(replay.tool_definition)
                 log_tool_injection_decision(
                     provider=provider,
                     session_id=session_id,
                     decision="inject_sticky_replay",
-                    tool_definition_bytes_count=len(golden),
+                    tool_definition_bytes_count=len(replay.canonical_bytes),
                     request_id=request_id,
                 )
                 return tools_out, True
@@ -2582,15 +2373,14 @@ def apply_session_sticky_ccr_tool(
                 # Fall through to fresh creation below
         # Tracker says "done CCR" but has no golden bytes (or they were corrupt). Pin
         # them now so future turns are stable.
-        tool_def = create_ccr_tool_definition(provider)
-        canonical = serialize_tool_definition_canonical(tool_def)
-        tracker.record_ccr_done(provider, session_id, canonical)
-        tools_out.append(tool_def)
+        replay = create_fresh_ccr_tool_definition(provider)
+        tracker.record_ccr_done(provider, session_id, replay.canonical_bytes)
+        tools_out.append(replay.tool_definition)
         log_tool_injection_decision(
             provider=provider,
             session_id=session_id,
             decision="inject_sticky_replay",
-            tool_definition_bytes_count=len(canonical),
+            tool_definition_bytes_count=len(replay.canonical_bytes),
             request_id=request_id,
         )
         return tools_out, True
@@ -2606,15 +2396,14 @@ def apply_session_sticky_ccr_tool(
         )
         return tools_out, False
 
-    tool_def = create_ccr_tool_definition(provider)
-    canonical = serialize_tool_definition_canonical(tool_def)
-    tracker.record_ccr_done(provider, session_id, canonical)
-    tools_out.append(tool_def)
+    replay = create_fresh_ccr_tool_definition(provider)
+    tracker.record_ccr_done(provider, session_id, replay.canonical_bytes)
+    tools_out.append(replay.tool_definition)
     log_tool_injection_decision(
         provider=provider,
         session_id=session_id,
         decision="inject_first_time",
-        tool_definition_bytes_count=len(canonical),
+        tool_definition_bytes_count=len(replay.canonical_bytes),
         request_id=request_id,
     )
     return tools_out, True

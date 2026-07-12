@@ -34,7 +34,7 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 use super::classifier::{classify_cell, CellClass};
-use super::compactor::{compact_with_ccr, CompactConfig};
+use super::compactor::{compact_with_store, CompactConfig};
 use super::formatter::{CsvSchemaFormatter, Formatter};
 use super::ir::OpaqueKind;
 use crate::ccr::CcrStore;
@@ -117,7 +117,7 @@ fn walk_array(items: Vec<Value>, ctx: &DocumentCompactor) -> Value {
     let inner: Vec<Value> = items.into_iter().map(|i| walk(i, ctx)).collect();
 
     // Then try the array as a whole.
-    let c = compact_with_ccr(&inner, &ctx.config, ctx.ccr_store.as_ref());
+    let c = compact_with_store(&inner, &ctx.config, ctx.ccr_store.as_ref());
     if c.was_compacted() {
         Value::String(ctx.formatter.format(&c))
     } else {
@@ -420,7 +420,7 @@ mod tests {
         // Regression for issue #2, exercised through the real
         // production entry point (`DocumentCompactor` with a wired CCR
         // store — what `SmartCrusher`/live-zone actually use), not just
-        // the lower-level `compact_with_ccr` unit test. An array of
+        // the lower-level `compact_with_store` unit test. An array of
         // objects where a field is a long opaque string gets tabulated;
         // the opaque cell must be retrievable from the store by the
         // hash embedded in its `<<ccr:HASH,KIND,SIZE>>` marker.

@@ -36,8 +36,12 @@ def test_every_litellm_requirement_is_skipped_on_py314() -> None:
     assert reqs, "expected litellm to be declared in pyproject"
     for r in reqs:
         assert r.marker is not None, f"{r}: litellm must carry a python_version marker (GH #956)"
-        assert not r.marker.evaluate({"python_version": "3.14"}), f"{r}: must be skipped on Python 3.14"
-        assert r.marker.evaluate({"python_version": "3.13"}), f"{r}: must still install on Python 3.13"
+        assert not r.marker.evaluate({"python_version": "3.14"}), (
+            f"{r}: must be skipped on Python 3.14"
+        )
+        assert r.marker.evaluate({"python_version": "3.13"}), (
+            f"{r}: must still install on Python 3.13"
+        )
 
 
 def test_proxy_cost_degrades_without_litellm(monkeypatch: pytest.MonkeyPatch) -> None:

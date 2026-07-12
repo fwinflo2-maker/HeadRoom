@@ -83,8 +83,17 @@ pub struct ClassifyConfig {
     /// opaque-shaped — the retrieval round-trip isn't worth it for a
     /// ~1 KB field. Default: 2048 bytes (2 KB); operators may raise to
     /// 4 KB for workloads with many small-but-opaque fields. Wired
-    /// end-to-end via `SmartCrusherConfig::opaque_min_bytes`.
+    /// end-to-end via `SmartCrusherConfig::opaque_min_bytes`. Orthogonal
+    /// to `emit_opaque_markers` below: that's a global on/off toggle
+    /// checked at classification time; this is a size floor checked at
+    /// substitution time by callers (`cell_from_value`, `process_string`,
+    /// the document walker) once a cell is already `CellClass::Opaque`.
     pub ccr_min_bytes: usize,
+    /// When false, long strings are NOT classified as opaque — they stay
+    /// `Scalar` and render verbatim, so output is marker-free and
+    /// guaranteed-lossless. Mirrors the row-drop path's `enable_ccr_marker`
+    /// gate (see `crusher.rs`). Default: true.
+    pub emit_opaque_markers: bool,
 }
 
 impl Default for ClassifyConfig {
@@ -94,6 +103,7 @@ impl Default for ClassifyConfig {
             base64_alphabet_ratio: 0.95,
             html_min_open_brackets: 3,
             ccr_min_bytes: 2048,
+            emit_opaque_markers: true,
         }
     }
 }
@@ -123,8 +133,10 @@ fn classify_string(s: &str, cfg: &ClassifyConfig) -> CellClass {
         }
     }
 
-    // Opaque-blob check — only for strings above the byte threshold.
-    if s.len() <= cfg.opaque_min_bytes {
+    // Opaque-blob check — only for strings above the byte threshold, and
+    // only when opaque markers are enabled. With markers off, keep the full
+    // string verbatim (Scalar) so the output stays lossless and marker-free.
+    if s.len() <= cfg.opaque_min_bytes || !cfg.emit_opaque_markers {
         return CellClass::Scalar;
     }
 
@@ -261,6 +273,22 @@ mod tests {
             CellClass::Opaque(OpaqueKind::LongString) => {}
             other => panic!("expected LongString, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn long_string_stays_scalar_when_opaque_markers_disabled() {
+        // #1091: with opaque markers disabled, a long string must NOT be
+        // classified Opaque (which would emit a `<<ccr:>>` marker); it stays
+        // Scalar and renders verbatim, so the output is lossless.
+        let v = Value::String("x".repeat(512));
+        // Default config classifies it Opaque.
+        assert!(matches!(classify_cell(&v, &cfg()), CellClass::Opaque(_)));
+        // Markers disabled → Scalar (verbatim).
+        let no_markers = ClassifyConfig {
+            emit_opaque_markers: false,
+            ..ClassifyConfig::default()
+        };
+        assert_eq!(classify_cell(&v, &no_markers), CellClass::Scalar);
     }
 
     #[test]

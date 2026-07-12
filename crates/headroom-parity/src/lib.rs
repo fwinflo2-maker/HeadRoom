@@ -414,6 +414,11 @@ impl TransformComparator for SmartCrusherComparator {
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize)
                 .unwrap_or(0),
+            // Compaction heuristics (lossless_only, compaction_*) are moot
+            // here: this comparator uses `without_compaction` (fixtures
+            // were recorded against the lossy-only path). Take the
+            // defaults wholesale for every other new field.
+            ..defaults
         };
 
         // Use without_compaction so the legacy fixtures (recorded

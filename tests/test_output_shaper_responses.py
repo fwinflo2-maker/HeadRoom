@@ -324,3 +324,47 @@ class TestShapeHandlerHelper:
         assert json.dumps(body, sort_keys=True) == snapshot  # control arm untouched
         assert len(labels) == 1
         assert labels[0].startswith("output_shaper:control:")
+
+
+class TestHandlerPathControlLabels:
+    """Regression: control-arm labels must reach the request outcome even
+    when the forwarded payload bytes are unchanged (review feedback on the
+    ``if _modified:`` gating in the /v1/responses HTTP handler)."""
+
+    def test_http_handler_records_control_label_without_mutation(self, monkeypatch):
+        import anyio
+
+        from tests.test_openai_codex_routing import (
+            _build_request,
+            _DummyOpenAIHandler,
+            _DummyTokenizer,
+        )
+
+        monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+        monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "1.0")
+        monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+        body = _mechanical_body()
+        snapshot = json.dumps(body, sort_keys=True)
+
+        outcomes: list[Any] = []
+
+        class _Handler(_DummyOpenAIHandler):
+            async def _record_request_outcome(self, outcome) -> None:
+                outcomes.append(outcome)
+
+        handler = _Handler()
+        handler.config.optimize = True
+
+        request = _build_request(body, {"Authorization": "Bearer sk-test"})
+        response = anyio.run(handler.handle_openai_responses, request)
+
+        assert response.status_code == 200
+        assert handler.captured_request is not None
+        forwarded_body = handler.captured_request[3]
+        assert json.dumps(forwarded_body, sort_keys=True) == snapshot
+
+        assert outcomes, "handler must record a request outcome"
+        transforms = list(outcomes[0].transforms_applied)
+        assert any(t.startswith("output_shaper:control:") for t in transforms)
+        assert not any(t.startswith("output_shaper:verbosity:") for t in transforms)

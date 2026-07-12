@@ -3502,11 +3502,16 @@ class OpenAIHandlerMixin:
                     request_id=request_id,
                 )
                 attempted_input_tokens = int(_attempted_tokens)
+                if _transforms:
+                    # Record transform labels even when the payload bytes are
+                    # unchanged: control-arm output-shaper labels
+                    # (output_shaper:control:*) must reach the outcome ledger
+                    # for A/B baseline accounting.
+                    transforms_applied = [*_transforms, *list(transforms_applied)]
                 if _modified:
                     body_mutation_tracker.mark_mutated("responses_compression")
                     tokens_saved = int(_tokens_saved)
                     optimized_tokens = max(0, original_tokens - tokens_saved)
-                    transforms_applied = [*_transforms, *list(transforms_applied)]
                     logger.info(
                         "[%s] /v1/responses compressed %d→%d bytes "
                         "(%d tokens saved, auth_mode=%s, transforms=%s)",
@@ -4786,6 +4791,13 @@ class OpenAIHandlerMixin:
                                 strategy_chain=_codex_ws_strategy_chain(_ws_transforms),
                                 final_strategies=_codex_ws_final_strategies(_ws_compression_timing),
                             )
+                        # Record transform labels even when the frame bytes are
+                        # unchanged: control-arm output-shaper labels
+                        # (output_shaper:control:*) must reach the outcome
+                        # ledger for A/B baseline accounting.
+                        for _t in _ws_transforms:
+                            if _t not in transforms_applied:
+                                transforms_applied.append(_t)
                         if _modified:
                             if isinstance(_new_inner, dict):
                                 _rewrite_started = time.perf_counter()
@@ -4802,9 +4814,6 @@ class OpenAIHandlerMixin:
                                 _record_ws_compression_overhead(_rewrite_ms)
                                 tokens_saved += int(_ws_saved)
                                 attempted_input_tokens_total += int(_ws_attempted_tokens)
-                                for _t in _ws_transforms:
-                                    if _t not in transforms_applied:
-                                        transforms_applied.append(_t)
                                 logger.info(
                                     "[%s] WS /v1/responses compressed "
                                     "%d→%d bytes (%d tokens saved, "
@@ -5105,6 +5114,13 @@ class OpenAIHandlerMixin:
                                 model=str(inner_payload.get("model") or "unknown"),
                             )
                             return raw_msg, False, "compression_exception"
+                        # Record transform labels even when the frame bytes are
+                        # unchanged: control-arm output-shaper labels
+                        # (output_shaper:control:*) must reach the outcome
+                        # ledger for A/B baseline accounting.
+                        for t in frame_transforms:
+                            if t not in transforms_applied:
+                                transforms_applied.append(t)
                         if not modified:
                             reason = frame_reason or "no_compression"
                             _log_ws_passthrough(
@@ -5139,9 +5155,6 @@ class OpenAIHandlerMixin:
                         _record_ws_compression_overhead(_rewrite_ms)
                         tokens_saved += int(frame_saved)
                         attempted_input_tokens_total += int(frame_attempted_tokens)
-                        for t in frame_transforms:
-                            if t not in transforms_applied:
-                                transforms_applied.append(t)
                         ws_frames_compressed += 1
                         logger.info(
                             "[%s] WS /v1/responses frame compressed "

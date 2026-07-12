@@ -1366,11 +1366,7 @@ class OpenAIHandlerMixin:
                     # can still be losslessly compacted. Reuse the router helper
                     # so the Responses path matches the chat/Anthropic behavior.
                     excl_out = _responses_part_text(item.get("output"))
-                    fold = (
-                        router._lossless_compact_excluded(excl_out)
-                        if excl_out
-                        else None
-                    )
+                    fold = router._lossless_compact_excluded(excl_out) if excl_out else None
                     if fold is not None:
                         lossless_excluded.append((idx, ("output", None), fold[0], excl_out))
                     if debug_enabled:

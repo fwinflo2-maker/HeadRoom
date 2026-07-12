@@ -13,7 +13,7 @@ import warnings
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 # Agno imports - these are optional dependencies
@@ -309,7 +309,10 @@ class HeadroomAgnoModel(Model):  # type: ignore[misc]
             return tc
         # Pydantic v2 model — use model_dump() for full fidelity
         if hasattr(tc, "model_dump"):
-            return tc.model_dump()
+            dumped = tc.model_dump()
+            if isinstance(dumped, dict):
+                return cast(dict[str, Any], dumped)
+            return _coerce_tool_call_to_dict(tc)
         # Pydantic v1 / dataclass
         if hasattr(tc, "__dict__"):
             result = {k: v for k, v in vars(tc).items() if not k.startswith("_")}

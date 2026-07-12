@@ -9,17 +9,18 @@ items; passing raw Pydantic models raises AttributeError and crashes the agent.
 
 from __future__ import annotations
 
-import pytest
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock
+
+import pytest
 
 pytest.importorskip("agno", reason="agno not installed")
 
 from headroom.integrations.agno.model import HeadroomAgnoModel
 
-
 # ── Minimal stubs for OpenAI SDK streaming objects ──────────────────────────
+
 
 @dataclass
 class _FunctionDelta:
@@ -30,6 +31,7 @@ class _FunctionDelta:
 @dataclass
 class _ChoiceDeltaToolCall:
     """Minimal stub of openai.types.chat.chat_completion_chunk.ChoiceDeltaToolCall."""
+
     id: str = "call_abc123"
     type: str = "function"
     function: _FunctionDelta = None
@@ -42,6 +44,7 @@ class _ChoiceDeltaToolCall:
 @dataclass
 class _ChatCompletionMessageToolCall:
     """Minimal stub of openai.types.chat.ChatCompletionMessageToolCall."""
+
     id: str = "call_xyz789"
     type: str = "function"
     function: _FunctionDelta = None
@@ -53,6 +56,7 @@ class _ChatCompletionMessageToolCall:
 
 class _PydanticLikeFunctionDelta:
     """Simulates Pydantic v2 model_dump() on function delta."""
+
     def __init__(self):
         self.name = "get_weather"
         self.arguments = '{"city": "Paris"}'
@@ -63,6 +67,7 @@ class _PydanticLikeFunctionDelta:
 
 class _PydanticLikeToolCall:
     """Simulates Pydantic v2 model with model_dump()."""
+
     def __init__(self):
         self.id = "call_pydantic"
         self.type = "function"
@@ -77,6 +82,7 @@ class _PydanticLikeToolCall:
 
 
 # ── _normalize_tool_call unit tests ─────────────────────────────────────────
+
 
 def test_normalize_plain_dict_passthrough():
     """Plain dicts must pass through unchanged."""
@@ -114,6 +120,7 @@ def test_normalize_pydantic_v2_model():
 
 def test_normalize_partial_delta_missing_fields():
     """Stream deltas often have None fields — must not raise."""
+
     @dataclass
     class _PartialDelta:
         id: str | None = None
@@ -129,6 +136,7 @@ def test_normalize_partial_delta_missing_fields():
 
 
 # ── Integration: _convert_messages_to_openai ────────────────────────────────
+
 
 def test_convert_messages_normalizes_tool_calls_in_agno_message():
     """tool_calls on an Agno Message object must be normalized to dicts."""
@@ -151,8 +159,9 @@ def test_convert_messages_normalizes_tool_calls_in_agno_message():
     assert len(result) == 1
     tool_calls = result[0]["tool_calls"]
     assert isinstance(tool_calls, list)
-    assert all(isinstance(tc, dict) for tc in tool_calls), \
+    assert all(isinstance(tc, dict) for tc in tool_calls), (
         "All tool_calls must be plain dicts after normalization"
+    )
 
     tc = tool_calls[0]
     assert tc["id"] == "call_abc123"

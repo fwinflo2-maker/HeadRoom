@@ -93,6 +93,21 @@ def _normalize_api_url(url: str | None, *, default: str) -> str:
     return normalized
 
 
+def _log_backend_init_failure(
+    logger: logging.Logger,
+    *,
+    backend: str,
+    provider: str,
+    exc: Exception,
+) -> None:
+    logger.error(
+        "backend initialization failed: backend=%s provider=%s error=%s",
+        backend,
+        provider,
+        exc,
+    )
+
+
 def resolve_api_overrides(
     *,
     anthropic_api_url: str | None,
@@ -148,6 +163,7 @@ def create_proxy_backend(
     backend: str,
     anyllm_provider: str,
     bedrock_region: str | None,
+    bedrock_profile: str | None = None,
     logger: logging.Logger,
     openai_api_url: str | None = None,
     anyllm_backend_cls: Any | None = None,
@@ -160,6 +176,7 @@ def create_proxy_backend(
 
     if backend == "anyllm" or backend.startswith("anyllm-"):
         provider = anyllm_provider
+        backend_name = "anyllm" if backend == "anyllm" else backend
         try:
             backend_cls = anyllm_backend_cls or _load_anyllm_backend()
             instance = cast("Backend", backend_cls(provider=provider, api_base=openai_api_url))
@@ -169,7 +186,12 @@ def create_proxy_backend(
             logger.warning("any-llm backend not available: %s", exc)
             return None
         except Exception as exc:  # pragma: no cover - defensive logging
-            logger.error("Failed to initialize any-llm backend: %s", exc)
+            _log_backend_init_failure(
+                logger,
+                backend=backend_name,
+                provider=provider,
+                exc=exc,
+            )
             return None
 
     normalized_backend = backend if backend.startswith("litellm-") else f"litellm-{backend}"
@@ -185,11 +207,12 @@ def create_proxy_backend(
     # no-op at runtime, but it widens the public call signature of
     # the backend ``__init__``. Restrict the kwarg to bedrock to
     # keep the API surface honest.
-    factory_kwarg: dict[str, Any] = (
-        {"bedrock_client_factory": bedrock_client_factory}
-        if provider == "bedrock" and bedrock_client_factory is not None
-        else {}
-    )
+    litellm_kwargs: dict[str, Any] = {}
+    if provider == "bedrock":
+        if bedrock_profile is not None:
+            litellm_kwargs["profile_name"] = bedrock_profile
+        if bedrock_client_factory is not None:
+            litellm_kwargs["bedrock_client_factory"] = bedrock_client_factory
     try:
         backend_cls = litellm_backend_cls or _load_litellm_backend()
         instance = cast(
@@ -197,7 +220,7 @@ def create_proxy_backend(
             backend_cls(
                 provider=provider,
                 region=bedrock_region,
-                **factory_kwarg,
+                **litellm_kwargs,
             ),
         )
         logger.info("LiteLLM backend enabled (provider=%s, region=%s)", provider, bedrock_region)
@@ -216,7 +239,12 @@ def create_proxy_backend(
         logger.exception("Invalid bedrock_client_factory: %s", exc)
         raise
     except Exception as exc:  # pragma: no cover - defensive logging
-        logger.error("Failed to initialize LiteLLM backend: %s", exc)
+        _log_backend_init_failure(
+            logger,
+            backend=normalized_backend,
+            provider=provider,
+            exc=exc,
+        )
         return None
 
 

@@ -193,6 +193,38 @@ class TestRetryMaxAttemptsValidation:
         assert result.exit_code != 0
 
 
+class TestRetryDelayValidation:
+    """Retry base/max delay flags should wire through and reject invalid values."""
+
+    def test_retry_base_delay_zero_is_valid(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy", "--retry-base-delay-ms", "0"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].retry_base_delay_ms == 0
+
+    def test_retry_max_delay_custom_value_is_valid(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy", "--retry-max-delay-ms", "45000"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].retry_max_delay_ms == 45000
+
+    def test_retry_base_delay_negative_is_rejected(self, runner: CliRunner) -> None:
+        result = runner.invoke(main, ["proxy", "--retry-base-delay-ms", "-1"])
+        assert result.exit_code != 0
+
+    def test_retry_max_delay_above_cap_is_rejected(self, runner: CliRunner) -> None:
+        result = runner.invoke(main, ["proxy", "--retry-max-delay-ms", "600001"])
+        assert result.exit_code != 0
+
+
 class TestConnectTimeoutSecondsValidation:
     """--connect-timeout-seconds should accept 1-300, reject outside that range."""
 
@@ -349,6 +381,30 @@ class TestNewEnvVarWiring:
         )
         assert result.exit_code == 0, result.output
         assert mock_run_server["config"].retry_max_attempts == 5
+
+    def test_headroom_retry_base_delay_from_env(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy"],
+            env={"HEADROOM_RETRY_BASE_DELAY_MS": "250"},
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].retry_base_delay_ms == 250
+
+    def test_headroom_retry_max_delay_from_env(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy"],
+            env={"HEADROOM_RETRY_MAX_DELAY_MS": "45000"},
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].retry_max_delay_ms == 45000
 
     def test_headroom_connect_timeout_from_env(
         self, runner: CliRunner, mock_run_server: dict

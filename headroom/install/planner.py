@@ -120,6 +120,7 @@ def build_manifest(
     telemetry_enabled: bool,
     image: str,
     no_rate_limit: bool = False,
+    no_http2: bool = False,
 ) -> DeploymentManifest:
     """Create a normalized deployment manifest."""
 
@@ -172,6 +173,8 @@ def build_manifest(
         proxy_args.extend(["--anyllm-provider", anyllm_provider])
     if region:
         proxy_args.extend(["--region", region])
+    if no_http2:
+        proxy_args.append("--no-http2")
 
     container_name = f"headroom-{normalized_profile}"
     return DeploymentManifest(

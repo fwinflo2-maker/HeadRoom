@@ -625,7 +625,52 @@ impl SearchCompressor {
 /// Returns `None` for lines that don't match the shape (no
 /// `<sep>\d+<sep>` found). Caller treats those as un-parseable and
 /// drops them.
+///
+/// # Why the scan runs in tiers
+///
+/// Leftmost-wins alone misreads any *path segment* that itself contains
+/// a `<sep>\d+<sep>` triplet, which is extremely common:
+///
+/// ```text
+/// logs/2026-05-03/app.log:12:ERROR   -> ("logs/2026", 5, "03/app.log:12:ERROR")
+/// advisories/CVE-2021-44228.md-9-ctx -> ("advisories/CVE", 2021, "44228.md-9-ctx")
+/// ```
+///
+/// That is silent corruption, not a drop — the bogus path becomes the
+/// grouping key in [`SearchCompressor::parse_search_results`], so the
+/// model is shown a file and a line number that do not exist, plus a
+/// body with a path fragment glued onto the front.
+///
+/// The tiers exploit what grep actually emits:
+///
+/// 1. **Colon tier** — leftmost `:\d+:` whose path part contains no
+///    whitespace. `:` is grep's *match*-line separator and a path
+///    practically never contains one (the Windows drive colon is
+///    already skipped above), so the leftmost is the right one. The
+///    no-whitespace guard keeps a `foo.rs:12:` reference *inside the
+///    body* of a `-`-separated context line from hijacking the parse.
+/// 2. **Dash tier** — *last* `-\d+-` whose path part contains no
+///    whitespace. `-` is grep's *context*-line separator, and unlike
+///    `:` it appears inside real paths (`2026-05-03`, `CVE-2021-44228`,
+///    `20240101-002-add_users.sql`), so the marker is the *last* such
+///    triplet in the path token, not the first.
+/// 3. **Permissive tier** — the original leftmost-any rule, unchanged.
+///    Only reached when neither tier matched (e.g. a path containing a
+///    space), so behaviour for those lines is exactly as before.
 fn parse_match_line(line: &str) -> Option<(&str, u64, &str)> {
+    scan_match_line(line, ScanTier::Colon)
+        .or_else(|| scan_match_line(line, ScanTier::Dash))
+        .or_else(|| scan_match_line(line, ScanTier::Permissive))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanTier {
+    Colon,
+    Dash,
+    Permissive,
+}
+
+fn scan_match_line(line: &str, tier: ScanTier) -> Option<(&str, u64, &str)> {
     let bytes = line.as_bytes();
     // Windows drive prefix: starts with [A-Za-z]:[\\/]
     let scan_start = if bytes.len() >= 3
@@ -640,9 +685,20 @@ fn parse_match_line(line: &str) -> Option<(&str, u64, &str)> {
         0
     };
 
+    // Best candidate so far, as (path_end, digits_start, digits_end).
+    // The colon and permissive tiers keep the first hit; the dash tier
+    // keeps the last one inside the whitespace-free path token.
+    let mut best: Option<(usize, usize, usize)> = None;
+
     let mut i = scan_start;
     while i < bytes.len() {
-        if bytes[i] == b':' || bytes[i] == b'-' {
+        let is_sep = bytes[i] == b':' || bytes[i] == b'-';
+        let tier_sep = match tier {
+            ScanTier::Colon => bytes[i] == b':',
+            ScanTier::Dash => bytes[i] == b'-',
+            ScanTier::Permissive => is_sep,
+        };
+        if tier_sep {
             // Reject markers where the byte immediately before the
             // first separator is itself a separator. That collapses
             // adjacent-separator runs (`::` or `:-`) so a line like
@@ -654,29 +710,49 @@ fn parse_match_line(line: &str) -> Option<(&str, u64, &str)> {
                 i += 1;
                 continue;
             }
+            // The typed tiers only consider markers that sit inside the
+            // leading whitespace-free run — grep paths don't contain
+            // whitespace, bodies routinely do.
+            if tier != ScanTier::Permissive && bytes[..i].iter().any(|b| b.is_ascii_whitespace()) {
+                break;
+            }
             // Try this as the first separator. Walk through digits.
             let digits_start = i + 1;
             let mut j = digits_start;
             while j < bytes.len() && bytes[j].is_ascii_digit() {
                 j += 1;
             }
-            if j > digits_start && j < bytes.len() && (bytes[j] == b':' || bytes[j] == b'-') {
+            // The closing separator must match the opening one: grep
+            // emits `file:12:body` or `file-12-body`, never a mix.
+            let closes = j > digits_start
+                && j < bytes.len()
+                && match tier {
+                    ScanTier::Permissive => bytes[j] == b':' || bytes[j] == b'-',
+                    _ => bytes[j] == bytes[i],
+                };
+            if closes {
                 // Found <sep><digits><sep>. Reject zero-length path
                 // (line starts with separator).
                 if i == 0 {
                     return None;
                 }
-                let file = &line[..i];
-                let line_no = std::str::from_utf8(&bytes[digits_start..j])
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())?;
-                let content = &line[j + 1..];
-                return Some((file, line_no, content));
+                best = Some((i, digits_start, j));
+                if tier != ScanTier::Dash {
+                    break;
+                }
+                // Dash tier: keep looking for a later marker.
+                i = j + 1;
+                continue;
             }
         }
         i += 1;
     }
-    None
+
+    let (path_end, digits_start, digits_end) = best?;
+    let line_no = std::str::from_utf8(&bytes[digits_start..digits_end])
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())?;
+    Some((&line[..path_end], line_no, &line[digits_end + 1..]))
 }
 
 // ─── Internals ──────────────────────────────────────────────────────────
@@ -764,6 +840,93 @@ mod tests {
                 42,
                 "fail_fast: true".into()
             ))
+        );
+    }
+
+    #[test]
+    fn date_stamped_path_is_not_misread_as_line_number_marker() {
+        // `logs/2026-05-03/...` contains `-05-`, a `<sep><digits><sep>`
+        // triplet INSIDE the path. Leftmost-wins parsing takes it as the
+        // line-number marker and silently reports a bogus file, a bogus
+        // line number, and a truncated body.
+        assert_eq!(
+            parse_line("logs/2026-05-03/app.log:12:ERROR boom"),
+            Some(("logs/2026-05-03/app.log".into(), 12, "ERROR boom".into()))
+        );
+        // Same for the ripgrep context-line form.
+        assert_eq!(
+            parse_line("logs/2026-11-23/app.log-11-context before"),
+            Some((
+                "logs/2026-11-23/app.log".into(),
+                11,
+                "context before".into()
+            ))
+        );
+        // And for version/ordinal path segments (`v1-2-beta`).
+        assert_eq!(
+            parse_line("src/v1-2-beta/mod.rs:3:fn x() {}"),
+            Some(("src/v1-2-beta/mod.rs".into(), 3, "fn x() {}".into()))
+        );
+        // `NAME-<digits>-<digits>` paths (CVE advisories, timestamped
+        // migrations) hide a triplet in the middle of the path token.
+        assert_eq!(
+            parse_line("advisories/CVE-2021-44228.md:8:Log4Shell"),
+            Some(("advisories/CVE-2021-44228.md".into(), 8, "Log4Shell".into()))
+        );
+        assert_eq!(
+            parse_line("migrations/20240101-002-add_users.sql-9-  id BIGINT"),
+            Some((
+                "migrations/20240101-002-add_users.sql".into(),
+                9,
+                "  id BIGINT".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn date_stamped_paths_are_not_collapsed_into_one_bogus_file() {
+        // The misparse doesn't just corrupt one line — the bogus path
+        // becomes the grouping key, so two unrelated files merge into a
+        // single `logs/2026` bucket and the model sees a path that
+        // doesn't exist. This is what reaches the LLM.
+        let compressor = SearchCompressor::new(SearchCompressorConfig::default());
+        let content = "\
+logs/2026-05-03/app.log:12:ERROR boom
+logs/2026-05-04/app.log:7:ERROR bang";
+        let mut stats = SearchCompressorStats::default();
+        let parsed = compressor.parse_search_results(content, &mut stats);
+
+        assert_eq!(stats.lines_unparsed, 0);
+        let files: Vec<&String> = parsed.keys().collect();
+        assert_eq!(
+            files,
+            vec!["logs/2026-05-03/app.log", "logs/2026-05-04/app.log"]
+        );
+        assert_eq!(parsed["logs/2026-05-03/app.log"].matches[0].line_number, 12);
+        assert_eq!(
+            parsed["logs/2026-05-03/app.log"].matches[0].content,
+            "ERROR boom"
+        );
+    }
+
+    #[test]
+    fn body_line_reference_does_not_hijack_a_context_line() {
+        // A `-`-separated context line whose BODY quotes a `file:line:`
+        // reference must still bind to the context marker, not the
+        // reference. Guards the whitespace-bounded colon tier.
+        assert_eq!(
+            parse_line("src/main.py-44-see foo.rs:12:bar"),
+            Some(("src/main.py".into(), 44, "see foo.rs:12:bar".into()))
+        );
+    }
+
+    #[test]
+    fn digit_terminated_path_still_parses_ripgrep_context_line() {
+        // Rotated logs end in a digit, so the context separator is
+        // digit-preceded — the last-marker rule must still land on it.
+        assert_eq!(
+            parse_line("logs/app.log.1-42-rotated line"),
+            Some(("logs/app.log.1".into(), 42, "rotated line".into()))
         );
     }
 

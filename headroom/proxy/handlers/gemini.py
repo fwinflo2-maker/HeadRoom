@@ -16,10 +16,11 @@ if TYPE_CHECKING:
     from fastapi import Request
     from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.compression_decision import CompressionDecision
-from headroom.proxy.helpers import extract_tags
+from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS, extract_tags
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
@@ -108,7 +109,11 @@ class GeminiHandlerMixin:
         return result
 
     def _gemini_contents_to_messages(
-        self, contents: list[dict], system_instruction: dict | None = None
+        self,
+        contents: list[dict],
+        system_instruction: dict | None = None,
+        *,
+        include_function_responses: bool = False,
     ) -> tuple[list[dict], set[int]]:
         """Convert Gemini contents[] format to OpenAI messages[] format for optimization.
 
@@ -118,6 +123,12 @@ class GeminiHandlerMixin:
 
         OpenAI format:
             messages: [{"role": "user", "content": "..."}]
+
+        When include_function_responses is True, functionResponse payloads are
+        additionally emitted as ``role="tool"`` messages so waste-signal
+        detection can see tool output (#819). That richer list is telemetry-only:
+        entries with non-text parts stay in preserved_indices and are restored
+        verbatim, so it must never be used as the compression input.
 
         Returns:
             Tuple of (messages, preserved_indices) where preserved_indices contains
@@ -151,7 +162,28 @@ class GeminiHandlerMixin:
             if text_parts:
                 messages.append({"role": role, "content": "\n".join(text_parts)})
 
+            if include_function_responses:
+                for part in parts:
+                    if "functionResponse" not in part:
+                        continue
+                    payload = self._function_response_text(part["functionResponse"])
+                    if payload:
+                        messages.append({"role": "tool", "content": payload})
+
         return messages, preserved_indices
+
+    @staticmethod
+    def _function_response_text(function_response: dict) -> str:
+        """Serialize a functionResponse payload for waste-signal parsing."""
+        response = function_response.get("response")
+        if response is None:
+            return ""
+        if isinstance(response, str):
+            return response
+        try:
+            return json.dumps(response, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return str(response)
 
     def _messages_to_gemini_contents(self, messages: list[dict]) -> tuple[list[dict], dict | None]:
         """Convert OpenAI messages[] format back to Gemini contents[] format.
@@ -392,6 +424,7 @@ class GeminiHandlerMixin:
                         request_id=request_id,
                         provider=provider_name,
                         model=model,
+                        status_code=response.status_code,
                         original_tokens=total_input_tokens,
                         optimized_tokens=total_input_tokens,
                         output_tokens=output_tokens,
@@ -446,11 +479,21 @@ class GeminiHandlerMixin:
             try:
                 # Use OpenAI pipeline (similar message format)
                 context_limit = self.openai_provider.get_context_limit(model)
-                result = self.openai_pipeline.apply(
-                    messages=messages,
-                    model=model,
-                    model_limit=context_limit,
-                    context=extract_user_query(messages),
+                # Richer conversion incl. functionResponse payloads so tool
+                # output reaches waste-signal detection (#819); telemetry-only.
+                waste_messages, _ = self._gemini_contents_to_messages(
+                    contents, system_instruction, include_function_responses=True
+                )
+                result = await self._run_compression_in_executor(
+                    lambda: self.openai_pipeline.apply(
+                        messages=messages,
+                        model=model,
+                        model_limit=context_limit,
+                        context=extract_user_query(messages),
+                        waste_messages=waste_messages,
+                        **proxy_pipeline_kwargs(self.config),
+                    ),
+                    timeout=COMPRESSION_TIMEOUT_SECONDS,
                 )
                 if result.messages != messages:
                     optimized_messages = result.messages
@@ -636,6 +679,7 @@ class GeminiHandlerMixin:
                     request_id=request_id,
                     provider=provider_name,
                     model=model,
+                    status_code=response.status_code,
                     original_tokens=original_tokens,
                     optimized_tokens=total_input_tokens,
                     output_tokens=output_tokens,
@@ -792,11 +836,21 @@ class GeminiHandlerMixin:
         if _decision.should_compress:
             try:
                 context_limit = self.openai_provider.get_context_limit(model)
-                result = self.openai_pipeline.apply(
-                    messages=messages,
-                    model=model,
-                    model_limit=context_limit,
-                    context=extract_user_query(messages),
+                # Richer conversion incl. functionResponse payloads so tool
+                # output reaches waste-signal detection (#819); telemetry-only.
+                waste_messages, _ = self._gemini_contents_to_messages(
+                    contents, system_instruction, include_function_responses=True
+                )
+                result = await self._run_compression_in_executor(
+                    lambda: self.openai_pipeline.apply(
+                        messages=messages,
+                        model=model,
+                        model_limit=context_limit,
+                        context=extract_user_query(messages),
+                        waste_messages=waste_messages,
+                        **proxy_pipeline_kwargs(self.config),
+                    ),
+                    timeout=COMPRESSION_TIMEOUT_SECONDS,
                 )
                 if result.messages != messages:
                     optimized_messages = result.messages
@@ -1049,11 +1103,15 @@ class GeminiHandlerMixin:
         if _decision.should_compress:
             try:
                 context_limit = self.openai_provider.get_context_limit(model)
-                result = self.openai_pipeline.apply(
-                    messages=messages,
-                    model=model,
-                    model_limit=context_limit,
-                    context=extract_user_query(messages),
+                result = await self._run_compression_in_executor(
+                    lambda: self.openai_pipeline.apply(
+                        messages=messages,
+                        model=model,
+                        model_limit=context_limit,
+                        context=extract_user_query(messages),
+                        **proxy_pipeline_kwargs(self.config),
+                    ),
+                    timeout=COMPRESSION_TIMEOUT_SECONDS,
                 )
                 if result.messages != messages:
                     optimized_messages = result.messages
@@ -1115,6 +1173,7 @@ class GeminiHandlerMixin:
                     request_id=request_id,
                     provider=provider_name,
                     model=model,
+                    status_code=response.status_code,
                     original_tokens=original_tokens,
                     optimized_tokens=compressed_tokens,
                     output_tokens=0,

@@ -164,7 +164,7 @@ def _load_custom_model_config() -> dict[str, Any]:
         try:
             # Check if it's a file path
             if os.path.isfile(env_config):
-                with open(env_config) as f:
+                with open(env_config, encoding="utf-8") as f:
                     loaded = json.load(f)
             else:
                 # Try to parse as JSON string
@@ -191,7 +191,7 @@ def _load_custom_model_config() -> dict[str, Any]:
             config_file = legacy_models
     if config_file.exists():
         try:
-            with open(config_file) as f:
+            with open(config_file, encoding="utf-8") as f:
                 loaded = json.load(f)
 
             openai_config = loaded.get("openai", {})
@@ -305,7 +305,14 @@ class OpenAITokenCounter:
         """Count tokens in text."""
         if not text:
             return 0
-        return len(self._encoding.encode(text))
+        try:
+            return len(self._encoding.encode(text))
+        except ValueError:
+            # Passthrough content can legitimately contain strings that look
+            # like tiktoken special tokens (e.g. "<|endoftext|>"). Treat them
+            # as ordinary text instead of raising. Matches
+            # AnthropicTokenCounter.count_text.
+            return len(self._encoding.encode(text, disallowed_special=()))
 
     def count_message(self, message: dict[str, Any]) -> int:
         """

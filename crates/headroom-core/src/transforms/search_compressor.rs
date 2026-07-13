@@ -652,10 +652,16 @@ impl SearchCompressor {
 /// 2. **Dash tier** — `-` is grep's *context*-line separator, and unlike
 ///    `:` it appears inside real paths (`2026-05-03`, `CVE-2021-44228`,
 ///    `20240101-002-add_users.sql`), so the leftmost triplet is often
-///    still inside the path. Walk rightward while the path part has no
-///    file extension, and stop at the first marker that gives it one:
-///    that marker is the path/body boundary. Bodies can be
-///    whitespace-free too, so whitespace alone cannot bound the walk.
+///    still inside the path. The scan therefore walks rightward — but it
+///    only advances past a marker on *positive* evidence that the path
+///    continues through it: either the path so far ends in a segment with
+///    an extension (that marker is the boundary — stop), or the rest of
+///    the token still holds a `/` (still inside the path — keep going).
+///    If the walk reaches the end of the token without ever finding that
+///    evidence, the line is genuinely ambiguous and the tier falls back
+///    to the leftmost marker — exactly what the permissive rule returns.
+///    So this tier is never worse than the rule it refines: on any line
+///    where it cannot prove it knows better, it agrees with it.
 /// 3. **Permissive tier** — the original leftmost-any rule, unchanged.
 ///    Only reached when neither tier matched (e.g. a path containing a
 ///    space), so behaviour for those lines is exactly as before.
@@ -684,6 +690,26 @@ fn last_segment_has_extension(path: &str) -> bool {
         .contains('.')
 }
 
+/// True when the token after this marker still carries *path structure* —
+/// a directory separator or an extension dot — before the next whitespace.
+///
+/// This is the positive evidence that the digits just matched were still
+/// inside the path rather than the line-number marker. Both forms occur:
+///
+/// ```text
+/// logs/2026-05-03/app.log             -> the path continues via `/`
+/// migrations/20240101-002-add_users.sql -> ...and here via `.`, same directory
+/// ```
+///
+/// Its absence is *not* proof of the opposite, which is why the caller
+/// falls back to the leftmost marker rather than reading "no evidence" as
+/// "keep walking".
+fn path_continues(rest: &str) -> bool {
+    rest.split_whitespace()
+        .next()
+        .is_some_and(|tok| tok.contains('/') || tok.contains('\\') || tok.contains('.'))
+}
+
 fn scan_match_line(line: &str, tier: ScanTier) -> Option<(&str, u64, &str)> {
     let bytes = line.as_bytes();
     // Windows drive prefix: starts with [A-Za-z]:[\\/]
@@ -699,10 +725,14 @@ fn scan_match_line(line: &str, tier: ScanTier) -> Option<(&str, u64, &str)> {
         0
     };
 
-    // Best candidate so far, as (path_end, digits_start, digits_end).
-    // The colon and permissive tiers keep the first hit; the dash tier
-    // keeps the last one inside the whitespace-free path token.
-    let mut best: Option<(usize, usize, usize)> = None;
+    // Candidates as (path_end, digits_start, digits_end).
+    //
+    // `first` is the leftmost marker — the answer the permissive
+    // leftmost-wins rule gives, and the fallback when the dash tier
+    // cannot prove a better one. `chosen` is a marker positively
+    // confirmed as the path/body boundary.
+    let mut first: Option<(usize, usize, usize)> = None;
+    let mut chosen: Option<(usize, usize, usize)> = None;
 
     let mut i = scan_start;
     while i < bytes.len() {
@@ -750,21 +780,36 @@ fn scan_match_line(line: &str, tier: ScanTier) -> Option<(&str, u64, &str)> {
                 if i == 0 {
                     return None;
                 }
-                best = Some((i, digits_start, j));
+                if first.is_none() {
+                    first = Some((i, digits_start, j));
+                }
                 if tier != ScanTier::Dash {
+                    chosen = Some((i, digits_start, j));
                     break;
                 }
-                // Dash tier: a marker whose path part ends in a segment
-                // carrying an extension IS the path/body boundary — take
-                // it. Otherwise the digits are still inside the path
-                // (`logs/2026-05-03/…`) and a later marker is the real
-                // one.
+                // Dash tier: advance past this marker only on *positive*
+                // evidence that the path runs through it. Stop when
+                // either
+                //   (a) the path so far ends in a segment with an
+                //       extension — that marker is the boundary
+                //       (`logs/2026-05-03/app.log-12-…`), or
+                //   (b) the rest of the token carries no further path
+                //       structure — no `/` and no `.` — so nothing
+                //       suggests the path continues
+                //       (`CHANGELOG-12-2026-05-03`).
+                // Otherwise the digits are still inside the path
+                // (`logs/2026` + `03/app.log…`) and a later marker is the
+                // real one.
                 //
-                // Without this the walk is bounded only by whitespace,
-                // and grep bodies are not guaranteed to contain any — so
-                // it runs past the path and latches onto a triplet in the
-                // *body* (`notes.md-3-see-4-here` -> path `notes.md-3-see`).
-                if last_segment_has_extension(&line[..i]) {
+                // Advancing on the *absence* of a stop signal is what
+                // breaks here: neither whitespace nor an extension is
+                // guaranteed to appear, so a walk bounded that way runs
+                // off the end of the path and latches onto a triplet in
+                // the *body* — silently, and for exactly the paths that
+                // carry no extension (`Makefile`, `Dockerfile`,
+                // `LICENSE`, `.github/workflows/ci`).
+                if last_segment_has_extension(&line[..i]) || !path_continues(&line[j + 1..]) {
+                    chosen = Some((i, digits_start, j));
                     break;
                 }
                 i = j + 1;
@@ -774,7 +819,11 @@ fn scan_match_line(line: &str, tier: ScanTier) -> Option<(&str, u64, &str)> {
         i += 1;
     }
 
-    let (path_end, digits_start, digits_end) = best?;
+    // Walked the whole token without ever confirming a boundary: the line
+    // is genuinely ambiguous (`Makefile-7-include-2-src/foo.mk`). Fall back
+    // to the leftmost marker — precisely what the leftmost-wins rule this
+    // tier refines would have returned.
+    let (path_end, digits_start, digits_end) = chosen.or(first)?;
     let line_no = std::str::from_utf8(&bytes[digits_start..digits_end])
         .ok()
         .and_then(|s| s.parse::<u64>().ok())?;
@@ -840,6 +889,68 @@ mod tests {
         assert_eq!(
             parse_line("CHANGELOG.md-7-v1-2-beta"),
             Some(("CHANGELOG.md".into(), 7, "v1-2-beta".into()))
+        );
+    }
+
+    #[test]
+    fn parses_context_line_for_extensionless_path() {
+        // Files with no extension are ordinary grep targets, and nothing in
+        // such a line ever gives the walk an extension to stop at. Bounding
+        // the walk on that signal alone splits the path *and* lifts the line
+        // number out of the body — silently. The tier must instead fall back
+        // to the leftmost marker for these.
+        for (line, file, no, body) in [
+            ("CHANGELOG-12-2026-05-03", "CHANGELOG", 12, "2026-05-03"),
+            (
+                "LICENSE-1-Copyright-2026-Acme",
+                "LICENSE",
+                1,
+                "Copyright-2026-Acme",
+            ),
+            ("Makefile-7-build-2-stage", "Makefile", 7, "build-2-stage"),
+            (
+                "Dockerfile-3-FROM-18-alpine",
+                "Dockerfile",
+                3,
+                "FROM-18-alpine",
+            ),
+            ("bin/run-3-exec-9-now", "bin/run", 3, "exec-9-now"),
+            (
+                ".github/workflows/ci-9-2026-01-02",
+                ".github/workflows/ci",
+                9,
+                "2026-01-02",
+            ),
+        ] {
+            assert_eq!(
+                parse_line(line),
+                Some((file.into(), no, body.into())),
+                "extension-less path mis-parsed: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn dated_dir_still_wins_for_an_extensionless_file() {
+        // The case this tier exists for and the case above, on one line: the
+        // walk must cross the dated directory (the rest of the token still
+        // has a `/`) and stop at `Makefile`, which has no extension to
+        // announce itself with.
+        assert_eq!(
+            parse_line("logs/2026-05-03/Makefile-12-all:"),
+            Some(("logs/2026-05-03/Makefile".into(), 12, "all:".into()))
+        );
+    }
+
+    #[test]
+    fn ambiguous_dash_line_falls_back_to_the_leftmost_marker() {
+        // No extension anywhere and a `/` still ahead: the walk never gets
+        // positive evidence either way. It must then return what the
+        // leftmost-wins rule returns rather than guessing — this tier is
+        // never worse than the rule it refines.
+        assert_eq!(
+            parse_line("Makefile-7-include-2-src/foo.mk"),
+            Some(("Makefile".into(), 7, "include-2-src/foo.mk".into()))
         );
     }
 

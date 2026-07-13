@@ -606,7 +606,7 @@ def _make_router_with_mock_compress(monkeypatch: pytest.MonkeyPatch) -> ContentR
         return SimpleNamespace(
             compressed=content[: len(content) // 2] + "[compressed]",
             compression_ratio=0.5,
-            strategy_used=SimpleNamespace(value="text"),
+            strategy_used=CompressionStrategy.TEXT,
         )
 
     monkeypatch.setattr(router, "compress", fake_compress)
@@ -676,6 +676,133 @@ def test_tool_result_cache_control_protected(monkeypatch: pytest.MonkeyPatch) ->
     )
     # cache_control hard-skip applies to tool_result too
     assert result["content"][0]["content"] == long_text
+
+
+def test_fresh_tail_tool_result_protected_from_compression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #3: the tail message (messages_from_end=1) is content the model
+    is about to read for the first time this exact request — SmartCrusher/
+    CCR substitution must not touch it, regardless of size or content type.
+    """
+    router = _make_router_with_mock_compress(monkeypatch)
+    long_text = "Z" * 1000
+    msg = {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "fresh", "content": long_text}],
+    }
+    counts: dict[str, int] = {}
+    result = router._process_content_blocks(
+        msg,
+        msg["content"],
+        "",
+        [],
+        set(),
+        route_counts=counts,
+        messages_from_end=1,
+    )
+    assert result["content"][0]["content"] == long_text
+    assert counts["recent_tool_result_protected"] == 1
+
+
+def _make_router_with_mock_smart_crusher_compress(
+    monkeypatch: pytest.MonkeyPatch, config: ContentRouterConfig | None = None
+) -> ContentRouter:
+    """Like `_make_router_with_mock_compress`, but the mocked `compress()`
+    reports `strategy_used=SMART_CRUSHER` — the strategy real tool_result
+    blocks actually route through. `TEXT`/`KOMPRESS`/`CODE_AWARE` are in
+    `LOSSY_UNMARKED_STRATEGIES`, which the reversibility guard (#1307)
+    rejects below `min_ratio` without a CCR marker present; `SMART_CRUSHER`
+    isn't in that set, so this mock's fixed 0.5 ratio doesn't trip it."""
+    router = ContentRouter(config or ContentRouterConfig())
+
+    def fake_compress(content, context: str = "", bias: float = 1.0):
+        return SimpleNamespace(
+            compressed=content[: len(content) // 2] + "[compressed]",
+            compression_ratio=0.5,
+            strategy_used=CompressionStrategy.SMART_CRUSHER,
+        )
+
+    monkeypatch.setattr(router, "compress", fake_compress)
+    return router
+
+
+def test_aged_tool_result_still_compresses_while_fresh_tail_is_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sibling case: an older message (messages_from_end > protect window)
+    is fully eligible for compression — the exemption only covers the tail,
+    it doesn't disable compression entirely."""
+    router = _make_router_with_mock_smart_crusher_compress(monkeypatch)
+    long_text = "Z" * 1000
+    msg = {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "aged", "content": long_text}],
+    }
+    counts: dict[str, int] = {}
+    result = router._process_content_blocks(
+        msg,
+        msg["content"],
+        "",
+        [],
+        set(),
+        route_counts=counts,
+        messages_from_end=2,
+    )
+    assert "[compressed]" in result["content"][0]["content"]
+    assert "recent_tool_result_protected" not in counts
+
+
+def test_unset_messages_from_end_does_not_trigger_freshness_protection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`messages_from_end` defaults to 0 (its "position unknown" sentinel).
+    Call sites that don't wire in a real position — direct unit tests, and
+    any future caller that doesn't track message order — must not have
+    every block silently protected as if it were the tail message."""
+    router = _make_router_with_mock_smart_crusher_compress(monkeypatch)
+    long_text = "Z" * 1000
+    msg = {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "unset", "content": long_text}],
+    }
+    counts: dict[str, int] = {}
+    result = router._process_content_blocks(
+        msg,
+        msg["content"],
+        "",
+        [],
+        set(),
+        route_counts=counts,
+        # messages_from_end intentionally omitted (defaults to 0)
+    )
+    assert "[compressed]" in result["content"][0]["content"]
+    assert "recent_tool_result_protected" not in counts
+
+
+def test_protect_recent_tool_results_zero_disables_freshness_protection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router = _make_router_with_mock_smart_crusher_compress(
+        monkeypatch, ContentRouterConfig(protect_recent_tool_results=0)
+    )
+    long_text = "Z" * 1000
+    msg = {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "tail", "content": long_text}],
+    }
+    counts: dict[str, int] = {}
+    result = router._process_content_blocks(
+        msg,
+        msg["content"],
+        "",
+        [],
+        set(),
+        route_counts=counts,
+        messages_from_end=1,
+    )
+    assert "[compressed]" in result["content"][0]["content"]
+    assert "recent_tool_result_protected" not in counts
 
 
 def test_assistant_text_blocks_skipped_by_default(

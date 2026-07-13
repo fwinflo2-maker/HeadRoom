@@ -5,8 +5,6 @@ Validates estimate_co2_saved_mg() and its presence in stats_preview().
 
 from __future__ import annotations
 
-import pytest
-
 from headroom.proxy.savings_tracker import estimate_co2_saved_mg
 
 
@@ -47,8 +45,10 @@ def test_large_savings_in_grams() -> None:
 
 def test_stats_preview_includes_co2() -> None:
     """stats_preview() must include a co2 block with co2_saved_mg."""
+    import pathlib
+    import tempfile
+
     from headroom.proxy.savings_tracker import SavingsTracker
-    import tempfile, pathlib
 
     with tempfile.TemporaryDirectory() as tmp:
         tracker = SavingsTracker(path=str(pathlib.Path(tmp) / "savings.json"))

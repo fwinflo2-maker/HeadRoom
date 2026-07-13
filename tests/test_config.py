@@ -336,6 +336,7 @@ class TestTransformResult:
             "cache_metrics",
             "timing",
             "waste_signals",
+            "protected_tool_result_contents",
         }
         assert field_names == expected_fields
 

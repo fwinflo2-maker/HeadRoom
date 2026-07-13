@@ -51,6 +51,22 @@ class TestTiktokenCounter:
         # gpt-4-turbo snapshots use cl100k_base.
         assert get_encoding_for_model("gpt-4-turbo-2099") == "cl100k_base"
 
+    def test_gpt41_and_o4_families_use_o200k(self):
+        """gpt-4.1 / gpt-4.5 / o4 use o200k_base, not cl100k_base.
+
+        Regression: gpt-4.1* and gpt-4.5* matched the broad "gpt-4" prefix and
+        resolved to cl100k_base, and o4* matched no prefix and fell to the
+        cl100k_base default — both wrong encodings for those models.
+        """
+        from headroom.tokenizers.tiktoken_counter import get_encoding_for_model
+
+        assert get_encoding_for_model("gpt-4.1") == "o200k_base"
+        assert get_encoding_for_model("gpt-4.1-mini") == "o200k_base"
+        assert get_encoding_for_model("gpt-4.5-preview") == "o200k_base"
+        assert get_encoding_for_model("o4-mini") == "o200k_base"
+        # A plain gpt-4 snapshot must still use cl100k_base (not shadowed).
+        assert get_encoding_for_model("gpt-4-0613") == "cl100k_base"
+
     def test_count_text_empty(self):
         """Test counting empty text."""
         counter = TiktokenCounter()
@@ -102,6 +118,43 @@ class TestTiktokenCounter:
         ]
         count = counter.count_messages(messages)
         assert count > 0
+
+    def test_count_messages_image_block_is_not_stringified(self):
+        """An Anthropic-style image block must be priced as an image, not text.
+
+        Over the wire the image arrives as a base64 string inside list content.
+        The old count_messages else-branch stringified any non-text/non-image_url
+        part and tokenized it as text, so a 1MB image counted as ~330K phantom
+        tokens. The base handler prices image blocks by a bounded estimate, so the
+        count must stay small regardless of the base64 payload size.
+        """
+        import base64
+
+        counter = TiktokenCounter()
+        blob = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 200_000).decode()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is in this screenshot?"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": blob,
+                        },
+                    },
+                ],
+            }
+        ]
+
+        count = counter.count_messages(messages)
+
+        # The base64 blob alone would be tens of thousands of text tokens; a
+        # bounded image estimate keeps the whole message well under that.
+        assert count < 5000, count
+        assert count < len(blob) // 10
 
     def test_encode_decode_roundtrip(self):
         """Test encode/decode roundtrip."""

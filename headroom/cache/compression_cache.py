@@ -48,8 +48,12 @@ def _extract_text_from_blocks(blocks: list) -> str | None:
     string.  This helper extracts text from ``type == "text"`` blocks and
     joins them.
     """
-    texts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
-    return "\n".join(t for t in texts if t) or None
+    texts = [
+        b.get("text", "")
+        for b in blocks
+        if isinstance(b, dict) and b.get("type") == "text"
+    ]
+    return "\n".join(t for t in texts if t != "") or None
 
 
 def _extract_tool_result_content(msg: dict) -> str | None:

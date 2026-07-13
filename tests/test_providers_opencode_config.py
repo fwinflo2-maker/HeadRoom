@@ -23,7 +23,9 @@ from headroom.providers.opencode.config import (
 
 
 def _expected_plugin_entry(port: int) -> list[object]:
-    return [[_resolve_plugin_spec(), {"proxyUrl": f"http://127.0.0.1:{port}", "mode": "native-fetch"}]]
+    return [
+        [_resolve_plugin_spec(), {"proxyUrl": f"http://127.0.0.1:{port}", "mode": "native-fetch"}]
+    ]
 
 
 def _set_test_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -495,9 +497,7 @@ def test_build_opencode_config_content_without_mcp() -> None:
     assert config == {}
 
 
-def test_build_launch_env_with_project(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_build_launch_env_with_project(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from headroom.providers.opencode.runtime import build_launch_env
 
     _set_test_home(monkeypatch, tmp_path)

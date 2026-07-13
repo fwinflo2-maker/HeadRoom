@@ -312,6 +312,7 @@ def test_register_server_with_env_vars(tmp_path: Path) -> None:
     assert data["mcp"]["headroom"]["type"] == "local"
     assert data["mcp"]["headroom"]["environment"] == {"HEADROOM_PROXY_URL": "http://127.0.0.1:9090"}
 
+
 def test_register_then_re_register_with_different_env_returns_mismatch(tmp_path: Path) -> None:
     """Re-registering with different env returns MISMATCH without force."""
     registrar = _registrar(tmp_path)

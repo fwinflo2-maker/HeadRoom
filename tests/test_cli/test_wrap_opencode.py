@@ -15,12 +15,24 @@ from headroom.providers.opencode.config import _resolve_plugin_spec
 
 
 def _expected_plugin_entry(port: int) -> list[object]:
-    return [[_resolve_plugin_spec(), {"proxyUrl": f"http://127.0.0.1:{port}", "mode": "native-fetch"}]]
+    return [
+        [_resolve_plugin_spec(), {"proxyUrl": f"http://127.0.0.1:{port}", "mode": "native-fetch"}]
+    ]
 
 
 @pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _stub_proxy_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep wrap-opencode CLI tests from starting a real proxy process."""
+
+    monkeypatch.setattr(wrap_mod, "_ensure_proxy", lambda port, _no_proxy, **_kw: (None, port))
+    monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda _port: None)
+    monkeypatch.setattr(wrap_mod, "_unregister_proxy_client", lambda _port: None)
+    monkeypatch.setattr(wrap_mod, "_live_proxy_clients", lambda _port, exclude_self=True: [])
 
 
 def _set_test_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -366,8 +378,12 @@ def test_wrap_opencode_port_change_updates_existing_config(
     with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
         with patch.object(wrap_mod, "_launch_tool", side_effect=SystemExit(0)):
             with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
-                runner.invoke(main, ["wrap", "opencode", "--port", "9000", "--no-mcp", "--no-serena"])
-                runner.invoke(main, ["wrap", "opencode", "--port", "9001", "--no-mcp", "--no-serena"])
+                runner.invoke(
+                    main, ["wrap", "opencode", "--port", "9000", "--no-mcp", "--no-serena"]
+                )
+                runner.invoke(
+                    main, ["wrap", "opencode", "--port", "9001", "--no-mcp", "--no-serena"]
+                )
 
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
     assert not config_file.exists()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import click
@@ -55,7 +56,8 @@ def test_find_toolset_walks_up_from_subdirectory(tmp_path: Path) -> None:
 
     assert toolset is not None
     assert toolset.repo_root == tmp_path
-    assert toolset.entrypoint == tmp_path / ".ctx" / "ctx"
+    expected_entrypoint = tmp_path / ".ctx" / ("ctx.cmd" if os.name == "nt" else "ctx")
+    assert toolset.entrypoint == expected_entrypoint
     assert toolset.contract_version == "0.1"
     assert sorted(toolset.commands) == ["find", "map"]
 

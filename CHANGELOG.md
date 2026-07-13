@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- **paths:** reject `.`, `..`, and NUL as plugin names so `plugin_config_dir` / `plugin_workspace_dir` cannot resolve outside the `plugins/` sandbox. Previously `plugin_config_dir("..")` returned the entire config root and `plugin_workspace_dir("..")` returned the workspace root (savings ledger, memory DB, license cache, logs).
 - **install:** include `orjson` in the `[proxy]` extra so `uv tool install "headroom-ai[all]"` satisfies LiteLLM OpenRouter/provider backends that import it at runtime ([#2056](https://github.com/headroomlabs-ai/headroom/issues/2056)).
 - The dashboard's per-request metadata (the `recent_requests` / `request_logs`
   tail and the `config` block with upstream URLs) is gated to loopback callers

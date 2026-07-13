@@ -1522,7 +1522,13 @@ def merge_extra_headers(headers: dict[str, str], extra: dict[str, str] | None) -
     """
     if not extra:
         return headers
-    return {**headers, **extra}
+    # HTTP header names are case-insensitive: drop any existing key that
+    # case-insensitively collides with a configured extra so the extra wins.
+    # A plain {**headers, **extra} would emit both casings upstream.
+    lowered = {k.lower() for k in extra}
+    merged = {k: v for k, v in headers.items() if k.lower() not in lowered}
+    merged.update(extra)
+    return merged
 
 
 def log_outbound_headers(

@@ -83,6 +83,18 @@ class TestValidation:
             settings_store.save({"rpm": "abc"})
         assert "rpm" in exc.value.field_errors
 
+    def test_save_rejects_non_finite_float(self, workspace):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(settings_store.SettingsValidationError) as exc:
+                settings_store.save({"budget": bad})
+            assert "budget" in exc.value.field_errors
+
+    def test_optional_bool_empty_string_coerces_to_none(self, workspace):
+        # Empty optional-bool means "inherit" -> dropped, not forced to False.
+        assert settings_store.validate({"disable_kompress_anthropic": ""}) == {}
+        # A plain bool empty string still coerces to False.
+        assert settings_store.validate({"disable_kompress": ""}) == {"disable_kompress": False}
+
 
 class TestFailOpen:
     def test_corrupt_json_returns_empty(self, workspace):

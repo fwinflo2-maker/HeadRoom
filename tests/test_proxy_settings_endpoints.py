@@ -141,6 +141,9 @@ class TestLoopbackGating:
         assert network_client.post("/settings", json={"values": {}}).status_code == 404
         assert network_client.post("/settings/apply", json={}).status_code == 404
 
+    def test_settings_page_rejected_off_loopback(self, network_client):
+        assert network_client.get("/dashboard/settings").status_code == 404
+
 
 class TestSameOriginGuard:
     """CSRF: a same-machine (loopback) attacker page can still send a

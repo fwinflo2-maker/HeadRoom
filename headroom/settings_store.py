@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import tempfile
 from dataclasses import dataclass
@@ -29,44 +30,6 @@ from headroom import paths
 logger = logging.getLogger(__name__)
 
 _MASK = "••••••"  # ●●●●●● for masked secret values
-
-
-class SettingsStore:
-    """Instance-based settings store for a workspace directory."""
-
-    def __init__(self, workspace_dir: str | Path) -> None:
-        """Initialize settings store for a specific workspace directory."""
-        self.workspace_dir = Path(workspace_dir)
-        self.settings_file = self.workspace_dir / "settings.json"
-
-    def load(self) -> dict[str, Any]:
-        """Load settings from workspace settings.json."""
-        if not self.settings_file.exists():
-            return {}
-        try:
-            return json.loads(self.settings_file.read_text())
-        except (json.JSONDecodeError, OSError):
-            return {}
-
-    def save(self, values: dict[str, Any]) -> None:
-        """Save settings to workspace settings.json."""
-        validated = validate(values)
-        self.workspace_dir.mkdir(parents=True, exist_ok=True)
-        serialized = {k: _serialize(f, validated[k]) for k, f in _BY_KEY.items() if k in validated}
-        _atomic_write_text(self.settings_file, json.dumps(serialized, indent=2))
-
-    def validate(self, values: dict[str, Any]) -> dict[str, Any]:
-        """Validate and coerce settings values."""
-        return validate(values)
-
-    def load_schema_with_secrets_masked(self) -> dict[str, Any]:
-        """Load stored values with secrets masked for display."""
-        stored = self.load()
-        result = {}
-        for field in SETTINGS:
-            if field.key in stored:
-                result[field.key] = _mask(field, stored[field.key])
-        return result
 
 
 @dataclass(frozen=True)
@@ -467,8 +430,9 @@ class SettingsValidationError(Exception):
 def _coerce(field: SettingField, value: Any) -> Any:
     """Coerce a raw JSON/env value to the field's Python type.
 
-    Returns ``None`` for null/empty. Raises ``ValueError`` on bad input so
-    callers can surface a per-field message.
+    Returns ``None`` for null and empty values (empty coerces to ``None`` for
+    every type except a plain ``bool``, which becomes ``False``). Raises
+    ``ValueError`` on bad input so callers can surface a per-field message.
     """
     if value is None:
         return None
@@ -476,6 +440,8 @@ def _coerce(field: SettingField, value: Any) -> Any:
         if isinstance(value, bool):
             return value
         token = str(value).strip().lower()
+        if field.type == "optional-bool" and token == "":
+            return None
         if token in ("1", "true", "yes", "on"):
             return True
         if token in ("0", "false", "no", "off", ""):
@@ -490,6 +456,8 @@ def _coerce(field: SettingField, value: Any) -> Any:
             number = int(value)
         else:
             number = float(value)
+            if not math.isfinite(number):
+                raise ValueError(f"expected a finite number, got {value!r}")
         if field.minimum is not None and number < field.minimum:
             raise ValueError(f"must be >= {field.minimum}")
         if field.maximum is not None and number > field.maximum:

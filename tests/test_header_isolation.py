@@ -34,6 +34,7 @@ from fastapi.testclient import TestClient
 from headroom.proxy.helpers import (
     _strip_internal_headers,
     get_strip_internal_headers_mode,
+    merge_extra_headers,
 )
 from headroom.proxy.server import ProxyConfig, create_app
 
@@ -619,3 +620,19 @@ def test_anthropic_no_extra_headers_configured_is_unchanged() -> None:
     upstream = {k.lower(): v for k, v in transport.captured_headers.items()}
     assert upstream.get("x-api-key") == "client-key"
     assert "x-gateway-id" not in upstream
+
+
+def test_merge_extra_headers_overrides_case_insensitively() -> None:
+    """A configured extra header wins even when the client used different casing."""
+    out = merge_extra_headers(
+        {"Authorization": "client", "keep": "v"}, {"authorization": "gateway"}
+    )
+    assert out == {"authorization": "gateway", "keep": "v"}
+    # Exactly one authorization header survives (no duplicate casings upstream).
+    assert [k for k in out if k.lower() == "authorization"] == ["authorization"]
+
+
+def test_merge_extra_headers_none_returns_same_object() -> None:
+    """No configured extras -> caller's dict is returned unchanged (no copy)."""
+    headers = {"a": "b"}
+    assert merge_extra_headers(headers, None) is headers

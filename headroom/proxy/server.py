@@ -3058,7 +3058,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         result = install_runtime.restart_current_deployment()
         return JSONResponse(status_code=200, content=result)
 
-    @app.get("/dashboard/settings", response_class=HTMLResponse)
+    @app.get("/dashboard/settings", response_class=HTMLResponse, dependencies=[Depends(_require_loopback)])
     async def dashboard_settings():
         """Serve the Headroom settings GUI."""
         from headroom.dashboard import get_settings_html

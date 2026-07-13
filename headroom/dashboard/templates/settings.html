@@ -221,7 +221,8 @@
                         const data = await res.json();
                         if (res.status === 200) {
                             this.status = 'Saved.';
-                            this.banner = 'Restart required to apply: ' + (data.changed_keys || []).join(', ');
+                            const changed = data.changed_keys || [];
+                            this.banner = changed.length ? ('Restart required to apply: ' + changed.join(', ')) : 'Saved — no changes to apply.';
                             this.applyMode = ''; this.applyCommand = '';
                             this.clearedKeys = {};
                         } else if (res.status === 422) {

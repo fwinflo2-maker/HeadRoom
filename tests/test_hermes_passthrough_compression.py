@@ -431,3 +431,54 @@ def test_hermes_adapter_preserves_structured_messages_when_compressor_changes_ou
     assert messages[0]["content"] == "compressed"
     assert messages[1] == original["messages"][1]
     assert messages[2] == original["messages"][2]
+
+
+def test_codex_adapter_compresses_canonical_responses_input_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, list[dict[str, Any]]] = {}
+
+    def fake_compress(*, messages: list[dict[str, Any]], **_: Any):
+        class Result:
+            pass
+
+        seen["messages"] = messages
+        result = Result()
+        result.messages = [
+            {
+                **messages[0],
+                "content": [{**messages[0]["content"][0], "text": "compressed prompt"}],
+            }
+        ]
+        return result
+
+    monkeypatch.setattr("headroom.compress", fake_compress)
+    original = {
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "metadata": {"source": "codex"},
+                "content": [{"type": "input_text", "text": "long prompt", "annotations": []}],
+            }
+        ],
+    }
+    body = json.dumps(original).encode()
+
+    transformed = compress_scoped_passthrough_body(
+        "/api/codex-proxy/session/v1/responses", body, optimize=True, bypass=False
+    )
+
+    assert transformed != body
+    assert seen["messages"][0]["type"] == "message"
+    assert seen["messages"][0]["content"] == [
+        {"type": "text", "text": "long prompt", "annotations": []}
+    ]
+    forwarded = json.loads(transformed)["input"][0]
+    assert forwarded == {
+        "type": "message",
+        "role": "user",
+        "metadata": {"source": "codex"},
+        "content": [{"type": "input_text", "text": "compressed prompt", "annotations": []}],
+    }

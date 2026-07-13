@@ -90,17 +90,12 @@ def _swap_tool_result_content(msg: dict, new_content: str) -> dict:
             if isinstance(block, dict) and block.get("type") == "tool_result":
                 inner = block.get("content")
                 if isinstance(inner, list):
-                    # Preserve list-of-blocks structure: replace text in the
-                    # first text block rather than overwriting the list with a
-                    # plain string, so the message format round-trips cleanly.
-                    replaced = False
-                    for b in inner:
-                        if isinstance(b, dict) and b.get("type") == "text":
-                            b["text"] = new_content
-                            replaced = True
-                            break
-                    if not replaced:
-                        inner.insert(0, {"type": "text", "text": new_content})
+                    # Collapse list-of-blocks to a single text block.
+                    # The compressed content is a single string; preserving
+                    # multiple text blocks would produce a different joined
+                    # output on re-extraction (first text block replaced,
+                    # remaining text blocks still joined).
+                    block["content"] = [{"type": "text", "text": new_content}]
                 else:
                     block["content"] = new_content
                 break

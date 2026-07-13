@@ -53,6 +53,21 @@ class _MemoryHandler:
         ]
 
 
+def _expected_memory_response_tools() -> list[dict[str, object]]:
+    expected: list[dict[str, object]] = []
+    for tool in _MemoryHandler().compute_memory_tool_definitions("openai"):
+        function = tool["function"]
+        expected.append(
+            {
+                "type": "function",
+                "name": function["name"],
+                "description": function["description"],
+                "parameters": function["parameters"],
+            }
+        )
+    return expected
+
+
 def _turn(text: str) -> str:
     return json.dumps({"type": "response.create", "response": {"input": text}})
 
@@ -114,6 +129,18 @@ class _FlakyMemoryHandler(_MemoryHandler):
         return f"current memory: {current_turn}"
 
 
+class _ToolFailingMemoryHandler(_MemoryHandler):
+    def __init__(self) -> None:
+        super().__init__()
+        self._fail_next_tools = True
+
+    def compute_memory_tool_definitions(self, _provider):
+        if self._fail_next_tools:
+            self._fail_next_tools = False
+            raise RuntimeError("memory tool preparation failed")
+        return super().compute_memory_tool_definitions(_provider)
+
+
 @pytest.mark.asyncio
 async def test_memory_lookup_runs_for_each_issue_artifact_frame_and_preserves_non_create_frames():
     upstream = _FakeUpstream(
@@ -144,9 +171,41 @@ async def test_memory_lookup_runs_for_each_issue_artifact_frame_and_preserves_no
     ]
     assert f"current memory: {first_input}" in forwarded_turns[0]["response"]["input"]
     assert f"current memory: {later_input}" in forwarded_turns[1]["response"]["input"]
+    expected_tools = _expected_memory_response_tools()
     for frame in forwarded_turns:
-        names = [tool.get("name") for tool in frame["response"]["tools"]]
-        assert len(names) == len(set(names))
+        assert frame["response"]["tools"] == expected_tools
+    assert forwarded_turns[0]["response"]["tools"] == forwarded_turns[1]["response"]["tools"]
+
+
+@pytest.mark.asyncio
+async def test_memory_lookup_skips_input_bearing_non_create_first_frame():
+    upstream = _FakeUpstream(
+        [
+            json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+            json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
+        ]
+    )
+    _first_input, later_input = _issue_2059_inputs()
+    cancel_frame = json.dumps(
+        {
+            "type": "response.cancel",
+            "response_id": "r_1",
+            "input": "must not query",
+        }
+    )
+    later_turn = _issue_2059_turns()[1]
+    client_ws = _FakeWebSocket(frames=[cancel_frame, later_turn])
+    handler = _DummyOpenAIHandler()
+    memory = _MemoryHandler()
+    handler.memory_handler = memory
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert memory.queries == [later_input]
+    assert upstream.sent[0] == cancel_frame
+    forwarded_later = json.loads(upstream.sent[1])
+    assert f"current memory: {later_input}" in forwarded_later["response"]["input"]
 
 
 @pytest.mark.asyncio
@@ -229,6 +288,36 @@ async def test_memory_lookup_fails_open_and_recovers_on_later_frame():
     client_ws = _FakeWebSocket(frames=[first, later], hold_after_initial=True)
     handler = _DummyOpenAIHandler()
     memory = _FlakyMemoryHandler(fail_on={first_input})
+    handler.memory_handler = memory
+
+    async def _trigger() -> None:
+        await asyncio.sleep(0.05)
+        client_ws.trigger_disconnect()
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        trigger_task = asyncio.create_task(_trigger())
+        try:
+            await handler.handle_openai_responses_ws(client_ws)
+        finally:
+            trigger_task.cancel()
+            try:
+                await trigger_task
+            except asyncio.CancelledError:
+                pass
+
+    assert memory.queries == [first_input, later_input]
+    assert upstream.sent[0] == first
+    assert f"current memory: {later_input}" in json.loads(upstream.sent[1])["response"]["input"]
+
+
+@pytest.mark.asyncio
+async def test_memory_lookup_fails_open_when_tool_preparation_raises():
+    first, later = _issue_2059_turns()
+    first_input, later_input = _issue_2059_inputs()
+    upstream = _FakeUpstream([], hold_after_events=True)
+    client_ws = _FakeWebSocket(frames=[first, later], hold_after_initial=True)
+    handler = _DummyOpenAIHandler()
+    memory = _ToolFailingMemoryHandler()
     handler.memory_handler = memory
 
     async def _trigger() -> None:

@@ -5540,7 +5540,7 @@ class OpenAIHandlerMixin:
                     return frame_raw
 
             if isinstance(body, dict) and (
-                body.get("type") == "response.create" or "input" in body
+                body.get("type") == "response.create" or ("type" not in body and "input" in body)
             ):
                 first_msg_raw = await _prepare_memory_frame(body, first_msg_raw)
 

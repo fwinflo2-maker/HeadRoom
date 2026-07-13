@@ -4,6 +4,15 @@ var __export = (target, all) => {
     __defProp(target, name, { get: all[name], enumerable: true });
 };
 
+// src/urls.ts
+function stripTrailingSlashes(url2) {
+  let end = url2.length;
+  while (end > 0 && url2.charCodeAt(end - 1) === 47) {
+    end -= 1;
+  }
+  return url2.slice(0, end);
+}
+
 // src/retrieve.ts
 var _proxyUrlCache = null;
 function setDefaultProxyUrl(url2) {
@@ -13,7 +22,7 @@ function getDefaultProxyUrl() {
   return _proxyUrlCache ?? process.env.HEADROOM_BASE_URL ?? "http://localhost:8787";
 }
 function createHeadroomRetrieveTool(config2) {
-  const origin = config2.proxyBaseUrl.replace(/\/+$/, "");
+  const origin = stripTrailingSlashes(config2.proxyBaseUrl);
   return {
     name: "headroom_retrieve",
     description: "Retrieve original uncompressed content from Headroom's compression store. Use when compressed context mentions a hash and you need the full details. Pass the hash from the compression marker (24 hex characters). Retrieval is by hash and always returns the full original content.",
@@ -12769,7 +12778,7 @@ config(en_default());
 
 // src/plugin.ts
 function normalizeProxyUrl2(url2) {
-  return url2.replace(/\/+$/, "");
+  return stripTrailingSlashes(url2);
 }
 function resolveProxyUrl(options) {
   return normalizeProxyUrl2(
@@ -12945,6 +12954,7 @@ var HeadroomPlugin = async (input, options = {}) => {
 };
 
 export {
+  stripTrailingSlashes,
   setDefaultProxyUrl,
   getDefaultProxyUrl,
   createHeadroomRetrieveTool,
@@ -12952,4 +12962,4 @@ export {
   installHeadroomTransport,
   HeadroomPlugin
 };
-//# sourceMappingURL=chunk-FNAHHECN.js.map
+//# sourceMappingURL=chunk-O36TDGAF.js.map

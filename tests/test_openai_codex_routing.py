@@ -115,7 +115,9 @@ def test_resolve_openai_upstream_base_url_prefers_headroom_override() -> None:
 
 
 def test_resolve_openai_upstream_base_url_falls_back_to_default() -> None:
-    assert _resolve_openai_upstream_base_url({}, "https://api.openai.com/") == "https://api.openai.com"
+    assert (
+        _resolve_openai_upstream_base_url({}, "https://api.openai.com/") == "https://api.openai.com"
+    )
 
 
 def test_openai_responses_unit_cache_key_includes_target_ratio() -> None:

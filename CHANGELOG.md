@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- **compress:** stop mutating the caller's `CompressConfig`. `compress(config=my_cfg, protect_recent=0, target_ratio=0.2)` used to write those kwargs onto `my_cfg`, so a shared per-agent config was silently rewritten by every request that overrode a single option.
 - **install:** include `orjson` in the `[proxy]` extra so `uv tool install "headroom-ai[all]"` satisfies LiteLLM OpenRouter/provider backends that import it at runtime ([#2056](https://github.com/headroomlabs-ai/headroom/issues/2056)).
 - The dashboard's per-request metadata (the `recent_requests` / `request_logs`
   tail and the `config` block with upstream URLs) is gated to loopback callers

@@ -15,6 +15,7 @@ from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
     _decode_openai_bearer_payload,
     _passthrough_usage_from_json,
+    _prefers_http1_passthrough,
 )
 from headroom.proxy.helpers import _headroom_bypass_enabled
 from headroom.proxy.server import HeadroomProxy
@@ -51,10 +52,35 @@ class _TimeoutHttpClient:
         raise httpx.ConnectTimeout("connect timed out")
 
 
+class _RecordingHttpClient:
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.calls = 0
+
+    async def request(self, **kwargs):  # noqa: ANN001, ANN201
+        self.calls += 1
+        request = httpx.Request(kwargs["method"], kwargs["url"])
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "application/json"},
+            json={"client": self.label},
+        )
+
+
+class _ChatGPTAccountRequest:
+    method = "GET"
+    headers = {}
+    url = SimpleNamespace(path="/backend-api/me", query="")
+
+    async def body(self) -> bytes:
+        return b""
+
+
 class _PassthroughRequest:
     method = "GET"
     headers = {}
-    url = SimpleNamespace(path="/favicon.ico", query="")
+    url = SimpleNamespace(path="/some/other/path", query="")
 
     async def body(self) -> bytes:
         return b""
@@ -168,10 +194,11 @@ class _RetryThenSuccessClient:
     def __init__(self) -> None:
         self.attempts = 0
 
-    async def post(self, url, content, headers):  # noqa: ANN001, ANN201
+    async def post(self, url, content, headers, timeout=None):  # noqa: ANN001, ANN201
         self.attempts += 1
         if self.attempts == 1:
             raise httpx.ConnectTimeout("connect timed out")
+        del timeout
         request = httpx.Request("POST", url, headers=headers, content=content)
         return httpx.Response(200, request=request, content=b"{}")
 
@@ -190,6 +217,27 @@ def test_openai_handler_prefix_helpers_cover_edge_cases() -> None:
     assert (
         OpenAIHandlerMixin._strict_previous_turn_frozen_count(
             [{"role": "assistant"}, {"role": "user"}],
+            0,
+        )
+        == 1
+    )
+    assert (
+        OpenAIHandlerMixin._strict_previous_turn_frozen_count(
+            [{"role": "assistant"}, {"role": "tool", "content": "observation"}],
+            0,
+        )
+        == 1
+    )
+    assert (
+        OpenAIHandlerMixin._strict_previous_turn_frozen_count(
+            [{"role": "user"}, {"role": "assistant"}, {"role": "tool", "content": "obs"}],
+            3,
+        )
+        == 2
+    )
+    assert (
+        OpenAIHandlerMixin._strict_previous_turn_frozen_count(
+            [{"role": "assistant"}, {"role": "function", "content": "legacy observation"}],
             0,
         )
         == 1
@@ -247,6 +295,61 @@ def test_openai_passthrough_connect_timeout_returns_502() -> None:
     payload = json.loads(response.body)
     assert payload["error"]["type"] == "connection_error"
     assert "Failed to connect to upstream API" in payload["error"]["message"]
+
+
+def test_prefers_http1_passthrough_matches_chatgpt_hosts_only() -> None:
+    assert _prefers_http1_passthrough("https://chatgpt.com") is True
+    assert _prefers_http1_passthrough("https://chatgpt.com/backend-api/me") is True
+    assert _prefers_http1_passthrough("https://api.chatgpt.com") is True
+    assert _prefers_http1_passthrough("https://CHATGPT.COM/backend-api/me") is True
+    assert _prefers_http1_passthrough("https://api.openai.com") is False
+    assert _prefers_http1_passthrough("https://notchatgpt.com") is False
+    assert _prefers_http1_passthrough("https://chatgpt.com.evil.com") is False
+    assert _prefers_http1_passthrough("") is False
+
+
+def test_chatgpt_passthrough_uses_http1_client() -> None:
+    handler = object.__new__(OpenAIHandlerMixin)
+    handler.http_client = _RecordingHttpClient("h2")
+    handler.http_client_h1 = _RecordingHttpClient("h1")
+
+    response = asyncio.run(
+        handler.handle_passthrough(_ChatGPTAccountRequest(), "https://chatgpt.com")
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["client"] == "h1"
+    assert handler.http_client.calls == 0
+    assert handler.http_client_h1.calls == 1
+
+
+def test_non_chatgpt_passthrough_uses_default_client() -> None:
+    handler = object.__new__(OpenAIHandlerMixin)
+    handler.http_client = _RecordingHttpClient("h2")
+    handler.http_client_h1 = _RecordingHttpClient("h1")
+
+    response = asyncio.run(
+        handler.handle_passthrough(_PassthroughRequest(), "https://api.openai.com")
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["client"] == "h2"
+    assert handler.http_client.calls == 1
+    assert handler.http_client_h1.calls == 0
+
+
+def test_chatgpt_passthrough_falls_back_when_h1_client_missing() -> None:
+    handler = object.__new__(OpenAIHandlerMixin)
+    handler.http_client = _RecordingHttpClient("h2")
+    handler.http_client_h1 = None
+
+    response = asyncio.run(
+        handler.handle_passthrough(_ChatGPTAccountRequest(), "https://chatgpt.com")
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["client"] == "h2"
+    assert handler.http_client.calls == 1
 
 
 def test_passthrough_usage_normalizes_vertex_usage_metadata() -> None:
@@ -473,6 +576,51 @@ def test_retry_request_retries_connect_timeout() -> None:
     assert proxy.http_client.attempts == 2
 
 
+def test_retry_request_returns_503_when_shutdown_interrupts_retry_sleep() -> None:
+    class _Always429Client:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def post(self, url, **kwargs):  # type: ignore[no-untyped-def]
+            self.attempts += 1
+            return httpx.Response(
+                429,
+                request=httpx.Request("POST", url),
+                json={"error": {"message": "slow down"}},
+                headers={"retry-after": "30"},
+            )
+
+    proxy = object.__new__(HeadroomProxy)
+    proxy.http_client = _Always429Client()
+    proxy.config = SimpleNamespace(
+        retry_enabled=True,
+        retry_max_attempts=3,
+        retry_base_delay_ms=30000,
+        retry_max_delay_ms=30000,
+    )
+    proxy._shutdown_event = asyncio.Event()
+    proxy._shutdown_event.set()
+
+    response = asyncio.run(
+        proxy._retry_request(
+            "POST",
+            "https://api.anthropic.test/v1/messages",
+            {},
+            {"model": "claude-3-5-sonnet"},
+        )
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": {
+            "type": "shutdown",
+            "message": "Proxy is shutting down; retry backoff cancelled.",
+        }
+    }
+    assert response.headers["retry-after"] == "0"
+    assert proxy.http_client.attempts == 1
+
+
 def test_anthropic_tool_sort_and_context_append_helpers() -> None:
     tools = [
         {"type": "function", "function": {"name": "beta"}},
@@ -488,6 +636,15 @@ def test_anthropic_tool_sort_and_context_append_helpers() -> None:
         "tool",
     ]
     assert AnthropicHandlerMixin._sort_tools_deterministically(None) is None
+    assert AnthropicHandlerMixin._tools_for_forwarding(tools, preserve_order=True) == tools
+    assert [
+        AnthropicHandlerMixin._tool_sort_key(tool)[0]
+        for tool in AnthropicHandlerMixin._tools_for_forwarding(tools, preserve_order=False) or []
+    ] == [
+        "alpha",
+        "beta",
+        "tool",
+    ]
     assert (
         AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn(
             [], "ctx", frozen_message_count=0
@@ -741,3 +898,163 @@ def test_resolve_ccr_workspace_malformed_request_returns_empty() -> None:
     key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
     assert key == ""
     assert label is None
+
+
+class TestHasNewCcrMarkers:
+    """#1850: replayed (overlay) markers must not count as new-this-turn.
+
+    ``overlay_cached_prefix`` replays the previously-forwarded compressed prefix
+    byte-identical to keep the messages cache warm — which reintroduces its old
+    ``hash=…`` markers. If those replayed markers counted as "new", the handler
+    would re-inject the retrieve tool every frozen turn and bust the *tools*
+    cache. ``has_new_ccr_markers`` filters them out.
+    """
+
+    @staticmethod
+    def _hashes(*contents: str) -> list[str]:
+        from headroom.ccr.tool_injection import CCRToolInjector
+
+        inj = CCRToolInjector(
+            provider="anthropic", inject_tool=False, inject_system_instructions=False
+        )
+        inj.scan_for_markers([{"role": "user", "content": c} for c in contents])
+        return inj.detected_hashes
+
+    def test_replayed_markers_are_not_new(self):
+        from headroom.proxy.helpers import has_new_ccr_markers
+
+        marker = "[100 items compressed to 10. Retrieve more: hash=abc123def456abc123def456]"
+        current = self._hashes(marker)
+        assert current, "sanity: the marker must be detected"
+        # Every marker was already in what we forwarded last turn → nothing new.
+        assert (
+            has_new_ccr_markers(
+                current_detected_hashes=current,
+                previous_forwarded_messages=[{"role": "user", "content": marker}],
+                provider="anthropic",
+            )
+            is False
+        )
+
+    def test_genuinely_new_marker_is_detected(self):
+        from headroom.proxy.helpers import has_new_ccr_markers
+
+        old = "[100 items compressed to 10. Retrieve more: hash=abc123def456abc123def456]"
+        new = "[50 items compressed to 5. Retrieve more: hash=deadbeefdeadbeefdeadbeef]"
+        current = self._hashes(old, new)
+        # Only `old` was forwarded before; `new` is fresh → override must fire.
+        assert (
+            has_new_ccr_markers(
+                current_detected_hashes=current,
+                previous_forwarded_messages=[{"role": "user", "content": old}],
+                provider="anthropic",
+            )
+            is True
+        )
+
+    def test_no_previous_forward_means_all_new(self):
+        from headroom.proxy.helpers import has_new_ccr_markers
+
+        marker = "[100 items compressed to 10. Retrieve more: hash=abc123def456abc123def456]"
+        assert (
+            has_new_ccr_markers(
+                current_detected_hashes=self._hashes(marker),
+                previous_forwarded_messages=None,
+                provider="anthropic",
+            )
+            is True
+        )
+
+    def test_no_markers_means_nothing_new(self):
+        from headroom.proxy.helpers import has_new_ccr_markers
+
+        assert (
+            has_new_ccr_markers(
+                current_detected_hashes=[],
+                previous_forwarded_messages=None,
+                provider="anthropic",
+            )
+            is False
+        )
+
+
+def test_strict_frozen_count_tool_and_function_tail_are_mutable():
+    # OpenAI function-calling harnesses (Kimi / fireworks) end each turn with a
+    # role:"tool" (or legacy role:"function") observation — NOT role:"user".
+    # Gating the mutable tail on role=="user" froze the whole conversation on
+    # every such turn => zero compression. Tool/function observations must be
+    # treated as the mutable delta (freeze all-but-last), like a user obs.
+    from headroom.proxy.handlers.openai import OpenAIHandlerMixin as M
+
+    # role:tool tail -> only the last message is mutable (frozen = final_idx)
+    assert (
+        M._strict_previous_turn_frozen_count(
+            [{"role": "user"}, {"role": "assistant"}, {"role": "tool"}], 0
+        )
+        == 2
+    )
+    assert (
+        M._strict_previous_turn_frozen_count(
+            [{"role": "user"}, {"role": "assistant"}, {"role": "function"}], 0
+        )
+        == 2
+    )
+    # assistant/system tail is NOT an observation -> freeze everything
+    assert (
+        M._strict_previous_turn_frozen_count(
+            [{"role": "user"}, {"role": "tool"}, {"role": "assistant"}], 0
+        )
+        == 3
+    )
+
+
+class _ClientDisconnectRequest:
+    """Mock request whose body() raises ClientDisconnect to simulate mid-stream cancel."""
+
+    method = "POST"
+    headers = {"content-type": "application/json"}
+    url = SimpleNamespace(path="/v1/chat/completions", query="")
+
+    async def body(self) -> bytes:
+        from starlette.requests import ClientDisconnect
+
+        raise ClientDisconnect()
+
+
+class _ClientDisconnectStreamRequest:
+    """Mock request for streaming passthrough with ClientDisconnect."""
+
+    method = "POST"
+    headers = {"content-type": "application/json"}
+    url = SimpleNamespace(
+        path="/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:streamGenerateContent",
+        query="alt=sse",
+    )
+
+    async def body(self) -> bytes:
+        from starlette.requests import ClientDisconnect
+
+        raise ClientDisconnect()
+
+
+def test_handle_passthrough_client_disconnect():
+    """ClientDisconnect during body read returns 204 instead of crashing TaskGroup."""
+    handler = object.__new__(OpenAIHandlerMixin)
+    response = asyncio.run(
+        handler.handle_passthrough(_ClientDisconnectRequest(), "https://api.openai.com")
+    )
+    assert response.status_code == 204
+
+
+def test_handle_streaming_passthrough_client_disconnect():
+    """ClientDisconnect during streaming body read returns 204."""
+    handler = object.__new__(OpenAIHandlerMixin)
+    response = asyncio.run(
+        handler.handle_passthrough(
+            _ClientDisconnectStreamRequest(),
+            "https://us-central1-aiplatform.googleapis.com",
+            endpoint_name="streamRawPredict",
+            provider="vertex:google",
+        )
+    )
+    assert response.status_code == 204

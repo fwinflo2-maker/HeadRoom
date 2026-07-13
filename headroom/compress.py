@@ -58,9 +58,10 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
+from .agent_savings import apply_agent_savings_profile
 from .observability import get_otel_metrics
 from .pipeline import PipelineExtensionManager, PipelineStage, summarize_routing_markers
 from .utils import extract_user_query as _extract_user_query
@@ -133,6 +134,9 @@ class CompressConfig:
     Set to 'disabled' to skip ML compression entirely
     (only SmartCrusher + CacheAligner will run)."""
 
+    savings_profile: str | None = None
+    """Named high-savings profile, e.g. 'agent-90' for Codex/Claude/Cursor."""
+
 
 @dataclass
 class CompressResult:
@@ -204,6 +208,9 @@ def compress(
     for key, value in kwargs.items():
         if key in config_fields:
             setattr(cfg, key, value)
+    if cfg.savings_profile:
+        cfg = replace(cfg)
+        apply_agent_savings_profile(cfg, cfg.savings_profile)
 
     pipeline = _get_pipeline()
     pipeline_extensions = PipelineExtensionManager(hooks=hooks, discover=False)
@@ -340,6 +347,39 @@ def compress(
             tokens_saved=0,
             compression_ratio=0.0,
         )
+
+
+def compress_spreadsheet(
+    path: str,
+    model: str = "claude-sonnet-4-5-20250929",
+    model_limit: int = 200000,
+    **kwargs: Any,
+) -> CompressResult:
+    """Compress a binary spreadsheet (``.xlsx`` / ``.xls``).
+
+    Each sheet is rendered to CSV text and submitted as its own user message so
+    the tabular compressor (CSV → SmartCrusher, lossless-first + lossy CCR
+    fallback) is applied per sheet. Requires the ``spreadsheet`` extra
+    (``pip install headroom-ai[spreadsheet]``).
+
+    Args:
+        path: Path to a ``.xlsx`` or ``.xls`` file.
+        model: Model name (token counting / context limit).
+        model_limit: Model context window size in tokens.
+        **kwargs: Forwarded to :func:`compress` (e.g. ``target_ratio``).
+
+    Returns:
+        CompressResult over the per-sheet messages.
+    """
+    from headroom.transforms.spreadsheet_ingest import load_spreadsheet
+
+    sheets = load_spreadsheet(path)
+    messages = [{"role": "user", "content": text} for text in sheets.values()]
+    if not messages:
+        return CompressResult(messages=[])
+    # User messages hold the table text, so they must be compressible here.
+    kwargs.setdefault("compress_user_messages", True)
+    return compress(messages, model=model, model_limit=model_limit, **kwargs)
 
 
 def _get_pipeline() -> Any:

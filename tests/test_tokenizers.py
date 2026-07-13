@@ -175,6 +175,26 @@ class TestEstimatingTokenCounter:
         count = counter.count_text(text)
         assert count == 10  # 50 / 5 = 10
 
+    def test_count_text_fixed_ratio_prices_cjk(self):
+        """The fixed-ratio path must price dense scripts (CJK) like the auto path.
+
+        The registry builds provider counters (Anthropic 3.5, Google 4.0, ...)
+        with a fixed ratio; before the fix CJK was priced at the Latin ratio, so
+        a large CJK context read as ~40-55% of its true size and could skip
+        compression."""
+        counter = EstimatingTokenCounter(chars_per_token=3.5)
+        cjk = "これはテストです" * 100  # 800 dense-script chars, no ASCII
+
+        count = counter.count_text(cjk)
+
+        # ~1 token per 1.5 chars (CHARS_PER_TOKEN_CJK), not 1 per 3.5.
+        assert count == pytest.approx(len(cjk) / 1.5, rel=0.05)
+        # Far higher than the old Latin-ratio estimate.
+        assert count > len(cjk) / 3.5 * 2
+
+        # ASCII is unaffected by the fixed ratio.
+        assert counter.count_text("x" * 35) == 10
+
     def test_count_text_minimum_one(self):
         """Test minimum of 1 token."""
         counter = EstimatingTokenCounter()
@@ -592,6 +612,38 @@ class TestLargeToolBlobEstimation:
         big = {"k": "A" * 200_000}
         exact = tok.count_text(json.dumps(big))
         assert abs(tok._count_serialized(big) - exact) / exact < 0.10
+
+    def test_tool_result_list_recurses_into_image_block(self):
+        """A tool that returns an image nests a base64 block inside a
+        `tool_result` list. Serializing it prices the base64 as text (a 50-200x
+        overcount); recursing into the block prices the image at ~1600 tokens."""
+        tok = EstimatingTokenCounter()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t1",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "A" * 280_000,  # ~280KB base64
+                                },
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+
+        count = tok.count_messages(messages)
+
+        # The image is priced structurally (~1600), not as a huge text blob.
+        assert count < 5_000
 
     def test_oversized_estimate_never_overcounts(self):
         """R4 (prefer false negatives): a token-dense head + sparse tail must not

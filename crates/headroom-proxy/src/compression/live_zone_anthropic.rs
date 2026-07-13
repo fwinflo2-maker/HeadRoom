@@ -19,10 +19,13 @@
 //!    the body is parsed at all — when disabled, floor=0 without
 //!    inspection.
 //! 2. Hand the buffered body bytes to
-//!    [`headroom_core::transforms::compress_anthropic_live_zone`].
-//!    The dispatcher inspects the live zone (latest user message),
-//!    detects per-block content type, dispatches each block to the
-//!    matching compressor (SmartCrusher / LogCompressor /
+//!    [`headroom_core::transforms::compress_anthropic_live_zone_with_ccr_and_freshness`]
+//!    with `fresh_message_count = 1`, exempting the tail (in-flight)
+//!    message from compression — it's about to be read by the model
+//!    for the first time this exact request (issue #3).
+//!    The dispatcher inspects the live zone (latest non-fresh user
+//!    message), detects per-block content type, dispatches each block
+//!    to the matching compressor (SmartCrusher / LogCompressor /
 //!    SearchCompressor / DiffCompressor), and rewrites the body
 //!    via byte-range surgery so unmodified bytes round-trip
 //!    byte-equal.
@@ -42,7 +45,8 @@ use bytes::Bytes;
 use headroom_core::auth_mode::AuthMode as RequestAuthMode;
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
 use headroom_core::transforms::{
-    compress_anthropic_live_zone, BlockAction, ExclusionReason, LiveZoneError, LiveZoneOutcome,
+    compress_anthropic_live_zone_with_ccr_and_freshness, BlockAction, ExclusionReason,
+    LiveZoneError, LiveZoneOutcome,
 };
 use serde_json::Value;
 
@@ -355,7 +359,19 @@ pub fn compress_anthropic_request(
     // getting compression, not losing it). The plumbing here lets
     // F2.2 vary per-block thresholds by mode without touching this
     // call site again.
-    match compress_anthropic_live_zone(&dispatch_body, frozen_count, auth_mode.into(), model) {
+    // `fresh_message_count = 1`: the tail (most-recent) message is the
+    // live zone itself — the content the model is about to read for the
+    // first time this exact request. Exempting it from CCR/opaque-blob
+    // substitution matches the freshness contract documented on
+    // `compress_anthropic_live_zone_with_ccr_and_freshness` (issue #3).
+    match compress_anthropic_live_zone_with_ccr_and_freshness(
+        &dispatch_body,
+        frozen_count,
+        1,
+        auth_mode.into(),
+        model,
+        None,
+    ) {
         Ok(LiveZoneOutcome::NoChange { manifest }) => {
             let block_count = manifest.block_outcomes.len();
             let blocks_excluded = manifest
@@ -1306,6 +1322,121 @@ mod tests {
             other => {
                 panic!("expected Compressed (E3 fires) for already-sorted tools, got {other:?}")
             }
+        }
+    }
+
+    // Issue #3 regression: the freshness exemption must actually be wired
+    // into the proxy's production call site (`fresh_message_count = 1`),
+    // not just exercised by the library-level tests in
+    // `headroom-core/tests/live_zone_freshness.rs`.
+
+    fn large_json_array_payload() -> String {
+        let items: Vec<serde_json::Value> = (0..400)
+            .map(|i| {
+                serde_json::json!({
+                    "id": i,
+                    "kind": "row",
+                    "status": "ok",
+                    "value": format!("repeat-{}", i % 5),
+                })
+            })
+            .collect();
+        let payload = serde_json::to_string(&items).unwrap();
+        assert!(
+            payload.len() >= 10_000,
+            "fixture must clear the byte threshold"
+        );
+        payload
+    }
+
+    #[test]
+    fn fresh_tail_message_is_not_compressed_through_proxy_entry_point() {
+        // Single user message, large tool_result — it's the ONLY (hence
+        // tail, hence in-flight/fresh) message. Before this fix, the
+        // proxy called `compress_anthropic_live_zone` (fresh_message_count
+        // implicitly 0) and would compress it anyway. Now the proxy must
+        // exempt it, yielding NoCompression.
+        let payload = large_json_array_payload();
+        let body = body_of(serde_json::json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_fresh",
+                    "content": payload,
+                }],
+            }],
+        }));
+        let out = compress_anthropic_request(
+            &body,
+            CompressionMode::LiveZone,
+            CacheControlAutoFrozen::Disabled,
+            RequestAuthMode::Payg,
+            "req-freshness-1",
+        );
+        match out {
+            Outcome::NoCompression => {}
+            other => panic!(
+                "expected NoCompression — fresh tail message must never be compressed \
+                 through the proxy entry point, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn aged_message_still_compresses_while_fresh_tail_is_untouched_through_proxy() {
+        // Three messages: [aged user tool_result (large), assistant text,
+        // fresh user tool_result (tail, large)]. The proxy must still
+        // compress the aged message — the freshness exemption only
+        // excludes the tail, it doesn't disable compression entirely.
+        let aged_payload = large_json_array_payload();
+        let fresh_payload = large_json_array_payload();
+        let body = body_of(serde_json::json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_aged",
+                        "content": aged_payload,
+                    }],
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok, one more lookup"}],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_fresh",
+                        "content": fresh_payload,
+                    }],
+                },
+            ],
+        }));
+        let out = compress_anthropic_request(
+            &body,
+            CompressionMode::LiveZone,
+            CacheControlAutoFrozen::Disabled,
+            RequestAuthMode::Payg,
+            "req-freshness-2",
+        );
+        match out {
+            Outcome::Compressed { body, .. } => {
+                let new_body_str = String::from_utf8_lossy(&body);
+                assert!(
+                    new_body_str.contains(&fresh_payload)
+                        || new_body_str.contains(&fresh_payload.replace('"', "\\\"")),
+                    "fresh tail payload must survive byte-identical in the rewritten body"
+                );
+            }
+            other => panic!(
+                "expected Compressed — aged (non-fresh) message must still compress, \
+                 got {other:?}"
+            ),
         }
     }
 }

@@ -13,23 +13,22 @@ import pytest
 
 from headroom.install.planner import build_manifest
 
-
-_BASE_KWARGS = dict(
-    profile="default",
-    preset="persistent-service",
-    runtime_kind="python",
-    scope="user",
-    provider_mode="auto",
-    targets=[],
-    port=8787,
-    backend="anthropic",
-    anyllm_provider=None,
-    region=None,
-    proxy_mode="token",
-    memory_enabled=False,
-    telemetry_enabled=False,
-    image="ghcr.io/chopratejas/headroom:latest",
-)
+_BASE_KWARGS = {
+    "profile": "default",
+    "preset": "persistent-service",
+    "runtime_kind": "python",
+    "scope": "user",
+    "provider_mode": "auto",
+    "targets": [],
+    "port": 8787,
+    "backend": "anthropic",
+    "anyllm_provider": None,
+    "region": None,
+    "proxy_mode": "token",
+    "memory_enabled": False,
+    "telemetry_enabled": False,
+    "image": "ghcr.io/chopratejas/headroom:latest",
+}
 
 
 def test_no_rate_limit_false_by_default() -> None:
@@ -64,14 +63,16 @@ def test_no_rate_limit_idempotent_on_reinstall() -> None:
 def test_cli_flag_wired_through_install_apply() -> None:
     """headroom install apply --no-rate-limit must produce a manifest
     with --no-rate-limit in proxy_args (integration: CLI → planner)."""
+    from unittest.mock import patch
+
     pytest.importorskip("fastapi")
     from click.testing import CliRunner
+
     from headroom.cli.install import install_apply
 
     runner = CliRunner()
     # --dry-run or equivalent: we just check the manifest is built correctly.
     # Since install_apply does real side-effects, we patch the heavy parts.
-    from unittest.mock import patch, MagicMock
 
     built_manifests = []
 
@@ -89,7 +90,7 @@ def test_cli_flag_wired_through_install_apply() -> None:
         patch("headroom.cli.install._start_deployment"),
         patch("headroom.cli.install.click.echo"),
     ):
-        result = runner.invoke(
+        runner.invoke(
             install_apply,
             ["--no-rate-limit", "--scope", "user"],
             catch_exceptions=False,

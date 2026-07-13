@@ -12,9 +12,9 @@
    when the Bedrock prompt cache was genuinely engaged. The ``message_start``
    emitted before streaming begins is necessarily sent before any usage is
    known (hardcoded ``input_tokens: 0``, no cache fields); once the real
-   values are captured from the trailing usage chunk, a second
-   ``message_start`` carries them so last-write-wins consumers
-   (``StreamingMixin._stream_response_bedrock``) see the real numbers.
+   values are captured from the trailing usage chunk, the terminal
+   ``message_delta.usage`` carries them so the public Anthropic event order
+   remains valid.
 """
 
 from __future__ import annotations
@@ -164,7 +164,7 @@ class TestStreamingCacheStatsCompletion:
             assert call_kwargs["stream_options"] == {"include_usage": True}
 
     @pytest.mark.asyncio
-    async def test_second_message_start_carries_real_cache_stats(self):
+    async def test_terminal_message_delta_carries_real_cache_stats(self):
         with (
             patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
             patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
@@ -182,19 +182,21 @@ class TestStreamingCacheStatsCompletion:
             ]
 
             message_starts = [e for e in events if e.event_type == "message_start"]
-            assert len(message_starts) == 2, "expected an initial and a trailing message_start"
+            assert len(message_starts) == 1, "stream should keep a single initial message_start"
 
             first_usage = message_starts[0].data["message"]["usage"]
             assert first_usage["input_tokens"] == 0
             assert "cache_read_input_tokens" not in first_usage
 
-            second_usage = message_starts[1].data["message"]["usage"]
-            assert second_usage["input_tokens"] == 1500
-            assert second_usage["cache_read_input_tokens"] == 1200
-            assert second_usage["cache_creation_input_tokens"] == 300
+            message_deltas = [e for e in events if e.event_type == "message_delta"]
+            assert len(message_deltas) == 1
+            final_usage = message_deltas[0].data["usage"]
+            assert final_usage["input_tokens"] == 1500
+            assert final_usage["cache_read_input_tokens"] == 1200
+            assert final_usage["cache_creation_input_tokens"] == 300
 
     @pytest.mark.asyncio
-    async def test_no_second_message_start_when_usage_never_reported(self):
+    async def test_no_extra_message_start_when_usage_never_reported(self):
         """Non-Bedrock LiteLLM providers (or any response that never carries a
         usage chunk) must not get a spurious trailing message_start."""
 
@@ -224,9 +226,9 @@ class TestStreamingCacheStatsCompletion:
             assert len(message_starts) == 1
 
     @pytest.mark.asyncio
-    async def test_trailing_message_start_omits_zero_cache_fields(self):
+    async def test_terminal_message_delta_omits_zero_cache_fields(self):
         """If only input_tokens came back (no caching engaged), the trailing
-        message_start should still fire but without empty cache_* keys."""
+        message_delta should include input_tokens but no empty cache_* keys."""
         with (
             patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
             patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
@@ -244,8 +246,9 @@ class TestStreamingCacheStatsCompletion:
             ]
 
             message_starts = [e for e in events if e.event_type == "message_start"]
-            assert len(message_starts) == 2
-            usage = message_starts[1].data["message"]["usage"]
+            assert len(message_starts) == 1
+            message_deltas = [e for e in events if e.event_type == "message_delta"]
+            usage = message_deltas[0].data["usage"]
             assert usage["input_tokens"] == 42
             assert "cache_read_input_tokens" not in usage
             assert "cache_creation_input_tokens" not in usage

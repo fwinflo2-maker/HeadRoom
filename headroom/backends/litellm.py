@@ -977,10 +977,10 @@ class LiteLLMBackend(Backend):
             stop_reason = "end_turn"
             # Populated from the final usage chunk (stream_options.include_usage=True
             # above). The message_start emitted before this loop always carries
-            # input_tokens=0 and no cache fields, since LiteLLM/Bedrock only reports
-            # usage on the trailing chunk; a second message_start after the loop
-            # carries the real values so callers reading cache stats from
-            # message_start (e.g. _stream_response_bedrock) see them.
+            # input_tokens=0 and no cache fields because LiteLLM/Bedrock only reports
+            # usage on the trailing chunk. Carry the final cache stats on the terminal
+            # message_delta instead of emitting a second protocol-invalid
+            # message_start after content has already streamed.
             final_input_tokens = 0
             final_cache_read_tokens = 0
             final_cache_write_tokens = 0
@@ -1099,37 +1099,13 @@ class LiteLLMBackend(Backend):
                     data={"type": "content_block_stop", "index": current_block_index},
                 )
 
-            # Re-emit message_start with the real usage captured from the final
-            # streaming chunk. The message_start above was sent before any usage
-            # was known, so cache_read/cache_creation there are always 0; callers
-            # that read cache stats off message_start (last-write-wins) now see
-            # the real numbers instead. Skipped entirely if the backend never
-            # surfaced usage, so it's a no-op for non-Bedrock LiteLLM providers.
+            delta_usage: dict[str, Any] = {"output_tokens": output_tokens}
             if final_input_tokens or final_cache_read_tokens or final_cache_write_tokens:
-                usage: dict[str, Any] = {
-                    "input_tokens": final_input_tokens,
-                    "output_tokens": 0,
-                }
+                delta_usage["input_tokens"] = final_input_tokens
                 if final_cache_read_tokens:
-                    usage["cache_read_input_tokens"] = final_cache_read_tokens
+                    delta_usage["cache_read_input_tokens"] = final_cache_read_tokens
                 if final_cache_write_tokens:
-                    usage["cache_creation_input_tokens"] = final_cache_write_tokens
-                yield StreamEvent(
-                    event_type="message_start",
-                    data={
-                        "type": "message_start",
-                        "message": {
-                            "id": msg_id,
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [],
-                            "model": original_model,
-                            "stop_reason": None,
-                            "stop_sequence": None,
-                            "usage": usage,
-                        },
-                    },
-                )
+                    delta_usage["cache_creation_input_tokens"] = final_cache_write_tokens
 
             # Emit message_delta with correct stop reason
             yield StreamEvent(
@@ -1137,7 +1113,7 @@ class LiteLLMBackend(Backend):
                 data={
                     "type": "message_delta",
                     "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                    "usage": {"output_tokens": output_tokens},
+                    "usage": delta_usage,
                 },
             )
 

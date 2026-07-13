@@ -88,7 +88,7 @@ def inject_models_override(port: int, project: str | None = None) -> tuple[Path,
     * Any user-defined providers/models from the pre-wrap file are preserved:
       the override only deep-sets ``providers.anthropic.baseUrl``.
     """
-    import yaml
+    import yaml  # type: ignore[import-untyped]  # PyYAML ships no stubs; lint env installs no deps
 
     models_file = models_yml_path()
     backup = backup_path(models_file)

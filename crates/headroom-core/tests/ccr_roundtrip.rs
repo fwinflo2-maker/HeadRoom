@@ -296,7 +296,7 @@ fn opaque_string_in_object_emits_marker_and_stores_original() {
 
     // 64-char base64 alphabet repeated → tripping the opaque-blob
     // detector deterministically.
-    let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+    let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(32);
     let doc = json!({"id": 1, "blob": big.clone()});
 
     let result = crusher.crush(&doc.to_string(), "", 1.0);
@@ -352,7 +352,7 @@ fn document_walker_with_store_roundtrips_opaque_blob() {
     let store: Arc<dyn CcrStore> = Arc::new(InMemoryCcrStore::new());
     let dc = DocumentCompactor::new().with_ccr_store(store.clone());
 
-    let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+    let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(32);
     let out = dc.compact(json!({"id": 1, "blob": big.clone()}));
     let blob = out.pointer("/blob").and_then(|v| v.as_str()).unwrap();
     assert!(blob.starts_with("<<ccr:"));

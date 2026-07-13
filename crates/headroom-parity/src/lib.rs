@@ -404,9 +404,20 @@ impl TransformComparator for SmartCrusherComparator {
                 .get("enable_ccr_marker")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(defaults.enable_ccr_marker),
-            // Compaction heuristics are moot here: this comparator uses
-            // `without_compaction` (fixtures were recorded against the
-            // lossy-only path). Take the defaults wholesale.
+            // Rust-only issue-#3 knob — legacy fixtures predate the
+            // ccr_min_bytes floor and their expected outputs assume
+            // opaque strings substitute unconditionally once
+            // classified Opaque (equivalent to floor = 0), not the
+            // new 2 KB default.
+            opaque_min_bytes: config
+                .get("opaque_min_bytes")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(0),
+            // Compaction heuristics (lossless_only, compaction_*) are moot
+            // here: this comparator uses `without_compaction` (fixtures
+            // were recorded against the lossy-only path). Take the
+            // defaults wholesale for every other new field.
             ..defaults
         };
 

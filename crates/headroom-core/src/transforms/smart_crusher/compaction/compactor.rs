@@ -114,7 +114,10 @@ pub fn compact(items: &[Value], cfg: &CompactConfig) -> Compaction {
 /// The IR (and therefore the rendered marker text) is identical whether or
 /// not a store is supplied — the store only adds a side-effecting write, so
 /// `compact(items, cfg)` and `compact_with_store(items, cfg, Some(store))`
-/// return the same [`Compaction`].
+/// return the same [`Compaction`]. Cells below
+/// [`ClassifyConfig::ccr_min_bytes`](super::classifier::ClassifyConfig::ccr_min_bytes)
+/// never reach the store at all — they render verbatim as `CellValue::Scalar`
+/// since the retrieval round-trip is not worth it for a small field (issue #3).
 pub fn compact_with_store(
     items: &[Value],
     cfg: &CompactConfig,
@@ -260,12 +263,19 @@ fn cell_from_value(v: &Value, cfg: &CompactConfig, store: Option<&Arc<dyn CcrSto
                 Value::String(s) => s,
                 _ => return CellValue::Scalar(v.clone()),
             };
+            // Below the CCR-substitution floor: opaque-shaped, but too
+            // small to be worth the retrieval round-trip (issue #3).
+            // Render verbatim rather than mint an unnecessary marker.
+            if s.len() < cfg.classify.ccr_min_bytes {
+                return CellValue::Scalar(v.clone());
+            }
             let ccr_hash = hash_opaque(s.as_bytes());
             // Stash the original so `GET /v1/retrieve/{hash}` and the
             // `headroom_retrieve` tool can serve it back — mirrors
             // `walker::emit_opaque_ccr_marker`. Without this write the
             // marker points at a key that was never stored and retrieval
-            // 404s (issue #1083).
+            // 404s (issue #1083 / #2 — same bug, fixed independently on
+            // both branches, reconciled here).
             if let Some(store) = store {
                 store.put(&ccr_hash, s);
             }
@@ -665,7 +675,7 @@ mod tests {
 
     #[test]
     fn opaque_cell_becomes_ccr_ref() {
-        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(32);
         let items = vec![
             json!({"id": 1, "blob": big.clone()}),
             json!({"id": 2, "blob": big.clone()}),
@@ -789,8 +799,9 @@ mod tests {
         use std::sync::Arc;
 
         // Same blob the `opaque_cell_becomes_ccr_ref` test uses — known to
-        // classify as Opaque, so the OpaqueRef / `<<ccr:HASH,...>>` path runs.
-        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+        // classify as Opaque, and long enough to clear ccr_min_bytes so the
+        // OpaqueRef / `<<ccr:HASH,...>>` path (not the floor short-circuit) runs.
+        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(32);
         let items = vec![
             json!({"id": 1, "blob": big.clone()}),
             json!({"id": 2, "blob": big.clone()}),
@@ -815,7 +826,7 @@ mod tests {
             other => panic!("expected Table, got {other:?}"),
         };
 
-        // Issue #1083: the original payload must be retrievable under the
+        // Issue #1083 / #2: the original payload must be retrievable under the
         // exact hash the marker carries (before the fix the store was empty).
         assert_eq!(store.get(&hash).as_deref(), Some(big.as_str()));
         // Lock the key<->marker contract: stored key == hash_opaque(payload).
@@ -827,7 +838,7 @@ mod tests {
         use crate::ccr::{CcrStore, InMemoryCcrStore};
         use std::sync::Arc;
 
-        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(32);
         let items = vec![
             json!({"id": 1, "blob": big.clone()}),
             json!({"id": 2, "blob": big.clone()}),
@@ -846,5 +857,66 @@ mod tests {
         assert_eq!(fmt.format(&without), fmt.format(&with));
         // ...and that write actually happened.
         assert!(!store.is_empty());
+    }
+
+    #[test]
+    fn compact_without_store_still_works_and_stores_nothing() {
+        // `compact()` (no store) must keep producing markers — just
+        // without a place to retrieve from. Back-compat contract for
+        // the many existing callers that pass no store.
+        let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(32);
+        let items = vec![
+            json!({"id": 1, "blob": big.clone()}),
+            json!({"id": 2, "blob": big.clone()}),
+        ];
+        match compact(&items, &cfg()) {
+            Compaction::Table { rows, schema, .. } => {
+                let blob_idx = schema
+                    .fields
+                    .iter()
+                    .position(|f| f.name == "blob")
+                    .expect("blob col");
+                assert!(matches!(&rows[0].0[blob_idx], CellValue::OpaqueRef { .. }));
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opaque_table_cell_below_ccr_floor_renders_verbatim_and_stores_nothing() {
+        // Issue #3 at the compactor/table-cell level: an opaque-shaped
+        // string that does not clear `ccr_min_bytes` must render as a
+        // plain Scalar (not OpaqueRef) and must never reach the store,
+        // even though it would otherwise classify as Opaque.
+        use crate::ccr::{CcrStore, InMemoryCcrStore};
+        use std::sync::Arc;
+
+        // Long enough to classify Opaque (> opaque_min_bytes=256) but short
+        // of the 2048-byte ccr_min_bytes substitution floor.
+        let small = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+        let items = vec![
+            json!({"id": 1, "blob": small.clone()}),
+            json!({"id": 2, "blob": small.clone()}),
+        ];
+
+        let store: Arc<dyn CcrStore> = Arc::new(InMemoryCcrStore::new());
+        match compact_with_store(&items, &cfg(), Some(&store)) {
+            Compaction::Table { rows, schema, .. } => {
+                let blob_idx = schema
+                    .fields
+                    .iter()
+                    .position(|f| f.name == "blob")
+                    .expect("blob col");
+                match &rows[0].0[blob_idx] {
+                    CellValue::Scalar(v) => assert_eq!(v.as_str(), Some(small.as_str())),
+                    other => panic!("expected Scalar (below floor), got {other:?}"),
+                }
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+        assert!(
+            store.is_empty(),
+            "below-floor cell must not write to the store"
+        );
     }
 }

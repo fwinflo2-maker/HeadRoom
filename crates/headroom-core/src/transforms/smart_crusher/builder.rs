@@ -142,7 +142,14 @@ impl SmartCrusherBuilder {
     /// formatter, default `CompactConfig`). Equivalent to
     /// `with_compaction(CompactionStage::default_csv_schema())`.
     pub fn with_default_compaction(self) -> Self {
-        self.with_compaction(CompactionStage::default_csv_schema())
+        // Thread the operator-facing `opaque_min_bytes` floor into the
+        // compaction stage's classifier config — otherwise table-cell
+        // opaque substitution would silently ignore whatever the
+        // caller configured and fall back to `ClassifyConfig`'s own
+        // default (issue #3).
+        let mut stage = CompactionStage::default_csv_schema();
+        stage.config.classify.ccr_min_bytes = self.config.opaque_min_bytes;
+        self.with_compaction(stage)
     }
 
     /// Plug in a CCR store. The lossy `crush_array` path stashes each

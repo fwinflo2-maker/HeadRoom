@@ -480,12 +480,13 @@ impl PySmartCrusherConfig {
         relevance_threshold = 0.3,
         lossless_min_savings_ratio = 0.15,
         enable_ccr_marker = true,
-        lossless_only = false,
-        compaction_core_field_fraction = 0.8,
-        compaction_heterogeneous_core_ratio = 0.6,
-        compaction_max_flatten_inner_keys = 6,
-        compaction_min_buckets = 2,
-        compaction_max_buckets = 8,
+    opaque_min_bytes = 2048,
+    lossless_only = false,
+    compaction_core_field_fraction = 0.8,
+    compaction_heterogeneous_core_ratio = 0.6,
+    compaction_max_flatten_inner_keys = 6,
+    compaction_min_buckets = 2,
+    compaction_max_buckets = 8,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -507,6 +508,7 @@ impl PySmartCrusherConfig {
         relevance_threshold: f64,
         lossless_min_savings_ratio: f64,
         enable_ccr_marker: bool,
+        opaque_min_bytes: usize,
         lossless_only: bool,
         compaction_core_field_fraction: f64,
         compaction_heterogeneous_core_ratio: f64,
@@ -534,6 +536,7 @@ impl PySmartCrusherConfig {
                 relevance_threshold,
                 lossless_min_savings_ratio,
                 enable_ccr_marker,
+                opaque_min_bytes,
                 lossless_only,
                 compaction_core_field_fraction,
                 compaction_heterogeneous_core_ratio,
@@ -611,6 +614,10 @@ impl PySmartCrusherConfig {
     #[getter]
     fn enable_ccr_marker(&self) -> bool {
         self.inner.enable_ccr_marker
+    }
+    #[getter]
+    fn opaque_min_bytes(&self) -> usize {
+        self.inner.opaque_min_bytes
     }
     #[getter]
     fn lossless_only(&self) -> bool {

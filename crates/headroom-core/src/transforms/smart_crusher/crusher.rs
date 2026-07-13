@@ -603,16 +603,28 @@ impl SmartCrusher {
         // 2. Opaque blob: substitute with CCR marker AND stash the
         // original in the store (PR8) so retrieval works. Hash + format
         // identical to walker.rs via the shared helper — zero drift.
-        // Gated by `enable_ccr_marker` so disabling markers stays lossless
-        // here too (#1091).
+        //
+        // `opaque_min_bytes` used to be hardcoded via
+        // `ClassifyConfig::default()`, silently ignoring
+        // `self.config.opaque_min_bytes` — every caller got the 256 B
+        // shape-detection default regardless of what they configured.
+        // Build from `self.config` so the operator-facing floor is
+        // actually honored (issue #3). Also gated by `enable_ccr_marker`
+        // (via `opaque_markers_enabled()`) so disabling markers stays
+        // lossless here too (#1091).
         let cfg = ClassifyConfig {
+            ccr_min_bytes: self.config.opaque_min_bytes,
             emit_opaque_markers: self.config.opaque_markers_enabled(),
             ..ClassifyConfig::default()
         };
         if let CellClass::Opaque(kind) = classify_cell(&Value::String(s.to_string()), &cfg) {
-            let marker = emit_opaque_ccr_marker(s, &kind, self.ccr_store.as_ref());
-            let kind_label = opaque_kind_label(&kind);
-            return (Value::String(marker), format!("string_ccr:{kind_label}"));
+            // Below the CCR-substitution floor: opaque-shaped, but not
+            // worth the retrieval round-trip. Render verbatim.
+            if s.len() >= cfg.ccr_min_bytes {
+                let marker = emit_opaque_ccr_marker(s, &kind, self.ccr_store.as_ref());
+                let kind_label = opaque_kind_label(&kind);
+                return (Value::String(marker), format!("string_ccr:{kind_label}"));
+            }
         }
 
         // 3. Plain string — passthrough.
@@ -675,7 +687,7 @@ impl SmartCrusher {
         if let Some(stage) = &self.compaction {
             // Thread the CCR store so opaque-blob `<<ccr:HASH,...>>` markers
             // emitted by lossless:table compaction are actually retrievable
-            // (issue #1083); the row-drop lossy path below stores its own
+            // (issue #1083 / #2); the row-drop lossy path below stores its own
             // payload separately.
             let (c, rendered) = stage.run_with_store(items, self.ccr_store.as_ref());
             if c.was_compacted() {
@@ -1593,12 +1605,56 @@ mod tests {
     #[test]
     fn process_string_opaque_blob_becomes_ccr_marker() {
         let c = SmartCrusher::new(SmartCrusherConfig::default());
-        let big_b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+        // 32 repeats of the 67-char alphabet = 2144 bytes — comfortably
+        // above the 2 KB default ccr_min_bytes floor.
+        let big_b64 =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(32);
         let doc = json!({"id": 1, "blob": big_b64});
         let (out, _info) = c.process_value(&doc, 0, "", 1.0);
         let blob = out.pointer("/blob").and_then(|v| v.as_str()).unwrap();
         assert!(blob.starts_with("<<ccr:"), "got: {blob}");
         assert!(blob.contains(",base64,"));
+    }
+
+    #[test]
+    fn process_string_opaque_but_below_ccr_floor_passes_through_verbatim() {
+        // Regression for issue #3: a ~1 KB opaque-shaped string (well
+        // above the 256 B shape-detection threshold, but below the
+        // 2 KB ccr_min_bytes substitution floor) must render verbatim
+        // — no marker, no retrieval round-trip forced on the model for
+        // fresh, modestly-sized tool output.
+        let c = SmartCrusher::new(SmartCrusherConfig::default());
+        let one_kb_b64 =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(15);
+        assert!(one_kb_b64.len() > 256 && one_kb_b64.len() < 2048);
+        let doc = json!({"id": 1, "blob": one_kb_b64.clone()});
+        let (out, _info) = c.process_value(&doc, 0, "", 1.0);
+        assert_eq!(
+            out.pointer("/blob").and_then(|v| v.as_str()),
+            Some(one_kb_b64.as_str()),
+            "sub-floor opaque field must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn process_string_ccr_floor_is_configurable() {
+        // Same ~1 KB payload as above, but with a custom, lower
+        // opaque_min_bytes — proves the floor is actually wired end to
+        // end, not just a hardcoded default that ignores config.
+        let config = SmartCrusherConfig {
+            opaque_min_bytes: 100,
+            ..SmartCrusherConfig::default()
+        };
+        let c = SmartCrusher::new(config);
+        let one_kb_b64 =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(15);
+        let doc = json!({"id": 1, "blob": one_kb_b64});
+        let (out, _info) = c.process_value(&doc, 0, "", 1.0);
+        let blob = out.pointer("/blob").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            blob.starts_with("<<ccr:"),
+            "a lowered floor must still substitute a >100B opaque field, got: {blob}"
+        );
     }
 
     #[test]
@@ -1720,7 +1776,7 @@ mod tests {
         // With `enable_ccr_marker = false` it must render inline instead,
         // so no configuration leaks markers into a "lossless-only" prompt.
         let rows: Vec<Value> = (0..10)
-            .map(|i| json!({"path": "a.py", "line": i, "content": "x".repeat(300)}))
+            .map(|i| json!({"path": "a.py", "line": i, "content": "x".repeat(2200)}))
             .collect();
 
         // ratio 0.0 forces the lossless table to ship, exercising the
@@ -1739,7 +1795,7 @@ mod tests {
             "opaque marker leaked despite enable_ccr_marker=false: {rendered_off}"
         );
         assert!(
-            rendered_off.contains(&"x".repeat(300)),
+            rendered_off.contains(&"x".repeat(2200)),
             "blob should be inline when markers are off: {rendered_off}"
         );
 

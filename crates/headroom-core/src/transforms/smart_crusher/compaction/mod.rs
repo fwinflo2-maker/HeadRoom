@@ -111,9 +111,7 @@ impl CompactionStage {
     /// [`Compaction`] tree (so callers can inspect kept/total row
     /// counts) alongside the rendered bytes.
     pub fn run(&self, items: &[serde_json::Value]) -> (Compaction, String) {
-        let c = compact(items, &self.config);
-        let rendered = self.formatter.format(&c);
-        (c, rendered)
+        self.run_with_store(items, None)
     }
 
     /// Like [`Self::run`], but stash every opaque-blob payload into `store`

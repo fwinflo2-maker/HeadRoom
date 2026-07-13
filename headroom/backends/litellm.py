@@ -420,7 +420,7 @@ def _anthropic_usage_from_litellm(litellm_usage: Any) -> dict[str, Any]:
     return usage
 
 
-def _system_to_openai_content(system: list) -> "str | list[dict[str, Any]]":
+def _system_to_openai_content(system: list) -> str | list[dict[str, Any]]:
     """Convert Anthropic system blocks to OpenAI format, preserving cache_control.
 
     LiteLLM translates `cache_control` on content blocks into provider cache

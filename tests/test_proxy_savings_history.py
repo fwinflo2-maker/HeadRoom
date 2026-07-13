@@ -1380,6 +1380,83 @@ def test_stats_history_includes_cli_filtering(tmp_path, monkeypatch):
     assert data["cli_filtering"]["lifetime"]["tokens_saved"] == 999
 
 
+def test_stats_history_cli_filtering_available_false_when_not_installed(tmp_path, monkeypatch):
+    """Reproduction: /stats-history's curated cli_filtering block must carry
+    `available` reflecting the backend `installed` flag. On origin/main this
+    key doesn't exist in the curated dict at all (`KeyError`); this asserts
+    the fixed key/value. The tool being merely absent must NOT collapse the
+    block to `None` -- it stays populated with `available: False` and zeroed
+    counters so the Historical tab can distinguish absence from a hard
+    read failure.
+    """
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    import headroom.proxy.server as server
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    savings_path = tmp_path / "proxy_savings.json"
+    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(savings_path))
+
+    _rtk_not_installed_payload = {
+        "tool": "rtk",
+        "label": "RTK",
+        "installed": False,
+        "tokens_saved": 0,
+        "session": {"tokens_saved": 0, "commands": 0},
+        "lifetime": {"tokens_saved": 0, "commands": 0},
+    }
+    monkeypatch.setattr(server, "_get_context_tool_stats", lambda: _rtk_not_installed_payload)
+
+    config = ProxyConfig(
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        log_requests=False,
+    )
+
+    with TestClient(create_app(config)) as client:
+        response = client.get("/stats-history")
+        assert response.status_code == 200
+        data = response.json()
+
+    assert data["cli_filtering"] is not None
+    assert data["cli_filtering"]["available"] is False
+
+
+def test_stats_history_cli_filtering_stays_none_on_hard_read_failure(tmp_path, monkeypatch):
+    """Preservation: /stats-history's cli_filtering key stays `None` only when
+    the underlying stats read hard-fails (exception), not merely because the
+    tool is absent -- the Historical tab keeps hiding the card in that case,
+    unchanged from prior behavior.
+    """
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    import headroom.proxy.server as server
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    savings_path = tmp_path / "proxy_savings.json"
+    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(savings_path))
+
+    def _raise() -> dict:
+        raise RuntimeError("simulated hard stats-read failure")
+
+    monkeypatch.setattr(server, "_get_context_tool_stats", _raise)
+
+    config = ProxyConfig(
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        log_requests=False,
+    )
+
+    with TestClient(create_app(config)) as client:
+        response = client.get("/stats-history")
+        assert response.status_code == 200
+        data = response.json()
+
+    assert data["cli_filtering"] is None
+
+
 def test_coercion_helpers_reject_non_finite_values():
     """Non-finite inputs fail open to the default -- never raise, never leak NaN/inf.
 
@@ -1500,6 +1577,37 @@ def test_cache_read_savings_accumulate_and_survive_restart(tmp_path, monkeypatch
     assert reloaded.history_response()["lifetime"]["cache_read_tokens"] == 1_600_000
 
 
+def test_by_model_savings_accumulate_and_survive_restart(tmp_path):
+    path = tmp_path / "proxy_savings.json"
+    tracker = SavingsTracker(path=str(path))
+
+    tracker.record_request(
+        model="gpt-4o",
+        input_tokens=100,
+        tokens_saved=40,
+        timestamp="2026-07-01T09:00:00Z",
+    )
+    tracker.record_request(
+        model="claude-sonnet-4-6",
+        input_tokens=300,
+        tokens_saved=60,
+        timestamp="2026-07-01T09:01:00Z",
+    )
+
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert set(persisted["by_model"]) == {"gpt-4o", "claude-sonnet-4-6"}
+    assert persisted["by_model"]["gpt-4o"]["tokens_saved"] == 40
+    assert persisted["by_model"]["gpt-4o"]["total_input_tokens"] == 100
+
+    reloaded = SavingsTracker(path=str(path))
+    stats_by_model = reloaded.stats_preview()["by_model"]
+    assert set(stats_by_model) == {"gpt-4o", "claude-sonnet-4-6"}
+    assert stats_by_model["claude-sonnet-4-6"]["tokens_saved"] == 60
+    assert stats_by_model["claude-sonnet-4-6"]["total_input_tokens"] == 300
+    assert stats_by_model["claude-sonnet-4-6"]["savings_percent"] == 16.67
+    assert reloaded.history_response()["by_model"] == stats_by_model
+
+
 def test_v3_state_without_cache_fields_loads_clean_and_saves_v4(tmp_path):
     path = tmp_path / "proxy_savings.json"
     path.write_text(
@@ -1612,7 +1720,13 @@ def test_active_display_session_without_cache_fields_reloads_safely(tmp_path, mo
     assert session["requests"] == 2
 
 
-def test_cache_savings_edge_cases_zero_and_unpriced(tmp_path):
+def test_cache_savings_edge_cases_zero_and_unpriced(tmp_path, monkeypatch):
+    # Pin a litellm whose price table doesn't know the model, so this stays a
+    # test of the unpriced-model path on every environment — on installs
+    # without litellm (e.g. Python 3.14) the blended-rate fallback would
+    # otherwise kick in and produce a nonzero estimate.
+    fake_litellm = SimpleNamespace(model_cost={})
+    monkeypatch.setattr(savings_tracker_module, "_get_litellm_module", lambda: fake_litellm)
     path = tmp_path / "proxy_savings.json"
     tracker = SavingsTracker(path=str(path))
 
@@ -1706,6 +1820,35 @@ def test_cache_savings_usd_uses_litellm_discount_delta(tmp_path, monkeypatch):
         timestamp="2026-07-02T00:00:00Z",
     )
     assert tracker.snapshot()["lifetime"]["cache_savings_usd"] == pytest.approx(2.7)
+
+
+def test_cache_savings_usd_falls_back_when_litellm_unavailable(tmp_path, monkeypatch):
+    # Regression: on any install without litellm (e.g. Python 3.14, where
+    # headroom-ai's own dependency spec excludes it), cache_savings_usd must
+    # use the same DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN estimate that
+    # _estimate_input_cost_usd already falls back to — not silently read as
+    # $0 forever while cache_read_tokens and total_input_cost_usd keep
+    # accumulating normally.
+    monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", False)
+    monkeypatch.setattr(savings_tracker_module, "litellm", None)
+
+    fallback_rate = savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
+    assert savings_tracker_module._estimate_cache_savings_usd(
+        "claude-sonnet-4-6", 1_000_000
+    ) == pytest.approx(1_000_000 * fallback_rate)
+
+    tracker = SavingsTracker(path=str(tmp_path / "proxy_savings.json"))
+    tracker.record_request(
+        model="claude-sonnet-4-6",
+        input_tokens=1_000,
+        tokens_saved=0,
+        cache_read_tokens=1_000_000,
+        timestamp="2026-07-02T00:00:00Z",
+    )
+    snapshot = tracker.snapshot()
+    assert snapshot["lifetime"]["cache_read_tokens"] == 1_000_000
+    assert snapshot["lifetime"]["cache_savings_usd"] > 0.0
+    assert snapshot["lifetime"]["cache_savings_usd"] == pytest.approx(1_000_000 * fallback_rate)
 
 
 def test_non_finite_state_values_coerce_to_defaults(tmp_path):

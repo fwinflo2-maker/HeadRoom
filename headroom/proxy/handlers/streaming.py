@@ -95,6 +95,27 @@ class StreamingMixin:
         self._mid_turn_queues[session_key].put_nowait(body)
         return {"status": 202, "event": "headroom_queued"}
 
+    def _should_queue_mid_turn(self, session_key: str, explicit_session_header: str | None) -> bool:
+        """Return True only when a follow-up should be queued as a mid-turn message.
+
+        Mid-turn steering is a private Headroom protocol: a queued message is
+        only ever drained back to the client via the custom
+        ``headroom_pending_messages`` SSE event, which a standard Anthropic SDK
+        does not understand. We therefore only engage it for clients that
+        *opt in* by sending an explicit ``x-headroom-session-id`` header.
+
+        Without that header the session identity falls back to
+        ``md5(model + system[:500])`` (see ``_get_session_key`` /
+        ``prefix_tracker.compute_session_id``). That fallback is intentionally
+        coarse and cannot distinguish genuinely concurrent, independent streams
+        that happen to share a model + system prompt (e.g. a main conversation
+        plus its background/parallel requests). Queuing those as mid-turn
+        messages wrongly returns a 202 + JSON body to a caller that issued a
+        *streaming* request, whose stream parser then sees an empty (non-SSE)
+        stream and fails. So only opt-in (header-bearing) callers get queued.
+        """
+        return bool(explicit_session_header) and session_key in self._active_streams
+
     def _cleanup_mid_turn_stream(
         self, session_key: str, *, drain_pending_messages: bool = False
     ) -> list[dict]:
@@ -350,6 +371,19 @@ class StreamingMixin:
         # sequentially, but the index map is the source of truth.
         blocks_by_index: dict[int, dict[str, Any]] = {}
         current_block: dict[str, Any] | None = None
+        # Track which block indices have already been appended to
+        # `response["content"]`. Dedup used to be `target not in
+        # response["content"]` — plain dict-equality. Two distinct blocks
+        # that happen to accumulate identical values (most commonly two
+        # separate empty `thinking` blocks, e.g. from a retried HTTP/2
+        # stream reset redelivering a truncated segment) either got
+        # wrongly collapsed into one, or — when their partial content
+        # happened to differ (same index, unequal dict) — both slipped
+        # through as duplicates. Indexing by `index` (falling back to
+        # object identity for the legacy no-index path) makes dedup exact
+        # regardless of what the accumulated content looks like: one
+        # entry per block index, first `content_block_stop` wins.
+        appended_block_keys: set[int] = set()
 
         for line in sse_data.split("\n"):
             if not line.startswith("data: "):
@@ -371,6 +405,8 @@ class StreamingMixin:
                 response["model"] = msg.get("model")
                 response["role"] = msg.get("role", "assistant")
                 response["stop_reason"] = msg.get("stop_reason")
+                if "stop_details" in msg:
+                    response["stop_details"] = msg["stop_details"]
                 if msg.get("usage"):
                     response["usage"].update(msg["usage"])
 
@@ -456,18 +492,23 @@ class StreamingMixin:
                     # Anthropic API.
                     if target.get("type") == "thinking" and "thinking_buffer" in target:
                         target["thinking"] = target.pop("thinking_buffer")
-                    # Append the block exactly once. `current_block`
-                    # may not match the indexed target if the stream
-                    # interleaved multiple blocks; index-keyed map is
-                    # authoritative.
-                    if target not in response["content"]:
+                    # Append the block exactly once, keyed by its block
+                    # index (or object identity when no index was ever
+                    # assigned). `current_block` may not match the
+                    # indexed target if the stream interleaved multiple
+                    # blocks; index-keyed map is authoritative.
+                    block_key = idx if idx is not None else id(target)
+                    if block_key not in appended_block_keys:
                         response["content"].append(target)
+                        appended_block_keys.add(block_key)
                     current_block = None
 
             elif event_type == "message_delta":
                 delta = data.get("delta", {})
-                if delta.get("stop_reason"):
+                if "stop_reason" in delta:
                     response["stop_reason"] = delta["stop_reason"]
+                if "stop_details" in delta:
+                    response["stop_details"] = delta["stop_details"]
                 if data.get("usage"):
                     response["usage"].update(data["usage"])
 
@@ -551,9 +592,11 @@ class StreamingMixin:
                     "content_block": block,
                 }
             else:
-                raise ValueError(
-                    f"Unsupported Anthropic content block type for SSE conversion: {block.get('type')!r}"
-                )
+                block_start = {
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": block,
+                }
 
             events.append(
                 f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n".encode()
@@ -611,9 +654,14 @@ class StreamingMixin:
             events.append(f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n".encode())
 
         # message_delta
+        msg_delta_payload: dict[str, Any] = {}
+        if "stop_reason" in response:
+            msg_delta_payload["stop_reason"] = response["stop_reason"]
+        if "stop_details" in response:
+            msg_delta_payload["stop_details"] = response["stop_details"]
         msg_delta = {
             "type": "message_delta",
-            "delta": {"stop_reason": response.get("stop_reason", "end_turn")},
+            "delta": msg_delta_payload,
             "usage": {"output_tokens": response.get("usage", {}).get("output_tokens", 0)},
         }
         events.append(f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n".encode())
@@ -1025,11 +1073,11 @@ class StreamingMixin:
         # bytes once before entering the connection-retry loop. When a
         # transform mutated the body we re-serialize canonically; otherwise
         # we forward the original client bytes verbatim.
+        from headroom.proxy.body_forwarding import prepare_outbound_body_bytes
         from headroom.proxy.helpers import (
             capture_codex_wire_debug,
             codex_wire_debug_enabled,
             log_outbound_request,
-            prepare_outbound_body_bytes,
         )
 
         outbound_bytes, outbound_source = prepare_outbound_body_bytes(

@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- **backends/litellm:** preserve `cache_control` on `tool_result` blocks when converting Anthropic messages for the Bedrock Converse path, and complete streaming cache-stats surfacing in `stream_message`. Complements [#1390](https://github.com/headroomlabs-ai/headroom/pull/1390), which preserves `cache_control` on the system prompt and plain text blocks but explicitly leaves `tool_result` out of scope — in agent loops the moving cache breakpoint lands on the tail `tool_result` far more often than on the system prompt, so that gap left most of the caching benefit on the table. Separately, `stream_message` never requested `stream_options.include_usage`, so LiteLLM/Bedrock never returned a usage chunk over SSE and `cache_read_input_tokens`/`cache_creation_input_tokens` always reported 0 downstream even when the prompt cache was genuinely engaged; a second `message_start` event now carries the real values captured from the trailing usage chunk once the stream completes.
 - **install:** include `orjson` in the `[proxy]` extra so `uv tool install "headroom-ai[all]"` satisfies LiteLLM OpenRouter/provider backends that import it at runtime ([#2056](https://github.com/headroomlabs-ai/headroom/issues/2056)).
 - The dashboard's per-request metadata (the `recent_requests` / `request_logs`
   tail and the `config` block with upstream URLs) is gated to loopback callers

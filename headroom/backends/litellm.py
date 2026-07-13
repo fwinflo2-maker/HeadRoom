@@ -669,13 +669,20 @@ class LiteLLMBackend(Backend):
                             tr_content = "\n".join(
                                 b.get("text", "") for b in tr_content if b.get("type") == "text"
                             )
-                        converted.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tr["tool_use_id"],
-                                "content": str(tr_content),
-                            }
-                        )
+                        tool_msg: dict[str, Any] = {
+                            "role": "tool",
+                            "tool_call_id": tr["tool_use_id"],
+                            "content": str(tr_content),
+                        }
+                        # Claude Code's moving cache breakpoint usually lands on the
+                        # tail tool_result, not just the system prompt. Carry
+                        # cache_control through so LiteLLM's Bedrock Converse
+                        # transformation can inject a cachePoint here too (#1390
+                        # covers the system-prompt/text-block case; this is the
+                        # tool_result case, out of scope there).
+                        if "cache_control" in tr:
+                            tool_msg["cache_control"] = tr["cache_control"]
+                        converted.append(tool_msg)
                     continue
 
                 # tool_use blocks → OpenAI assistant message with tool_calls
@@ -954,6 +961,13 @@ class LiteLLMBackend(Backend):
                 },
             )
 
+            # Request usage in the final streaming chunk so cache metrics
+            # (cache_read_input_tokens / cache_creation_input_tokens) come back at
+            # all. Without this, LiteLLM/Bedrock never emits a usage chunk over SSE
+            # and the caller's cache stats always read 0, even when caching is
+            # working server-side.
+            kwargs["stream_options"] = {"include_usage": True}
+
             # Stream content — blocks emitted dynamically based on response
             response = await acompletion(**kwargs)
             output_tokens = 0
@@ -961,8 +975,25 @@ class LiteLLMBackend(Backend):
             active_block_type: str | None = None  # "text" or "tool_use"
             tool_block_map: dict[int, int] = {}  # litellm tc.index → SSE block index
             stop_reason = "end_turn"
+            # Populated from the final usage chunk (stream_options.include_usage=True
+            # above). The message_start emitted before this loop always carries
+            # input_tokens=0 and no cache fields, since LiteLLM/Bedrock only reports
+            # usage on the trailing chunk; a second message_start after the loop
+            # carries the real values so callers reading cache stats from
+            # message_start (e.g. _stream_response_bedrock) see them.
+            final_input_tokens = 0
+            final_cache_read_tokens = 0
+            final_cache_write_tokens = 0
 
             async for chunk in response:
+                if hasattr(chunk, "usage") and chunk.usage:
+                    cu = chunk.usage
+                    final_input_tokens = int(getattr(cu, "prompt_tokens", 0) or 0)
+                    final_cache_read_tokens = int(getattr(cu, "cache_read_input_tokens", 0) or 0)
+                    final_cache_write_tokens = int(
+                        getattr(cu, "cache_creation_input_tokens", 0) or 0
+                    )
+
                 if not hasattr(chunk, "choices") or not chunk.choices:
                     continue
 
@@ -1066,6 +1097,38 @@ class LiteLLMBackend(Backend):
                 yield StreamEvent(
                     event_type="content_block_stop",
                     data={"type": "content_block_stop", "index": current_block_index},
+                )
+
+            # Re-emit message_start with the real usage captured from the final
+            # streaming chunk. The message_start above was sent before any usage
+            # was known, so cache_read/cache_creation there are always 0; callers
+            # that read cache stats off message_start (last-write-wins) now see
+            # the real numbers instead. Skipped entirely if the backend never
+            # surfaced usage, so it's a no-op for non-Bedrock LiteLLM providers.
+            if final_input_tokens or final_cache_read_tokens or final_cache_write_tokens:
+                usage: dict[str, Any] = {
+                    "input_tokens": final_input_tokens,
+                    "output_tokens": 0,
+                }
+                if final_cache_read_tokens:
+                    usage["cache_read_input_tokens"] = final_cache_read_tokens
+                if final_cache_write_tokens:
+                    usage["cache_creation_input_tokens"] = final_cache_write_tokens
+                yield StreamEvent(
+                    event_type="message_start",
+                    data={
+                        "type": "message_start",
+                        "message": {
+                            "id": msg_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                            "model": original_model,
+                            "stop_reason": None,
+                            "stop_sequence": None,
+                            "usage": usage,
+                        },
+                    },
                 )
 
             # Emit message_delta with correct stop reason

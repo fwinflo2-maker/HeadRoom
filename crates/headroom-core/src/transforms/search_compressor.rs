@@ -649,11 +649,13 @@ impl SearchCompressor {
 ///    already skipped above), so the leftmost is the right one. The
 ///    no-whitespace guard keeps a `foo.rs:12:` reference *inside the
 ///    body* of a `-`-separated context line from hijacking the parse.
-/// 2. **Dash tier** — *last* `-\d+-` whose path part contains no
-///    whitespace. `-` is grep's *context*-line separator, and unlike
+/// 2. **Dash tier** — `-` is grep's *context*-line separator, and unlike
 ///    `:` it appears inside real paths (`2026-05-03`, `CVE-2021-44228`,
-///    `20240101-002-add_users.sql`), so the marker is the *last* such
-///    triplet in the path token, not the first.
+///    `20240101-002-add_users.sql`), so the leftmost triplet is often
+///    still inside the path. Walk rightward while the path part has no
+///    file extension, and stop at the first marker that gives it one:
+///    that marker is the path/body boundary. Bodies can be
+///    whitespace-free too, so whitespace alone cannot bound the walk.
 /// 3. **Permissive tier** — the original leftmost-any rule, unchanged.
 ///    Only reached when neither tier matched (e.g. a path containing a
 ///    space), so behaviour for those lines is exactly as before.
@@ -668,6 +670,18 @@ enum ScanTier {
     Colon,
     Dash,
     Permissive,
+}
+
+/// True when `path`'s final segment carries a file extension.
+///
+/// The dash tier uses this to tell "these digits are still inside the
+/// path" (`logs/2026`, no extension → keep scanning) from "these digits
+/// are the line-number marker" (`logs/2026-05-03/app.log` → stop).
+fn last_segment_has_extension(path: &str) -> bool {
+    path.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .contains('.')
 }
 
 fn scan_match_line(line: &str, tier: ScanTier) -> Option<(&str, u64, &str)> {
@@ -740,7 +754,19 @@ fn scan_match_line(line: &str, tier: ScanTier) -> Option<(&str, u64, &str)> {
                 if tier != ScanTier::Dash {
                     break;
                 }
-                // Dash tier: keep looking for a later marker.
+                // Dash tier: a marker whose path part ends in a segment
+                // carrying an extension IS the path/body boundary — take
+                // it. Otherwise the digits are still inside the path
+                // (`logs/2026-05-03/…`) and a later marker is the real
+                // one.
+                //
+                // Without this the walk is bounded only by whitespace,
+                // and grep bodies are not guaranteed to contain any — so
+                // it runs past the path and latches onto a triplet in the
+                // *body* (`notes.md-3-see-4-here` -> path `notes.md-3-see`).
+                if last_segment_has_extension(&line[..i]) {
+                    break;
+                }
                 i = j + 1;
                 continue;
             }
@@ -799,6 +825,37 @@ mod tests {
         assert!(b.contains("认证") && b.contains("证令") && b.contains("令牌") && b.len() == 3);
         assert!(cjk_bigrams("hello").is_empty());
         assert!(cjk_bigrams("a认b证").is_empty()); // isolated CJK chars -> no pair
+    }
+
+    #[test]
+    fn dash_tier_does_not_run_past_the_path_into_the_body() {
+        // The dash tier keeps the *last* `-<digits>-` marker so that a
+        // dated path (`logs/2026-05-03/…`) isn't split at its first
+        // triplet. But a context-line *body* can be whitespace-free and
+        // carry a triplet of its own — the walk must not follow it there.
+        assert_eq!(
+            parse_line("notes.md-3-see-4-here"),
+            Some(("notes.md".into(), 3, "see-4-here".into()))
+        );
+        assert_eq!(
+            parse_line("CHANGELOG.md-7-v1-2-beta"),
+            Some(("CHANGELOG.md".into(), 7, "v1-2-beta".into()))
+        );
+    }
+
+    #[test]
+    fn dated_path_inside_a_context_body_is_not_hijacked() {
+        // Same shape as the paths this PR fixes, but on the *body* side of
+        // the marker. Left unbounded, the scan reports a path that never
+        // existed and a line number taken from a date.
+        assert_eq!(
+            parse_line("manifest.txt-5-logs/2026-05-03/app.log"),
+            Some(("manifest.txt".into(), 5, "logs/2026-05-03/app.log".into()))
+        );
+        assert_eq!(
+            parse_line("index.md-2-advisories/CVE-2021-44228.md"),
+            Some(("index.md".into(), 2, "advisories/CVE-2021-44228.md".into()))
+        );
     }
 
     #[test]

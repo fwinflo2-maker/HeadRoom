@@ -656,12 +656,30 @@ impl SearchCompressor {
 ///    only advances past a marker on *positive* evidence that the path
 ///    continues through it: either the path so far ends in a segment with
 ///    an extension (that marker is the boundary — stop), or the rest of
-///    the token still holds a `/` (still inside the path — keep going).
-///    If the walk reaches the end of the token without ever finding that
-///    evidence, the line is genuinely ambiguous and the tier falls back
-///    to the leftmost marker — exactly what the permissive rule returns.
-///    So this tier is never worse than the rule it refines: on any line
-///    where it cannot prove it knows better, it agrees with it.
+///    the token still holds a `/` or a further extension (still inside
+///    the path — keep going). If the walk reaches the end of the token
+///    without ever finding that evidence, the line is genuinely ambiguous
+///    and the tier falls back to the leftmost marker — exactly what the
+///    permissive rule returns. On any line where it cannot prove it knows
+///    better, it agrees with the rule it refines.
+///
+///    One shape stays ambiguous *in principle*, and the tier knowingly
+///    takes the other side of it than the permissive rule does:
+///
+///    ```text
+///    advisories/CVE-2021-44228.md-9-ctx   -> file is CVE-2021-44228.md, line 9
+///    Makefile-7-build.sh-2-stage          -> file is Makefile, line 7
+///    ```
+///
+///    Both are `<stem>-<digits>-<name>.<ext>-<digits>-<rest>`. Nothing in
+///    the *text* separates them — only a filesystem could. The tier stops
+///    at the extension, so it reads the first correctly and the second
+///    wrong; the permissive rule takes the leftmost marker and does the
+///    reverse. That trade is deliberate: dated and CVE-style paths are
+///    everyday grep output, whereas the second shape needs a context line
+///    from an *extension-less* file whose body begins with a bare
+///    `name.ext-<digits>-` token. Both readings lose sometimes; this one
+///    loses far less often.
 /// 3. **Permissive tier** — the original leftmost-any rule, unchanged.
 ///    Only reached when neither tier matched (e.g. a path containing a
 ///    space), so behaviour for those lines is exactly as before.
@@ -678,16 +696,40 @@ enum ScanTier {
     Permissive,
 }
 
+/// True when `tok` holds a dot that looks like a *file extension*: a run
+/// of 1–8 alphanumerics, at least one of them a letter, ending the token
+/// or bounded by a path/marker separator.
+///
+/// The letter requirement is what keeps a dotted *version* out of the
+/// extension test. `v1.2.3` and `rel.1.2` end in all-digit runs, so they
+/// are not extensions — which matters because they show up in the bodies
+/// of context lines from extension-less files (`git describe` output in a
+/// `Makefile`, a version bump in a `CHANGELOG`), and reading one as an
+/// extension is what lets the dash tier walk out of the path and into the
+/// body. `.md`, `.sql`, `.log`, `.7z` all still qualify.
+fn has_extension_dot(tok: &str) -> bool {
+    let b = tok.as_bytes();
+    b.iter().enumerate().any(|(i, &c)| {
+        if c != b'.' || i + 1 == b.len() {
+            return false;
+        }
+        let tail = &b[i + 1..];
+        let end = tail
+            .iter()
+            .position(|c| !c.is_ascii_alphanumeric())
+            .unwrap_or(tail.len());
+        let ext = &tail[..end];
+        (1..=8).contains(&ext.len()) && ext.iter().any(|c| c.is_ascii_alphabetic())
+    })
+}
+
 /// True when `path`'s final segment carries a file extension.
 ///
 /// The dash tier uses this to tell "these digits are still inside the
 /// path" (`logs/2026`, no extension → keep scanning) from "these digits
 /// are the line-number marker" (`logs/2026-05-03/app.log` → stop).
 fn last_segment_has_extension(path: &str) -> bool {
-    path.rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(path)
-        .contains('.')
+    has_extension_dot(path.rsplit(['/', '\\']).next().unwrap_or(path))
 }
 
 /// True when the token after this marker still carries *path structure* —
@@ -707,7 +749,7 @@ fn last_segment_has_extension(path: &str) -> bool {
 fn path_continues(rest: &str) -> bool {
     rest.split_whitespace()
         .next()
-        .is_some_and(|tok| tok.contains('/') || tok.contains('\\') || tok.contains('.'))
+        .is_some_and(|tok| tok.contains('/') || tok.contains('\\') || has_extension_dot(tok))
 }
 
 fn scan_match_line(line: &str, tier: ScanTier) -> Option<(&str, u64, &str)> {
@@ -951,6 +993,45 @@ mod tests {
         assert_eq!(
             parse_line("Makefile-7-include-2-src/foo.mk"),
             Some(("Makefile".into(), 7, "include-2-src/foo.mk".into()))
+        );
+    }
+
+    #[test]
+    fn a_dotted_version_in_the_body_is_not_an_extension() {
+        // The evidence that "the path continues" must not fire on a dotted
+        // *version* sitting in the body of an extension-less file. The
+        // classic source is `git describe` output — `v1.2.3-4-gdeadbee`
+        // carries both a dot and a `-<digits>-` run, so reading its `.3`
+        // as an extension walks the parse clean out of the path and makes
+        // the marker the `-4-`, inventing the file `Makefile-9-VERSION=v1.2.3`.
+        // An extension needs a letter; `.3` and `.2` are not extensions.
+        for line in [
+            "Makefile-9-VERSION=v1.2.3-4-gdeadbee",
+            "Dockerfile-4-TAG=v2.0.1-3-gabc",
+            "CHANGELOG-2-rel.1.2-3-final",
+            "LICENSE-1-v1.0-2-clause",
+        ] {
+            let (file, _, _) = parse_line(line).expect("parses");
+            assert!(
+                !file.contains('.'),
+                "{line}: dotted version read as a path extension, got file {file:?}"
+            );
+        }
+
+        assert_eq!(
+            parse_line("Makefile-9-VERSION=v1.2.3-4-gdeadbee"),
+            Some(("Makefile".into(), 9, "VERSION=v1.2.3-4-gdeadbee".into()))
+        );
+    }
+
+    #[test]
+    fn a_real_extension_still_counts_even_with_digits_in_it() {
+        // The letter requirement must not cost us genuine extensions that
+        // carry digits (`.mp3`, `.7z`, `.h264`): the walk still has to cross
+        // the dated directory and stop at the file.
+        assert_eq!(
+            parse_line("media/2026-05-03/track-2-final.mp3-8-id3"),
+            Some(("media/2026-05-03/track-2-final.mp3".into(), 8, "id3".into()))
         );
     }
 

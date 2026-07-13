@@ -108,7 +108,7 @@ The `headroom` CLI ships **only** via the PyPI package. The npm `headroom-ai` is
 
 Granular extras: `[proxy]`, `[mcp]`, `[ml]`, `[code]`, `[memory]`, `[vector]` (optional HNSW backend, needs a C++ toolchain, not in `[all]`), `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`, `[pytorch-mps]` (Apple-GPU memory-embedder offload, set `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.
 
-On Intel macOS, `[all]` means everything supported on that platform. It skips the torch-bearing `[ml]`, `[memory]`, `[evals]`, and `[voice]` extras because upstream torch wheels are unavailable there.
+On Intel macOS, `[all]` means everything supported on that platform. It still includes `[ml]`, `[memory]`, `[evals]`, and `[voice]`, but skips the unavailable torch-bearing requirements inside those extras.
 
 ### Codex / global install
 

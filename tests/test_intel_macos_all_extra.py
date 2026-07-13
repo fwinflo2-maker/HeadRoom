@@ -66,9 +66,10 @@ def test_all_extra_skips_torch_bearing_dependencies_on_intel_macos() -> None:
 
     assert "torch" not in names
     assert "sentence-transformers" not in names
-    assert "datasets" not in names
+    assert "datasets" in names
     assert "fastembed" in names
     assert "openpyxl" in names
+    assert "transformers" in names
 
 
 def test_all_extra_keeps_full_bundle_on_linux() -> None:
@@ -99,6 +100,6 @@ def test_install_docs_note_intel_macos_all_exception() -> None:
 
     assert "On Intel macOS, `[all]` means everything supported on that platform." in readme
     assert (
-        "On Intel macOS, `[all]` skips the torch-bearing `ml`, `memory`, `evals`, and `voice` extras"
+        "On Intel macOS, `[all]` still includes the `ml`, `memory`, `evals`, and `voice` extras,"
         in installation
     )

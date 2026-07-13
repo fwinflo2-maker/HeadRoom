@@ -57,7 +57,7 @@ pip install "headroom-ai[all]"
 | `pytorch-mps` | Apple-GPU (MPS) memory-embedder offload — **macOS only**, not in `[all]` (torch + sentence-transformers); opt in with `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps` | `pip install "headroom-ai[pytorch-mps]"` |
 | `all` | Everything supported on your platform | `pip install "headroom-ai[all]"` |
 
-On Intel macOS, `[all]` skips the torch-bearing `ml`, `memory`, `evals`, and `voice` extras because upstream torch wheels are unavailable there.
+On Intel macOS, `[all]` still includes the `ml`, `memory`, `evals`, and `voice` extras, but skips the unavailable torch-bearing requirements inside them.
 
 You can combine extras:
 

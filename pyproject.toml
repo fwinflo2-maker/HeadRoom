@@ -290,8 +290,7 @@ dev = [
 # need the accuracy harness opt in explicitly with `pip install
 # headroom-ai[benchmark]`.
 all = [
-    "headroom-ai[proxy,code,relevance,image,reports,otel,html,mcp,spreadsheet]",
-    "headroom-ai[ml,memory,evals,voice]; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "headroom-ai[proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,mcp,spreadsheet]",
 ]
 
 [project.scripts]

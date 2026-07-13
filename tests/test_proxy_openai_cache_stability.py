@@ -280,7 +280,9 @@ def test_issue_327_openai_handler_does_not_call_walker_functions() -> None:
             calls.append(("compute_frozen_count", (), {}))
             return 0
 
-        def update_from_result(self, originals, compressed):  # noqa: ANN001
+        def update_from_result(  # noqa: ANN001
+            self, originals, compressed, protected_contents=None
+        ):
             calls.append(("update_from_result", (), {}))
 
         def mark_stable_from_messages(self, messages, up_to):  # noqa: ANN001

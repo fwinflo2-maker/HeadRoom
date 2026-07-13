@@ -61,7 +61,9 @@ class _FakeCompressionCache:
     def mark_stable_from_messages(self, messages, frozen_count) -> None:  # noqa: ARG002
         return None
 
-    def update_from_result(self, originals, compressed) -> None:  # noqa: ARG002
+    def update_from_result(  # noqa: ARG002
+        self, originals, compressed, protected_contents=None
+    ) -> None:
         return None
 
 

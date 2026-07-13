@@ -722,6 +722,13 @@ class TransformResult:
     cache_metrics: CachePrefixMetrics | None = None  # Populated by CacheAligner
     timing: dict[str, float] = field(default_factory=dict)  # transform_name → ms
     waste_signals: WasteSignals | None = None  # Detected waste in original messages
+    # Raw content of tool_result blocks left verbatim by ContentRouter's
+    # freshness exemption (issue #3), this call only. CompressionCache uses
+    # this to avoid marking freshness-skipped content permanently "stable"
+    # (see CompressionCache.update_from_result) -- it was skipped because it
+    # was the fresh tail this turn, not because it's incompressible, so it
+    # must stay eligible for compression once it's no longer the tail.
+    protected_tool_result_contents: list[str] = field(default_factory=list)
 
     @property
     def transforms_summary(self) -> dict[str, int]:

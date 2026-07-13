@@ -13,6 +13,7 @@ import logging
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -283,11 +284,30 @@ class CompressionCache:
                 result.append(msg)
             return result
 
-    def update_from_result(self, originals: list[dict], compressed: list[dict]) -> None:
+    def update_from_result(
+        self,
+        originals: list[dict],
+        compressed: list[dict],
+        protected_contents: Iterable[str] | None = None,
+    ) -> None:
         """Cache new compressions by comparing original and compressed messages.
 
         Index-aligned: for each position, if both are tool results and the
         content differs, store the mapping original_hash -> compressed_content.
+
+        Args:
+            protected_contents: Raw tool_result content left verbatim by
+                ContentRouter's freshness exemption this call (issue #3),
+                i.e. `TransformResult.protected_tool_result_contents`. Content
+                unchanged for this reason must NOT be marked stable below: it
+                was skipped only because it was the fresh tail this turn, not
+                because it's incompressible, so it needs to stay eligible for
+                compression once a later turn ages it out of the protection
+                window. Without this exclusion, `compute_frozen_count` would
+                treat it as part of the stable/frozen prefix as soon as it's
+                no longer the tail, and content_router would never see it
+                again to actually compress it -- permanently forfeiting the
+                compression, not just deferring it by one turn.
         """
         if len(originals) != len(compressed):
             logger.warning(
@@ -296,6 +316,10 @@ class CompressionCache:
                 len(compressed),
             )
             return
+
+        protected_hashes = (
+            {self.content_hash(c) for c in protected_contents} if protected_contents else set()
+        )
 
         # Single critical section: `store_compressed` re-acquires the lock
         # (RLock) safely.
@@ -306,8 +330,11 @@ class CompressionCache:
                 if orig_content is None or comp_content is None:
                     continue
                 if orig_content == comp_content:
+                    h = self.content_hash(orig_content)
+                    if h in protected_hashes:
+                        continue
                     # Content unchanged — mark as stable for frozen count walk
-                    self._stable_hashes.add(self.content_hash(orig_content))
+                    self._stable_hashes.add(h)
                     continue
                 h = self.content_hash(orig_content)
                 tokens_saved = len(orig_content) // 4 - len(comp_content) // 4

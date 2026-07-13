@@ -197,6 +197,10 @@ def test_force_kompress_routes_anthropic_tool_result_to_targeted_kompress(
         compress_user_messages=True,
         min_tokens_to_compress=10,
         read_protection_window=0,
+        # This test's single message is also the tail, so it would otherwise
+        # hit the freshness exemption (issue #3) by default -- disable it
+        # here to isolate what's actually under test: force_kompress routing.
+        protect_recent_tool_results=0,
     )
 
     assert result.messages[0]["content"][0]["content"] != tool_content

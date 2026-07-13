@@ -783,9 +783,12 @@ def test_unset_messages_from_end_does_not_trigger_freshness_protection(
 def test_protect_recent_tool_results_zero_disables_freshness_protection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    router = _make_router_with_mock_smart_crusher_compress(
-        monkeypatch, ContentRouterConfig(protect_recent_tool_results=0)
-    )
+    # `_process_content_blocks` reads the freshness window from its
+    # `protect_recent_tool_results` parameter (threaded down from `apply()`,
+    # which sources it from config / the runtime kwarg), not from `self.config`
+    # directly — so a direct call passes the knob explicitly. `0` disables the
+    # gate, letting the fresh tail compress normally.
+    router = _make_router_with_mock_smart_crusher_compress(monkeypatch)
     long_text = "Z" * 1000
     msg = {
         "role": "user",
@@ -800,9 +803,100 @@ def test_protect_recent_tool_results_zero_disables_freshness_protection(
         set(),
         route_counts=counts,
         messages_from_end=1,
+        protect_recent_tool_results=0,
     )
     assert "[compressed]" in result["content"][0]["content"]
     assert "recent_tool_result_protected" not in counts
+
+
+def test_apply_surfaces_protected_tool_result_contents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full `apply()` path: the config field flows through to protect the fresh
+    tail AND surfaces its raw content on `TransformResult.protected_tool_result_
+    contents`, so the proxy's CompressionCache can avoid marking it stable
+    (see CompressionCache.update_from_result). An aged tool_result earlier in
+    the same request still compresses and is NOT surfaced as protected."""
+
+    class FakeTokenizer:
+        def count_text(self, text: str) -> int:
+            return len(text)
+
+        def count_message(self, message: object) -> int:
+            return 1
+
+        def count_messages(self, messages: object) -> int:
+            return 1
+
+    router = _make_router_with_mock_smart_crusher_compress(monkeypatch)
+    aged_text = "A" * 1000
+    fresh_text = "F" * 1000
+    messages = [
+        {"role": "user", "content": "do the thing"},
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "aged", "content": aged_text}],
+        },
+        {"role": "assistant", "content": "ok"},
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "fresh", "content": fresh_text}],
+        },
+    ]
+    result = router.apply(
+        messages,
+        FakeTokenizer(),
+        model_limit=200000,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+    )
+
+    fresh_out = result.messages[3]["content"][0]["content"]
+    aged_out = result.messages[1]["content"][0]["content"]
+    assert fresh_out == fresh_text
+    assert "[compressed]" in aged_out
+    # The fresh tail's raw content is surfaced; the aged (compressed) one is not.
+    assert result.protected_tool_result_contents == [fresh_text]
+
+
+def test_apply_runtime_kwarg_overrides_protect_recent_tool_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The `protect_recent_tool_results` runtime kwarg overrides the config
+    default, mirroring how `read_protection_window` is overridable per call.
+    `0` opts out, so even the fresh tail compresses and nothing is surfaced
+    as protected."""
+
+    class FakeTokenizer:
+        def count_text(self, text: str) -> int:
+            return len(text)
+
+        def count_message(self, message: object) -> int:
+            return 1
+
+        def count_messages(self, messages: object) -> int:
+            return 1
+
+    router = _make_router_with_mock_smart_crusher_compress(monkeypatch)
+    fresh_text = "F" * 1000
+    messages = [
+        {"role": "user", "content": "do the thing"},
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "fresh", "content": fresh_text}],
+        },
+    ]
+    result = router.apply(
+        messages,
+        FakeTokenizer(),
+        model_limit=200000,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+        protect_recent_tool_results=0,
+    )
+
+    assert "[compressed]" in result.messages[1]["content"][0]["content"]
+    assert result.protected_tool_result_contents == []
 
 
 def test_assistant_text_blocks_skipped_by_default(

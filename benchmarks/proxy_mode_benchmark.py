@@ -200,7 +200,11 @@ def _simulate_mode(turns: int, mode: str) -> ModeBenchmarkResult:
         forwarded = pipeline_result.messages
 
         if mode == PROXY_MODE_TOKEN:
-            comp_cache.update_from_result(messages, forwarded)
+            comp_cache.update_from_result(
+                messages,
+                forwarded,
+                protected_contents=pipeline_result.protected_tool_result_contents,
+            )
         if mode == PROXY_MODE_CACHE:
             forwarded, _ = AnthropicHandlerMixin._restore_frozen_prefix(
                 messages, forwarded, frozen_message_count=frozen

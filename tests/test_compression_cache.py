@@ -237,6 +237,51 @@ class TestCompressionCacheFrozenCount:
         ]
         assert cache.compute_frozen_count(messages) == 2
 
+    def test_update_from_result_freshness_protected_not_marked_stable(
+        self, cache: CompressionCache
+    ) -> None:
+        """Content left unchanged because it was freshness-protected (issue #3)
+        must NOT be marked stable — otherwise `compute_frozen_count` would freeze
+        it on the next turn and it would never get compressed once it ages out of
+        the protection window (permanently forfeiting the compression, not just
+        deferring it). This is the counterpart to
+        `test_update_from_result_identical_content_marks_stable`: identical
+        content, opposite outcome, distinguished by `protected_contents`."""
+        tool_content = "fresh tail tool output the model has not read yet"
+        originals = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": tool_content}],
+            },
+        ]
+        # Compressed is identical (freshness gate skipped it), and the router
+        # surfaced it via TransformResult.protected_tool_result_contents.
+        compressed = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": tool_content}],
+            },
+        ]
+        cache.update_from_result(originals, compressed, protected_contents=[tool_content])
+
+        h = CompressionCache.content_hash(tool_content)
+        assert h not in cache._stable_hashes
+
+        # Next turn: this tool_result is no longer the tail. Because it was NOT
+        # marked stable, the frozen walk stops at it (cache miss) rather than
+        # freezing it, keeping it in the live zone where it can be compressed.
+        messages = [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": tool_content}],
+            },
+            {"role": "user", "content": "more stuff"},
+        ]
+        assert cache.compute_frozen_count(messages) == 1
+
     def test_mark_stable_from_messages(self, cache: CompressionCache) -> None:
         """mark_stable_from_messages records hashes for tool_results."""
         content_a = "tool output A"

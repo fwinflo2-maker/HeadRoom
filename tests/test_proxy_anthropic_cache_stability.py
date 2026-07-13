@@ -354,7 +354,9 @@ def test_token_mode_freeze_is_capped_by_prefix_tracker() -> None:
             def compute_frozen_count(self, messages):  # noqa: ANN001
                 return 99
 
-            def update_from_result(self, originals, compressed):  # noqa: ANN001
+            def update_from_result(  # noqa: ANN001
+                self, originals, compressed, protected_contents=None
+            ):
                 return None
 
             def mark_stable_from_messages(self, messages, up_to):  # noqa: ANN001
@@ -814,7 +816,9 @@ def test_token_mode_does_not_force_freeze_all_previous_turns() -> None:
             def compute_frozen_count(self, messages):  # noqa: ANN001
                 return 0
 
-            def update_from_result(self, originals, compressed):  # noqa: ANN001
+            def update_from_result(  # noqa: ANN001
+                self, originals, compressed, protected_contents=None
+            ):
                 return None
 
             def mark_stable_from_messages(self, messages, up_to):  # noqa: ANN001
@@ -1243,7 +1247,9 @@ class _IssueFakeCompCache:
     def mark_stable_from_messages(self, messages, up_to):  # noqa: ANN001
         self.calls.append(("mark_stable_from_messages", (up_to,), {}))
 
-    def update_from_result(self, originals, compressed):  # noqa: ANN001
+    def update_from_result(  # noqa: ANN001
+        self, originals, compressed, protected_contents=None
+    ):
         self.calls.append(("update_from_result", (), {}))
 
     # Methods that should NOT be called in the post-fix code path. If any of

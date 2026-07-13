@@ -3330,6 +3330,11 @@ class ContentRouter(Transform):
         if runtime_read_protection_window is not None:
             read_protection_window = max(0, int(runtime_read_protection_window))
 
+        protect_recent_tool_results = self.config.protect_recent_tool_results
+        runtime_protect_recent_tool_results = kwargs.get("protect_recent_tool_results")
+        if runtime_protect_recent_tool_results is not None:
+            protect_recent_tool_results = max(0, int(runtime_protect_recent_tool_results))
+
         # Adaptive compression ratio: scale with context pressure
         if model_limit > 0:
             context_pressure = min(1.0, tokens_before / model_limit)
@@ -3375,6 +3380,10 @@ class ContentRouter(Transform):
             "content_blocks": 0,
         }
         compressed_details: list[str] = []  # e.g. ["code_aware:0.72", "kompress:0.65"]
+        # Raw content of tool_result blocks skipped by the freshness gate this
+        # call, surfaced on TransformResult so CompressionCache can avoid
+        # treating them as permanently "stable" (see TransformResult docstring).
+        protected_tool_result_contents: list[str] = []
 
         # Check for analysis intent in the most recent user message
         analysis_intent = False
@@ -3490,6 +3499,8 @@ class ContentRouter(Transform):
                     skip_user=skip_user,
                     skip_system=skip_system,
                     compress_assistant_text_blocks=compress_assistant_text_blocks,
+                    protect_recent_tool_results=protect_recent_tool_results,
+                    protected_tool_result_contents=protected_tool_result_contents,
                 )
                 result_slots[i] = transformed_message
                 route_counts["content_blocks"] += 1
@@ -3935,6 +3946,7 @@ class ContentRouter(Transform):
             markers_inserted=lifecycle_ccr_hashes,
             warnings=warnings,
             timing=compressor_timing,
+            protected_tool_result_contents=protected_tool_result_contents,
         )
 
     def _lossless_compact_excluded(self, content: Any) -> tuple[str, str] | None:
@@ -4193,6 +4205,8 @@ class ContentRouter(Transform):
         skip_user: bool = True,
         skip_system: bool = True,
         compress_assistant_text_blocks: bool = False,
+        protect_recent_tool_results: int = 1,
+        protected_tool_result_contents: list[str] | None = None,
     ) -> dict[str, Any]:
         """Process content blocks (Anthropic format) for compression.
 
@@ -4439,14 +4453,29 @@ class ContentRouter(Transform):
                 # from `apply()`'s loop always pass `num_messages - i >= 1`.
                 # `0 < messages_from_end` excludes that sentinel so this
                 # protection stays opt-in to real position tracking instead
-                # of silently firing on every unpositioned call.
-                protect_recent_results = self.config.protect_recent_tool_results
-                if protect_recent_results > 0 and 0 < messages_from_end <= protect_recent_results:
+                # of silently firing on every unpositioned call. Runtime-
+                # overridable via the `protect_recent_tool_results` kwarg
+                # (threaded down from `apply()`, mirroring `read_protection_window`)
+                # so callers that need to bypass it for an unrelated, narrow
+                # test/purpose (e.g. isolating `force_kompress` routing) can do
+                # so explicitly, the same way `read_protection_window=0` already
+                # opts out of the read-tool protection above.
+                if (
+                    protect_recent_tool_results > 0
+                    and 0 < messages_from_end <= protect_recent_tool_results
+                ):
                     new_blocks.append(block)
                     transforms_applied.append("router:protected:recent_tool_result")
                     if route_counts is not None:
                         route_counts.setdefault("recent_tool_result_protected", 0)
                         route_counts["recent_tool_result_protected"] += 1
+                    # Surface the raw content so CompressionCache (proxy layer)
+                    # doesn't mark it permanently "stable" -- it was skipped for
+                    # freshness this turn, not because it's incompressible, and
+                    # must stay eligible for compression once it ages out of the
+                    # protection window (see TransformResult docstring).
+                    if protected_tool_result_contents is not None and isinstance(tool_text, str):
+                        protected_tool_result_contents.append(tool_text)
                     continue
 
                 # Only process string content. Blocks below the lossy min_chars

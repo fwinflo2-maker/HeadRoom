@@ -2486,7 +2486,17 @@ class OpenAIHandlerMixin:
                     )
 
                     if result.messages != working_messages:
-                        comp_cache.update_from_result(messages, result.messages)
+                        comp_cache.update_from_result(
+                            messages,
+                            result.messages,
+                            # getattr default: pipeline results that predate this
+                            # field (or non-TransformResult shims) degrade to old
+                            # stable-marking behavior instead of crashing the
+                            # fail-open proxy path.
+                            protected_contents=getattr(
+                                result, "protected_tool_result_contents", None
+                            ),
+                        )
 
                     # Always use pipeline result in token mode
                     optimized_messages = result.messages

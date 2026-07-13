@@ -1302,7 +1302,16 @@ class AnthropicHandlerMixin:
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
                                     lambda bg_result: comp_cache.update_from_result(
-                                        messages, bg_result.messages
+                                        messages,
+                                        bg_result.messages,
+                                        # getattr default: pipeline results that
+                                        # predate this field (or non-TransformResult
+                                        # shims) degrade to old stable-marking
+                                        # behavior instead of crashing the
+                                        # fail-open proxy path.
+                                        protected_contents=getattr(
+                                            bg_result, "protected_tool_result_contents", None
+                                        ),
                                     ),
                                 )
 
@@ -1336,7 +1345,13 @@ class AnthropicHandlerMixin:
 
                             # Cache newly compressed messages (index-aligned diff)
                             if result.messages != working_messages:
-                                comp_cache.update_from_result(messages, result.messages)
+                                comp_cache.update_from_result(
+                                    messages,
+                                    result.messages,
+                                    protected_contents=getattr(
+                                        result, "protected_tool_result_contents", None
+                                    ),
+                                )
 
                             # Always use pipeline result — Zone 1 swaps are already applied
                             optimized_messages = result.messages

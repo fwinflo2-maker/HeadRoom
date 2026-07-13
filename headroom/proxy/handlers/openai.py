@@ -6472,11 +6472,12 @@ class OpenAIHandlerMixin:
         # the generic OpenAI passthrough handler.
         from headroom.providers.hermes import compress_scoped_passthrough_body
 
+        optimize_enabled = bool(getattr(getattr(self, "config", None), "optimize", False))
         original_body = body
         body = compress_scoped_passthrough_body(
             path,
             body,
-            optimize=self.config.optimize,
+            optimize=optimize_enabled,
             bypass=_headroom_bypass_enabled(request.headers),
         )
         if body is not original_body:

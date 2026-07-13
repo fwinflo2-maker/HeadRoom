@@ -1043,6 +1043,18 @@ class ContentRouterConfig:
     protect_recent_code: int = 4  # Don't compress CODE in last N messages (0 = disabled)
     protect_analysis_context: bool = True  # Detect "analyze/review" intent, protect code
 
+    # Protection: freshness exemption for tool_result content (issue #3).
+    # The most-recent N messages are content the model is about to read
+    # for the first time this exact request — SmartCrusher/CCR
+    # substitution there means the model never actually sees what it just
+    # asked for. This is distinct from `protect_recent_code` above, which
+    # only gates SOURCE_CODE-classified content on the plain-string
+    # (OpenAI-style flattened) message path; it does not cover general
+    # JSON/log/text tool_result content blocks (Anthropic-style), which is
+    # where SmartCrusher/CCR opaque-blob substitution actually happens for
+    # the typical MCP tool-output case. 0 disables this protection.
+    protect_recent_tool_results: int = 1
+
     # Protection: failed tool calls / error outputs stay verbatim (issue #847).
     # The model needs exact tracebacks and error text to recover; compressing
     # them measurably hurts agent recovery. Outputs above the size cap still
@@ -4404,6 +4416,37 @@ class ContentRouter(Transform):
                     if route_counts is not None:
                         route_counts.setdefault("error_protected", 0)
                         route_counts["error_protected"] += 1
+                    continue
+
+                # Protection: freshness exemption (issue #3). The most-recent
+                # `protect_recent_tool_results` messages carry content the
+                # model is about to read for the first time this exact
+                # request — SmartCrusher/CCR substitution here means the
+                # model never actually sees what it just asked for. Skip
+                # entirely (both lossless and lossy tiers below) rather than
+                # gating only the CCR-marker path, mirroring how the Rust
+                # live-zone dispatcher's `fresh_message_count` fully excludes
+                # the tail message from its search window. Unlike
+                # `protect_recent_code` above, this isn't gated on
+                # content-type classification — SmartCrusher's typical input
+                # (tool_result JSON/log/text) never classifies as
+                # SOURCE_CODE, so that older check doesn't reach it.
+                #
+                # `messages_from_end == 0` is the parameter's unset/"not
+                # applicable" sentinel (its own default), used by call sites
+                # (mainly unit tests) that invoke this method directly
+                # without wiring in real message position — real messages
+                # from `apply()`'s loop always pass `num_messages - i >= 1`.
+                # `0 < messages_from_end` excludes that sentinel so this
+                # protection stays opt-in to real position tracking instead
+                # of silently firing on every unpositioned call.
+                protect_recent_results = self.config.protect_recent_tool_results
+                if protect_recent_results > 0 and 0 < messages_from_end <= protect_recent_results:
+                    new_blocks.append(block)
+                    transforms_applied.append("router:protected:recent_tool_result")
+                    if route_counts is not None:
+                        route_counts.setdefault("recent_tool_result_protected", 0)
+                        route_counts["recent_tool_result_protected"] += 1
                     continue
 
                 # Only process string content. Blocks below the lossy min_chars

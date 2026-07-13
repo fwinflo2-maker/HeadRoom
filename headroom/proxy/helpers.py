@@ -24,7 +24,34 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from headroom import paths as _paths
 from headroom._subprocess import run
-from headroom.proxy import request_limit_policy, sse_byte_buffer_policy, wire_debug_redaction_policy
+from headroom.proxy import (
+    diagnostic_decode_policy,
+    memory_injection_mode_policy,
+    query_log_policy,
+    request_limit_policy,
+    sse_byte_buffer_policy,
+    wire_debug_format_policy,
+    wire_debug_redaction_policy,
+)
+from headroom.proxy.beta_header_merge import (
+    merge_anthropic_beta as merge_anthropic_beta,
+)
+from headroom.proxy.beta_header_merge import (
+    merge_beta_tokens,
+    split_beta_tokens,
+)
+from headroom.proxy.beta_header_merge import (
+    merge_openai_beta as merge_openai_beta,
+)
+from headroom.proxy.beta_header_policy import (
+    BETA_HEADER_STICKY_DEFAULT,
+    BETA_HEADER_STICKY_ENV,
+    BETA_TRACKER_MAX_SESSIONS_DEFAULT,
+    BETA_TRACKER_MAX_SESSIONS_ENV,
+    BetaHeaderStickyMode,
+    resolve_beta_header_sticky_mode,
+    resolve_beta_tracker_max_sessions,
+)
 from headroom.proxy.body_forwarding import (
     BodyMutationTracker as BodyMutationTracker,  # noqa: F401 - compatibility export
 )
@@ -42,6 +69,12 @@ from headroom.proxy.ccr_golden_policy import (
     create_fresh_ccr_tool_definition,
     replay_golden_ccr_tool_definition,
 )
+from headroom.proxy.ccr_marker_policy import (
+    has_new_ccr_markers as _has_new_ccr_markers,
+)
+from headroom.proxy.ccr_marker_policy import (
+    should_inject_ccr_tool as _should_inject_ccr_tool,
+)
 from headroom.proxy.ccr_session_tracker import SessionCcrTracker as _SessionCcrTracker
 from headroom.proxy.internal_header_policy import (
     INTERNAL_HEADER_PREFIX,
@@ -51,6 +84,10 @@ from headroom.proxy.internal_header_policy import (
     resolve_strip_internal_headers_mode,
     strip_internal_headers,
 )
+from headroom.proxy.memory_golden_policy import (
+    replay_golden_memory_tool_definition,
+    serialize_memory_tool_definition_canonical,
+)
 from headroom.proxy.tool_injection_config import (
     ToolInjectionStickyMode,
 )
@@ -59,6 +96,12 @@ from headroom.proxy.tool_injection_config import (
 )
 from headroom.proxy.tool_injection_config import (
     get_tool_tracker_max_sessions as _get_tool_tracker_max_sessions,
+)
+from headroom.proxy.tool_injection_logging import (
+    ToolInjectionDecision,
+)
+from headroom.proxy.tool_injection_logging import (
+    log_tool_injection_decision as _log_tool_injection_decision,
 )
 from headroom.proxy.tool_injection_tracker import SessionToolTracker as _SessionToolTracker
 from headroom.proxy.tool_name_policy import extract_tool_name
@@ -107,7 +150,7 @@ def redact_for_wire_debug(value: Any) -> Any:
 
 
 def _safe_event_name(event: str) -> str:
-    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in event)[:80]
+    return wire_debug_format_policy.safe_wire_debug_name(event)
 
 
 def _wire_debug_preview(value: Any, *, max_chars: int | None = None) -> str:
@@ -118,22 +161,7 @@ def _wire_debug_preview(value: Any, *, max_chars: int | None = None) -> str:
     deliberate trim boundary belongs.
     """
 
-    try:
-        if isinstance(value, bytes):
-            text = value.decode("utf-8", errors="replace")
-        elif isinstance(value, str):
-            text = value
-        elif value is None:
-            return ""
-        else:
-            text = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
-    except Exception:
-        text = repr(value)
-
-    text = " ".join(text.split())
-    if max_chars is not None and len(text) > max_chars:
-        return text[: max_chars - 1] + "…"
-    return text
+    return wire_debug_format_policy.wire_debug_preview(value, max_chars=max_chars)
 
 
 def capture_codex_wire_debug(
@@ -228,9 +256,9 @@ def capture_codex_wire_debug(
 # Configurable via HEADROOM_MEMORY_INJECTION_MODE env var. There is no
 # "system_prompt" option — that path is permanently retired by I2 (cache hot
 # zone never modified). See REALIGNMENT/02-architecture.md §2.2.
-_MEMORY_INJECTION_MODE_ENV = "HEADROOM_MEMORY_INJECTION_MODE"
-_MEMORY_INJECTION_MODE_DEFAULT: Literal["live_zone_tail", "disabled"] = "live_zone_tail"
-MemoryInjectionMode = Literal["live_zone_tail", "disabled"]
+_MEMORY_INJECTION_MODE_ENV = memory_injection_mode_policy.MEMORY_INJECTION_MODE_ENV
+_MEMORY_INJECTION_MODE_DEFAULT = memory_injection_mode_policy.MEMORY_INJECTION_MODE_DEFAULT
+MemoryInjectionMode = memory_injection_mode_policy.MemoryInjectionMode
 
 
 def get_memory_injection_mode() -> MemoryInjectionMode:
@@ -239,13 +267,8 @@ def get_memory_injection_mode() -> MemoryInjectionMode:
     Read at request time so the env var can be flipped without restart for
     smoke tests. Unknown values are rejected loudly (no silent fallback).
     """
-    raw = os.environ.get(_MEMORY_INJECTION_MODE_ENV, "").strip().lower()
-    if not raw:
-        return _MEMORY_INJECTION_MODE_DEFAULT
-    if raw in ("live_zone_tail", "disabled"):
-        return cast(MemoryInjectionMode, raw)
-    raise ValueError(
-        f"Invalid {_MEMORY_INJECTION_MODE_ENV}={raw!r}; expected 'live_zone_tail' or 'disabled'"
+    return memory_injection_mode_policy.resolve_memory_injection_mode(
+        os.environ.get(_MEMORY_INJECTION_MODE_ENV)
     )
 
 
@@ -254,8 +277,7 @@ def hash_query_for_log(query: str) -> str:
 
     Uses BLAKE2b truncated to 16 hex chars. Never logs the raw query content.
     """
-    h = hashlib.blake2b(query.encode("utf-8", errors="replace"), digest_size=8)
-    return h.hexdigest()
+    return query_log_policy.hash_query_for_log(query)
 
 
 def extract_tags(headers: Any) -> dict[str, str]:
@@ -563,16 +585,7 @@ def safe_decode_for_logging(raw: bytes, *, max_bytes: int | None = None) -> str:
 
     Use ``parse_sse_events_from_byte_buffer`` for SSE parsing instead.
     """
-    blob = raw[:max_bytes] if max_bytes is not None else raw
-    # Decode incrementally and represent any invalid bytes as the
-    # Unicode replacement character (�). Implemented via the
-    # `codecs` incremental decoder so we never reach for the
-    # forbidden `errors="ignore"`/`errors="replace"` keyword in the
-    # SSE-bearing modules.
-    import codecs as _codecs
-
-    decoder = _codecs.getincrementaldecoder("utf-8")(errors="replace")
-    return decoder.decode(bytes(blob), final=True)
+    return diagnostic_decode_policy.safe_decode_for_logging(raw, max_bytes=max_bytes)
 
 
 def parse_sse_events_from_byte_buffer(
@@ -1554,12 +1567,11 @@ def log_outbound_headers(
 # the tracker (returns the client value verbatim). That mode is loud and
 # explicit per realignment build constraint #4 — NOT a silent fallback.
 
-_BETA_HEADER_STICKY_ENV = "HEADROOM_BETA_HEADER_STICKY"
-BetaHeaderStickyMode = Literal["enabled", "disabled"]
-_BETA_HEADER_STICKY_DEFAULT: BetaHeaderStickyMode = "enabled"
+_BETA_HEADER_STICKY_ENV = BETA_HEADER_STICKY_ENV
+_BETA_HEADER_STICKY_DEFAULT = BETA_HEADER_STICKY_DEFAULT
 
-_BETA_TRACKER_MAX_SESSIONS_ENV = "HEADROOM_BETA_TRACKER_MAX_SESSIONS"
-_BETA_TRACKER_MAX_SESSIONS_DEFAULT = 1000
+_BETA_TRACKER_MAX_SESSIONS_ENV = BETA_TRACKER_MAX_SESSIONS_ENV
+_BETA_TRACKER_MAX_SESSIONS_DEFAULT = BETA_TRACKER_MAX_SESSIONS_DEFAULT
 
 
 def get_beta_header_sticky_mode() -> BetaHeaderStickyMode:
@@ -1569,103 +1581,18 @@ def get_beta_header_sticky_mode() -> BetaHeaderStickyMode:
     restart. Unknown values raise loudly per the no-silent-fallback
     build constraint.
     """
-    raw = os.environ.get(_BETA_HEADER_STICKY_ENV, "").strip().lower()
-    if not raw:
-        return _BETA_HEADER_STICKY_DEFAULT
-    if raw in ("enabled", "disabled"):
-        return cast(BetaHeaderStickyMode, raw)
-    raise ValueError(f"Invalid {_BETA_HEADER_STICKY_ENV}={raw!r}; expected 'enabled' or 'disabled'")
+    return resolve_beta_header_sticky_mode(os.environ.get(_BETA_HEADER_STICKY_ENV))
 
 
 def get_beta_tracker_max_sessions() -> int:
     """Return the LRU bound for `SessionBetaTracker` (sessions cap)."""
-    raw = os.environ.get(_BETA_TRACKER_MAX_SESSIONS_ENV, "").strip()
-    if not raw:
-        return _BETA_TRACKER_MAX_SESSIONS_DEFAULT
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            f"Invalid {_BETA_TRACKER_MAX_SESSIONS_ENV}={raw!r}; expected positive int"
-        ) from exc
-    if value <= 0:
-        raise ValueError(f"Invalid {_BETA_TRACKER_MAX_SESSIONS_ENV}={raw!r}; expected positive int")
-    return value
+    return resolve_beta_tracker_max_sessions(os.environ.get(_BETA_TRACKER_MAX_SESSIONS_ENV))
 
 
-def _split_beta_tokens(value: str | None) -> list[str]:
-    """Split a comma-separated beta-header value into trimmed tokens.
-
-    Empty/whitespace-only entries are dropped. Pure function, no regex.
-    """
-    if not value:
-        return []
-    out: list[str] = []
-    for raw in value.split(","):
-        token = raw.strip()
-        if token:
-            out.append(token)
-    return out
+_split_beta_tokens = split_beta_tokens
 
 
-def _merge_beta_tokens(client_value: str | None, headroom_required: list[str]) -> str:
-    """Shared deterministic merge for `anthropic-beta` / `OpenAI-Beta` tokens.
-
-    Rules (per Anthropic guide §6.3 #6 "sticky-on; add but never reorder"):
-
-    * Client tokens come first, in their original order.
-    * Headroom-required tokens append in the order given, skipping any
-      token already present (case-insensitive).
-    * Dedupe is case-insensitive but the FIRST occurrence's casing wins
-      (prevents drift when client uses one casing across turns).
-    * Returns ``""`` when both inputs are empty.
-
-    Pure function. No regex. No global state.
-    """
-    seen_lower: set[str] = set()
-    out: list[str] = []
-    for token in _split_beta_tokens(client_value):
-        lower = token.lower()
-        if lower in seen_lower:
-            continue
-        seen_lower.add(lower)
-        out.append(token)
-    for token in headroom_required:
-        if not token:
-            continue
-        token = token.strip()
-        if not token:
-            continue
-        lower = token.lower()
-        if lower in seen_lower:
-            continue
-        seen_lower.add(lower)
-        out.append(token)
-    return ",".join(out)
-
-
-def merge_anthropic_beta(client_value: str | None, headroom_required: list[str]) -> str:
-    """Merge client `anthropic-beta` value with Headroom-required tokens.
-
-    See `_merge_beta_tokens` for full semantics. Order is deterministic:
-    client tokens first (in their original order), then headroom tokens
-    (in the order passed). No sorting — sticky-on per Anthropic guide
-    §6.3 #6 means we add but never reorder. Dedupe is case-insensitive
-    but preserves the original casing of the first occurrence.
-
-    Returns ``""`` when both inputs are empty.
-    """
-    return _merge_beta_tokens(client_value, headroom_required)
-
-
-def merge_openai_beta(client_value: str | None, headroom_required: list[str]) -> str:
-    """Merge client `OpenAI-Beta` value with Headroom-required tokens.
-
-    Mirror of `merge_anthropic_beta`. Same semantics — the OpenAI header
-    follows the same comma-separated convention and the same cache-stable
-    rules apply.
-    """
-    return _merge_beta_tokens(client_value, headroom_required)
+_merge_beta_tokens = merge_beta_tokens
 
 
 class SessionBetaTracker:
@@ -1944,12 +1871,7 @@ def log_tool_injection_decision(
     *,
     provider: str,
     session_id: str | None,
-    decision: Literal[
-        "inject_first_time",
-        "inject_sticky_replay",
-        "skip",
-        "skip_disabled_via_env",
-    ],
+    decision: ToolInjectionDecision,
     tool_definition_bytes_count: int,
     request_id: str | None,
 ) -> None:
@@ -1961,14 +1883,13 @@ def log_tool_injection_decision(
     tool definition contents (might contain user-specific schemas) per
     constraint #11.
     """
-    logger.info(
-        "event=tool_injection_decision provider=%s session_id=%s "
-        "decision=%s tool_definition_bytes_count=%d request_id=%s",
-        provider,
-        session_id or "",
-        decision,
-        tool_definition_bytes_count,
-        request_id or "",
+    _log_tool_injection_decision(
+        logger=logger,
+        provider=provider,
+        session_id=session_id,
+        decision=decision,
+        tool_definition_bytes_count=tool_definition_bytes_count,
+        request_id=request_id,
     )
 
 
@@ -2055,7 +1976,7 @@ def apply_session_sticky_memory_tools(
                 continue
             tools_out.append(tool_def)
             existing_names.add(tn)
-            added_bytes += len(serialize_tool_definition_canonical(tool_def))
+            added_bytes += len(serialize_memory_tool_definition_canonical(tool_def))
         log_tool_injection_decision(
             provider=provider,
             session_id=session_id,
@@ -2085,7 +2006,7 @@ def apply_session_sticky_memory_tools(
                 continue
             tools_out.append(tool_def)
             existing_names.add(tn)
-            added_bytes += len(serialize_tool_definition_canonical(tool_def))
+            added_bytes += len(serialize_memory_tool_definition_canonical(tool_def))
         log_tool_injection_decision(
             provider=provider,
             session_id=None,
@@ -2110,7 +2031,10 @@ def apply_session_sticky_memory_tools(
                 # Their bytes win (the client's choice, not ours to gate).
                 continue
             try:
-                tool_def = json.loads(golden_bytes.decode("utf-8"))
+                replay = replay_golden_memory_tool_definition(
+                    tool_name=tool_name,
+                    golden_tool_bytes=golden_bytes,
+                )
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 logger.error(
                     "corrupt golden tool bytes for session %s tool %s: %s — skipping tool injection",
@@ -2120,9 +2044,9 @@ def apply_session_sticky_memory_tools(
                     exc_info=True,
                 )
                 continue
-            tools_out.append(tool_def)
-            existing_names.add(tool_name)
-            replay_bytes += len(golden_bytes)
+            tools_out.append(replay.tool_definition)
+            existing_names.add(replay.tool_name)
+            replay_bytes += len(replay.canonical_bytes)
         log_tool_injection_decision(
             provider=provider,
             session_id=session_id,
@@ -2149,7 +2073,7 @@ def apply_session_sticky_memory_tools(
         tn = _extract_tool_name(tool_def)
         if tn is None or tn in existing_names:
             continue
-        golden_bytes = serialize_tool_definition_canonical(tool_def)
+        golden_bytes = serialize_memory_tool_definition_canonical(tool_def)
         tracker.record_injection(
             provider=provider,
             session_id=session_id,
@@ -2232,21 +2156,11 @@ def has_new_ccr_markers(
     Returns True iff ``current_detected_hashes`` contains a hash that is not present
     in ``previous_forwarded_messages``.
     """
-    current = set(current_detected_hashes)
-    if not current:
-        return False
-    if not previous_forwarded_messages:
-        # No prior forward → every marker is new (genuine first CCR turn).
-        return True
-    from headroom.ccr.tool_injection import CCRToolInjector
-
-    prev = CCRToolInjector(
+    return _has_new_ccr_markers(
+        current_detected_hashes=current_detected_hashes,
+        previous_forwarded_messages=previous_forwarded_messages,
         provider=provider,
-        inject_tool=False,
-        inject_system_instructions=False,
     )
-    prev.scan_for_markers(previous_forwarded_messages)
-    return bool(current - set(prev.detected_hashes))
 
 
 def should_inject_ccr_tool(
@@ -2271,11 +2185,11 @@ def should_inject_ccr_tool(
     True only when injection happens *because* of new markers despite a deferral,
     so the caller can log the override distinctly.
     """
-    inject_tool = configured_inject_tool
-    if inject_tool and frozen_message_count > 0:
-        inject_tool = False  # defer to preserve cache
-    is_marker_override = not inject_tool and has_compressed_content
-    return (inject_tool or is_marker_override), is_marker_override
+    return _should_inject_ccr_tool(
+        configured_inject_tool=configured_inject_tool,
+        frozen_message_count=frozen_message_count,
+        has_compressed_content=has_compressed_content,
+    )
 
 
 def apply_session_sticky_ccr_tool(

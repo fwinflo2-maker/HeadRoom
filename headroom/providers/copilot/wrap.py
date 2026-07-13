@@ -11,8 +11,6 @@ from typing import Any
 
 import click
 
-from headroom.proxy.project_context import with_project_prefix
-
 
 def resolve_provider_type(
     backend: str | None, provider_type: str, environ: Mapping[str, str] | None = None
@@ -22,6 +20,10 @@ def resolve_provider_type(
         return provider_type
 
     env = environ or os.environ
+    # Check COPILOT_PROVIDER_TYPE env var before falling back to backend default.
+    env_type = env.get("COPILOT_PROVIDER_TYPE")
+    if env_type in {"anthropic", "openai"}:
+        return env_type
     effective_backend = backend or env.get("HEADROOM_BACKEND") or "anthropic"
     return "anthropic" if effective_backend == "anthropic" else "openai"
 
@@ -166,6 +168,8 @@ def build_launch_env(
     base-URL prefix because the Copilot CLI cannot send custom headers; the
     proxy strips it and attributes savings per project.
     """
+    from headroom.proxy.project_context import with_project_prefix
+
     # Distinguish "caller passed nothing" (use os.environ) from "caller
     # explicitly passed an empty dict" (start fresh — the test/CLI is in
     # charge of which keys to seed). The previous `environ or os.environ`

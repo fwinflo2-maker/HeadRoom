@@ -14,6 +14,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from headroom.cache.backends import InMemoryBackend
+from headroom.cache.compression_store import get_compression_store, reset_compression_store
 from headroom.proxy.server import ProxyConfig, create_app
 
 GATED = [
@@ -42,6 +44,18 @@ def _loopback_client() -> TestClient:
     # A real loopback peer + a loopback Host header — passes both guard gates
     # (client-IP check and the DNS-rebinding Host-header check).
     return TestClient(_make_app(), base_url="http://127.0.0.1", client=("127.0.0.1", 12345))
+
+
+def _seed_ccr_entry() -> str:
+    reset_compression_store()
+    store = get_compression_store(backend=InMemoryBackend())
+    return store.store(
+        "seeded-ccr-content",
+        "<<ccr:seeded>>",
+        original_tokens=3,
+        compressed_tokens=1,
+        tool_name="seeded-test",
+    )
 
 
 @pytest.mark.parametrize("method,path", GATED)
@@ -74,6 +88,20 @@ CCR_GATED = [
 def test_ccr_non_loopback_gets_404(method: str, path: str) -> None:
     resp = TestClient(_make_app()).request(method, path, json={})
     assert resp.status_code == 404, resp.text
+
+
+def test_ccr_retrieve_hash_route_blocks_valid_hash_for_non_loopback() -> None:
+    ccr_hash = _seed_ccr_entry()
+    try:
+        loopback = _loopback_client()
+        loopback_resp = loopback.get(f"/v1/retrieve/{ccr_hash}")
+        assert loopback_resp.status_code == 200, loopback_resp.text
+        assert loopback_resp.json()["original_content"] == "seeded-ccr-content"
+
+        network_resp = TestClient(_make_app()).get(f"/v1/retrieve/{ccr_hash}")
+        assert network_resp.status_code == 404, network_resp.text
+    finally:
+        reset_compression_store()
 
 
 def test_dns_rebinding_host_header_rejected() -> None:
@@ -122,3 +150,38 @@ def test_stats_per_request_metadata_is_loopback_only() -> None:
     local = _client(loopback=True).get("/stats").json()
     assert "recent_requests" in local
     assert "config" in local
+
+
+def test_stats_metadata_served_to_trusted_gateway_peer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Containerized dashboards: a browser on the host reaches a bridge-network
+    container via the gateway IP, so the peer isn't 127.0.0.1 and per-request
+    metadata gets stripped. When the operator allow-lists the gateway CIDR via
+    HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS, the peer is treated as
+    loopback-equivalent and the metadata is served again."""
+    gateway_ip = "172.18.0.1"  # typical docker/mocker bridge gateway
+    app = _make_app()
+
+    def _gateway_client() -> TestClient:
+        # Loopback Host header (the operator browses http://127.0.0.1:8787) but
+        # the peer IP is the container gateway, not loopback.
+        return TestClient(app, base_url="http://127.0.0.1", client=(gateway_ip, 54321))
+
+    # Without the allow-list, the gateway peer is untrusted → metadata stripped.
+    monkeypatch.delenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", raising=False)
+    stripped = _gateway_client().get("/stats").json()
+    assert "recent_requests" not in stripped
+    assert "config" not in stripped
+
+    # Allow-list the gateway CIDR → peer trusted → metadata served.
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "172.18.0.0/16")
+    served = _gateway_client().get("/stats").json()
+    assert "recent_requests" in served
+    assert "config" in served
+
+    # DNS-rebinding defence still applies even for a trusted gateway peer: a
+    # non-loopback Host header must be rejected.
+    rebind = TestClient(app, base_url="http://attacker.example", client=(gateway_ip, 54321))
+    payload = rebind.get("/stats").json()
+    assert "recent_requests" not in payload

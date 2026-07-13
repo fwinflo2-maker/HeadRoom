@@ -420,6 +420,29 @@ def _anthropic_usage_from_litellm(litellm_usage: Any) -> dict[str, Any]:
     return usage
 
 
+def _system_to_openai_content(system: list) -> "str | list[dict[str, Any]]":
+    """Convert Anthropic system blocks to OpenAI format, preserving cache_control.
+
+    LiteLLM translates `cache_control` on content blocks into provider cache
+    points (e.g. Bedrock cachePoint). When no block carries a marker, keep the
+    legacy joined-string form byte-for-byte.
+    """
+    blocks: list[dict[str, Any]] = []
+    has_cache_control = False
+    for s in system:
+        if isinstance(s, dict):
+            block: dict[str, Any] = {"type": "text", "text": s.get("text", "")}
+            if "cache_control" in s:
+                block["cache_control"] = s["cache_control"]
+                has_cache_control = True
+            blocks.append(block)
+        else:
+            blocks.append({"type": "text", "text": str(s)})
+    if not has_cache_control:
+        return " ".join(b["text"] for b in blocks)
+    return blocks
+
+
 def _convert_anthropic_tool(tool: dict[str, Any]) -> dict[str, Any]:
     """Convert Anthropic tool format to OpenAI function format.
 
@@ -431,7 +454,10 @@ def _convert_anthropic_tool(tool: dict[str, Any]) -> dict[str, Any]:
         func["description"] = tool["description"]
     if "input_schema" in tool:
         func["parameters"] = tool["input_schema"]
-    return {"type": "function", "function": func}
+    converted: dict[str, Any] = {"type": "function", "function": func}
+    if "cache_control" in tool:
+        converted["cache_control"] = tool["cache_control"]
+    return converted
 
 
 def _convert_tool_choice(choice: Any) -> Any:
@@ -665,17 +691,30 @@ class LiteLLMBackend(Backend):
                     # doesn't send text with tool_result blocks in practice).
                     for tr in tool_result_blocks:
                         tr_content = tr.get("content", "")
+                        cache_control = tr.get("cache_control")
                         if isinstance(tr_content, list):
+                            if cache_control is None:
+                                for b in tr_content:
+                                    if isinstance(b, dict) and "cache_control" in b:
+                                        cache_control = b["cache_control"]
+                                        break
                             tr_content = "\n".join(
                                 b.get("text", "") for b in tr_content if b.get("type") == "text"
                             )
-                        converted.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tr["tool_use_id"],
-                                "content": str(tr_content),
-                            }
-                        )
+                        tool_msg: dict[str, Any] = {
+                            "role": "tool",
+                            "tool_call_id": tr["tool_use_id"],
+                            "content": str(tr_content),
+                        }
+                        if cache_control is not None:
+                            tool_msg["content"] = [
+                                {
+                                    "type": "text",
+                                    "text": str(tr_content),
+                                    "cache_control": cache_control,
+                                }
+                            ]
+                        converted.append(tool_msg)
                     continue
 
                 # tool_use blocks → OpenAI assistant message with tool_calls
@@ -699,9 +738,29 @@ class LiteLLMBackend(Backend):
                     converted.append(assistant_msg)
                     continue
 
-                # Simple text only
+                # Simple text only (cache_control preserved per block)
                 if text_parts:
-                    converted.append({"role": role, "content": "\n".join(text_parts)})
+                    if any(isinstance(b, dict) and "cache_control" in b for b in content):
+                        converted.append(
+                            {
+                                "role": role,
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": b.get("text", ""),
+                                        **(
+                                            {"cache_control": b["cache_control"]}
+                                            if "cache_control" in b
+                                            else {}
+                                        ),
+                                    }
+                                    for b in content
+                                    if isinstance(b, dict) and b.get("type") == "text"
+                                ],
+                            }
+                        )
+                    else:
+                        converted.append({"role": role, "content": "\n".join(text_parts)})
                 else:
                     converted.append({"role": role, "content": ""})
 
@@ -800,11 +859,10 @@ class LiteLLMBackend(Backend):
                 if isinstance(system, str):
                     kwargs["messages"].insert(0, {"role": "system", "content": system})
                 elif isinstance(system, list):
-                    # Anthropic list format
-                    system_text = " ".join(
-                        s.get("text", "") if isinstance(s, dict) else str(s) for s in system
+                    # Anthropic list format (cache_control preserved)
+                    kwargs["messages"].insert(
+                        0, {"role": "system", "content": _system_to_openai_content(system)}
                     )
-                    kwargs["messages"].insert(0, {"role": "system", "content": system_text})
 
             # Provider-specific region config
             if self.region:
@@ -908,10 +966,10 @@ class LiteLLMBackend(Backend):
                 if isinstance(system, str):
                     kwargs["messages"].insert(0, {"role": "system", "content": system})
                 elif isinstance(system, list):
-                    system_text = " ".join(
-                        s.get("text", "") if isinstance(s, dict) else str(s) for s in system
+                    # cache_control preserved
+                    kwargs["messages"].insert(
+                        0, {"role": "system", "content": _system_to_openai_content(system)}
                     )
-                    kwargs["messages"].insert(0, {"role": "system", "content": system_text})
 
             # Provider-specific region config
             if self.region:

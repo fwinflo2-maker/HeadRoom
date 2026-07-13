@@ -22,7 +22,9 @@ use crate::cache_stabilization::drift_detector::{
 };
 use crate::compression;
 use crate::config::Config;
-use crate::error::ProxyError;
+use crate::error::ProxyError::{self, GlobalCheckComplianceFailed, GlobalCheckServiceError};
+// --- GLOBALCHECK: Add new types for GlobalCheck integration
+use serde::{Deserialize, Serialize};
 use crate::headers::{build_forward_request_headers, filter_response_headers};
 use crate::health::{healthz, healthz_upstream};
 use crate::websocket::ws_handler;
@@ -631,6 +633,36 @@ pub(crate) async fn forward_http(
         // - Anthropic: no extra skip rules at this layer.
         let endpoint = compression::classify_compressible_path(uri.path())
             .expect("is_compressible_path guarded above");
+
+        // --- GLOBALCHECK GATE ──────────────────────────────────────────────
+        // This runs before compression or any other mutation, ensuring the
+        // original agent intent is evaluated for compliance.
+        match run_globalcheck_check(&state, &request_id, endpoint, &buffered, &path_for_log).await {
+            Ok(_) => {
+                // Content is compliant or check was skipped, proceed with compression/forwarding.
+                tracing::debug!(
+                    event = "globalcheck_decision",
+                    request_id = %request_id,
+                    decision = "compliant_or_skipped",
+                    path = %path_for_log,
+                    "GlobalCheck: content compliant or check skipped, proceeding"
+                );
+            },
+            Err(e) => {
+                // Content is non-compliant or GlobalCheck service failed.
+                // Log and return the error to block the request.
+                tracing::warn!(
+                    event = "globalcheck_decision",
+                    request_id = %request_id,
+                    decision = "non_compliant_or_service_error",
+                    error = %e,
+                    path = %path_for_log,
+                    "GlobalCheck: compliance failed or service error, returning error response"
+                );
+                return Err(e); // Propagate the error to return early
+            }
+        };
+        // --- END GLOBALCHECK GATE ──────────────────────────────────────────
 
         // PR-E5 + PR-E6: cache-stabilization observability hooks.
         // Both run READ-ONLY against the buffered body and emit
@@ -1577,6 +1609,151 @@ fn ensure_request_id(headers: &HeaderMap) -> String {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
+// --- GLOBALCHECK: New types for request/response bodies
+#[derive(Serialize)]
+struct GlobalCheckRequest<'a> {
+    request_id: &'a str,
+    path: &'a str,
+    content_type: &'a str, // "anthropic_messages", "openai_chat_completions", etc.
+    content: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct GlobalCheckResponse {
+    compliant: bool,
+    reason: Option<String>,
+}
+
+/// New helper function to call the GlobalCheck service.
+///
+/// Returns `Ok(())` if the content is compliant or the check is skipped.
+/// Returns `Err(ProxyError)` if the content is non-compliant or the service fails.
+async fn run_globalcheck_check(
+    state: &AppState,
+    request_id: &str,
+    endpoint: compression::CompressibleEndpoint, // Pass the enum, easier for service to categorize
+    body_bytes: &bytes::Bytes,
+    path_for_log: &str,
+) -> Result<(), ProxyError> {
+    if !state.config.enable_globalcheck {
+        tracing::debug!(
+            event = "globalcheck_skipped",
+            request_id = %request_id,
+            reason = "disabled_by_config",
+            "GlobalCheck: disabled by config, skipping compliance check"
+        );
+        return Ok(());
+    }
+
+    let globalcheck_endpoint = match &state.config.globalcheck_endpoint {
+        Some(url) => url,
+        None => {
+            tracing::warn!(
+                event = "globalcheck_skipped",
+                request_id = %request_id,
+                reason = "endpoint_not_configured",
+                "GlobalCheck: enabled but endpoint not configured, skipping compliance check (fail-open)"
+            );
+            return Ok(());
+        }
+    };
+
+    let parsed_body: serde_json::Value = match serde_json::from_slice(body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            // If body isn't valid JSON, GlobalCheck can't process it.
+            // This path only runs for compressible (JSON) bodies anyway.
+            tracing::warn!(
+                event = "globalcheck_parse_error",
+                request_id = %request_id,
+                error = %e,
+                "GlobalCheck: failed to parse request body as JSON, treating as compliant (cannot check malformed JSON)"
+            );
+            return Ok(());
+        }
+    };
+
+    let globalcheck_req_body = GlobalCheckRequest {
+        request_id,
+        path: path_for_log,
+        content_type: endpoint.as_str(),
+        content: parsed_body,
+    };
+
+    let globalcheck_resp = state.client
+        .post(globalcheck_endpoint)
+        .json(&globalcheck_req_body)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                event = "globalcheck_service_error",
+                request_id = %request_id,
+                endpoint = globalcheck_endpoint,
+                error = %e,
+                "GlobalCheck: failed to send request to service"
+            );
+            GlobalCheckServiceError(format!("Failed to reach GlobalCheck service: {}", e))
+        })?;
+
+    let status = globalcheck_resp.status();
+    if !status.is_success() {
+        let err_text = globalcheck_resp.text().await.unwrap_or_default();
+        tracing::error!(
+            event = "globalcheck_service_error",
+            request_id = %request_id,
+            endpoint = globalcheck_endpoint,
+            status = status.as_u16(),
+            response = %err_text,
+            "GlobalCheck: service returned non-success status"
+        );
+        return Err(GlobalCheckServiceError(format!(
+            "GlobalCheck service returned non-success status {}: {}",
+            status,
+            err_text
+        )));
+    }
+
+    let globalcheck_response_body: GlobalCheckResponse = globalcheck_resp
+        .json()
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                event = "globalcheck_response_parse_error",
+                request_id = %request_id,
+                endpoint = globalcheck_endpoint,
+                error = %e,
+                "GlobalCheck: failed to parse service response"
+            );
+            GlobalCheckServiceError(format!(
+                "Failed to parse GlobalCheck service response: {}",
+                e
+            ))
+        })?;
+
+    if !globalcheck_response_body.compliant {
+        let reason = globalcheck_response_body
+            .reason
+            .unwrap_or_else(|| "Content deemed non-compliant".to_string());
+        tracing::warn!(
+            event = "globalcheck_non_compliant",
+            request_id = %request_id,
+            reason = %reason,
+            path = %path_for_log,
+            "GlobalCheck: content is non-compliant"
+        );
+        return Err(GlobalCheckComplianceFailed(reason));
+    }
+
+    tracing::debug!(
+        event = "globalcheck_compliant",
+        request_id = %request_id,
+        path = %path_for_log,
+        "GlobalCheck: content is compliant"
+    );
+    Ok(())
 }
 
 /// Test-only helper: drain a body to bytes (uses BodyExt).

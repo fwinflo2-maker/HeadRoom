@@ -190,6 +190,14 @@ def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None
     normalized = _normalize_origin(raw_base_url)
     if normalized is None:
         return None
+
+    # _normalize_origin drops the path; re-attach it so a custom upstream served
+    # from a sub-path (e.g. https://host/api/v1) is preserved rather than routed
+    # to the bare origin.
+    path = (urlparse(raw_base_url.strip()).path or "").rstrip("/")
+    if path:
+        normalized = f"{normalized}{path}"
+
     if urlparse(normalized).scheme not in {"http", "https"}:
         return None
     return normalized
@@ -7493,6 +7501,21 @@ class OpenAIHandlerMixin:
         except ClientDisconnect:
             logger.debug("Client disconnected during body read for passthrough")
             return Response(status_code=204)
+
+        # Hermes owns its scoped coding-agent protocols; keep that adapter out of
+        # the generic OpenAI passthrough handler.
+        from headroom.providers.hermes import compress_scoped_passthrough_body
+
+        optimize_enabled = bool(getattr(getattr(self, "config", None), "optimize", False))
+        original_body = body
+        body = compress_scoped_passthrough_body(
+            path,
+            body,
+            optimize=optimize_enabled,
+            bypass=_headroom_bypass_enabled(request.headers),
+        )
+        if body is not original_body:
+            headers["content-length"] = str(len(body))
 
         headers = await apply_copilot_api_auth(headers, url=url)
         # Cloudflare bot-management challenges our HTTP/2 fingerprint on

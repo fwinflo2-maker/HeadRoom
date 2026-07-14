@@ -65,6 +65,7 @@ describe("isLocalProxyUrl", () => {
   it("returns true for localhost addresses", () => {
     expect(isLocalProxyUrl("http://127.0.0.1:8787")).toBe(true);
     expect(isLocalProxyUrl("http://localhost:8787")).toBe(true);
+    expect(isLocalProxyUrl("http://[::1]:8787")).toBe(true);
   });
 
   it("returns false for remote addresses", () => {
@@ -364,7 +365,7 @@ describe("ProxyManager launch internals", () => {
       expect(pathSpec.checkUseShell).toBe(false);
     } else {
       expect(pathSpec.checkCommand).toBe("sh");
-      expect(pathSpec.checkArgs).toEqual(["-lc", "command -v headroom >/dev/null 2>&1"]);
+      expect(pathSpec.checkArgs).toEqual(["-c", "command -v headroom >/dev/null 2>&1"]);
     }
   });
 

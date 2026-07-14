@@ -53,6 +53,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request time as a misleading `authentication_error: No module named
   'botocore'`. The proxy now tells the user to install the `bedrock` extra up
   front ([#1551](https://github.com/headroomlabs-ai/headroom/issues/1551)).
+- **openclaw:** route custom OpenAI-compatible provider paths through the
+  proxy using `x-headroom-base-url` / `x-headroom-original-path`, add IPv6
+  loopback hostname (`[::1]`) support to local proxy checks, guard malformed
+  tool calls without function definitions, and guard `headroom_retrieve`
+  against null/undefined arguments.
 - Content detection no longer crashes the proxy on text containing an
   orphaned `+++ ` target line with no preceding `--- ` source line (common in
   `set -x` xtrace output and partial diffs). The bundled `unidiff` 0.4.0 parser

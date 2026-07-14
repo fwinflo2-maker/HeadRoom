@@ -169,8 +169,10 @@ export class HeadroomContextEngine {
       tokensAfter?: number;
     };
   }> {
-    if (!this.proxyUrl) {
-      return { ok: false, compacted: false, reason: "Proxy not available" };
+    try {
+      await this.ensureProxyUrl();
+    } catch (error) {
+      return { ok: false, compacted: false, reason: `Proxy not available: ${error}` };
     }
 
     // Read current messages from session file if available
@@ -253,15 +255,14 @@ export class HeadroomContextEngine {
         this.proxyStartupError = null;
         await this.notifyProxyReady(proxyUrl);
         this.logger.info(`Headroom proxy ready at ${proxyUrl}`);
+        this.proxyStartupPromise = null;
         return proxyUrl;
       })
       .catch((error) => {
         this.proxyStartupError = error;
         this.logger.warn(`Headroom proxy unavailable: ${error}`);
-        throw error;
-      })
-      .finally(() => {
         this.proxyStartupPromise = null;
+        throw error;
       });
 
     // Fire-and-forget lifecycle callers intentionally do not await this promise.

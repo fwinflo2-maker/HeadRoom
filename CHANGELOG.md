@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- **proxy image compression:** run native image compression in a spawned subprocess so an OpenCV or KleidiCV crash now fails open to the original image payload instead of taking down the whole proxy process ([#2107](https://github.com/headroomlabs-ai/headroom/issues/2107)).
 - **shared_context:** `SharedContext.put` no longer evicts an unrelated entry when it merely updates a key that is already cached at capacity — same defect class fixed for `SemanticCache` in [#2094](https://github.com/headroomlabs-ai/headroom/pull/2094).
 - **compress:** stop mutating the caller's `CompressConfig`. `compress(config=my_cfg, protect_recent=0, target_ratio=0.2)` used to write those kwargs onto `my_cfg`, so a shared per-agent config was silently rewritten by every request that overrode a single option.
 - **paths:** reject `.`, `..`, and NUL as plugin names so `plugin_config_dir` / `plugin_workspace_dir` cannot resolve outside the `plugins/` sandbox. Previously `plugin_config_dir("..")` returned the entire config root and `plugin_workspace_dir("..")` returned the workspace root (savings ledger, memory DB, license cache, logs).

@@ -364,9 +364,7 @@ class TestFrozenMessageCount:
             },
             {
                 "role": "user",
-                "content": [
-                    {"type": "tool_result", "tool_use_id": "t_edit", "content": "ok"}
-                ],
+                "content": [{"type": "tool_result", "tool_use_id": "t_edit", "content": "ok"}],
             },
             {"role": "assistant", "content": "edited."},
             {"role": "user", "content": "now summarize the change"},
@@ -414,7 +412,5 @@ class TestFrozenMessageCount:
         """Explicit 0 matches the default: stale Read gets rewritten."""
         messages = self._stale_read_conversation()
         original = self._read_result_content(messages)
-        result = compress(
-            messages, model="claude-sonnet-4-5-20250929", frozen_message_count=0
-        )
+        result = compress(messages, model="claude-sonnet-4-5-20250929", frozen_message_count=0)
         assert self._read_result_content(result.messages) != original

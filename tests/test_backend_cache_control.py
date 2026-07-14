@@ -127,17 +127,13 @@ class TestConvertMessagesCacheControl:
                     {
                         "type": "tool_result",
                         "tool_use_id": "t2",
-                        "content": [
-                            {"type": "text", "text": "rows", "cache_control": CC}
-                        ],
+                        "content": [{"type": "text", "text": "rows", "cache_control": CC}],
                     }
                 ],
             }
         ]
         converted = LiteLLMBackend._convert_messages_for_litellm(self._backend(), msgs)
-        assert converted[0]["content"] == [
-            {"type": "text", "text": "rows", "cache_control": CC}
-        ]
+        assert converted[0]["content"] == [{"type": "text", "text": "rows", "cache_control": CC}]
 
     def test_tool_result_without_marker_unchanged(self):
         msgs = [

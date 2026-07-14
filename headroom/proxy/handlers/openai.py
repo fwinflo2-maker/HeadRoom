@@ -95,6 +95,33 @@ def _codex_ws_compression_timeout_seconds() -> float:
 _WS_ALLOWED_ORIGINS_ENV = "HEADROOM_WS_ORIGINS"
 _CORS_ALLOWED_ORIGINS_ENV = "HEADROOM_CORS_ORIGINS"
 _CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
+# Codex mirrors the responses-lite request header into the response.create
+# frame body under client_metadata; upstream rejects gpt-5.x when it is
+# truthy. Stripping the WS handshake header alone is insufficient
+# (headroomlabs-ai/headroom#1523) — the frame-body mirror must be removed too.
+_CODEX_LITE_METADATA_KEY = "ws_request_header_x_openai_internal_codex_responses_lite"
+
+
+def _strip_codex_lite_metadata(raw_msg: str) -> str:
+    """Remove the Codex responses-lite marker mirrored into a response.create
+    frame's client_metadata. Fail-safe: returns raw_msg unchanged on any
+    parse issue or when the marker is absent."""
+    try:
+        frame = json.loads(raw_msg)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return raw_msg
+    if not isinstance(frame, dict):
+        return raw_msg
+    changed = False
+    for container in (frame, frame.get("response")):
+        if isinstance(container, dict):
+            cm = container.get("client_metadata")
+            if isinstance(cm, dict) and _CODEX_LITE_METADATA_KEY in cm:
+                del cm[_CODEX_LITE_METADATA_KEY]
+                changed = True
+    return json.dumps(frame) if changed else raw_msg
+
+
 _OPENAI_CHAT_COMPLETIONS_PATH = "/chat/completions"
 _OPENAI_RESPONSES_PATH = "/responses"
 _OPENAI_ORIGINAL_PATH_HEADER = "x-headroom-original-path"
@@ -190,6 +217,14 @@ def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None
     normalized = _normalize_origin(raw_base_url)
     if normalized is None:
         return None
+
+    # _normalize_origin drops the path; re-attach it so a custom upstream served
+    # from a sub-path (e.g. https://host/api/v1) is preserved rather than routed
+    # to the bare origin.
+    path = (urlparse(raw_base_url.strip()).path or "").rstrip("/")
+    if path:
+        normalized = f"{normalized}{path}"
+
     if urlparse(normalized).scheme not in {"http", "https"}:
         return None
     return normalized
@@ -1506,6 +1541,24 @@ class OpenAIHandlerMixin:
 
         unit_build_started = time.perf_counter()
         unit_debug: list[dict[str, Any]] = []
+        # Aggregate-then-floor: the Responses payload splits each tool output
+        # into its own unit, so a per-item size floor would reject every unit
+        # in a session made of many small tool outputs (e.g. Codex), yielding
+        # 0% savings even when the combined compressible text is large. The
+        # Anthropic path compresses the whole message list as one batch and is
+        # not subject to a per-item floor. Match that: evaluate the floor once
+        # against the *aggregate* compressible bytes of the extracted group. If
+        # the group as a whole clears the threshold, disable the per-unit floor
+        # so small units still reach the router; if the whole group is below
+        # the threshold, keep the floor so trivially small payloads are skipped.
+        aggregate_compressible_bytes = sum(
+            len(text.encode("utf-8", errors="replace")) for _, _, text in candidates
+        )
+        effective_unit_min_bytes = (
+            0
+            if aggregate_compressible_bytes >= self.OPENAI_RESPONSES_ROUTER_MIN_BYTES
+            else self.OPENAI_RESPONSES_ROUTER_MIN_BYTES
+        )
         for item_idx, slot_ref, original_text in candidates:
             item = items[item_idx] if item_idx < len(items) else {}
             item_type = item.get("type", "unknown") if isinstance(item, dict) else "unknown"
@@ -1518,7 +1571,7 @@ class OpenAIHandlerMixin:
                 item_type=str(item_type),
                 cache_zone="live",
                 mutable=True,
-                min_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
+                min_bytes=effective_unit_min_bytes,
             )
             routed_units.append(RoutedCompressionUnit(unit=unit, slot=(item_idx, slot_ref)))
             if debug_enabled:
@@ -5812,7 +5865,7 @@ class OpenAIHandlerMixin:
 
             if ws_connected:
                 async with upstream:
-                    await upstream.send(first_msg_raw)
+                    await upstream.send(_strip_codex_lite_metadata(first_msg_raw))
 
                     # Unit 3: flag the upstream side flips on seeing
                     # ``response.completed`` so the outer cause
@@ -6185,7 +6238,7 @@ class OpenAIHandlerMixin:
                                         "transforms_applied": transforms_applied,
                                     },
                                 )
-                                await upstream.send(msg)
+                                await upstream.send(_strip_codex_lite_metadata(msg))
                         except asyncio.CancelledError:
                             # Explicit cancel from the outer
                             # orchestrator — re-raise so
@@ -7475,6 +7528,21 @@ class OpenAIHandlerMixin:
         except ClientDisconnect:
             logger.debug("Client disconnected during body read for passthrough")
             return Response(status_code=204)
+
+        # Hermes owns its scoped coding-agent protocols; keep that adapter out of
+        # the generic OpenAI passthrough handler.
+        from headroom.providers.hermes import compress_scoped_passthrough_body
+
+        optimize_enabled = bool(getattr(getattr(self, "config", None), "optimize", False))
+        original_body = body
+        body = compress_scoped_passthrough_body(
+            path,
+            body,
+            optimize=optimize_enabled,
+            bypass=_headroom_bypass_enabled(request.headers),
+        )
+        if body is not original_body:
+            headers["content-length"] = str(len(body))
 
         headers = await apply_copilot_api_auth(headers, url=url)
         # Cloudflare bot-management challenges our HTTP/2 fingerprint on

@@ -512,9 +512,7 @@ class CompressionOnlyRunner:
             total_original += original_bytes
 
             try:
-                compacted, modified, before_bytes, after_bytes = compact_tools(
-                    payload
-                )
+                compacted, modified, before_bytes, after_bytes = compact_tools(payload)
                 total_compressed += after_bytes if modified else original_bytes
 
                 case_errors: list[str] = []

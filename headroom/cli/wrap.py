@@ -136,7 +136,11 @@ from headroom.providers.opencode.config import (
 )
 from headroom.providers.zcode import (
     detect_upstream as _detect_zcode_upstream,
+)
+from headroom.providers.zcode import (
     render_setup_lines as _render_zcode_setup_lines,
+)
+from headroom.providers.zcode import (
     upstream_to_proxy_urls as _zcode_upstream_to_urls,
 )
 from headroom.proxy.project_context import with_project_prefix as _with_project_prefix
@@ -5412,11 +5416,11 @@ def zcode(
     upstream = _detect_zcode_upstream()
     anthropic_url, openai_url = _zcode_upstream_to_urls(upstream)
 
-    def _print_zcode_setup() -> None:
+    def _print_zcode_setup(actual_port: int) -> None:
         click.echo(f"  Detected provider: {upstream.provider_name}")
         click.echo(f"  Upstream: {upstream.base_url}")
         click.echo()
-        for line in _render_zcode_setup_lines(port):
+        for line in _render_zcode_setup_lines(actual_port):
             click.echo(line)
         if not no_rtk:
             click.echo()

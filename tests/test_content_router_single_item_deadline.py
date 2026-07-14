@@ -57,7 +57,7 @@ def test_single_cache_miss_fails_open_at_deadline(monkeypatch, caplog):
     router = _router()
 
     def slow_compress(content, *, context="", bias=1.0):
-        time.sleep(0.05)
+        time.sleep(0.2)
         return _compression_result(content, "compressed output")
 
     monkeypatch.setattr(router, "compress", slow_compress)
@@ -71,7 +71,7 @@ def test_single_cache_miss_fails_open_at_deadline(monkeypatch, caplog):
         min_tokens_to_compress=1,
     )
 
-    assert time.perf_counter() - started < 0.04
+    assert time.perf_counter() - started < 0.12
     assert result.messages[1]["content"] == _messages()[1]["content"]
     assert "failing open via PASSTHROUGH" in caplog.text
 

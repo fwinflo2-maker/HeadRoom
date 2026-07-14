@@ -1325,9 +1325,14 @@ class AnthropicHandlerMixin:
                                 # blow the request budget (#1171), so only Kompress
                                 # stays deferred. Fail-open: on timeout/error the
                                 # request forwards exactly as before this pass
-                                # existed. A timeout leaks a worker briefly, but the
-                                # pass is bounded by routing + statistical crushers
-                                # (observed seconds even on multi-M-token counts).
+                                # existed. On timeout the worker can't be cancelled
+                                # (Python can't preempt a running thread), but
+                                # _run_compression_in_executor runs it on the bounded
+                                # compression pool and tracks it via the leaked-thread
+                                # metric, so stragglers are capped and observable
+                                # rather than unbounded. The pass is also bounded by
+                                # routing + statistical crushers (observed seconds even
+                                # on multi-M-token counts).
                                 from headroom.proxy.helpers import (
                                     COLD_START_FAST_PASS_TIMEOUT_SECONDS,
                                 )

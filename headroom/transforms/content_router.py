@@ -4314,7 +4314,7 @@ class ContentRouter(Transform):
                         route_counts["read_protected"] += 1
                     continue
                 if tool_use_id in excluded_tool_ids:
-                    tool_name = tool_name_map.get(tool_use_id, "")
+                    tool_name = tool_name_map.get(tool_use_id, "") if tool_name_map else ""
                     if tool_name and is_tool_excluded(tool_name, DEFAULT_VERBATIM_EXCLUDE_TOOLS):
                         new_blocks.append(block)
                         transforms_applied.append("router:excluded:tool")

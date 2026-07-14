@@ -1802,9 +1802,7 @@ class StreamingMixin:
                                 f"prefix_changed={miss.prefix_changed} "
                                 f"ttl_exceeded={miss.ttl_exceeded}"
                             )
-                            await self.metrics.record_cache_miss_attribution(
-                                provider, miss.reason
-                            )
+                            await self.metrics.record_cache_miss_attribution(provider, miss.reason)
                     prefix_tracker.update_from_response(
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,

@@ -136,9 +136,7 @@ def test_bedrock_nonstreaming_advances_prefix_tracker_turn() -> None:
             )
             assert resp.status_code == 200, resp.text[:200]
 
-    tracker = proxy.session_tracker_store.get_or_create(
-        "bedrock-nonstream-session", "anthropic"
-    )
+    tracker = proxy.session_tracker_store.get_or_create("bedrock-nonstream-session", "anthropic")
     assert tracker._turn_number == 1, (
         "prefix tracker never advanced past turn 0 — update_from_response() "
         "was not called on the Bedrock non-streaming path"
@@ -207,9 +205,7 @@ def test_bedrock_nonstreaming_second_turn_sees_frozen_prefix() -> None:
             )
             assert turn2.status_code == 200, turn2.text[:200]
 
-    tracker = proxy.session_tracker_store.get_or_create(
-        "bedrock-nonstream-2turn", "anthropic"
-    )
+    tracker = proxy.session_tracker_store.get_or_create("bedrock-nonstream-2turn", "anthropic")
     assert tracker._turn_number == 2
     assert tracker.get_frozen_message_count() > 0, (
         "frozen_message_count stayed 0 on turn 2 despite a cache hit on turn 1 "
@@ -291,9 +287,7 @@ def test_bedrock_streaming_advances_prefix_tracker_turn() -> None:
             assert resp.status_code == 200, resp.text[:200]
             assert "message_stop" in resp.text
 
-    tracker = proxy.session_tracker_store.get_or_create(
-        "bedrock-stream-session", "anthropic"
-    )
+    tracker = proxy.session_tracker_store.get_or_create("bedrock-stream-session", "anthropic")
     assert tracker._turn_number == 1, (
         "prefix tracker never advanced past turn 0 on the Bedrock streaming "
         "path — update_from_response() was not called from "

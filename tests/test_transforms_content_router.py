@@ -484,7 +484,7 @@ def test_content_router_mixed_pure_apply_and_toin(monkeypatch: pytest.MonkeyPatc
     )
     pure = router._compress_pure("some plain text", CompressionStrategy.TEXT, "ctx")
     assert pure.routing_log[0].content_type is ContentType.PLAIN_TEXT
-    assert pure.total_original_tokens == 3
+    assert pure.total_original_tokens == _estimate_tokens("some plain text")
     assert pure.total_compressed_tokens == 1
 
     calls: list[dict] = []

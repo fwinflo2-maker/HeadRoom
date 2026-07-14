@@ -58,6 +58,7 @@ from ..config import (
 )
 from ..parser import CCR_RETRIEVAL_MARKER_RE
 from ..tokenizer import Tokenizer
+from ..tokenizers.estimator import EstimatingTokenCounter
 from .base import Transform
 from .content_detector import ContentType, DetectionResult, _try_detect_log, _try_detect_search
 from .content_detector import detect_content_type as _regex_detect_content_type
@@ -72,16 +73,24 @@ _detect_panic_warned = False
 _detect_native_unhealthy = False  # circuit breaker: native detect hung once (#575)
 
 
+# Shared calibrated fallback estimator (tiktoken cl100k_base ~90% accuracy,
+# content-type aware incl. JSON). Kept as one module-level instance so the
+# size heuristic lives in a single reusable place, not a hardcoded constant.
+_TOKEN_ESTIMATOR = EstimatingTokenCounter()
+
+
 def _estimate_tokens(text: str) -> int:
-    """Cheap size-proportional token estimate (~4 chars/token).
+    """Size-proportional token estimate for section ratio decisions.
 
     Whitespace splitting undercounts pathologically on compact
     machine-generated JSON (no spaces means the whole payload is ~1
     "word"), which made section compression ratios compute as ~1.0 and
     the min_ratio acceptance gate silently reject real compression.
-    chars/4 is monotone in content size for any format.
+    Delegates to the shared EstimatingTokenCounter — JSON/code aware and
+    calibrated against tiktoken — so the estimate tracks real tokens across
+    formats instead of a fixed chars/N constant.
     """
-    return max(1, len(text) // 4)
+    return max(1, _TOKEN_ESTIMATOR.count_text(text))
 
 
 def _router_debug_dumps(value: Any) -> str:

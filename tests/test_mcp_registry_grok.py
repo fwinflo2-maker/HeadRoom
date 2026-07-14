@@ -26,4 +26,6 @@ def test_grok_registrar_unregister_removes_marker_block(tmp_path: Path) -> None:
     removed = registrar.unregister_server("headroom")
 
     assert removed is True
-    assert not registrar._config_file.exists() or "Headroom MCP server" not in registrar._read_text()
+    assert (
+        not registrar._config_file.exists() or "Headroom MCP server" not in registrar._read_text()
+    )

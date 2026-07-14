@@ -5212,7 +5212,9 @@ def grok(
             agent="grok",
             agent_display="Grok",
             marker_path=agents_md,
-            on_rtk_ready=lambda _rtk: _inject_rtk_instructions(cast(Path, agents_md), verbose=verbose),
+            on_rtk_ready=lambda _rtk: _inject_rtk_instructions(
+                cast(Path, agents_md), verbose=verbose
+            ),
             verbose=verbose,
         )
 

@@ -67,7 +67,11 @@ class GrokPlugin(LearnPlugin, ConversationScanner):
                     name=workspace_dir.name,
                     project_path=project_path,
                     data_path=workspace_dir,
-                    context_file=grok_md if grok_md.exists() else agents_md if agents_md.exists() else None,
+                    context_file=grok_md
+                    if grok_md.exists()
+                    else agents_md
+                    if agents_md.exists()
+                    else None,
                 )
             )
         return projects

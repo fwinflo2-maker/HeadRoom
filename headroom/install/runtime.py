@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
-from headroom._subprocess import run
+from headroom._subprocess import pid_alive, run
 
 from .health import probe_ready
 from .models import DeploymentManifest, InstallPreset, RuntimeKind
@@ -140,7 +140,13 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
     for name, value in runtime_env.items():
         command.extend(["--env", f"{name}={value}"])
     for name in sorted(os.environ):
-        if name.startswith(PASSTHROUGH_ENV_PREFIXES):
+        # Skip any name the manifest already pinned above: Docker resolves
+        # duplicate `--env` last-wins, so a bare `--env HEADROOM_BACKEND`
+        # passthrough (which reads the host process env at
+        # `start_persistent_docker` time) would silently override the manifest's
+        # `--env HEADROOM_BACKEND=<value>`, diverging the container from its
+        # deployment config.
+        if name.startswith(PASSTHROUGH_ENV_PREFIXES) and name not in runtime_env:
             command.extend(["--env", name])
     # The image ENTRYPOINT already runs `headroom proxy` (see Dockerfile), so
     # the args appended after the image name are only the proxy flags — never
@@ -275,7 +281,15 @@ def start_detached_agent(profile: str) -> subprocess.Popen[str]:
         )
     else:
         kwargs["start_new_session"] = True
-    return subprocess.Popen(command, **kwargs)
+    try:
+        proc = subprocess.Popen(command, **kwargs)
+    finally:
+        # The child has inherited the log file descriptor, so the parent's
+        # copy is dead weight. Closing it (even when Popen raises) avoids
+        # leaking one fd per `headroom install start` and lets the log file
+        # be rotated. Wrapped in try/finally so a Popen failure can't leak.
+        log_file.close()
+    return proc
 
 
 def start_persistent_docker(manifest: DeploymentManifest) -> None:
@@ -321,7 +335,8 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
         return
     try:
         os.kill(pid, signal.SIGTERM)
-    except OSError:
+    except (OSError, SystemError):
+        # SystemError covers the Windows WinError 87 surfacing described in #1544.
         pass
     _clear_pid(manifest.profile)
 
@@ -351,8 +366,7 @@ def runtime_status(manifest: DeploymentManifest) -> str:
     pid = _read_pid(manifest.profile)
     if pid is None:
         return "stopped"
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return "stopped"
-    return "running"
+    # Windows-safe liveness probe: a bare os.kill(pid, 0) here raised WinError 87
+    # as a SystemError against the detached agent, crashing status and taking the
+    # live proxy down with it (#1544).
+    return "running" if pid_alive(pid) else "stopped"

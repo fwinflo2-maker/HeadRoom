@@ -6,12 +6,37 @@ Extracted from server.py to keep the codebase maintainable.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
 from headroom.memory import qdrant_env
 from headroom.providers.registry import ProviderApiOverrides
+
+logger = logging.getLogger(__name__)
+
+
+def _qdrant_env_port_or_default() -> int:
+    """Resolve ``HEADROOM_QDRANT_PORT``, falling back to the default on a bad value.
+
+    ``qdrant_env.qdrant_env_port`` raises on an invalid port (intended for
+    explicit qdrant setup). As a ``ProxyConfig`` field ``default_factory`` it
+    runs on EVERY ``ProxyConfig()`` construction, regardless of whether
+    memory/qdrant is enabled (both off by default), so a stray or typo'd
+    ``HEADROOM_QDRANT_PORT`` would crash proxy startup for an unrelated,
+    off-by-default subsystem. Fail soft here so config construction never raises.
+    """
+    try:
+        return qdrant_env.qdrant_env_port()
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid HEADROOM_QDRANT_PORT; using default %d. "
+            "Set a valid 1-65535 port to override.",
+            qdrant_env.DEFAULT_QDRANT_PORT,
+        )
+        return qdrant_env.DEFAULT_QDRANT_PORT
+
 
 # =============================================================================
 # Data Models
@@ -137,8 +162,8 @@ class ProxyConfig:
     ccr_inject_tool: bool = True
     ccr_inject_system_instructions: bool = False
     # Proxy-level mirror of ContentRouterConfig.ccr_inject_marker, so retrieval
-    # markers can be toggled from the CLI (--no-ccr-marker). Threaded into the
-    # router in server.py; default preserves current behavior.
+    # markers can be toggled from the CLI (--no-ccr, which also drops the retrieve
+    # tool). Threaded into the router in server.py; default preserves current behavior.
     ccr_inject_marker: bool = True
 
     # CCR Response Handling
@@ -174,6 +199,17 @@ class ProxyConfig:
     # (1 = disable, 0 = enable).
     disable_kompress_anthropic: bool | None = None
     disable_kompress_openai: bool | None = None
+
+    # Force ALL compressible content through Kompress (kompress-v2-base),
+    # bypassing per-type compressor selection (SmartCrusher/CodeAware/log/
+    # diff/html/tabular/search). Tool ground truth stays protected: excluded
+    # tools (Read/Glob/Grep/...) and reversibility-gated tool output are never
+    # touched. Off by default; opt-in for systems that want one uniform
+    # compressor at the cost of per-type structural fidelity.
+    # CLI: --force-kompress-all; env: HEADROOM_FORCE_KOMPRESS_ALL=1.
+    force_kompress_all: bool = False
+
+    lossless: bool = False  # CLI: --lossless; env: HEADROOM_LOSSLESS=1. No-CCR mode: compress without any retrieval marker.
 
     # Code graph live watcher (triggers incremental reindex on file changes)
     code_graph_watcher: bool = False
@@ -280,6 +316,7 @@ class ProxyConfig:
     max_keepalive_connections: int = 100
     keepalive_expiry: float = 90.0
     http2: bool = True
+    http_proxy: str | None = None
 
     # Memory System
     memory_enabled: bool = False
@@ -311,7 +348,7 @@ class ProxyConfig:
     # Qdrant connection (defaults resolve from HEADROOM_QDRANT_* env vars)
     memory_qdrant_url: str | None = field(default_factory=qdrant_env.qdrant_env_url)
     memory_qdrant_host: str = field(default_factory=qdrant_env.qdrant_env_host)
-    memory_qdrant_port: int = field(default_factory=qdrant_env.qdrant_env_port)
+    memory_qdrant_port: int = field(default_factory=_qdrant_env_port_or_default)
     memory_qdrant_api_key: str | None = field(default_factory=qdrant_env.qdrant_env_api_key)
     memory_neo4j_uri: str = "neo4j://localhost:7687"
     memory_neo4j_user: str = "neo4j"
@@ -377,7 +414,7 @@ class ProxyConfig:
     # Precedence: CLI > env > auto-compute.
     anthropic_pre_upstream_concurrency: int | None = None
     # Upper bound for waiting on the Anthropic pre-upstream semaphore
-    # before failing fast with a 503 + Retry-After. Keeps the queue bounded
+    # before failing open to passthrough compression. Keeps the queue bounded
     # when all pre-upstream slots are occupied by slow/hung work.
     anthropic_pre_upstream_acquire_timeout_seconds: float = 15.0
     # Fail-open timeout for Anthropic memory-context lookup while the request
@@ -388,9 +425,9 @@ class ProxyConfig:
     # Bound the dedicated compression threadpool. CPU-bound Rust work runs
     # here; the pool is separate from asyncio's default executor so other
     # ``asyncio.to_thread`` callers (file IO, etc.) are not contended by
-    # compression bursts. ``None`` resolves to ``min(32, (cpu_count or 1) * 4)``,
-    # matching asyncio's default executor sizing today. Lower the cap to
-    # tighten resource use on multi-tenant hosts; raise it to handle larger
+    # compression bursts. ``None`` resolves to ``cpu_count or 1`` so CPU-bound
+    # compression work does not oversubscribe hosts by default. Lower the cap
+    # to tighten resource use on multi-tenant hosts; raise it to handle larger
     # bursts. CLI: ``--compression-max-workers``. Env:
     # ``HEADROOM_COMPRESSION_MAX_WORKERS``.
     #

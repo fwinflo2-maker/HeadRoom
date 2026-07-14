@@ -738,7 +738,6 @@ class TestRestartCurrentDeployment:
         assert result["command"] == "headroom install restart --profile default"
         assert popen_calls == []  # cannot run docker from inside the container
 
-
     def test_task_mode_detected_and_not_restarted(self, monkeypatch) -> None:
         """A persistent-task deployment must not be told it's a self-restartable 'service'.
 

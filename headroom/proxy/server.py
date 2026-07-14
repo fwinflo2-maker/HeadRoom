@@ -3030,10 +3030,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
         return JSONResponse(
             status_code=200,
-            content={"ok": True, "needs_restart": bool(changed_keys), "changed_keys": changed_keys}
+            content={"ok": True, "needs_restart": bool(changed_keys), "changed_keys": changed_keys},
         )
 
-    @app.post("/settings/apply", dependencies=[Depends(_require_loopback), Depends(_require_same_origin)])
+    @app.post(
+        "/settings/apply", dependencies=[Depends(_require_loopback), Depends(_require_same_origin)]
+    )
     async def settings_apply(request: Request):
         """Persist settings (optional body) then restart the proxy to apply them.
 
@@ -3061,11 +3063,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 if exc.unknown_keys:
                     return JSONResponse(
                         status_code=400,
-                        content={"error": "unknown settings key(s)", "unknown_keys": exc.unknown_keys},
+                        content={
+                            "error": "unknown settings key(s)",
+                            "unknown_keys": exc.unknown_keys,
+                        },
                     )
                 return JSONResponse(
                     status_code=422,
-                    content={"error": "invalid settings value(s)", "field_errors": exc.field_errors},
+                    content={
+                        "error": "invalid settings value(s)",
+                        "field_errors": exc.field_errors,
+                    },
                 )
         _manifest, mode = install_runtime.detect_current_deployment()
         record_admin_action(
@@ -3086,7 +3094,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         result = install_runtime.restart_current_deployment()
         return JSONResponse(status_code=200, content=result)
 
-    @app.get("/dashboard/settings", response_class=HTMLResponse, dependencies=[Depends(_require_loopback)])
+    @app.get(
+        "/dashboard/settings",
+        response_class=HTMLResponse,
+        dependencies=[Depends(_require_loopback)],
+    )
     async def dashboard_settings():
         """Serve the Headroom settings GUI."""
         from headroom.dashboard import get_settings_html

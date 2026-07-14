@@ -162,6 +162,7 @@
                 fields: [],
                 groups: [],
                 values: {},
+                storedValues: {},
                 manifestManaged: false,  // true on supervised installs (locks manifest fields)
                 fieldErrors: {},
                 banner: '',
@@ -182,6 +183,7 @@
                         // Seed the editable model from the effective values.
                         for (const f of this.fields) {
                             this.values[f.key] = schema.values ? schema.values[f.key] : f.value;
+                            this.storedValues[f.key] = f.stored;
                         }
                         // The server tells us whether this is a supervised install
                         // (docker/service); there manifest-managed knobs are baked
@@ -197,14 +199,29 @@
 
                 isLocked(field) { return (!!field.manifest_managed && this.manifestManaged) || !!field.env_override; },
 
+                isEmptyValue(value) { return value === '' || value === null || value === undefined; },
+
+                normalizedComparable(value) {
+                    return this.isEmptyValue(value) ? null : value;
+                },
+
                 editableValues() {
-                    // Send only non-locked values; explicit `null` marks a cleared secret.
+                    // Send only changed, non-locked values. The server merges partial
+                    // updates; posting every effective default would freeze those
+                    // defaults into settings.json and change future upgrade behavior.
+                    // Explicit `null` clears a previously stored value.
                     const out = {};
                     for (const f of this.fields) {
                         if (this.isLocked(f)) continue;
                         if (this.clearedKeys[f.key]) { out[f.key] = null; continue; }
                         let v = this.values[f.key];
-                        if (v === '' || v === null || v === undefined) continue;
+                        const stored = this.storedValues[f.key];
+                        const baseline = this.isEmptyValue(stored) ? f.default : stored;
+                        if (this.isEmptyValue(v)) {
+                            if (!this.isEmptyValue(stored)) out[f.key] = null;
+                            continue;
+                        }
+                        if (this.normalizedComparable(v) === this.normalizedComparable(baseline)) continue;
                         out[f.key] = v;
                     }
                     return out;

@@ -155,9 +155,7 @@ class TestSecretMasking:
             secret_field if f.key == "log_file" else f for f in settings_store.SETTINGS
         )
         monkeypatch.setattr(settings_store, "SETTINGS", registry)
-        monkeypatch.setattr(
-            settings_store, "_BY_KEY", {f.key: f for f in registry}
-        )
+        monkeypatch.setattr(settings_store, "_BY_KEY", {f.key: f for f in registry})
         settings_store.save({"log_file": "/tmp/secret.log"})
 
         stored = settings_store.stored_values()
@@ -176,7 +174,6 @@ class TestSecretMasking:
         assert schema["needs_restart_keys"] == [f.key for f in settings_store.SETTINGS]
         assert "Compression" in schema["groups"]
 
-
     def test_anthropic_extra_headers_retain_on_mask(self, workspace, monkeypatch):
         """Saving _MASK for anthropic_extra_headers retains the stored value."""
         _clear_env(monkeypatch)
@@ -186,8 +183,9 @@ class TestSecretMasking:
 
         settings_store.save({"anthropic_extra_headers": settings_store._MASK})
         stored = settings_store.load()
-        assert stored.get("anthropic_extra_headers") == '{"Api-Key": "secret123"}', \
+        assert stored.get("anthropic_extra_headers") == '{"Api-Key": "secret123"}', (
             "Saving _MASK should retain the stored value, not overwrite it"
+        )
 
     def test_anthropic_extra_headers_clear_on_none(self, workspace, monkeypatch):
         """Saving None for anthropic_extra_headers removes it."""
@@ -212,6 +210,7 @@ class TestSecretMasking:
         """Invalid JSON in anthropic_extra_headers field raises SettingsValidationError."""
         _clear_env(monkeypatch)
         from headroom.settings_store import SettingsValidationError
+
         with pytest.raises(SettingsValidationError) as exc_info:
             settings_store.save({"anthropic_extra_headers": "not json"})
         assert "anthropic_extra_headers" in exc_info.value.field_errors
@@ -220,6 +219,7 @@ class TestSecretMasking:
         """Header-map JSON with non-string values raises SettingsValidationError."""
         _clear_env(monkeypatch)
         from headroom.settings_store import SettingsValidationError
+
         with pytest.raises(SettingsValidationError) as exc_info:
             settings_store.save({"anthropic_extra_headers": '{"header": 123}'})
         assert "anthropic_extra_headers" in exc_info.value.field_errors
@@ -228,6 +228,7 @@ class TestSecretMasking:
         """Header-map with non-object JSON raises SettingsValidationError."""
         _clear_env(monkeypatch)
         from headroom.settings_store import SettingsValidationError
+
         with pytest.raises(SettingsValidationError) as exc_info:
             settings_store.save({"anthropic_extra_headers": '["header", "value"]'})
         assert "anthropic_extra_headers" in exc_info.value.field_errors
@@ -287,5 +288,3 @@ class TestRegistryDriftAgainstClick:
             f"{sorted(missing)}. Add a SettingField for each, or document why it's "
             "deliberately excluded (e.g. a secret)."
         )
-
-

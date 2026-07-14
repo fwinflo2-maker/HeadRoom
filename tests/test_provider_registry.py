@@ -425,9 +425,7 @@ def test_proxy_provider_runtime_openai_transport_handles_prompt_details_without_
 
 def test_resolve_extra_headers_cli_wins_over_env(monkeypatch) -> None:
     monkeypatch.setenv("ANTHROPIC_TARGET_API_HEADERS", '{"Env-Header": "env-value"}')
-    result = resolve_extra_headers(
-        '{"Cli-Header": "cli-value"}', "ANTHROPIC_TARGET_API_HEADERS"
-    )
+    result = resolve_extra_headers('{"Cli-Header": "cli-value"}', "ANTHROPIC_TARGET_API_HEADERS")
     assert result == {"Cli-Header": "cli-value"}
 
 

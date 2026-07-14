@@ -414,7 +414,7 @@ def test_handle_openai_responses_chatgpt_codex_timeout_fails_open(monkeypatch):
     assert body["store"] is False
 
 
-def test_handle_openai_responses_api_auth_keeps_memory_tools(monkeypatch):
+def test_handle_openai_responses_api_auth_store_false_skips_memory_tools(monkeypatch):
     request = _build_request(
         {"model": "gpt-4o-mini", "input": "hello", "store": False},
         {"Authorization": "Bearer sk-test", "x-headroom-user-id": "user-1"},
@@ -434,8 +434,8 @@ def test_handle_openai_responses_api_auth_keeps_memory_tools(monkeypatch):
     assert handler.captured_request is not None
     _, url, _, body = handler.captured_request
     assert url == "https://api.openai.com/v1/responses"
-    assert body["store"] is True
-    assert body["tools"][0]["name"] == "memory_search"
+    assert body["store"] is False
+    assert "tools" not in body
     assert memory_handler.compute_calls == 1
 
 

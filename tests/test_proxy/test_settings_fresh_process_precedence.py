@@ -40,10 +40,16 @@ def test_env_beats_file_beats_default_in_subprocess(workspace, monkeypatch):
     env = dict(os.environ)
     env["HEADROOM_WORKSPACE_DIR"] = str(workspace)
     env["HEADROOM_RPM"] = "999"  # explicit export: must win over the file's 20
-    env.pop("HEADROOM_TARGET_RATIO", None)  # not exported: file's 0.3 must win over the code default
+    env.pop(
+        "HEADROOM_TARGET_RATIO", None
+    )  # not exported: file's 0.3 must win over the code default
 
     result = subprocess.run(
-        [sys.executable, "-c", script], capture_output=True, text=True, env=env, timeout=30,
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
     )
     assert result.returncode == 0, result.stderr
     out = json.loads(result.stdout)

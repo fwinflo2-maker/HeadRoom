@@ -109,6 +109,7 @@ class TestEndpointsGroup:
         body = resp.json()
         assert body["values"]["openai_extra_headers"] == settings_store._MASK
 
+
 class TestWriteValidation:
     def test_valid_write_persists(self, client, workspace):
         resp = client.post("/settings", json={"values": {"target_ratio": 0.4, "rpm": 30}})
@@ -172,7 +173,9 @@ class TestSameOriginGuard:
     def test_foreign_origin_rejected_on_settings_apply(self, client, monkeypatch):
         from headroom.install import runtime as rt
 
-        monkeypatch.setattr(rt, "restart_current_deployment", lambda: {"restarted": False, "mode": "foreground"})
+        monkeypatch.setattr(
+            rt, "restart_current_deployment", lambda: {"restarted": False, "mode": "foreground"}
+        )
         resp = client.post(
             "/settings/apply",
             json={},
@@ -228,9 +231,7 @@ class TestApplyRestart:
         return calls
 
     def test_service_returns_202_and_runs_background_restart(self, client, monkeypatch):
-        calls = self._patch_mode(
-            monkeypatch, "service", {"restarted": True, "mode": "service"}
-        )
+        calls = self._patch_mode(monkeypatch, "service", {"restarted": True, "mode": "service"})
         resp = client.post("/settings/apply", json={})
         assert resp.status_code == 202, resp.text
         assert resp.json()["restarted"] is True
@@ -241,7 +242,11 @@ class TestApplyRestart:
         self._patch_mode(
             monkeypatch,
             "docker",
-            {"restarted": False, "mode": "docker", "command": "headroom install restart --profile default"},
+            {
+                "restarted": False,
+                "mode": "docker",
+                "command": "headroom install restart --profile default",
+            },
         )
         resp = client.post("/settings/apply", json={})
         assert resp.status_code == 200, resp.text
@@ -253,7 +258,11 @@ class TestApplyRestart:
         self._patch_mode(
             monkeypatch,
             "foreground",
-            {"restarted": False, "mode": "foreground", "instruction": "Restart the proxy to apply the new settings."},
+            {
+                "restarted": False,
+                "mode": "foreground",
+                "instruction": "Restart the proxy to apply the new settings.",
+            },
         )
         resp = client.post("/settings/apply", json={})
         assert resp.status_code == 200, resp.text
@@ -261,7 +270,9 @@ class TestApplyRestart:
 
     def test_apply_persists_provided_values(self, client, workspace, monkeypatch):
         self._patch_mode(
-            monkeypatch, "foreground", {"restarted": False, "mode": "foreground", "instruction": "x"}
+            monkeypatch,
+            "foreground",
+            {"restarted": False, "mode": "foreground", "instruction": "x"},
         )
         resp = client.post("/settings/apply", json={"values": {"rpm": 42}})
         assert resp.status_code == 200, resp.text

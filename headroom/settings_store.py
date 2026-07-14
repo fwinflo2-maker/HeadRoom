@@ -305,6 +305,18 @@ SETTINGS: tuple[SettingField, ...] = (
         tier="advanced",
     ),
     SettingField(
+        "HEADROOM_RETRY_BASE_DELAY_MS", "retry_base_delay_ms", "Retry base delay (ms)",
+        "Timeouts", "int", default=None, minimum=0,
+        help="Initial upstream retry delay in milliseconds. Default: 1000.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_RETRY_MAX_DELAY_MS", "retry_max_delay_ms", "Retry max delay (ms)",
+        "Timeouts", "int", default=None, minimum=0,
+        help="Maximum upstream retry delay in milliseconds. Default: 30000.",
+        tier="advanced",
+    ),
+    SettingField(
         "HEADROOM_REQUEST_TIMEOUT", "request_timeout", "Request timeout (s)",
         "Timeouts", "int", default=None,
         help="Overall upstream request timeout in seconds. Default: 300.",

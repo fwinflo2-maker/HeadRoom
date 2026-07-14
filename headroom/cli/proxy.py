@@ -1089,8 +1089,17 @@ def proxy(
         environ=os.environ,
     )
 
-    # Resolve anyllm provider: env var takes precedence over CLI default (matches argparse path)
-    effective_anyllm_provider = os.environ.get("HEADROOM_ANYLLM_PROVIDER") or anyllm_provider
+    # Resolve anyllm provider. An explicit --anyllm-provider flag always wins;
+    # otherwise honor HEADROOM_ANYLLM_PROVIDER, which the settings store may
+    # have exported into os.environ after Click parsed the option (so the
+    # already-parsed param can't see it).
+    _anyllm_source = click.get_current_context().get_parameter_source("anyllm_provider")
+    if _anyllm_source is click.core.ParameterSource.COMMANDLINE:
+        effective_anyllm_provider = anyllm_provider
+    else:
+        effective_anyllm_provider = (
+            os.environ.get("HEADROOM_ANYLLM_PROVIDER") or anyllm_provider
+        )
 
     # Resolve mode: CLI flag > env var > default. Default is CACHE (Headroom's
     # coding posture): delta-only compression at ~0 prefix-cache busts.

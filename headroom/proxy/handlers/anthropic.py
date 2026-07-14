@@ -31,6 +31,7 @@ from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
 from headroom.proxy.helpers import extract_tags
+from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
 from headroom.proxy.outcome import RequestOutcome
@@ -1156,19 +1157,18 @@ class AnthropicHandlerMixin:
                 try:
                     compressor = _get_image_compressor()
                     if compressor and compressor.has_images(messages):
-                        # Offload CPU-bound image compression onto the bounded
-                        # executor (same as text compression); inline blocked the loop.
-                        messages = await self._run_compression_in_executor(
-                            lambda: compressor.compress(messages, provider="anthropic"),
+                        messages, image_result = await run_image_compression_isolated(
+                            messages,
+                            provider="anthropic",
                             timeout=COMPRESSION_TIMEOUT_SECONDS,
                         )
-                        body_mutation_tracker.mark_mutated("image_compression")
-                        if compressor.last_result:
+                        if image_result is not None:
+                            body_mutation_tracker.mark_mutated("image_compression")
                             logger.info(
-                                f"Image compression: {compressor.last_result.technique.value} "
-                                f"({compressor.last_result.savings_percent:.0f}% saved, "
-                                f"{compressor.last_result.original_tokens} -> "
-                                f"{compressor.last_result.compressed_tokens} tokens)"
+                                f"Image compression: {image_result['technique']} "
+                                f"({image_result['savings_percent']:.0f}% saved, "
+                                f"{image_result['original_tokens']} -> "
+                                f"{image_result['compressed_tokens']} tokens)"
                             )
                 except Exception as e:
                     # Image compression is best-effort — fail open on timeout/error and
@@ -1314,16 +1314,79 @@ class AnthropicHandlerMixin:
                                     ),
                                 )
 
-                                class _DeferredCompressionResult:
-                                    messages = working_messages
-                                    transforms_applied = [
-                                        "deferred:background_compression"
+                                # Cold-start fast pass: run everything EXCEPT the
+                                # Kompress ML stage synchronously before forwarding.
+                                # The byte-identical freeze (#1850) locks a session
+                                # to whatever form its cold start put in the provider
+                                # cache; deferring the WHOLE pipeline locks in the raw
+                                # transcript and forfeits the session's savings for
+                                # its lifetime — including sub-second wins like
+                                # read_lifecycle stale-read drops. Only Kompress can
+                                # blow the request budget (#1171), so only Kompress
+                                # stays deferred. Fail-open: on timeout/error the
+                                # request forwards exactly as before this pass
+                                # existed. On timeout the worker can't be cancelled
+                                # (Python can't preempt a running thread), but
+                                # _run_compression_in_executor runs it on the bounded
+                                # compression pool and tracks it via the leaked-thread
+                                # metric, so stragglers are capped and observable
+                                # rather than unbounded. The pass is also bounded by
+                                # routing + statistical crushers (observed seconds even
+                                # on multi-M-token counts).
+                                from headroom.proxy.helpers import (
+                                    COLD_START_FAST_PASS_TIMEOUT_SECONDS,
+                                )
+
+                                _fast_pass = None
+                                try:
+                                    async with stage_timer.measure("compression_first_stage"):
+                                        _fast_pass = await self._run_compression_in_executor(
+                                            lambda: self.anthropic_pipeline.apply(
+                                                messages=working_messages,
+                                                model=model,
+                                                model_limit=context_limit,
+                                                context=extract_user_query(working_messages),
+                                                frozen_message_count=frozen_message_count,
+                                                idle_seconds=idle_seconds,
+                                                biases=biases,
+                                                request_id=request_id,
+                                                compression_policy=compression_policy,
+                                                skip_kompress=True,
+                                                **proxy_pipeline_kwargs(self.config),
+                                            ),
+                                            timeout=COLD_START_FAST_PASS_TIMEOUT_SECONDS,
+                                        )
+                                except Exception as e:
+                                    logger.info(
+                                        "[%s] Cold-start fast pass skipped (%s: %s); "
+                                        "deferring full pipeline to background",
+                                        request_id,
+                                        type(e).__name__,
+                                        e,
+                                    )
+
+                                if _fast_pass is not None:
+                                    comp_cache.update_from_result(messages, _fast_pass.messages)
+                                    _fast_pass.transforms_applied = list(
+                                        _fast_pass.transforms_applied
+                                    ) + [
+                                        "deferred:kompress_background"
                                         if accepted
                                         else "deferred:dropped"
                                     ]
-                                    timing = {}
+                                    result = _fast_pass
+                                else:
 
-                                result = _DeferredCompressionResult()
+                                    class _DeferredCompressionResult:
+                                        messages = working_messages
+                                        transforms_applied = [
+                                            "deferred:background_compression"
+                                            if accepted
+                                            else "deferred:dropped"
+                                        ]
+                                        timing = {}
+
+                                    result = _DeferredCompressionResult()
                             else:
                                 async with stage_timer.measure("compression_first_stage"):
                                     result = await self._run_compression_in_executor(
@@ -1505,6 +1568,14 @@ class AnthropicHandlerMixin:
                     logger.warning(f"[{request_id}] Optimization failed: {type(e).__name__}: {e}")
                     # Flag compression failure for observability
                     _compression_failed = True
+                    # Split timeout from other errors: a timeout means the
+                    # compression budget was too tight, not a code bug.
+                    reason = (
+                        "timeout"
+                        if isinstance(e, (asyncio.TimeoutError, TimeoutError))
+                        else "error"
+                    )
+                    self.metrics.record_compression_failed(reason)
 
             # Cache-safety (ALL modes): forward the previously-cached (compressed)
             # prefix byte-identical. The freeze path can emit the agent's ORIGINAL
@@ -3586,6 +3657,12 @@ class AnthropicHandlerMixin:
                 logger.warning(
                     f"[{request_id}] Optimization failed for batch request '{custom_id}': {e}"
                 )
+                # Same fail-open accounting as the single-message path: a
+                # timeout means the budget was too tight, not a code bug.
+                reason = (
+                    "timeout" if isinstance(e, (asyncio.TimeoutError, TimeoutError)) else "error"
+                )
+                self.metrics.record_compression_failed(reason)
                 # Pass through unchanged on failure
                 compressed_requests.append(batch_req)
                 total_optimized_tokens += original_tokens

@@ -1967,4 +1967,3 @@ def test_normalize_history_entry_defaults_missing_cache_fields(tmp_path):
     assert history[0]["cache_read_tokens"] == 0
     assert history[0]["cache_savings_usd"] == 0.0
     assert history[0]["total_tokens_saved"] == 40
-

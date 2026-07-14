@@ -16,8 +16,8 @@ from __future__ import annotations
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 from .claude import ClaudeRegistrar
 from .codex import CodexRegistrar
-from .grok import GrokRegistrar
 from .display import any_succeeded, format_result, format_results
+from .grok import GrokRegistrar
 from .install import (
     DEFAULT_PROXY_URL,
     build_headroom_spec,

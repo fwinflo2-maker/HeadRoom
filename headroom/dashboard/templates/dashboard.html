@@ -192,6 +192,59 @@
         <template x-if="viewMode === 'session'">
             <div>
                 <p class="mb-4 text-xs text-gray-500">Current proxy process · runtime counters reset on restart</p>
+                <div class="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between"
+                     x-show="hasMetricScopes">
+                    <div class="inline-flex rounded-lg border border-border bg-surface p-1">
+                        <button class="px-3 py-1.5 text-sm rounded-md transition-colors"
+                                data-testid="scope-current"
+                                :class="scopeMode === 'current_process' ? 'bg-accent text-black' : 'text-gray-400 hover:text-gray-200'"
+                                @click="setScopeMode('current_process')">
+                            Current process
+                        </button>
+                        <button class="px-3 py-1.5 text-sm rounded-md transition-colors"
+                                data-testid="scope-session"
+                                :class="scopeMode === 'display_session' ? 'bg-accent text-black' : 'text-gray-400 hover:text-gray-200'"
+                                @click="setScopeMode('display_session')">
+                            Session
+                        </button>
+                        <button class="px-3 py-1.5 text-sm rounded-md transition-colors"
+                                data-testid="scope-lifetime"
+                                :class="scopeMode === 'lifetime' ? 'bg-accent text-black' : 'text-gray-400 hover:text-gray-200'"
+                                @click="setScopeMode('lifetime')">
+                            Lifetime
+                        </button>
+                    </div>
+                    <div class="text-xs text-gray-500 font-mono"
+                         data-testid="scope-freshness"
+                         x-text="scopeFreshnessBadge"></div>
+                </div>
+        <!-- Hero Metrics: Savings $ -> Input Compression -> Output Reduction -> Overhead -->
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+            <!-- Savings ($) - proxy compression only, priced at model list rate -->
+            <div class="bg-surface rounded-lg p-4 border border-border">
+                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Proxy $ Saved</div>
+                <div class="flex items-baseline gap-2">
+                    <span class="text-3xl font-light tabular-nums text-emerald-400"
+                          data-testid="scope-proxy-saved-value"
+                          x-text="scopeCompressionUnavailable ? 'Unavailable' : '$' + formatCurrency(hasMetricScopes ? scopeCompressionUsd : (stats.persistent_savings?.lifetime?.compression_savings_usd || 0))"></span>
+                </div>
+                <div class="mt-2 text-xs text-gray-500">
+                    <span x-show="hasMetricScopes && !scopeCompressionUnavailable"
+                          x-text="formatNumber(scopeCompressionTokensSaved) + ' proxy tokens · ' + scopeFreshnessText"></span>
+                    <span x-show="scopeCompressionUnavailable">Unavailable for selected scope</span>
+                    <span x-show="!hasMetricScopes && (stats.persistent_savings?.lifetime?.compression_savings_usd || 0) > 0"
+                          x-text="formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' proxy tokens only; ' + cliFilteringLabel + ' excluded from $'"></span>
+                    <span x-show="!hasMetricScopes && !((stats.persistent_savings?.lifetime?.compression_savings_usd || 0) > 0) && stats.litellm_available !== false"
+                          x-text="formatNumber(stats.requests?.total || 0) + ' requests processed'"></span>
+                    <!-- Pricing is LiteLLM-only. LiteLLM currently can't install on
+                         newer Python (e.g. 3.14+); state the fact, not the version,
+                         so the hint stays correct if that changes. -->
+                    <span x-show="!hasMetricScopes && !((stats.persistent_savings?.lifetime?.compression_savings_usd || 0) > 0) && stats.litellm_available === false">
+                        Cost pricing needs LiteLLM, which isn't installed in this environment. If you're on a Python version LiteLLM doesn't support yet, reinstall Headroom on Python 3.13:
+                        <code class="text-gray-400">pipx reinstall headroom-ai --python python3.13</code>
+                    </span>
+                </div>
+            </div>
 
                 <!-- Runtime Overview -->
                 <div class="grid grid-cols-1 gap-4 mb-6 lg:grid-cols-2">
@@ -222,6 +275,8 @@
                         </div>
                         <div class="mt-1 text-xs text-gray-500 leading-relaxed">
                             <span x-text="'Proxy ' + formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' (' + proxyShareOfTotal.toFixed(1) + '%)'"></span>
+                            <span class="mx-1 text-gray-600">/</span>
+                            <span x-text="cliFilteringAvailable ? (cliFilteringLabel + ' ' + formatNumber(cliFilteringSaved) + ' this session (' + cliFilteringSessionPctDisplay.toFixed(1) + '%)') : (cliFilteringLabel + ' not installed')"></span>
                         </div>
                         <div class="mt-1 text-xs text-gray-600 leading-relaxed">
                             <span x-text="'Of total wire: ' + (stats.tokens?.savings_percent || 0).toFixed(2) + '%'" title="Savings as fraction of all input tokens including frozen prefix"></span>
@@ -390,6 +445,14 @@
                                 <span class="text-sm text-gray-400">Before Compression</span>
                                 <span class="font-mono text-sm" x-text="formatNumber(stats.tokens?.total_before_compression || 0)"></span>
                             </div>
+                            <div class="flex justify-between items-center" x-show="cliFilteringAvailable">
+                                <span class="text-sm text-gray-400" x-text="cliFilteringLabel + ' Filtered (this session)'"></span>
+                                <span class="font-mono text-sm text-emerald-400" x-text="formatNumber(cliFilteringSaved)"></span>
+                            </div>
+                            <div class="flex justify-between items-center" x-show="!cliFilteringAvailable">
+                                <span class="text-sm text-gray-400" x-text="cliFilteringLabel + ' Filtered (this session)'"></span>
+                                <span class="font-mono text-sm text-gray-600">not installed</span>
+                            </div>
                             <div class="flex justify-between items-center">
                                 <span class="text-sm text-gray-400">Proxy Removed</span>
                                 <span class="font-mono text-sm text-accent" x-text="formatNumber(stats.tokens?.proxy_compression_saved || 0)"></span>
@@ -461,61 +524,63 @@
                     </div>
                 </div>
 
-                <!-- Prefix Cache Impact: current process plus durable cache reads after restart -->
-                <template x-if="cacheCardAvailable">
+                <!-- Card renders on live cache traffic OR persisted lifetime cache savings —
+                     the lifetime figure must survive a restart with zero traffic. -->
+                <template x-if="hasAnyScopedCacheData">
                     <div class="bg-surface rounded-lg p-4 border border-border mb-6">
                         <div class="flex justify-between items-center mb-3">
                             <div class="text-sm font-medium text-gray-300">Prefix Cache Impact</div>
-                            <div class="text-xs text-emerald-400 font-mono"
-                                 x-show="cacheSessionActive"
-                                 x-text="'Net savings: $' + formatCurrency(stats.prefix_cache?.totals?.net_savings_usd || 0)"></div>
-                            <div class="text-xs text-gray-500 font-mono"
-                                 x-show="!cacheSessionActive">no activity since restart</div>
+                            <div class="text-xs font-mono"
+                                 :class="scopeCacheUnavailable ? 'text-gray-500' : 'text-emerald-400'"
+                                 x-text="scopeCacheUnavailable ? 'Unavailable for selected scope' : scopeFreshnessBadge"></div>
                         </div>
-                        <template x-if="!cacheSessionActive && lifetimeCacheReadTokens > 0">
-                            <div class="mb-4 rounded-lg border border-cyan-500/20 bg-cyan-500/5 p-3">
-                                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Cache Reads (lifetime)</div>
-                                <div class="text-2xl font-light tabular-nums text-cyan-400"
-                                     x-text="formatNumber(lifetimeCacheReadTokens)"></div>
-                                <div class="text-xs text-cyan-400/70"
-                                     x-text="'$' + formatCurrency(lifetimeCacheSavingsUsd) + ' saved'"></div>
-                            </div>
-                        </template>
                         <!-- Totals row -->
-                        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
+                        <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-4">
+                            <div>
+                                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1" x-text="scopeCacheReadsLabel"></div>
+                                <div data-testid="scope-cache-reads-value" class="text-2xl font-light tabular-nums text-emerald-400" x-text="scopeCacheUnavailable ? 'Unavailable' : formatNumber(scopeCacheReads)"></div>
+                                <!-- Three-way zero state mirrors the Proxy $ Saved tile: real value /
+                                     unpriced-but-healthy / litellm unavailable. -->
+                                <div class="text-xs text-emerald-400/70"
+                                     x-show="!scopeCacheUnavailable && (scopeCacheSavingsUsd || 0) > 0"
+                                     x-text="'$' + formatCurrency(scopeCacheSavingsUsd || 0) + ' saved'"></div>
+                                <div class="text-xs text-gray-500"
+                                     x-show="!scopeCacheUnavailable && !((scopeCacheSavingsUsd || 0) > 0) && stats.litellm_available !== false">savings not priced yet</div>
+                                <div class="text-xs text-gray-500"
+                                     x-show="!scopeCacheUnavailable && !((scopeCacheSavingsUsd || 0) > 0) && stats.litellm_available === false">pricing needs LiteLLM</div>
+                            </div>
                             <div>
                                 <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Cache Writes</div>
-                                <div class="text-2xl font-light tabular-nums text-amber-400"
-                                     x-show="cacheSessionActive"
-                                     x-text="formatNumber(stats.prefix_cache?.totals?.cache_write_tokens || 0)"></div>
-                                <div class="text-2xl font-light tabular-nums text-gray-600"
-                                     x-show="!cacheSessionActive">&mdash;</div>
+                                <div class="text-2xl font-light tabular-nums text-amber-400" x-text="scopeCacheUnavailable ? 'Unavailable' : formatNumber(scopeCacheWrites)"></div>
                                 <div class="text-xs text-amber-400/70"
-                                     x-show="cacheSessionActive"
+                                     x-show="!hasMetricScopes && cacheSessionActive"
                                      x-text="'$' + formatCurrency(stats.prefix_cache?.totals?.write_premium_usd || 0) + ' write premium'"></div>
                                 <div class="text-xs text-gray-500"
-                                     x-show="!cacheSessionActive">no activity since restart</div>
+                                     x-show="hasMetricScopes">selected scope</div>
+                                <div class="text-xs text-gray-500"
+                                     x-show="!hasMetricScopes && !cacheSessionActive">no activity since restart</div>
                             </div>
                             <div>
                                 <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Hit Rate</div>
-                                <div class="text-2xl font-light tabular-nums" x-show="cacheSessionActive" :class="(stats.prefix_cache?.totals?.hit_rate || 0) > 80 ? 'text-emerald-400' : (stats.prefix_cache?.totals?.hit_rate || 0) > 50 ? 'text-amber-400' : 'text-red-400'" x-text="(stats.prefix_cache?.totals?.hit_rate || 0).toFixed(0) + '%'"></div>
-                                <div class="text-2xl font-light tabular-nums text-gray-600" x-show="!cacheSessionActive">&mdash;</div>
-                                <div class="text-xs text-gray-500" x-show="cacheSessionActive" x-text="(stats.prefix_cache?.totals?.hit_requests || 0) + ' / ' + (stats.prefix_cache?.totals?.requests || 0) + ' requests'"></div>
-                                <div class="text-xs text-gray-500" x-show="!cacheSessionActive">no activity since restart</div>
+                                <div class="text-2xl font-light tabular-nums"
+                                     :class="scopeCacheUnavailable ? 'text-gray-500' : (scopeCacheHitRate > 80 ? 'text-emerald-400' : scopeCacheHitRate > 50 ? 'text-amber-400' : 'text-red-400')"
+                                     x-text="scopeCacheUnavailable ? 'Unavailable' : scopeCacheHitRate.toFixed(0) + '%'"></div>
+                                <div class="text-xs text-gray-500"
+                                     x-text="scopeCacheUnavailable ? 'Unavailable for selected scope' : scopeCacheHitRequests + ' / ' + scopeCacheRequests + ' requests'"></div>
                             </div>
                             <div>
                                 <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Cache Busts</div>
-                                <div class="text-2xl font-light tabular-nums" x-show="cacheSessionActive" :class="(stats.prefix_cache?.totals?.bust_count || 0) > 5 ? 'text-red-400' : (stats.prefix_cache?.totals?.bust_count || 0) > 0 ? 'text-amber-400' : 'text-emerald-400'" x-text="stats.prefix_cache?.totals?.bust_count || 0"></div>
-                                <div class="text-2xl font-light tabular-nums text-gray-600" x-show="!cacheSessionActive">&mdash;</div>
-                                <div class="text-xs text-gray-500" x-show="cacheSessionActive" x-text="formatNumber(stats.prefix_cache?.totals?.bust_write_tokens || 0) + ' tokens re-written'"></div>
-                                <div class="text-xs text-gray-500" x-show="!cacheSessionActive">no activity since restart</div>
+                                <div class="text-2xl font-light tabular-nums"
+                                     :class="scopeCacheUnavailable ? 'text-gray-500' : (scopeCacheBustCount > 5 ? 'text-red-400' : scopeCacheBustCount > 0 ? 'text-amber-400' : 'text-emerald-400')"
+                                     x-text="scopeCacheUnavailable ? 'Unavailable' : scopeCacheBustCount"></div>
+                                <div class="text-xs text-gray-500"
+                                     x-text="scopeCacheUnavailable ? 'Unavailable for selected scope' : formatNumber(scopeCacheBustWriteTokens) + ' tokens re-written'"></div>
                             </div>
                             <div>
                                 <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Providers</div>
-                                <div class="text-2xl font-light tabular-nums text-gray-300" x-show="cacheSessionActive" x-text="Object.keys(stats.prefix_cache?.by_provider || {}).length"></div>
-                                <div class="text-2xl font-light tabular-nums text-gray-600" x-show="!cacheSessionActive">&mdash;</div>
-                                <div class="text-xs text-gray-500" x-show="cacheSessionActive">with cache data</div>
-                                <div class="text-xs text-gray-500" x-show="!cacheSessionActive">no activity since restart</div>
+                                <div class="text-2xl font-light tabular-nums text-gray-300"
+                                     x-text="cacheSessionActive ? processLocalProviderCount : '—'"></div>
+                                <div class="text-xs text-gray-500">Current process</div>
                             </div>
                         </div>
                         <!-- Cache efficiency bar (session-scoped; hidden until traffic arrives) -->
@@ -551,10 +616,10 @@
                                     <div>
                                         <div class="text-[11px] uppercase tracking-[0.22em] text-cyan-300/75">Bucket Mix</div>
                                         <div class="mt-1 text-2xl font-light text-cyan-50">
-                                            <span data-testid="ttl-bucket-mix-1h-total" x-text="formatNumber(stats.prefix_cache?.totals?.cache_write_1h_tokens || 0)"></span>
+                                            <span data-testid="ttl-bucket-mix-1h-total" x-text="formatNumber(scopeObservedTtlBuckets['1h']?.tokens || 0)"></span>
                                             <span class="text-sm text-cyan-300/70">1h</span>
                                             <span class="mx-2 text-cyan-500/60">/</span>
-                                            <span data-testid="ttl-bucket-mix-5m-total" x-text="formatNumber(stats.prefix_cache?.totals?.cache_write_5m_tokens || 0)"></span>
+                                            <span data-testid="ttl-bucket-mix-5m-total" x-text="formatNumber(scopeObservedTtlBuckets['5m']?.tokens || 0)"></span>
                                             <span class="text-sm text-cyan-300/70">5m</span>
                                         </div>
                                     </div>
@@ -563,28 +628,28 @@
                                         <div class="mt-4">
                                             <div class="flex justify-between text-xs text-gray-500 mb-1">
                                                 <span>Observed write-token split</span>
-                                                <span x-text="(stats.prefix_cache?.totals?.observed_ttl_mix?.active_buckets || []).join(' + ')"></span>
+                                                <span x-text="scopedObservedTtlWindowLabel"></span>
                                             </div>
                                             <div class="h-3 overflow-hidden rounded-full bg-black/30 ring-1 ring-white/5 flex">
-                                                <div class="h-full bg-cyan-400 transition-all duration-500" :style="'width:' + (stats.prefix_cache?.totals?.observed_ttl_mix?.['1h_pct'] || 0) + '%'"></div>
-                                                <div class="h-full bg-violet-400 transition-all duration-500" :style="'width:' + (stats.prefix_cache?.totals?.observed_ttl_mix?.['5m_pct'] || 0) + '%'"></div>
+                                                <div class="h-full bg-cyan-400 transition-all duration-500" :style="'width:' + (scopedObservedTtlMix['1h_pct'] || 0) + '%'"></div>
+                                                <div class="h-full bg-violet-400 transition-all duration-500" :style="'width:' + (scopedObservedTtlMix['5m_pct'] || 0) + '%'"></div>
                                             </div>
                                             <div class="mt-2 flex flex-wrap gap-3 text-xs text-gray-400">
-                                                <span class="inline-flex items-center gap-1.5"><span class="inline-block h-2 w-2 rounded-full bg-cyan-400"></span><span data-testid="ttl-bucket-mix-1h-pct" x-text="'1h ' + (stats.prefix_cache?.totals?.observed_ttl_mix?.['1h_pct'] || 0).toFixed(1) + '%'"></span></span>
-                                                <span class="inline-flex items-center gap-1.5"><span class="inline-block h-2 w-2 rounded-full bg-violet-400"></span><span data-testid="ttl-bucket-mix-5m-pct" x-text="'5m ' + (stats.prefix_cache?.totals?.observed_ttl_mix?.['5m_pct'] || 0).toFixed(1) + '%'"></span></span>
+                                                <span class="inline-flex items-center gap-1.5"><span class="inline-block h-2 w-2 rounded-full bg-cyan-400"></span><span data-testid="ttl-bucket-mix-1h-pct" x-text="'1h ' + (scopedObservedTtlMix['1h_pct'] || 0).toFixed(1) + '%'"></span></span>
+                                                <span class="inline-flex items-center gap-1.5"><span class="inline-block h-2 w-2 rounded-full bg-violet-400"></span><span data-testid="ttl-bucket-mix-5m-pct" x-text="'5m ' + (scopedObservedTtlMix['5m_pct'] || 0).toFixed(1) + '%'"></span></span>
                                             </div>
                                         </div>
                                     </div>
                                     <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-1 gap-3">
                                         <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
                                             <div class="text-[11px] uppercase tracking-[0.18em] text-cyan-300/75">1h Cache Writes</div>
-                                            <div data-testid="ttl-bucket-1h-value" class="mt-2 text-3xl font-light text-cyan-50" x-text="formatNumber(stats.prefix_cache?.totals?.observed_ttl_buckets?.['1h']?.tokens || 0)"></div>
-                                            <div class="mt-1 text-xs text-gray-500" x-text="formatNumber(stats.prefix_cache?.totals?.observed_ttl_buckets?.['1h']?.requests || 0) + ' requests observed'"></div>
+                                            <div data-testid="ttl-bucket-1h-value" class="mt-2 text-3xl font-light text-cyan-50" x-text="formatNumber(scopeObservedTtlBuckets['1h']?.tokens || 0)"></div>
+                                            <div class="mt-1 text-xs text-gray-500" x-text="formatNumber(scopeObservedTtlBuckets['1h']?.requests || 0) + ' requests observed'"></div>
                                         </div>
                                         <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
                                             <div class="text-[11px] uppercase tracking-[0.18em] text-violet-300/75">5m Cache Writes</div>
-                                            <div data-testid="ttl-bucket-5m-value" class="mt-2 text-3xl font-light text-violet-50" x-text="formatNumber(stats.prefix_cache?.totals?.observed_ttl_buckets?.['5m']?.tokens || 0)"></div>
-                                            <div class="mt-1 text-xs text-gray-500" x-text="formatNumber(stats.prefix_cache?.totals?.observed_ttl_buckets?.['5m']?.requests || 0) + ' requests observed'"></div>
+                                            <div data-testid="ttl-bucket-5m-value" class="mt-2 text-3xl font-light text-violet-50" x-text="formatNumber(scopeObservedTtlBuckets['5m']?.tokens || 0)"></div>
+                                            <div class="mt-1 text-xs text-gray-500" x-text="formatNumber(scopeObservedTtlBuckets['5m']?.requests || 0) + ' requests observed'"></div>
                                         </div>
                                     </div>
                                 </div>
@@ -603,13 +668,13 @@
                                 <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
                                     <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
                                         <div class="text-[11px] uppercase tracking-[0.18em] text-emerald-300/75">Saved by Compression</div>
-                                        <div data-testid="cvc-saved-value" class="mt-2 text-3xl font-light text-emerald-50" x-text="formatNumber(stats.prefix_cache?.compression_vs_cache?.tokens_saved_by_compression || 0)"></div>
+                                    <div data-testid="cvc-saved-value" class="mt-2 text-3xl font-light text-emerald-50" x-text="formatNumber(scopeCompressionVsCacheSaved)"></div>
                                         <div class="mt-1 text-xs text-gray-500">tokens removed before send</div>
                                     </div>
                                     <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
                                         <div class="text-[11px] uppercase tracking-[0.18em] text-red-300/75">Lost to Cache Busts</div>
-                                        <div data-testid="cvc-bust-value" class="mt-2 text-3xl font-light text-red-50" x-text="formatNumber(stats.prefix_cache?.compression_vs_cache?.tokens_lost_to_cache_bust || 0)"></div>
-                                        <div class="mt-1 text-xs text-gray-500" x-text="formatNumber(stats.prefix_cache?.compression_vs_cache?.cache_bust_count || 0) + ' busts observed'"></div>
+                                    <div data-testid="cvc-bust-value" class="mt-2 text-3xl font-light text-red-50" x-text="formatNumber(scopeCompressionVsCacheBustTokens)"></div>
+                                    <div class="mt-1 text-xs text-gray-500" x-text="formatNumber(scopeCompressionVsCacheBustCount) + ' busts observed'"></div>
                                     </div>
                                     <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
                                         <div class="text-[11px] uppercase tracking-[0.18em] text-gray-400">Net</div>
@@ -617,10 +682,11 @@
                                         <div class="mt-1 text-xs text-gray-500">saved minus bust losses</div>
                                     </div>
                                     <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
-                                        <div class="text-[11px] uppercase tracking-[0.18em] text-cyan-300/75">Prefix Freeze Net</div>
-                                        <div data-testid="freeze-net-value" class="mt-2 text-3xl font-light" :class="prefixFreezeNet >= 0 ? 'text-cyan-50' : 'text-red-400'" x-text="(prefixFreezeNet >= 0 ? '+' : '-') + formatNumber(Math.abs(prefixFreezeNet))"></div>
-                                        <div class="mt-1 text-xs text-gray-500" x-text="formatNumber(stats.prefix_cache?.prefix_freeze?.busts_avoided || 0) + ' busts avoided, ' + formatNumber(stats.prefix_cache?.prefix_freeze?.compression_foregone_tokens || 0) + ' foregone'"></div>
-                                    </div>
+                                    <div class="text-[11px] uppercase tracking-[0.18em] text-cyan-300/75">Prefix Freeze Net</div>
+                                    <div data-testid="freeze-net-value" class="mt-2 text-3xl font-light" :class="prefixFreezeNet >= 0 ? 'text-cyan-50' : 'text-red-400'" x-text="(prefixFreezeNet >= 0 ? '+' : '-') + formatNumber(Math.abs(prefixFreezeNet))"></div>
+                                    <div class="mt-1 text-xs text-gray-500" x-text="formatNumber(stats.prefix_cache?.prefix_freeze?.busts_avoided || 0) + ' busts avoided, ' + formatNumber(stats.prefix_cache?.prefix_freeze?.compression_foregone_tokens || 0) + ' foregone'"></div>
+                                    <div class="mt-1 text-[11px] text-gray-600">Current process</div>
+                                </div>
                                 </div>
                             </div>
                         </template>
@@ -785,9 +851,7 @@
 
                         <template x-if="agentRows.length === 0">
                             <div class="rounded-lg border border-dashed border-border p-6 text-center text-sm text-gray-500">
-                                <div>Agent usage appears after Cursor, Claude, Codex, or another client sends traffic through this proxy.</div>
-                                <div class="mt-2 font-mono text-xs text-accent"
-                                     x-text="'ANTHROPIC_BASE_URL: ' + window.location.origin + '/p/&lt;project-name&gt;'"></div>
+                                Agent usage appears after Cursor, Claude, Codex, or another client sends traffic through this proxy.
                             </div>
                         </template>
                     </div>
@@ -820,7 +884,7 @@
                         <div class="bg-surface rounded-lg border border-border overflow-hidden lg:col-span-2">
                             <div class="px-4 py-3 border-b border-border flex justify-between items-center">
                                 <span class="text-sm font-medium text-gray-300">Per-Model Token Savings</span>
-                                <span class="text-xs text-gray-500">Exact tokens saved per model</span>
+                                <span data-testid="per-model-process-label" class="text-xs text-gray-500">Current process only</span>
                             </div>
                             <div class="overflow-x-auto">
                                 <table class="w-full text-sm" style="table-layout:fixed">
@@ -1327,7 +1391,8 @@
                         <div class="px-4 py-8 text-center">
                             <div class="text-xs text-gray-500 mb-3">No per-project data yet.</div>
                             <div class="text-xs text-gray-600 font-mono leading-relaxed">
-                                <span class="text-accent" x-text="'ANTHROPIC_BASE_URL: ' + window.location.origin + '/p/&lt;project-name&gt;'"></span>
+                                Route project traffic through
+                                <span class="text-accent" x-text="window.location.origin + '/p/&lt;project-name&gt;'"></span>
                             </div>
                         </div>
                     </template>
@@ -1459,6 +1524,17 @@
                         <div class="mt-2 text-xs text-gray-500">Based on persisted weekly buckets</div>
                     </div>
 
+                    <template x-if="historyStats.cli_filtering && historyCliFilteringAvailable">
+                        <div class="bg-surface rounded-lg p-4 border border-border">
+                            <div class="text-xs text-gray-500 uppercase tracking-wide mb-1"
+                                 x-text="(historyStats.cli_filtering?.label || cliFilteringLabel) + ' Lifetime Saved'"></div>
+                            <div class="flex items-baseline gap-2">
+                                <span class="text-3xl font-light tabular-nums text-cyan-400"
+                                      x-text="formatNumber(historyStats.cli_filtering?.lifetime?.tokens_saved || 0)"></span>
+                            </div>
+                            <div class="mt-2 text-xs text-gray-500">CLI output filtering (lifetime)</div>
+                        </div>
+                    </template>
                 </div>
 
                 <template x-if="hasHistoricalData">
@@ -1817,6 +1893,7 @@
                 version: 'loading',
                 lastUpdate: 'never',
                 viewMode: 'session',
+                scopeMode: 'lifetime',
                 historyGranularity: 'daily',
                 historyChartMode: 'tokens',
                 historySelectedModel: null,
@@ -1880,6 +1957,10 @@
                     if (mode === 'history') {
                         await this.fetchHistoryStats();
                     }
+                },
+
+                setScopeMode(mode) {
+                    this.scopeMode = mode;
                 },
 
                 async toggleFeed() {
@@ -2141,6 +2222,220 @@
                         hour: '2-digit',
                         minute: '2-digit',
                     });
+                },
+
+                get hasMetricScopes() {
+                    const scopes = this.stats.metric_scopes;
+                    return Boolean(
+                        scopes
+                        && scopes.current_process
+                        && scopes.display_session
+                        && scopes.lifetime
+                    );
+                },
+
+                get selectedScopeLabel() {
+                    const labels = {
+                        current_process: 'Current process',
+                        display_session: 'Session',
+                        lifetime: 'Lifetime',
+                    };
+                    return labels[this.scopeMode] || 'Lifetime';
+                },
+
+                get selectedScope() {
+                    if (!this.hasMetricScopes) return null;
+                    return this.stats.metric_scopes?.[this.scopeMode] || null;
+                },
+
+                get selectedScopeRequests() {
+                    return this.selectedScope?.requests || null;
+                },
+
+                get selectedScopeCompression() {
+                    return this.selectedScope?.compression || null;
+                },
+
+                get selectedScopeCache() {
+                    return this.selectedScope?.cache || null;
+                },
+
+                get selectedScopeCodexWs() {
+                    return this.selectedScope?.codex_ws || null;
+                },
+
+                get scopeCompressionAvailable() {
+                    if (!this.hasMetricScopes) return true;
+                    const compression = this.selectedScopeCompression;
+                    return Boolean(
+                        compression
+                        && typeof compression.tokens_saved === 'number'
+                        && typeof compression.compression_savings_usd === 'number'
+                    );
+                },
+
+                get scopeCacheAvailable() {
+                    if (!this.hasMetricScopes) return true;
+                    const cache = this.selectedScopeCache;
+                    return Boolean(
+                        cache
+                        && typeof cache.cache_read_tokens === 'number'
+                        && typeof cache.cache_write_tokens === 'number'
+                        && typeof cache.hit_rate === 'number'
+                        && typeof cache.bust_count === 'number'
+                    );
+                },
+
+                get scopeCacheUnavailable() {
+                    return this.hasMetricScopes && !this.scopeCacheAvailable;
+                },
+
+                get scopeFreshnessText() {
+                    if (!this.hasMetricScopes) return '';
+                    if (this.scopeMode === 'current_process') {
+                        const startedAt = this.stats.metric_scopes?.process_started_at;
+                        return startedAt ? 'Started ' + this.formatDateTime(startedAt) : 'Current process';
+                    }
+                    const updatedAt = this.stats.metric_scopes?.updated_at;
+                    return updatedAt ? 'Updated ' + this.formatDateTime(updatedAt) : this.selectedScopeLabel;
+                },
+
+                get scopeFreshnessBadge() {
+                    if (!this.hasMetricScopes) return '';
+                    return this.selectedScopeLabel + ' · ' + this.scopeFreshnessText;
+                },
+
+                get scopeRequestTotal() {
+                    return this.selectedScopeRequests?.total ?? 0;
+                },
+
+                get scopeCompressionUsd() {
+                    return this.selectedScopeCompression?.compression_savings_usd ?? 0;
+                },
+
+                get scopeCompressionTokensSaved() {
+                    return this.selectedScopeCompression?.tokens_saved ?? 0;
+                },
+
+                get scopeCompressionUnavailable() {
+                    return this.hasMetricScopes && !this.scopeCompressionAvailable;
+                },
+
+                get hasAnyScopedCacheData() {
+                    if (!this.hasMetricScopes) {
+                        return this.cacheSessionActive || (this.stats.persistent_savings?.lifetime?.cache_read_tokens || 0) > 0;
+                    }
+                    const scopes = this.stats.metric_scopes || {};
+                    return ['current_process', 'display_session', 'lifetime'].some((key) => {
+                        const cache = scopes[key]?.cache;
+                        return Boolean(
+                            cache
+                            && (
+                                (cache.requests || 0) > 0
+                                || (cache.cache_read_tokens || 0) > 0
+                                || (cache.cache_write_tokens || 0) > 0
+                            )
+                        );
+                    });
+                },
+
+                get scopedCacheActive() {
+                    if (!this.hasMetricScopes) return this.cacheSessionActive;
+                    const cache = this.selectedScopeCache;
+                    return Boolean(
+                        cache
+                        && (
+                            (cache.requests || 0) > 0
+                            || (cache.cache_read_tokens || 0) > 0
+                            || (cache.cache_write_tokens || 0) > 0
+                        )
+                    );
+                },
+
+                get scopeCacheReadsLabel() {
+                    if (!this.hasMetricScopes) return 'Cache Reads (lifetime)';
+                    return 'Cache Reads (' + this.selectedScopeLabel.toLowerCase() + ')';
+                },
+
+                get scopeCacheReads() {
+                    if (!this.hasMetricScopes) return this.stats.persistent_savings?.lifetime?.cache_read_tokens || 0;
+                    return this.selectedScopeCache?.cache_read_tokens ?? 0;
+                },
+
+                get scopeCacheSavingsUsd() {
+                    if (!this.hasMetricScopes) return this.stats.persistent_savings?.lifetime?.cache_savings_usd || 0;
+                    return this.selectedScopeCache?.cache_savings_usd ?? 0;
+                },
+
+                get scopeCacheWrites() {
+                    if (!this.hasMetricScopes) return this.stats.prefix_cache?.totals?.cache_write_tokens || 0;
+                    return this.selectedScopeCache?.cache_write_tokens ?? 0;
+                },
+
+                get scopeCacheHitRate() {
+                    if (!this.hasMetricScopes) return this.stats.prefix_cache?.totals?.hit_rate || 0;
+                    return this.selectedScopeCache?.hit_rate ?? 0;
+                },
+
+                get scopeCacheHitRequests() {
+                    if (!this.hasMetricScopes) return this.stats.prefix_cache?.totals?.hit_requests || 0;
+                    return this.selectedScopeCache?.hit_requests ?? 0;
+                },
+
+                get scopeCacheRequests() {
+                    if (!this.hasMetricScopes) return this.stats.prefix_cache?.totals?.requests || 0;
+                    return this.selectedScopeCache?.requests ?? 0;
+                },
+
+                get scopeCacheBustCount() {
+                    if (!this.hasMetricScopes) return this.stats.prefix_cache?.totals?.bust_count || 0;
+                    return this.selectedScopeCache?.bust_count ?? 0;
+                },
+
+                get scopeCacheBustWriteTokens() {
+                    if (!this.hasMetricScopes) return this.stats.prefix_cache?.totals?.bust_write_tokens || 0;
+                    return this.selectedScopeCache?.bust_write_tokens ?? 0;
+                },
+
+                get hasScopedObservedTtlBuckets() {
+                    const buckets = this.hasMetricScopes
+                        ? (this.selectedScopeCache?.observed_ttl_buckets || {})
+                        : (this.stats.prefix_cache?.totals?.observed_ttl_buckets || {});
+                    return ((buckets['5m']?.tokens || 0) + (buckets['1h']?.tokens || 0)) > 0;
+                },
+
+                get scopedObservedTtlMix() {
+                    return this.hasMetricScopes
+                        ? (this.selectedScopeCache?.observed_ttl_mix || {})
+                        : (this.stats.prefix_cache?.totals?.observed_ttl_mix || {});
+                },
+
+                get scopedObservedTtlHeadline() {
+                    const mix = this.scopedObservedTtlMix;
+                    const oneHour = mix['1h_pct'] || 0;
+                    const fiveMinute = mix['5m_pct'] || 0;
+                    if (oneHour === fiveMinute) return 'Balanced';
+                    return oneHour > fiveMinute ? '1h leaning' : '5m leaning';
+                },
+
+                get scopedObservedTtlWindowLabel() {
+                    const active = this.scopedObservedTtlMix.active_buckets || [];
+                    if (!active.length) return 'No TTL bucket data';
+                    return active.length === 1 ? active[0] + ' only' : active.join(' / ');
+                },
+
+                get hasScopedCompressionVsCache() {
+                    if (!this.hasMetricScopes) return this.hasCompressionVsCache;
+                    return (this.scopeCompressionTokensSaved > 0) || ((this.selectedScopeCache?.cache_bust_tokens_lost || 0) > 0);
+                },
+
+                get scopedCompressionVsCacheNet() {
+                    if (!this.hasMetricScopes) return this.compressionVsCacheNet;
+                    return this.scopeCompressionTokensSaved - (this.selectedScopeCache?.cache_bust_tokens_lost || 0);
+                },
+
+                get processLocalProviderCount() {
+                    return Object.keys(this.stats.prefix_cache?.by_provider || {}).length;
                 },
 
                 truncateModel(model) {
@@ -2467,42 +2762,37 @@
                 // --- Prefix Cache ---
 
                 get cacheSessionActive() {
+                    if (this.hasMetricScopes) return this.scopedCacheActive;
                     return (this.stats.prefix_cache?.totals?.requests || 0) > 0;
                 },
 
-                get lifetimeCacheReadTokens() {
-                    return this.stats.persistent_savings?.lifetime?.cache_read_tokens || 0;
-                },
-
-                get lifetimeCacheSavingsUsd() {
-                    return this.stats.persistent_savings?.lifetime?.cache_savings_usd || 0;
-                },
-
-                get cacheCardAvailable() {
-                    return this.cacheSessionActive || this.lifetimeCacheReadTokens > 0 || this.lifetimeCacheSavingsUsd > 0;
-                },
-
                 get cacheSavingsPercent() {
-                    const t = this.stats.prefix_cache?.totals || {};
-                    const total = (t.cache_read_tokens || 0) + (t.cache_write_tokens || 0);
+                    const t = this.hasMetricScopes
+                        ? (this.selectedScopeCache || {})
+                        : (this.stats.prefix_cache?.totals || {});
+                    const total = (t.cache_read_tokens || 0) + (t.cache_write_tokens || 0) + (t.uncached_input_tokens || 0);
                     if (total === 0) return 0;
                     return Math.round((t.cache_read_tokens || 0) / total * 100);
                 },
 
                 get cacheWritePercent() {
-                    const t = this.stats.prefix_cache?.totals || {};
-                    const total = (t.cache_read_tokens || 0) + (t.cache_write_tokens || 0);
+                    const t = this.hasMetricScopes
+                        ? (this.selectedScopeCache || {})
+                        : (this.stats.prefix_cache?.totals || {});
+                    const total = (t.cache_read_tokens || 0) + (t.cache_write_tokens || 0) + (t.uncached_input_tokens || 0);
                     if (total === 0) return 0;
                     return Math.round((t.cache_write_tokens || 0) / total * 100);
                 },
 
                 get hasObservedTtlBuckets() {
-                    const buckets = this.stats.prefix_cache?.totals?.observed_ttl_buckets || {};
+                    const buckets = this.scopeObservedTtlBuckets;
                     return ((buckets['5m']?.tokens || 0) + (buckets['1h']?.tokens || 0)) > 0;
                 },
 
                 get observedTtlHeadline() {
-                    const mix = this.stats.prefix_cache?.totals?.observed_ttl_mix || {};
+                    const mix = this.hasMetricScopes
+                        ? (this.selectedScopeCache?.observed_ttl_mix || {})
+                        : (this.stats.prefix_cache?.totals?.observed_ttl_mix || {});
                     const oneHour = mix['1h_pct'] || 0;
                     const fiveMinute = mix['5m_pct'] || 0;
                     if (oneHour === fiveMinute) return 'Balanced';
@@ -2510,13 +2800,37 @@
                 },
 
                 get observedTtlWindowLabel() {
-                    const mix = this.stats.prefix_cache?.totals?.observed_ttl_mix || {};
+                    const mix = this.hasMetricScopes
+                        ? (this.selectedScopeCache?.observed_ttl_mix || {})
+                        : (this.stats.prefix_cache?.totals?.observed_ttl_mix || {});
                     const active = mix.active_buckets || [];
                     if (!active.length) return 'No TTL bucket data';
                     return active.length === 1 ? active[0] + ' only' : active.join(' / ');
                 },
 
+                get scopeObservedTtlBuckets() {
+                    return this.hasMetricScopes
+                        ? (this.selectedScopeCache?.observed_ttl_buckets || {})
+                        : (this.stats.prefix_cache?.totals?.observed_ttl_buckets || {});
+                },
+
+                get scopeCompressionVsCacheSaved() {
+                    if (!this.hasMetricScopes) return this.stats.prefix_cache?.compression_vs_cache?.tokens_saved_by_compression || 0;
+                    return this.scopeCompressionTokensSaved;
+                },
+
+                get scopeCompressionVsCacheBustTokens() {
+                    if (!this.hasMetricScopes) return this.stats.prefix_cache?.compression_vs_cache?.tokens_lost_to_cache_bust || 0;
+                    return this.selectedScopeCache?.cache_bust_tokens_lost || 0;
+                },
+
+                get scopeCompressionVsCacheBustCount() {
+                    if (!this.hasMetricScopes) return this.stats.prefix_cache?.compression_vs_cache?.cache_bust_count || 0;
+                    return this.selectedScopeCache?.cache_bust_count || 0;
+                },
+
                 get compressionVsCacheNet() {
+                    if (this.hasMetricScopes) return this.scopedCompressionVsCacheNet;
                     const cvc = this.stats.prefix_cache?.compression_vs_cache || {};
                     return cvc.net_tokens ?? ((cvc.tokens_saved_by_compression || 0) - (cvc.tokens_lost_to_cache_bust || 0));
                 },
@@ -2527,6 +2841,7 @@
                 },
 
                 get hasCompressionVsCache() {
+                    if (this.hasMetricScopes) return this.hasScopedCompressionVsCache;
                     const cvc = this.stats.prefix_cache?.compression_vs_cache || {};
                     const pf = this.stats.prefix_cache?.prefix_freeze || {};
                     return (cvc.tokens_saved_by_compression || 0) > 0
@@ -2610,6 +2925,49 @@
                     const total = this.compressionTotalBefore;
                     if (total <= 0) return 0;
                     return (this.stats.tokens?.proxy_compression_saved || 0) / total * 100;
+                },
+
+                get cliFilteringLabel() {
+                    const raw = this.stats.savings?.by_layer?.cli_filtering?.label
+                        || this.stats.context_tool?.label
+                        || this.stats.context_tool?.configured
+                        || 'Context Tool';
+                    if (String(raw).toLowerCase() === 'lean-ctx') return 'Lean-ctx';
+                    return String(raw);
+                },
+
+                get cliFilteringSaved() {
+                    return this.stats.tokens?.cli_filtering_saved
+                        ?? this.stats.tokens?.cli_tokens_avoided
+                        ?? this.stats.tokens?.rtk_saved
+                        ?? 0;
+                },
+
+                get cliFilteringShareOfTotal() {
+                    const total = this.compressionTotalBefore;
+                    if (total <= 0) return 0;
+                    return this.cliFilteringSaved / total * 100;
+                },
+
+                get cliFilteringLifetime() {
+                    return this.stats.savings?.by_layer?.cli_filtering?.lifetime?.tokens_saved ?? 0;
+                },
+
+                get cliFilteringSessionPctDisplay() {
+                    const p = this.stats.savings?.by_layer?.cli_filtering?.session_savings_pct;
+                    return (p === null || p === undefined) ? this.cliFilteringShareOfTotal : p;
+                },
+
+                get cliFilteringAvailable() {
+                    const ct = this.stats.context_tool;
+                    if (ct && typeof ct.available === 'boolean') return ct.available;
+                    return true;
+                },
+
+                get historyCliFilteringAvailable() {
+                    const hf = this.historyStats?.cli_filtering;
+                    if (hf && typeof hf.available === 'boolean') return hf.available;
+                    return true;
                 },
 
                 // --- Headline savings percent ---

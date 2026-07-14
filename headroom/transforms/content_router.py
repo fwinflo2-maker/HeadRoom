@@ -59,13 +59,19 @@ from ..config import (
 from ..parser import CCR_RETRIEVAL_MARKER_RE
 from ..tokenizer import Tokenizer
 from ..tokenizers.estimator import EstimatingTokenCounter
+from . import mixed_content as _mixed_content
 from .base import Transform
 from .content_detector import ContentType, DetectionResult, _try_detect_log, _try_detect_search
 from .content_detector import detect_content_type as _regex_detect_content_type
 from .error_detection import content_has_strong_error_indicators
+from .mixed_content import ContentSection, mixed_content_indicators
 from .relevance_split import build_relevance_query, plan_relevance_split
 
 logger = logging.getLogger(__name__)
+
+_extract_json_block = _mixed_content._extract_json_block
+is_mixed_content = _mixed_content.is_mixed_content
+split_into_sections = _mixed_content.split_into_sections
 
 
 _detect_backend_warned = False
@@ -93,6 +99,16 @@ def _estimate_tokens(text: str) -> int:
     return max(1, _TOKEN_ESTIMATOR.count_text(text))
 
 
+def _compression_deadline_seconds() -> float:
+    try:
+        return max(
+            0.0,
+            float(os.environ.get("HEADROOM_COMPRESSION_DEADLINE_MS", "20000")) / 1000.0,
+        )
+    except ValueError:
+        return 20.0
+
+
 def _router_debug_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
 
@@ -108,7 +124,7 @@ def _tool_call_args_text(raw: Any) -> str:
     if isinstance(raw, str):
         text = raw
     elif isinstance(raw, dict):
-        text = " ".join(str(v) for v in raw.values() if isinstance(v, (str, int, float, bool)))
+        text = " ".join(str(v) for v in raw.values() if isinstance(v, str | int | float | bool))
     else:
         return ""
     return " ".join(text.split())[:300]
@@ -338,12 +354,7 @@ def _json_shape(content: str) -> dict[str, Any]:
 
 
 def _mixed_indicators(content: str) -> dict[str, bool]:
-    return {
-        "has_code_fences": bool(_CODE_FENCE_PATTERN.search(content)),
-        "has_json_blocks": bool(_JSON_BLOCK_START.search(content)),
-        "has_prose": len(_PROSE_PATTERN.findall(content)) > 5,
-        "has_search_results": bool(_SEARCH_RESULT_PATTERN.search(content)),
-    }
+    return mixed_content_indicators(content)
 
 
 def _section_debug(section: ContentSection, index: int) -> dict[str, Any]:
@@ -918,18 +929,6 @@ class RoutingDecision:
 
 
 @dataclass
-class ContentSection:
-    """A typed section of content."""
-
-    content: str
-    content_type: ContentType
-    language: str | None = None
-    start_line: int = 0
-    end_line: int = 0
-    is_code_fence: bool = False
-
-
-@dataclass
 class RouterCompressionResult:
     """Result from ContentRouter with routing metadata.
 
@@ -1208,190 +1207,6 @@ class ContentRouterConfig:
     # Group search-compressor output by file (`rg --heading` style).
     # Default False; the proxy enables it in token mode.
     search_group_by_file: bool = False
-
-
-# Patterns for detecting mixed content
-_CODE_FENCE_PATTERN = re.compile(r"^```(\w*)\s*$", re.MULTILINE)
-_JSON_BLOCK_START = re.compile(r"^\s*[\[{]", re.MULTILINE)
-_SEARCH_RESULT_PATTERN = re.compile(r"^\S+:\d+:", re.MULTILINE)
-_PROSE_PATTERN = re.compile(r"[A-Z][a-z]+\s+\w+\s+\w+")
-
-
-def is_mixed_content(content: str) -> bool:
-    """Detect if content contains multiple distinct types.
-
-    Args:
-        content: Content to analyze.
-
-    Returns:
-        True if content appears to be mixed (multiple types).
-    """
-    indicators = {
-        "has_code_fences": bool(_CODE_FENCE_PATTERN.search(content)),
-        "has_json_blocks": bool(_JSON_BLOCK_START.search(content)),
-        "has_prose": len(_PROSE_PATTERN.findall(content)) > 5,
-        "has_search_results": bool(_SEARCH_RESULT_PATTERN.search(content)),
-    }
-
-    # Mixed if 2+ indicators are true
-    return sum(indicators.values()) >= 2
-
-
-def split_into_sections(content: str) -> list[ContentSection]:
-    """Parse mixed content into typed sections.
-
-    Args:
-        content: Mixed content to split.
-
-    Returns:
-        List of ContentSection objects.
-    """
-    sections: list[ContentSection] = []
-    lines = content.split("\n")
-
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-
-        # Code fence: ```language
-        if match := _CODE_FENCE_PATTERN.match(line):
-            language = match.group(1) or "unknown"
-            code_lines = []
-            start_line = i
-            i += 1
-
-            while i < len(lines) and not lines[i].startswith("```"):
-                code_lines.append(lines[i])
-                i += 1
-
-            sections.append(
-                ContentSection(
-                    content="\n".join(code_lines),
-                    content_type=ContentType.SOURCE_CODE,
-                    language=language,
-                    start_line=start_line,
-                    end_line=i,
-                    is_code_fence=True,
-                )
-            )
-            i += 1  # Skip closing ```
-            continue
-
-        # JSON block
-        if line.strip().startswith(("[", "{")):
-            json_content, end_i = _extract_json_block(lines, i)
-            if json_content:
-                sections.append(
-                    ContentSection(
-                        content=json_content,
-                        content_type=ContentType.JSON_ARRAY,
-                        start_line=i,
-                        end_line=end_i,
-                    )
-                )
-                i = end_i + 1
-                continue
-
-        # Search result lines
-        if _SEARCH_RESULT_PATTERN.match(line):
-            search_lines = []
-            start_line = i
-            while i < len(lines) and _SEARCH_RESULT_PATTERN.match(lines[i]):
-                search_lines.append(lines[i])
-                i += 1
-            sections.append(
-                ContentSection(
-                    content="\n".join(search_lines),
-                    content_type=ContentType.SEARCH_RESULTS,
-                    start_line=start_line,
-                    end_line=i - 1,
-                )
-            )
-            continue
-
-        # Collect text until next special section
-        text_lines = [line]
-        start_line = i
-        i += 1
-
-        while i < len(lines):
-            next_line = lines[i]
-            # Stop if we hit a special section
-            if (
-                _CODE_FENCE_PATTERN.match(next_line)
-                or next_line.strip().startswith(("[", "{"))
-                or _SEARCH_RESULT_PATTERN.match(next_line)
-            ):
-                break
-            text_lines.append(next_line)
-            i += 1
-
-        # Only add non-empty text sections
-        text_content = "\n".join(text_lines)
-        if text_content.strip():
-            sections.append(
-                ContentSection(
-                    content=text_content,
-                    content_type=ContentType.PLAIN_TEXT,
-                    start_line=start_line,
-                    end_line=i - 1,
-                )
-            )
-
-    return sections
-
-
-def _extract_json_block(lines: list[str], start: int) -> tuple[str | None, int]:
-    """Extract a complete JSON block from lines.
-
-    Args:
-        lines: All lines of content.
-        start: Starting line index.
-
-    Returns:
-        Tuple of (json_content, end_line_index) or (None, start) if invalid.
-    """
-    bracket_count = 0
-    brace_count = 0
-    json_lines = []
-    in_string = False
-    escaped = False
-
-    for i in range(start, len(lines)):
-        line = lines[i]
-        json_lines.append(line)
-
-        # Count brackets/braces, but ignore any that appear inside a JSON
-        # string literal — a naive line.count() treats e.g. the "]" in
-        # {"path": "a]b"} as a closing bracket and terminates the block
-        # early, splitting one array across multiple sections.
-        for ch in line:
-            if escaped:
-                escaped = False
-                continue
-            if ch == "\\":
-                if in_string:
-                    escaped = True
-                continue
-            if ch == '"':
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if ch == "[":
-                bracket_count += 1
-            elif ch == "]":
-                bracket_count -= 1
-            elif ch == "{":
-                brace_count += 1
-            elif ch == "}":
-                brace_count -= 1
-
-        if bracket_count <= 0 and brace_count <= 0 and json_lines:
-            return "\n".join(json_lines), i
-
-    # Didn't find complete JSON
-    return None, start
 
 
 class ContentRouter(Transform):
@@ -2016,6 +1831,18 @@ class ContentRouter(Transform):
         order = ([primary] if primary else []) + [
             k for k in ("search", "paths", "log", "diff", "text") if k != primary
         ]
+        # The "diff" fold (diff_strip_index) is the one compact_lossless kind that
+        # is purely subtractive with NO exact-inverse check: it removes any line
+        # shaped like `index <hex>..<hex>`. On non-diff content that happens to
+        # contain such a line, that line is silently and unrecoverably dropped —
+        # breaking the lossless contract this method's docstring promises, and
+        # unmarked in CCR mode. Only fold diffs as diffs.
+        if (
+            "diff" in order
+            and strategy is not CompressionStrategy.DIFF
+            and not self._looks_like_diff(content)
+        ):
+            order = [k for k in order if k != "diff"]
         best, best_label = content, None
         for kind in order:
             try:
@@ -2578,6 +2405,16 @@ class ContentRouter(Transform):
             if compressor:
                 if not compressor.is_ready():
                     compressor.ensure_background_load()
+                    # Surface: warn once per ContentRouter instance so operators
+                    # know compression is degraded — model not cached, or
+                    # HuggingFace unreachable (corporate firewall, SSL, etc.).
+                    if not getattr(self, "_kompress_warned", False):
+                        logger.warning(
+                            "Kompress model not ready; requests will not be "
+                            "compressed. Check HuggingFace connectivity or "
+                            "pre-download: headroom-ai[ml] + first-run warmup."
+                        )
+                        self._kompress_warned = True
                 else:
                     try:
                         result = compressor.compress(
@@ -2910,34 +2747,17 @@ class ContentRouter(Transform):
 
         # 1. ML text compressor: Kompress.
         #
-        # Eager preload is cache-only (allow_download=False): on a cold cache we
-        # must NOT trigger a network download here, because this runs on the
-        # blocking startup/lifespan path before the proxy binds its port. A slow
-        # download stalls the bind, and a hard crash in the native download/ML
-        # stack (uncatchable SIGABRT) kills the interpreter before it ever
-        # listens — the proxy then "never opens its port" and the supervisor
-        # gives up. When the model isn't cached we defer to first use instead.
+        # Native model initialization stays out of the blocking startup/lifespan
+        # path. The existing lazy request path loads Kompress on first use.
         if self.config.enable_kompress:
-            from .kompress_compressor import KompressModelNotCached
-
             compressor = self._get_kompress()
             if compressor:
                 if not hasattr(compressor, "preload"):
                     status["kompress"] = "enabled"
                     status["kompress_backend"] = "unknown"
                 else:
-                    try:
-                        backend = compressor.preload(allow_download=False)
-                    except KompressModelNotCached:
-                        logger.info(
-                            "Kompress model not cached; deferring download to "
-                            "first use to keep startup non-blocking"
-                        )
-                        status["kompress"] = "deferred"
-                    else:
-                        logger.info("Kompress model pre-loaded at startup backend=%s", backend)
-                        status["kompress"] = "enabled"
-                        status["kompress_backend"] = str(backend)
+                    logger.info("Kompress model preload deferred until first request")
+                    status["kompress"] = "deferred"
             else:
                 status["kompress"] = "unavailable"
 
@@ -3034,6 +2854,15 @@ class ContentRouter(Transform):
         if model_id == "disabled":
             return None
 
+        # Remote Kompress (HEADROOM_KOMPRESS_ENDPOINT): offload inference to a
+        # hosted /compress endpoint so a sandboxed proxy needs no local ML deps.
+        # Intercepts BOTH default and custom-model paths (the endpoint's deployed
+        # model is authoritative) and bypasses is_kompress_available() — there is
+        # nothing to load locally. The CCR store stays proxy-local.
+        remote = self._get_remote_kompress()
+        if remote is not None:
+            return remote
+
         # Custom model — don't touch self._kompress (that's the default cache)
         if model_id:
             try:
@@ -3074,6 +2903,29 @@ class ContentRouter(Transform):
             except ImportError:
                 logger.debug("Kompress dependencies not available")
         return self._kompress
+
+    def _get_remote_kompress(self) -> Any:
+        """Return a cached RemoteKompressCompressor when HEADROOM_KOMPRESS_ENDPOINT
+        is set, else None.
+
+        The endpoint runs the model, so this needs no local ML deps and no
+        is_kompress_available() gate. Cached per ContentRouter instance so the
+        httpx connection pool is reused across requests.
+        """
+        endpoint = os.environ.get("HEADROOM_KOMPRESS_ENDPOINT", "").strip()
+        if not endpoint:
+            return None
+        if getattr(self, "_kompress_remote", None) is None:
+            from .kompress_compressor import KompressConfig
+            from .kompress_remote import RemoteKompressCompressor
+
+            self._kompress_remote = RemoteKompressCompressor(
+                endpoint=endpoint,
+                token=os.environ.get("HEADROOM_KOMPRESS_ENDPOINT_TOKEN") or None,
+                config=KompressConfig(enable_ccr=self.config.ccr_inject_marker),
+            )
+            logger.info("Kompress: using remote endpoint %s", endpoint)
+        return self._kompress_remote
 
     def _get_image_optimizer(self) -> Any:
         """Create an ImageCompressor for one optimization pass.
@@ -3520,7 +3372,16 @@ class ContentRouter(Transform):
         else:
             read_protection_window = num_messages  # 0.0 = protect all (old behavior)
         runtime_read_protection_window = kwargs.get("read_protection_window")
-        if runtime_read_protection_window is not None:
+        if (
+            runtime_read_protection_window is not None
+            and self.config.protect_recent_reads_fraction > 0
+        ):
+            # A profile-derived window may only narrow protection when the
+            # deployment hasn't explicitly opted into "protect everything"
+            # (protect_recent_reads_fraction == 0.0, set by --protect-tool-results).
+            # See #1374's documented contract: protected tool output must never
+            # lossy-compress "regardless of conversation depth" -- a per-request
+            # savings-profile kwarg must not silently weaken that.
             read_protection_window = max(0, int(runtime_read_protection_window))
 
         # Adaptive compression ratio: scale with context pressure
@@ -3925,8 +3786,48 @@ class ContentRouter(Transform):
                 task_results = []
                 for _, task_content, task_ctx, task_bias, _, _ in pending_tasks:
                     t0 = time.perf_counter()
-                    r = self.compress(task_content, context=task_ctx, bias=task_bias)
-                    task_results.append((r, (time.perf_counter() - t0) * 1000))
+                    deadline_s = _compression_deadline_seconds() if len(pending_tasks) == 1 else 0.0
+                    if deadline_s:
+                        box: dict[str, Any] = {}
+
+                        def _run(
+                            _box: dict[str, Any] = box,
+                            _content: str = task_content,
+                            _context: str = task_ctx,
+                            _bias: float = task_bias,
+                        ) -> None:
+                            try:
+                                _box["result"] = self.compress(
+                                    _content, context=_context, bias=_bias
+                                )
+                            except BaseException as exc:  # noqa: BLE001
+                                _box["error"] = exc
+
+                        # ponytail: daemon watchdog cannot stop native GIL holds; native layer owns that fix.
+                        worker = threading.Thread(
+                            target=_run, name="headroom-single-compress-watchdog", daemon=True
+                        )
+                        worker.start()
+                        worker.join(deadline_s)
+                        if worker.is_alive():
+                            logger.warning(
+                                "ContentRouter single-cache-miss compression exceeded %.1fs; "
+                                "failing open via PASSTHROUGH",
+                                deadline_s,
+                            )
+                            r = RouterCompressionResult(
+                                compressed=task_content,
+                                original=task_content,
+                                strategy_used=CompressionStrategy.PASSTHROUGH,
+                            )
+                        elif "error" in box:
+                            raise box["error"]
+                        else:
+                            r = box["result"]
+                    else:
+                        r = self.compress(task_content, context=task_ctx, bias=task_bias)
+                    compress_ms = (time.perf_counter() - t0) * 1000
+                    task_results.append((r, compress_ms))
             else:
                 # Parallel compression via thread pool
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:

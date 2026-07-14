@@ -33,6 +33,8 @@ def _subscription_resolution(
     api_url: str = DEFAULT_API_URL,
     source: str = "headroom-copilot-auth:/tmp/copilot_auth.json:token-exchange",
     confidence: str = "copilot-token-exchange",
+    refresh_oauth_token: str | None = None,
+    api_token_expires_at: float | None = None,
 ) -> CopilotSubscriptionTokenResolution:
     return CopilotSubscriptionTokenResolution(
         token=token,
@@ -40,6 +42,8 @@ def _subscription_resolution(
         confidence=confidence,
         api_url=api_url,
         token_fingerprint="sha256:0123456789ab",
+        refresh_oauth_token=refresh_oauth_token,
+        api_token_expires_at=api_token_expires_at,
     )
 
 
@@ -463,7 +467,12 @@ def test_wrap_copilot_subscription_pins_validated_token_for_proxy(
         patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
         patch(
             "headroom.cli.wrap.resolve_subscription_bearer_token_details",
-            return_value=_subscription_resolution("gho-validated", api_url=business_api),
+            return_value=_subscription_resolution(
+                "gho-validated",
+                api_url=business_api,
+                refresh_oauth_token="gho-refresh",
+                api_token_expires_at=1234567890.0,
+            ),
         ),
         patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
         patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
@@ -476,8 +485,14 @@ def test_wrap_copilot_subscription_pins_validated_token_for_proxy(
     # The validated token is handed to the proxy as an explicit launch
     # argument — not via the child env, not via the parent's os.environ.
     assert captured["copilot_api_token"] == "gho-validated"
+    assert captured["copilot_refresh_oauth_token"] == "gho-refresh"
+    assert captured["copilot_api_token_expires_at"] == 1234567890.0
     assert "GITHUB_COPILOT_API_TOKEN" not in env
+    assert "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN" not in env
+    assert "GITHUB_COPILOT_API_TOKEN_EXPIRES_AT" not in env
     assert os.environ.get("GITHUB_COPILOT_API_TOKEN") is None
+    assert os.environ.get("GITHUB_COPILOT_REFRESH_OAUTH_TOKEN") is None
+    assert os.environ.get("GITHUB_COPILOT_API_TOKEN_EXPIRES_AT") is None
     assert env["COPILOT_PROVIDER_TYPE"] == "openai"
     assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "gho-validated"
     assert env["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] == "false"

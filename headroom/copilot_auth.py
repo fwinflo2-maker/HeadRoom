@@ -41,6 +41,8 @@ _API_TOKEN_ENV_VARS = (
     "GITHUB_COPILOT_API_TOKEN",
     "COPILOT_PROVIDER_BEARER_TOKEN",
 )
+_REFRESH_OAUTH_TOKEN_ENV_VAR = "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN"
+_API_TOKEN_EXPIRES_AT_ENV_VAR = "GITHUB_COPILOT_API_TOKEN_EXPIRES_AT"
 _COPILOT_OAUTH_TOKEN_ENV_VARS = (
     "GITHUB_COPILOT_GITHUB_TOKEN",
     "GITHUB_COPILOT_TOKEN",
@@ -94,6 +96,8 @@ class CopilotSubscriptionTokenResolution:
     confidence: str
     api_url: str
     token_fingerprint: str
+    refresh_oauth_token: str | None = None
+    api_token_expires_at: float | None = None
 
 
 def token_fingerprint(token: str) -> str:
@@ -795,6 +799,8 @@ def _subscription_resolution(
     source: str,
     confidence: str,
     api_url: str,
+    refresh_oauth_token: str | None = None,
+    api_token_expires_at: float | None = None,
 ) -> CopilotSubscriptionTokenResolution:
     return CopilotSubscriptionTokenResolution(
         token=token,
@@ -802,6 +808,8 @@ def _subscription_resolution(
         confidence=confidence,
         api_url=api_url,
         token_fingerprint=token_fingerprint(token),
+        refresh_oauth_token=refresh_oauth_token,
+        api_token_expires_at=api_token_expires_at,
     )
 
 
@@ -833,6 +841,8 @@ def _subscription_resolution_from_token_exchange(
         source=f"{candidate.source}:token-exchange",
         confidence="copilot-token-exchange",
         api_url=_api_url_from_exchange_payload(payload, oauth_token=candidate.token),
+        refresh_oauth_token=candidate.token,
+        api_token_expires_at=_parse_expiry(payload.get("expires_at")),
     )
 
 
@@ -990,7 +1000,8 @@ class CopilotTokenProvider:
 
     async def get_api_token(self) -> CopilotAPIToken:
         explicit_api_token = os.environ.get("GITHUB_COPILOT_API_TOKEN", "").strip()
-        if explicit_api_token:
+        refresh_oauth_token = os.environ.get(_REFRESH_OAUTH_TOKEN_ENV_VAR, "").strip()
+        if explicit_api_token and not refresh_oauth_token:
             return CopilotAPIToken(
                 token=explicit_api_token,
                 expires_at=time.time() + 3600,
@@ -1005,6 +1016,23 @@ class CopilotTokenProvider:
             cached = self._cached
             if cached is not None and cached.is_valid:
                 return cached
+
+            if explicit_api_token and refresh_oauth_token:
+                if cached is None:
+                    seeded = CopilotAPIToken(
+                        token=explicit_api_token,
+                        expires_at=(
+                            _parse_expiry(os.environ.get(_API_TOKEN_EXPIRES_AT_ENV_VAR))
+                            or (time.time() + 1800)
+                        ),
+                        api_url=_configured_api_url(),
+                    )
+                    self._cached = seeded
+                    if seeded.is_valid:
+                        return seeded
+                exchanged = await self._exchange_token(refresh_oauth_token)
+                self._cached = exchanged
+                return exchanged
 
             oauth_token = read_cached_oauth_token()
             if not oauth_token:

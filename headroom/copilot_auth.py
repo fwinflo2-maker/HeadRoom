@@ -7,6 +7,7 @@ import ctypes
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 from ctypes import wintypes
@@ -373,6 +374,8 @@ def _parse_expiry(value: Any) -> float | None:
 
     if isinstance(value, int | float):
         number = float(value)
+        if not math.isfinite(number):
+            return None
         if number > 10_000_000_000:
             return number / 1000.0
         return number
@@ -383,6 +386,10 @@ def _parse_expiry(value: Any) -> float | None:
             return None
         if raw.isdigit():
             return _parse_expiry(int(raw))
+        try:
+            return _parse_expiry(float(raw))
+        except ValueError:
+            pass
         try:
             normalized = raw.replace("Z", "+00:00")
             return datetime.fromisoformat(normalized).timestamp()
@@ -1019,12 +1026,10 @@ class CopilotTokenProvider:
 
             if explicit_api_token and refresh_oauth_token:
                 if cached is None:
+                    seeded_expires_at = _parse_expiry(os.environ.get(_API_TOKEN_EXPIRES_AT_ENV_VAR))
                     seeded = CopilotAPIToken(
                         token=explicit_api_token,
-                        expires_at=(
-                            _parse_expiry(os.environ.get(_API_TOKEN_EXPIRES_AT_ENV_VAR))
-                            or (time.time() + 1800)
-                        ),
+                        expires_at=seeded_expires_at if seeded_expires_at is not None else 0.0,
                         api_url=_configured_api_url(),
                     )
                     self._cached = seeded
@@ -1170,6 +1175,20 @@ def _token_kind(token: str) -> str:
     return "unknown" if t else "empty"
 
 
+def _is_managed_copilot_seeded_bearer(token: str) -> bool:
+    """Return True when the incoming bearer is the proxy's seeded wrapper token."""
+
+    refresh_oauth_token = os.environ.get(_REFRESH_OAUTH_TOKEN_ENV_VAR, "").strip()
+    explicit_api_token = os.environ.get("GITHUB_COPILOT_API_TOKEN", "").strip()
+    normalized = token.strip()
+    return bool(
+        refresh_oauth_token
+        and explicit_api_token
+        and normalized
+        and normalized == explicit_api_token
+    )
+
+
 async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[str, str]:
     """Apply Copilot auth headers for GitHub Copilot API requests."""
     resolved = dict(headers)
@@ -1187,14 +1206,20 @@ async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[s
             and raw_token
             and _is_forwardable_copilot_bearer_token(raw_token)
         ):
-            logger.info(
-                "apply_copilot_api_auth: passing through client token kind=%s",
-                _token_kind(raw_token),
-            )
-            for key in list(resolved):
-                if key.lower() == "x-api-key":
-                    resolved.pop(key)
-            return resolved
+            if _is_managed_copilot_seeded_bearer(raw_token):
+                logger.info(
+                    "apply_copilot_api_auth: managed seed token kind=%s, will replace",
+                    _token_kind(raw_token),
+                )
+            else:
+                logger.info(
+                    "apply_copilot_api_auth: passing through client token kind=%s",
+                    _token_kind(raw_token),
+                )
+                for key in list(resolved):
+                    if key.lower() == "x-api-key":
+                        resolved.pop(key)
+                return resolved
         logger.info(
             "apply_copilot_api_auth: incoming token not suitable (kind=%s), will replace",
             _token_kind(raw_token) if raw_token else "none",

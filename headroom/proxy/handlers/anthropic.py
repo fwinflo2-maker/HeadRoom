@@ -34,6 +34,7 @@ from headroom.proxy.helpers import extract_tags
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
+from headroom.proxy.model_router import estimate_input_tokens
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
@@ -768,6 +769,24 @@ class AnthropicHandlerMixin:
             preserve_tool_order = _bypass or not self.config.optimize
             if _bypass:
                 logger.info(f"[{request_id}] Bypass: skipping compression (header)")
+
+            # Cost-aware model routing (#1706). Opt-in and disabled by default; when
+            # configured, rewrite the outgoing model based on request size and tool
+            # presence, recording the decision so it stays observable. Skipped under
+            # bypass/passthrough so a byte-faithful request is never model-rewritten.
+            if self.model_router.enabled and not _bypass:
+                routing_decision = self.model_router.select(
+                    model=model,
+                    input_tokens=estimate_input_tokens(
+                        messages, body.get("tools"), body.get("system")
+                    ),
+                    has_tools=bool(body.get("tools")),
+                )
+                if routing_decision.changed:
+                    body["model"] = routing_decision.routed_model
+                    model = routing_decision.routed_model
+                    body_mutation_tracker.mark_mutated("model_router")
+                    logger.info("model routing applied: %s", routing_decision.reason)
 
             # NOTE: Upstream temporarily disabled broad image compression due to
             # token-counting inaccuracies. We only compress the latest non-frozen

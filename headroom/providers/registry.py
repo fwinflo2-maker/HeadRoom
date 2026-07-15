@@ -296,6 +296,32 @@ def resolve_api_overrides(
     )
 
 
+def resolve_extra_headers(
+    cli_value: str | None,
+    env_var: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str] | None:
+    """Resolve extra headers to merge into (and override) forwarded provider requests.
+
+    Accepts a JSON object string from CLI or env (CLI wins). Returns ``None`` if unset.
+    Raises ``ValueError`` on invalid JSON or a non-string-keyed/valued object.
+    """
+    env = environ or os.environ
+    raw = cli_value or env.get(env_var)
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"{env_var} must be a JSON object of header name/value strings") from exc
+    if not isinstance(parsed, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in parsed.items()
+    ):
+        raise ValueError(f"{env_var} must be a JSON object of header name/value strings")
+    return parsed or None
+
+
 def resolve_api_targets(overrides: ProviderApiOverrides) -> ProviderApiTargets:
     """Resolve normalized upstream provider targets from configured overrides."""
     return ProviderApiTargets(

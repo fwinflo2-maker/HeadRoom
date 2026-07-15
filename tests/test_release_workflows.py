@@ -40,7 +40,12 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     assert root["name"] == ""
     assert nonroot["name"] == "nonroot"
     assert "matrix.variant.name == ''" in promotion["if"]
+    assert "steps.manifest.outputs.index_digest != ''" in promotion["if"]
     assert "steps.version.outputs.version != ''" in promotion["if"]
+    assert (
+        promotion["if"]
+        == "steps.manifest.outputs.index_digest != '' && matrix.variant.name == '' && steps.version.outputs.version != ''"
+    )
     assert '"${IMAGE}:latest"' in command
     assert '"${IMAGE}:${VERSION}"' in command
     assert "promote-latest" not in jobs

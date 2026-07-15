@@ -173,9 +173,7 @@ def run_git_log(since: str | None, cwd: Path) -> str:
         cmd.append("HEAD")
     result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(
-            f"git log failed (exit {result.returncode}): {result.stderr.strip()}"
-        )
+        raise RuntimeError(f"git log failed (exit {result.returncode}): {result.stderr.strip()}")
     return result.stdout
 
 

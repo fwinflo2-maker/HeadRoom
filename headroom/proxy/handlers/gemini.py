@@ -602,6 +602,39 @@ class GeminiHandlerMixin:
             except Exception as e:
                 logger.warning(f"[{request_id}] Memory injection failed (gemini): {e}")
 
+        native_tools = body.get("tools")
+        native_function_declarations = None
+        if self.config.ccr_inject_tool and tokens_saved > 0:
+            from headroom.ccr import CCRToolInjector
+
+            for tool in native_tools or []:
+                if "functionDeclarations" in tool:
+                    native_function_declarations = tool["functionDeclarations"]
+                    break
+            injector = CCRToolInjector(
+                provider="google",
+                inject_tool=True,
+                inject_system_instructions=self.config.ccr_inject_system_instructions,
+            )
+            optimized_messages, injected_funcs, was_injected = injector.process_request(
+                optimized_messages, native_function_declarations
+            )
+            if was_injected:
+                native_function_declarations = injected_funcs
+                rebuilt_tools = []
+                replaced = False
+                for tool in native_tools or []:
+                    if "functionDeclarations" in tool:
+                        rebuilt_tools.append({**tool, "functionDeclarations": injected_funcs})
+                        replaced = True
+                    else:
+                        rebuilt_tools.append(tool)
+                if not replaced:
+                    rebuilt_tools.append({"functionDeclarations": injected_funcs})
+                body["tools"] = rebuilt_tools
+            elif native_function_declarations is not None:
+                native_function_declarations = list(native_function_declarations)
+
         # Convert back to Gemini format if optimized
         if optimized_messages != messages:
             optimized_contents, optimized_system = self._messages_to_gemini_contents(
@@ -675,6 +708,8 @@ class GeminiHandlerMixin:
                 total_input_tokens = optimized_tokens  # fallback
                 output_tokens = 0
                 cache_read_tokens = 0
+                resp_json = None
+                response_content = response.content
                 try:
                     resp_json = response.json()
                     usage = resp_json.get("usageMetadata", {})
@@ -705,6 +740,70 @@ class GeminiHandlerMixin:
                     logger.debug(
                         f"[{request_id}] Failed to extract cached tokens from Gemini response: {e}"
                     )
+
+                if (
+                    response.status_code == 200
+                    and isinstance(resp_json, dict)
+                    and self.ccr_response_handler
+                    and getattr(getattr(self.ccr_response_handler, "config", None), "enabled", True)
+                    and self.ccr_response_handler.has_ccr_tool_calls(resp_json, "google")
+                ):
+
+                    async def api_call_fn(
+                        native_contents: list[dict],
+                        function_declarations: list[dict] | None,
+                    ) -> dict[str, Any]:
+                        continuation_body = {**body, "contents": native_contents}
+                        if function_declarations is not None:
+                            continuation_tools = []
+                            replaced = False
+                            for tool in body.get("tools") or []:
+                                if "functionDeclarations" in tool:
+                                    continuation_tools.append(
+                                        {
+                                            **tool,
+                                            "functionDeclarations": function_declarations,
+                                        }
+                                    )
+                                    replaced = True
+                                else:
+                                    continuation_tools.append(tool)
+                            if not replaced:
+                                continuation_tools.append(
+                                    {"functionDeclarations": function_declarations}
+                                )
+                            continuation_body["tools"] = continuation_tools
+                        continuation_headers = {
+                            key: value
+                            for key, value in headers.items()
+                            if key.lower()
+                            not in ("accept-encoding", "content-encoding", "content-length")
+                        }
+                        continuation = await self._retry_request(
+                            "POST", url, continuation_headers, continuation_body
+                        )
+                        return continuation.json()
+
+                    final_resp_json = await self.ccr_response_handler.handle_response(
+                        resp_json,
+                        body.get("contents", []),
+                        native_function_declarations,
+                        api_call_fn,
+                        provider="google",
+                    )
+                    from headroom.ccr.response_handler import RESIDUAL_CCR_ERROR
+
+                    if (
+                        self.ccr_response_handler.residual_ccr_status(final_resp_json, "google")
+                        == RESIDUAL_CCR_ERROR
+                    ):
+                        raise RuntimeError("Gemini CCR continuation left an unresolved retrieval")
+                    resp_json = final_resp_json
+                    response_content = json.dumps(resp_json).encode()
+                    usage = resp_json.get("usageMetadata", {})
+                    total_input_tokens = usage.get("promptTokenCount", total_input_tokens)
+                    output_tokens = usage.get("candidatesTokenCount", output_tokens)
+                    cache_read_tokens = usage.get("cachedContentTokenCount", cache_read_tokens)
 
                 uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
 
@@ -774,7 +873,7 @@ class GeminiHandlerMixin:
                     response_headers["x-headroom-compression-failed"] = "true"
 
                 return Response(
-                    content=response.content,
+                    content=response_content,
                     status_code=response.status_code,
                     headers=response_headers,
                 )

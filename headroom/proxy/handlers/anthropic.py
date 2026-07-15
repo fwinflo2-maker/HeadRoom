@@ -1421,6 +1421,7 @@ class AnthropicHandlerMixin:
                                             else "deferred:dropped"
                                         ]
                                         timing = {}
+                                        waste_signals = None
 
                                     result = _DeferredCompressionResult()
                             else:

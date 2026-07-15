@@ -101,6 +101,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Features
 
 * **wrap:** add `headroom wrap omp` / `headroom unwrap omp` for Oh My Pi — points omp's built-in `anthropic` provider at the local proxy via a marker-fenced `providers.anthropic.baseUrl` override in `~/.omp/agent/models.yml`, snapshotting the pre-wrap file byte-for-byte and restoring it on unwrap. omp resolves its Anthropic chat endpoint from models.yml (`ANTHROPIC_BASE_URL` only feeds its web-search helper), and a same-ID override keeps omp's bundled model catalog and stored credentials ([#1149](https://github.com/headroomlabs-ai/headroom/issues/1149))
+* **compress:** expose `frozen_message_count` in library-mode `compress()` via a new `CompressConfig` field (default `0`, unchanged behavior). `read_lifecycle.apply()` already skips stale-Read replacements inside a frozen message prefix, but only the proxy handlers could pass it — `ContentRouter` reads it from transform kwargs and the public API never forwarded it. Library-mode callers that manage their own conversation loop can now stop transforms from rewriting messages already anchored in the provider's prompt cache, which would otherwise convert 0.1x cached prefix reads into full-price cache writes ([#2178](https://github.com/headroomlabs-ai/headroom/pull/2178)).
+
 * **proxy:** report a new-content-relative input savings rate in `/stats`: `tokens.new_input_tokens` (provider-billed non-cache-read input: uncached + cache-write tokens, from response usage) and `tokens.new_input_savings_percent` (savings as a fraction of new input plus the tokens compression removed before they could be billed). The existing whole-request ratios recount the full transcript on every turn, so a 200-turn session counts its history 200x into the denominator and long-running cached sessions (especially 1M-context models, which never compact) dilute toward ~0% regardless of how well compression performs on content newly entering context. Purely additive; existing fields unchanged. Reports 0 when no cache usage data exists (e.g. providers without cache metrics) rather than dividing savings by themselves.
 * **transforms:** first-class C# support in `CodeAwareCompressor` via the tree-sitter `csharp` grammar already shipped in the pinned `tree-sitter-language-pack` — no new dependencies ([#1664](https://github.com/headroomlabs-ai/headroom/issues/1664)). Parity with Java/C++/Rust: signatures preserved verbatim, method/constructor/destructor/operator/local-function bodies compressed; block-scoped and file-scoped namespaces, records, structs, interfaces, and enums handled; C#-distinctive auto-detection. Preprocessor conditionals (`#if`…`#endif`) are preserved verbatim as opaque regions (blocks wrapping only `using` directives stay with the imports), `#region` markers no longer swallow the following line during class-member extraction, and top-of-file license banners / `#region License` headers stay on top instead of being relocated below the code. Real-repo runs: 16.1% tokens saved on Newtonsoft.Json (945 files), 37.8% on Polly (797 files), output syntax-valid for 1742/1742 files.
 * **proxy:** add provider-only HTTP proxy routing via `--http-proxy` and `HEADROOM_HTTP_PROXY`. Upstream LLM provider calls can now use an HTTP proxy without setting process-wide `HTTP_PROXY`/`HTTPS_PROXY` variables that are inherited by tool executions; proxied provider clients use HTTP/1.1 so HTTPS provider APIs can tunnel through CONNECT.
@@ -705,6 +707,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+* **wrap:** add `headroom wrap zcode` / `headroom unwrap zcode` for the ZCode
+  desktop app (zcode.z.ai). Follows the Pattern-B (proxy-only watcher)
+  approach: starts the proxy, injects RTK guidance into `AGENTS.md` at the
+  project root, and prints the ZCode settings the user should configure
+  (OpenAI and Anthropic base URLs). Auto-detects the enabled provider from
+  `~/.zcode/v2/config.json` and configures the proxy upstream accordingly.
+  Unwrap removes the injected RTK instructions and stops the proxy.
 * **kompress:** warn when `HEADROOM_KOMPRESS_BACKEND` is set to an unrecognized
   value instead of silently falling back to `auto`, and document the backend
   selection env var (`auto` / `onnx` / `onnx_cpu` / `onnx_coreml` / `pytorch` /

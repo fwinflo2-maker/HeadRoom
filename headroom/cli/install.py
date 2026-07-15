@@ -121,7 +121,27 @@ def _stop_deployment(manifest: DeploymentManifest) -> None:
     stop_runtime(manifest)
 
 
+def _deactivate_deployment_mutations(
+    manifest: DeploymentManifest, *, persist_manifest: bool = True
+) -> None:
+    if not manifest.mutations:
+        return
+    revert_mutations(manifest)
+    manifest.mutations = []
+    if persist_manifest:
+        save_manifest(manifest)
+
+
+def _activate_deployment_mutations(manifest: DeploymentManifest) -> None:
+    manifest.mutations = apply_mutations(manifest)
+    save_manifest(manifest)
+
+
 def _remove_deployment(manifest: DeploymentManifest) -> None:
+    try:
+        _deactivate_deployment_mutations(manifest, persist_manifest=False)
+    except Exception:
+        pass
     try:
         _stop_deployment(manifest)
     except Exception:
@@ -130,19 +150,15 @@ def _remove_deployment(manifest: DeploymentManifest) -> None:
         remove_supervisor(manifest)
     except Exception:
         pass
-    try:
-        revert_mutations(manifest)
-    except Exception:
-        pass
     delete_manifest(manifest.profile)
 
 
 def _restore_deployment(manifest: DeploymentManifest) -> None:
     restored = deepcopy(manifest)
-    restored.mutations = apply_mutations(restored)
     restored.artifacts = install_supervisor(restored)
     save_manifest(restored)
     _start_deployment(restored)
+    _activate_deployment_mutations(restored)
 
 
 def _reject_task_lifecycle(manifest: DeploymentManifest, action: str) -> None:
@@ -262,6 +278,11 @@ def _build_deployment_manifest(
     no_telemetry: bool,
     image: str,
     no_http2: bool,
+    code_aware: bool | None = None,
+    intercept_tool_results: bool = False,
+    protect_tool_results: str | None = None,
+    bedrock_profile: str | None = None,
+    extra_env: dict[str, str] | None = None,
     supervisor_kind: str | None = None,
     extra_base_env: dict[str, str] | None = None,
 ) -> DeploymentManifest:
@@ -281,6 +302,11 @@ def _build_deployment_manifest(
         telemetry_enabled=telemetry and not no_telemetry,
         image=image,
         no_http2=no_http2,
+        code_aware=code_aware,
+        intercept_tool_results=intercept_tool_results,
+        protect_tool_results=protect_tool_results,
+        bedrock_profile=bedrock_profile,
+        extra_env=extra_env or {},
     )
     if supervisor_kind is not None:
         manifest.supervisor_kind = supervisor_kind
@@ -301,10 +327,10 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
         _remove_deployment(existing)
 
     try:
-        manifest.mutations = apply_mutations(manifest)
         manifest.artifacts = install_supervisor(manifest)
         save_manifest(manifest)
         _start_deployment(manifest)
+        _activate_deployment_mutations(manifest)
     except Exception as exc:
         _remove_deployment(manifest)
         if existing is not None:
@@ -412,6 +438,50 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
     is_flag=True,
     help="Disable HTTP/2 in the persistent runtime (enabled by default).",
 )
+@click.option(
+    "--code-aware/--no-code-aware",
+    "code_aware",
+    default=None,
+    help=(
+        "Enable/disable AST-based code compression in the persistent runtime. "
+        "Requires the optional tree-sitter dependency: pip install headroom-ai[code]. "
+        "Default: disabled, matching `headroom proxy`."
+    ),
+)
+@click.option(
+    "--intercept-tool-results",
+    is_flag=True,
+    help=(
+        "Opt in to tool_result interceptors (ast-grep Read outliner, etc.) in the "
+        "persistent runtime. Off by default while this feature ships."
+    ),
+)
+@click.option(
+    "--protect-tool-results",
+    default=None,
+    help=(
+        "Comma-separated tool names whose results are never lossy-compressed in "
+        "the persistent runtime, merged with the built-in defaults (e.g. Bash,WebFetch)."
+    ),
+)
+@click.option(
+    "--bedrock-profile",
+    default=None,
+    help="AWS profile name for Bedrock in the persistent runtime (default: use default credentials).",
+)
+@click.option(
+    "--env",
+    "extra_env",
+    multiple=True,
+    metavar="KEY=VALUE",
+    help=(
+        "Extra environment variable for the supervised process, e.g. "
+        "--env HEADROOM_WORKSPACE_DIR=/path. Supervisors (launchd, systemd, cron) "
+        "start with a bare environment and do not inherit the interactive shell's "
+        "exports, so anything the runtime needs beyond the flags above must be set "
+        "here. Repeatable."
+    ),
+)
 def install_apply(
     preset: str,
     runtime: str,
@@ -429,6 +499,11 @@ def install_apply(
     no_telemetry: bool,
     image: str,
     no_http2: bool,
+    code_aware: bool | None,
+    intercept_tool_results: bool,
+    protect_tool_results: str | None,
+    bedrock_profile: str | None,
+    extra_env: tuple[str, ...],
 ) -> None:
     """Install a persistent Headroom deployment."""
 
@@ -440,6 +515,13 @@ def install_apply(
 
     if preset == InstallPreset.PERSISTENT_DOCKER.value:
         runtime = RuntimeKind.DOCKER.value
+
+    parsed_env: dict[str, str] = {}
+    for item in extra_env:
+        if "=" not in item:
+            raise click.ClickException(f"--env expects KEY=VALUE, got: {item!r}")
+        key, _, value = item.partition("=")
+        parsed_env[key] = value
 
     manifest = _build_deployment_manifest(
         profile=profile,
@@ -458,6 +540,11 @@ def install_apply(
         no_telemetry=no_telemetry,
         image=image,
         no_http2=no_http2,
+        code_aware=code_aware,
+        intercept_tool_results=intercept_tool_results,
+        protect_tool_results=protect_tool_results,
+        bedrock_profile=bedrock_profile,
+        extra_env=parsed_env,
     )
 
     _apply_manifest(manifest)
@@ -595,7 +682,15 @@ def install_status(profile: str) -> None:
     click.echo(f"Healthy:    {'yes' if probe_ready(manifest.health_url) else 'no'}")
     if payload and isinstance(payload, dict):
         click.echo(f"Health URL: {manifest.health_url.replace('/readyz', '/health')}")
-        click.echo(f"Backend:    {payload.get('config', {}).get('backend', manifest.backend)}")
+        # `config` may be a non-dict (null / string / list) if a different or
+        # older service is answering on the port. `payload.get('config', {})`
+        # only defaults on a MISSING key, so a present-but-non-dict value would
+        # reach `.get('backend', ...)` and crash with AttributeError. Guard on
+        # isinstance, mirroring wrap.py's _proxy_health_config.
+        config = payload.get("config")
+        if not isinstance(config, dict):
+            config = {}
+        click.echo(f"Backend:    {config.get('backend', manifest.backend)}")
 
 
 @install.command("start")
@@ -605,7 +700,11 @@ def install_start(profile: str) -> None:
 
     manifest = _require_manifest(profile)
     _reject_task_lifecycle(manifest, "start")
+    if not probe_ready(manifest.health_url):
+        _deactivate_deployment_mutations(manifest)
     _start_deployment(manifest)
+    if probe_ready(manifest.health_url) and not manifest.mutations:
+        _activate_deployment_mutations(manifest)
     click.echo(f"Started deployment '{profile}'.")
 
 
@@ -616,6 +715,7 @@ def install_stop(profile: str) -> None:
 
     manifest = _require_manifest(profile)
     _reject_task_lifecycle(manifest, "stop")
+    _deactivate_deployment_mutations(manifest)
     _stop_deployment(manifest)
     click.echo(f"Stopped deployment '{profile}'.")
 
@@ -627,8 +727,10 @@ def install_restart(profile: str) -> None:
 
     manifest = _require_manifest(profile)
     _reject_task_lifecycle(manifest, "restart")
+    _deactivate_deployment_mutations(manifest)
     _stop_deployment(manifest)
     _start_deployment(manifest)
+    _activate_deployment_mutations(manifest)
     click.echo(f"Restarted deployment '{profile}'.")
 
 
@@ -638,6 +740,7 @@ def install_remove(profile: str) -> None:
     """Remove a persistent deployment and undo managed config."""
 
     manifest = _require_manifest(profile)
+    _deactivate_deployment_mutations(manifest, persist_manifest=False)
     try:
         if manifest.supervisor_kind == SupervisorKind.SERVICE.value:
             stop_supervisor(manifest)
@@ -651,7 +754,6 @@ def install_remove(profile: str) -> None:
         remove_supervisor(manifest)
     except Exception:
         pass
-    revert_mutations(manifest)
     delete_manifest(profile)
     click.echo(f"Removed deployment '{profile}'.")
 
@@ -697,6 +799,10 @@ def install_agent_ensure(profile: str) -> None:
             if wait_ready(manifest, timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS):
                 click.echo(f"Deployment '{profile}' is healthy.")
                 return
+            _deactivate_deployment_mutations(manifest)
             stop_runtime(manifest)
+        else:
+            _deactivate_deployment_mutations(manifest)
         _start_deployment(manifest, assume_start_lock=True)
+        _activate_deployment_mutations(manifest)
     click.echo(f"Deployment '{profile}' is healthy.")

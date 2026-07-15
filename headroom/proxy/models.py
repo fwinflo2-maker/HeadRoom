@@ -124,9 +124,18 @@ class ProxyConfig:
     port: int = 8787
     anthropic_api_url: str | None = None  # Custom Anthropic API URL override
     openai_api_url: str | None = None  # Custom OpenAI API URL override
+    # Display label for the OpenAI-compatible upstream (dashboard/stats only).
+    # Overrides hostname detection from ``openai_api_url``; the internal
+    # provider stays ``openai`` so pricing/format keys are unaffected.
+    provider_name: str | None = None
     gemini_api_url: str | None = None  # Custom Gemini API URL override
     cloudcode_api_url: str | None = None  # Custom Cloud Code Assist API URL override
     vertex_api_url: str | None = None  # Custom Vertex AI regional API URL override
+    # Extra headers merged into (and overriding) forwarded Anthropic/OpenAI requests.
+    # JSON-object config knobs; see settings_store's anthropic_extra_headers/
+    # openai_extra_headers and providers.registry.resolve_extra_headers.
+    anthropic_extra_headers: dict[str, str] | None = None
+    openai_extra_headers: dict[str, str] | None = None
 
     # Backend: "anthropic" (direct API), "litellm-*" (via LiteLLM), or "anyllm" (via any-llm)
     backend: str = "anthropic"
@@ -440,6 +449,15 @@ class ProxyConfig:
     def __post_init__(self, smart_routing: bool | None = None) -> None:
         if self.retry_enabled and self.retry_max_attempts < 1:
             raise ValueError("retry_max_attempts must be >= 1 when retry_enabled=True")
+        # A 0 (or negative) requests-per-minute limit divides by zero in the
+        # token-bucket wait computation (rate_limit_policy.consume_from_bucket),
+        # 500-ing every request. The CLI already guards this with IntRange(min=1);
+        # fail fast here too so the JSON/programmatic config paths can't produce a
+        # limiter that crashes at request time. Only matters when limiting is on.
+        if self.rate_limit_enabled and self.rate_limit_requests_per_minute < 1:
+            raise ValueError(
+                "rate_limit_requests_per_minute must be >= 1 when rate_limit_enabled=True"
+            )
 
     @property
     def provider_api_overrides(self) -> ProviderApiOverrides:

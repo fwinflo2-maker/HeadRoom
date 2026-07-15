@@ -314,6 +314,11 @@ jobs:
             echo "ERROR: no digests downloaded for variant '${{ matrix.variant.name || 'root' }}'" >&2
             exit 1
           fi
+          digest_count="$(find "${DIGEST_DIR}" -maxdepth 1 -type f | wc -l)"
+          if [ "${digest_count}" -ne 2 ]; then
+            echo "ERROR: expected both architecture digests for variant '${{ matrix.variant.name || 'root' }}', found ${digest_count}" >&2
+            exit 1
+          fi
           digest_refs=()
           for f in "${DIGEST_DIR}"/*; do
             digest="$(basename "$f")"

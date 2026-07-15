@@ -50,6 +50,11 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     assert step_names.index("Sign multi-arch index manifest with cosign") < step_names.index(
         "Re-tag root image as :latest"
     )
+    manifest_script = next(
+        step["run"] for step in manifest["steps"] if step["name"] == "Create multi-arch manifest"
+    )
+    assert 'digest_count="$(find "${DIGEST_DIR}" -maxdepth 1 -type f | wc -l)"' in manifest_script
+    assert '"${digest_count}" -ne 2' in manifest_script
 
 
 def test_release_workflow_publishes_both_node_packages_to_github_packages() -> None:

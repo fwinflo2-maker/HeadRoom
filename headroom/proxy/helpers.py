@@ -64,7 +64,9 @@ from headroom.proxy.body_forwarding import (
 from headroom.proxy.body_forwarding import (
     prepare_outbound_body_bytes as prepare_outbound_body_bytes,  # noqa: F401 - compatibility export
 )
-from headroom.proxy.body_forwarding import serialize_body_canonical
+from headroom.proxy.body_forwarding import (
+    serialize_body_canonical as serialize_body_canonical,  # noqa: F401 - compatibility export
+)
 from headroom.proxy.ccr_golden_policy import (
     create_fresh_ccr_tool_definition,
     replay_golden_ccr_tool_definition,
@@ -87,6 +89,9 @@ from headroom.proxy.internal_header_policy import (
 from headroom.proxy.memory_golden_policy import (
     replay_golden_memory_tool_definition,
     serialize_memory_tool_definition_canonical,
+)
+from headroom.proxy.tool_definition_serialization import (
+    serialize_tool_definition_canonical as _serialize_tool_definition_canonical,
 )
 from headroom.proxy.tool_injection_config import (
     ToolInjectionStickyMode,
@@ -353,6 +358,7 @@ def log_memory_injection(
     decision: str,
     bytes_injected: int,
     query: str | None = None,
+    tags: dict[str, str] | None = None,
 ) -> None:
     """Emit a structured log line for every memory-context routing decision.
 
@@ -360,6 +366,8 @@ def log_memory_injection(
     Never log raw query content or Authorization header — only a stable
     hash of the query.
     """
+    if tags is not None and bytes_injected > 0:
+        tags["memory_injected"] = "true"
     query_hash = hash_query_for_log(query) if query else ""
     logger.info(
         "event=memory_injection request_id=%s session_id=%s decision=%s "
@@ -1514,6 +1522,24 @@ def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
     return strip_internal_headers(headers, mode=get_strip_internal_headers_mode())
 
 
+def merge_extra_headers(headers: dict[str, str], extra: dict[str, str] | None) -> dict[str, str]:
+    """Merge configured extra headers into ``headers``, overriding same-named keys.
+
+    ``extra`` comes from ``ProxyConfig.anthropic_extra_headers``/``openai_extra_headers``
+    (settings-panel/CLI-configured, for gateways that need one extra header alongside the
+    client's own auth). Returns ``headers`` unchanged (no copy) when nothing is configured.
+    """
+    if not extra:
+        return headers
+    # HTTP header names are case-insensitive: drop any existing key that
+    # case-insensitively collides with a configured extra so the extra wins.
+    # A plain {**headers, **extra} would emit both casings upstream.
+    lowered = {k.lower() for k in extra}
+    merged = {k: v for k, v in headers.items() if k.lower() not in lowered}
+    merged.update(extra)
+    return merged
+
+
 def log_outbound_headers(
     *,
     forwarder: str,
@@ -1835,7 +1861,7 @@ def serialize_tool_definition_canonical(tool_definition: dict[str, Any]) -> byte
     follow-up turn must inject byte-equal output to keep the prefix
     cache hot.
     """
-    return serialize_body_canonical(tool_definition)
+    return _serialize_tool_definition_canonical(tool_definition)
 
 
 class SessionToolTracker(_SessionToolTracker):

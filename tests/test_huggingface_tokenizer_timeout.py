@@ -138,6 +138,7 @@ def test_get_tokenizer_name_prefers_most_specific_prefix() -> None:
     assert get_tokenizer_name("qwen2-7b-instruct") == "Qwen/Qwen2-7B"
     assert get_tokenizer_name("qwen2.5-turbo") == "Qwen/Qwen2.5-7B"
     assert get_tokenizer_name("deepseek-v2.5") == "deepseek-ai/DeepSeek-V2"
-    # Direct hits use their literal mapping; shorter family fallback remains.
+    # Direct hits and shorter family fallbacks still resolve through their
+    # longest matching tokenizer aliases.
     assert get_tokenizer_name("qwen-14b") == "Qwen/Qwen-14B"
     assert get_tokenizer_name("deepseek-chat") == "deepseek-ai/DeepSeek-V3"

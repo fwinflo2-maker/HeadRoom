@@ -149,6 +149,7 @@ from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
 # Data models (extracted to headroom/proxy/models.py for maintainability)
+from headroom.proxy.model_router import ModelRouter, ModelRouterConfig
 from headroom.proxy.models import CacheEntry, ProxyConfig, RateLimitState, RequestLog  # noqa: F401
 from headroom.proxy.modes import (
     PROXY_MODE_CACHE,
@@ -707,6 +708,10 @@ class HeadroomProxy(
             else None
         )
         self.metrics = PrometheusMetrics(cost_tracker=self.cost_tracker, stateless=config.stateless)
+
+        # Cost-aware model routing (issue #1706). Disabled unless configured, so
+        # the default request path is unchanged.
+        self.model_router = ModelRouter(config.model_router)
 
         # Initialize transforms based on routing mode.
         #
@@ -4679,6 +4684,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         disable_kompress_openai=_get_env_optional_bool("HEADROOM_DISABLE_KOMPRESS_OPENAI"),
         force_kompress_all=_get_env_bool("HEADROOM_FORCE_KOMPRESS_ALL", False),
         lossless=_get_env_bool("HEADROOM_LOSSLESS", False),
+        compress_passthrough=_get_env_bool("HEADROOM_COMPRESS_PASSTHROUGH", False),
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", 500),
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", 100),
         keepalive_expiry=_get_env_float("HEADROOM_KEEPALIVE_EXPIRY", 90.0),
@@ -4699,6 +4705,10 @@ def _proxy_config_from_env() -> ProxyConfig:
         read_maturation_max_hold_turns=_get_env_int("HEADROOM_READ_MATURATION_MAX_HOLD_TURNS", 25),
         read_maturation_min_size_bytes=_get_env_int(
             "HEADROOM_READ_MATURATION_MIN_SIZE_BYTES", 2048
+        ),
+        model_router=ModelRouterConfig.from_env(
+            os.environ.get("HEADROOM_MODEL_ROUTER_ENABLED"),
+            os.environ.get("HEADROOM_MODEL_ROUTES"),
         ),
     )
 
@@ -5229,6 +5239,18 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--compress-passthrough",
+        action="store_true",
+        help=(
+            "Also compress requests that fall through to the catch-all "
+            "passthrough handler (custom proxy paths not matched by a built-in "
+            "API route, e.g. `/api/codex-proxy/<key>/v1/responses` behind "
+            "another proxy). Applies to OpenAI Responses-shaped bodies (paths "
+            "ending in `/responses`). Off by default; also settable via "
+            "HEADROOM_COMPRESS_PASSTHROUGH=1."
+        ),
+    )
+    parser.add_argument(
         "--exclude-tools",
         default=None,
         help="Comma-separated tool names whose output is never compressed, "
@@ -5310,6 +5332,9 @@ if __name__ == "__main__":
         "HEADROOM_FORCE_KOMPRESS_ALL", False
     )
     lossless = getattr(args, "lossless", False) or _get_env_bool("HEADROOM_LOSSLESS", False)
+    compress_passthrough = args.compress_passthrough or _get_env_bool(
+        "HEADROOM_COMPRESS_PASSTHROUGH", False
+    )
 
     # Set OpenRouter API key from CLI if provided
     if hasattr(args, "openrouter_api_key") and args.openrouter_api_key:
@@ -5366,6 +5391,7 @@ if __name__ == "__main__":
         disable_kompress_openai=disable_kompress_openai,
         force_kompress_all=force_kompress_all,
         lossless=lossless,
+        compress_passthrough=compress_passthrough,
         # Connection pool settings
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", args.max_connections),
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", args.max_keepalive),

@@ -14,7 +14,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
-from headroom.proxy.model_router import ModelRoute, ModelRouterConfig
+from headroom.proxy.model_router import ModelRoute, ModelRouter, ModelRouterConfig
 from headroom.proxy.server import ProxyConfig, _proxy_config_from_env, create_app
 
 MESSAGES = "/v1/messages"
@@ -111,11 +111,56 @@ def test_create_app_router_disabled_when_unset() -> None:
         assert not client.app.state.proxy.model_router.enabled
 
 
-def test_anthropic_handler_contains_routing_wiring() -> None:
+def test_handler_delegates_to_maybe_route_model() -> None:
     src = inspect.getsource(AnthropicHandlerMixin.handle_anthropic_messages)
-    assert "self.model_router.enabled" in src, "router gate missing from handler"
-    assert "routing_decision" in src, "routing decision not applied in handler"
-    assert 'mark_mutated("model_router")' in src, "model rewrite not tracked as a mutation"
+    assert "_maybe_route_model(" in src, "handler must apply model routing"
+
+
+class _RouterHost(AnthropicHandlerMixin):
+    """Minimal mixin host (like a handler test double) for routing-only tests."""
+
+
+def test_maybe_route_model_fails_closed_without_router() -> None:
+    # A host that never set model_router (test doubles, alternate mixin hosts that
+    # do not run HeadroomProxy.__init__) must not crash when routing is off.
+    host = _RouterHost()
+    tracker = MagicMock()
+    out = host._maybe_route_model(
+        "claude-sonnet-4-6", [{"content": "hi"}], {"model": "claude-sonnet-4-6"}, tracker, False
+    )
+    assert out == "claude-sonnet-4-6"
+    tracker.mark_mutated.assert_not_called()
+
+
+def test_maybe_route_model_routes_when_enabled() -> None:
+    host = _RouterHost()
+    host.model_router = ModelRouter(
+        ModelRouterConfig(
+            enabled=True,
+            routes=(
+                ModelRoute(
+                    to_model="claude-haiku-4-5", max_input_tokens=100_000, require_no_tools=True
+                ),
+            ),
+        )
+    )
+    tracker = MagicMock()
+    body = {"model": "claude-sonnet-4-6"}
+    out = host._maybe_route_model("claude-sonnet-4-6", [{"content": "hi"}], body, tracker, False)
+    assert out == "claude-haiku-4-5"
+    assert body["model"] == "claude-haiku-4-5"
+    tracker.mark_mutated.assert_called_once_with("model_router")
+
+
+def test_maybe_route_model_skips_on_bypass() -> None:
+    host = _RouterHost()
+    host.model_router = ModelRouter(
+        ModelRouterConfig(enabled=True, routes=(ModelRoute(to_model="cheap"),))
+    )
+    tracker = MagicMock()
+    out = host._maybe_route_model("keep", [{"content": "hi"}], {"model": "keep"}, tracker, True)
+    assert out == "keep"
+    tracker.mark_mutated.assert_not_called()
 
 
 def _messages_config() -> ProxyConfig:

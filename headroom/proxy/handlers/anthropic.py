@@ -514,6 +514,37 @@ class AnthropicHandlerMixin:
             "content": copy.deepcopy(resp_json.get("content", "")),
         }
 
+    def _maybe_route_model(
+        self,
+        model: str,
+        messages: object,
+        body: dict[str, Any],
+        body_mutation_tracker: Any,
+        bypass: bool,
+    ) -> str:
+        """Apply cost-aware model routing (#1706), returning the model to forward.
+
+        Fails closed to disabled when no ``model_router`` is present: alternate
+        mixin hosts and test doubles that do not run ``HeadroomProxy.__init__``
+        never set the attribute, and reading it unconditionally would crash them
+        even when routing is off. Also skipped under bypass/passthrough so a
+        byte-faithful request is never model-rewritten.
+        """
+        router = getattr(self, "model_router", None)
+        if router is None or not router.enabled or bypass:
+            return model
+        decision = router.select(
+            model=model,
+            input_tokens=estimate_input_tokens(messages, body.get("tools"), body.get("system")),
+            has_tools=bool(body.get("tools")),
+        )
+        if not decision.changed:
+            return model
+        body["model"] = decision.routed_model
+        body_mutation_tracker.mark_mutated("model_router")
+        logger.info("model routing applied: %s", decision.reason)
+        return decision.routed_model
+
     async def handle_anthropic_messages(
         self,
         request: Request,
@@ -770,23 +801,9 @@ class AnthropicHandlerMixin:
             if _bypass:
                 logger.info(f"[{request_id}] Bypass: skipping compression (header)")
 
-            # Cost-aware model routing (#1706). Opt-in and disabled by default; when
-            # configured, rewrite the outgoing model based on request size and tool
-            # presence, recording the decision so it stays observable. Skipped under
-            # bypass/passthrough so a byte-faithful request is never model-rewritten.
-            if self.model_router.enabled and not _bypass:
-                routing_decision = self.model_router.select(
-                    model=model,
-                    input_tokens=estimate_input_tokens(
-                        messages, body.get("tools"), body.get("system")
-                    ),
-                    has_tools=bool(body.get("tools")),
-                )
-                if routing_decision.changed:
-                    body["model"] = routing_decision.routed_model
-                    model = routing_decision.routed_model
-                    body_mutation_tracker.mark_mutated("model_router")
-                    logger.info("model routing applied: %s", routing_decision.reason)
+            # Cost-aware model routing (#1706). Opt-in and disabled by default;
+            # fail-closed and bypass handling live in the helper.
+            model = self._maybe_route_model(model, messages, body, body_mutation_tracker, _bypass)
 
             # NOTE: Upstream temporarily disabled broad image compression due to
             # token-counting inaccuracies. We only compress the latest non-frozen

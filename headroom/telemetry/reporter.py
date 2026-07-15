@@ -32,7 +32,7 @@ import httpx
 from headroom import paths as _paths
 
 if TYPE_CHECKING:
-    from headroom.proxy.server import HeadroomProxy
+    pass  # Any removed in Phase H1; reporter.start() is a no-op
 
 logger = logging.getLogger("headroom.telemetry.reporter")
 
@@ -107,7 +107,7 @@ class UsageReporter:
         self._report_interval = report_interval
         self._cache_path = cache_path or LICENSE_CACHE_PATH
         self._license_info: LicenseInfo | None = None
-        self._proxy: HeadroomProxy | None = None
+        self._proxy: Any | None = None
         self._task: asyncio.Task[None] | None = None
         self._http_client: httpx.AsyncClient | None = None
         self._stopped = False
@@ -168,7 +168,7 @@ class UsageReporter:
         # Fallback to cache
         return self._load_cache_or_default()
 
-    async def start(self, proxy: HeadroomProxy) -> None:
+    async def start(self, proxy: Any) -> None:
         """Start the background reporting loop. Called during proxy startup."""
         self._proxy = proxy
         self._stopped = False

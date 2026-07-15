@@ -25,15 +25,47 @@ from pathlib import Path
 from typing import Any
 
 from headroom import paths as _paths
+from headroom.proxy.project_context import sanitize_project_name
 
-# Reuse the proxy tracker's pricing + normalization so MCP and proxy events
-# bucket models identically and price them through one implementation.
-from headroom.proxy.savings_tracker import (
-    _estimate_compression_savings_usd,
-    _normalize_model,
-    _parse_timestamp,
-    sanitize_project_name,
-)
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    """Parse an ISO 8601 string to a UTC-aware datetime, or return None."""
+    if not isinstance(value, str) or not value:
+        return None
+    normalized = value.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _normalize_model(model: str) -> str:
+    """Strip provider-prefix from model names (e.g. 'anthropic/claude-3' → 'claude-3')."""
+    if "/" in model:
+        return model.split("/", 1)[1]
+    return model
+
+
+def _estimate_compression_savings_usd(model: str, tokens_saved: int) -> float:
+    """Estimate dollar value of saved tokens using litellm pricing, or 0.0 on failure."""
+    try:
+        import litellm  # type: ignore[import-untyped]
+
+        cost = litellm.cost_per_token(
+            model=_normalize_model(model),
+            prompt_tokens=tokens_saved,
+            completion_tokens=0,
+        )
+        if isinstance(cost, (int, float)):
+            return float(cost)
+        if isinstance(cost, tuple):
+            return float(cost[0])
+    except Exception:
+        pass
+    return 0.0
 
 # fcntl is Unix-only; on Windows we skip locking (append is still best-effort).
 fcntl: Any | None = None

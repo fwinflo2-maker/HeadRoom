@@ -489,7 +489,9 @@ class CompressionOnlyRunner:
           (no dangling required entry pointing at a stripped property)
         - schema-level annotations ($schema, title at root level) ARE dropped
         """
-        from headroom.proxy.handlers.openai import _compact_openai_responses_tools
+        raise NotImplementedError(
+            "_compact_openai_responses_tools removed in Phase H1 (Python proxy retired)."
+        )
 
         if cases is None:
             cases = self.generate_tool_schema_cases()

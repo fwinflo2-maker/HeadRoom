@@ -28,6 +28,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import hmac
+import ipaddress
 import json
 import logging
 import math
@@ -40,6 +41,7 @@ from dataclasses import fields, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
+from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
     from ..backends.base import Backend
@@ -2036,6 +2038,77 @@ def _request_is_loopback(request: Request) -> bool:
     return peer_is_trusted_gateway(client_host, load_trusted_gateway_cidrs())
 
 
+def _request_can_view_dashboard_metadata(
+    request: Request,
+    trusted_dashboard_client_cidrs: tuple[
+        ipaddress.IPv4Network | ipaddress.IPv6Network, ...
+    ],
+) -> bool:
+    """Authorize sensitive ``/stats`` metadata without widening admin access."""
+    if _request_is_loopback(request):
+        return True
+
+    from headroom.proxy.forwarded_headers import peer_is_trusted_gateway, resolve_client_ip
+    from headroom.proxy.loopback_guard import is_ip_literal_host_header
+
+    try:
+        host_header = request.headers.get("host")
+    except AttributeError:
+        return False
+    if not is_ip_literal_host_header(host_header):
+        return False
+
+    # CIDR authorization makes this endpoint usable by a remote dashboard, but
+    # it must not let an unrelated site read sensitive metadata through a
+    # victim's browser. Native CLI clients usually send neither header, so
+    # absence remains valid. If either browser provenance header is present,
+    # require it to identify this exact scheme/host/port.
+    if not _request_has_same_origin_or_no_provenance(request, host_header):
+        return False
+
+    return peer_is_trusted_gateway(
+        resolve_client_ip(request),
+        trusted_dashboard_client_cidrs,
+    )
+
+
+def _request_has_same_origin_or_no_provenance(
+    request: Request, host_header: str
+) -> bool:
+    """Accept no browser provenance, otherwise require same-origin headers."""
+
+    from headroom.proxy.forwarded_headers import trusted_forwarded_headers
+
+    forwarded_proto = trusted_forwarded_headers(request)["proto"]
+    request_scheme = forwarded_proto or request.url.scheme
+    expected_origin = _normalized_http_origin(f"{request_scheme}://{host_header}")
+    if expected_origin is None:
+        return False
+
+    for header_name in ("origin", "referer"):
+        header_value = request.headers.get(header_name)
+        if header_value and _normalized_http_origin(header_value) != expected_origin:
+            return False
+    return True
+
+
+def _normalized_http_origin(value: str) -> tuple[str, str, int] | None:
+    """Return a normalized HTTP(S) origin tuple."""
+
+    try:
+        parsed = urlsplit(value.strip())
+        port = parsed.port
+    except ValueError:
+        return None
+
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    if port is None:
+        port = 80 if scheme == "http" else 443
+    return scheme, parsed.hostname.lower(), port
+
+
 _is_known_websocket_callback_failure = is_known_websocket_callback_failure
 
 
@@ -2047,6 +2120,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     if not FASTAPI_AVAILABLE:
         raise ImportError("FastAPI required. Install: pip install fastapi uvicorn httpx")
 
+    from headroom.proxy.forwarded_headers import load_trusted_dashboard_client_cidrs
+
+    # Parse once at startup so invalid operator configuration fails loudly.
+    trusted_dashboard_client_cidrs = load_trusted_dashboard_client_cidrs()
+
     from contextlib import asynccontextmanager
 
     # Always-on file logging to ~/.headroom/logs/ for `headroom perf` analysis.
@@ -2056,6 +2134,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     _setup_file_logging()
 
     config = config or ProxyConfig()
+
+    # Defensive re-apply of file-backed settings for embedded/non-CLI callers
+    # that construct the app without going through the `headroom` CLI entrypoint
+    # (which already applies them before Click parsing). setdefault keeps
+    # explicit env exports authoritative; fail-open so it never blocks startup.
+    try:
+        from headroom import settings_store
+
+        settings_store.apply_to_environ(settings_store.load())
+    except Exception:  # noqa: BLE001 — settings load must never break startup
+        pass
 
     # Air-gap master switch. Propagate config.offline to the env so the
     # env-based egress predicates (telemetry, update check, license) all honor
@@ -2855,6 +2944,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         collect_tasks as _collect_tasks,
     )
     from headroom.proxy.loopback_guard import require_loopback as _require_loopback
+    from headroom.proxy.loopback_guard import require_same_origin as _require_same_origin
 
     @app.get("/admin/upstream", dependencies=[Depends(_require_loopback)])
     async def get_upstream():
@@ -2947,6 +3037,152 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         """Serve the Headroom dashboard UI."""
         return get_dashboard_html()
 
+    # --- Dashboard settings API (loopback-gated, registry-validated) ---------
+    # Read/write the curated HEADROOM_* knobs the settings GUI manages. Writes
+    # reuse the same loopback guard as the /admin and /debug endpoints and only
+    # ever touch keys in the settings_store registry allowlist. All curated
+    # knobs are startup-captured, so a write always requires a restart to apply
+    # (Phase 3's /settings/apply drives that).
+    from headroom import settings_store
+
+    @app.get("/settings/schema", dependencies=[Depends(_require_loopback)])
+    async def settings_schema(_request: Request):
+        """Registry + grouped fields + effective values for the settings form."""
+        schema = settings_store.to_schema()
+        # Tell the UI whether this is a supervised (docker/service) install, where
+        # manifest-baked knobs (HEADROOM_PORT/HEADROOM_HOST) are owned by the
+        # install manifest and must be rendered read-only. Foreground proxies
+        # can edit everything. Fail-open to "not supervised".
+        try:
+            from headroom.install import runtime as install_runtime
+
+            _manifest, mode = install_runtime.detect_current_deployment()
+            schema["supervised"] = mode != "foreground"
+        except Exception:  # noqa: BLE001 — schema must render even if detection fails
+            schema["supervised"] = False
+        return JSONResponse(status_code=200, content=schema)
+
+    @app.get("/settings", dependencies=[Depends(_require_loopback)])
+    async def settings_get(_request: Request):
+        """Return stored (file) values only; secret fields masked."""
+        return JSONResponse(status_code=200, content=settings_store.stored_values())
+
+    @app.post("/settings", dependencies=[Depends(_require_loopback), Depends(_require_same_origin)])
+    async def settings_post(request: Request):
+        """Persist settings. Unknown key -> 400; bad type/enum/range -> 422.
+
+        Loopback-only (mutates process configuration; treated as an admin
+        action). The audit log records which keys changed — never their values,
+        so no secret is leaked.
+        """
+        try:
+            body = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            body = None
+        if not isinstance(body, dict) or not isinstance(body.get("values"), dict):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "expected a JSON object with a `values` object"},
+            )
+        values = body["values"]
+        before = settings_store.load()
+        try:
+            settings_store.save(values)
+        except settings_store.SettingsValidationError as exc:
+            if exc.unknown_keys:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "unknown settings key(s)", "unknown_keys": exc.unknown_keys},
+                )
+            return JSONResponse(
+                status_code=422,
+                content={"error": "invalid settings value(s)", "field_errors": exc.field_errors},
+            )
+        after = settings_store.load()
+        changed_keys = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+        record_admin_action(
+            request=request,
+            action="settings_update",
+            status_code=200,
+            details={"changed_keys": changed_keys},
+        )
+        return JSONResponse(
+            status_code=200,
+            content={"ok": True, "needs_restart": bool(changed_keys), "changed_keys": changed_keys},
+        )
+
+    @app.post(
+        "/settings/apply", dependencies=[Depends(_require_loopback), Depends(_require_same_origin)]
+    )
+    async def settings_apply(request: Request):
+        """Persist settings (optional body) then restart the proxy to apply them.
+
+        Loopback-only. Service deployments self-restart (one-click): we flush a
+        202 BEFORE the detached restarter tears this process down, and the UI
+        polls /health to detect the proxy returning. Docker deployments cannot
+        self-restart (no docker socket in-container), so we surface the host
+        command instead. Foreground `headroom proxy` returns a manual-restart
+        instruction. /health is the single source of truth for "proxy is back".
+        """
+        from starlette.background import BackgroundTask
+
+        from headroom.install import runtime as install_runtime
+
+        try:
+            body = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            body = None
+        # `values` is optional — the UI may have already saved via POST /settings.
+        # When present, persist it under the same validation contract.
+        if isinstance(body, dict) and isinstance(body.get("values"), dict):
+            try:
+                settings_store.save(body["values"])
+            except settings_store.SettingsValidationError as exc:
+                if exc.unknown_keys:
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "error": "unknown settings key(s)",
+                            "unknown_keys": exc.unknown_keys,
+                        },
+                    )
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "error": "invalid settings value(s)",
+                        "field_errors": exc.field_errors,
+                    },
+                )
+        _manifest, mode = install_runtime.detect_current_deployment()
+        record_admin_action(
+            request=request,
+            action="settings_apply",
+            status_code=202 if mode == "service" else 200,
+            details={"mode": mode},
+        )
+        if mode == "service":
+            # Flush the 202 first; run the detached restart only after the
+            # response body is sent (Starlette runs BackgroundTask post-response),
+            # so restarting our own process never drops this response.
+            return JSONResponse(
+                status_code=202,
+                content={"restarted": True, "mode": "service"},
+                background=BackgroundTask(install_runtime.restart_current_deployment),
+            )
+        result = install_runtime.restart_current_deployment()
+        return JSONResponse(status_code=200, content=result)
+
+    @app.get(
+        "/dashboard/settings",
+        response_class=HTMLResponse,
+        dependencies=[Depends(_require_loopback)],
+    )
+    async def dashboard_settings():
+        """Serve the Headroom settings GUI."""
+        from headroom.dashboard import get_settings_html
+
+        return get_settings_html()
+
     @app.get("/favicon.ico")
     async def favicon() -> Response:
         # Registered before register_provider_routes' catch-all passthrough
@@ -2993,7 +3229,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     def _build_recent_request_payload(limit: int = RECENT_REQUEST_LOG_WINDOW) -> dict[str, Any]:
         recent_request_logs = proxy.logger.get_recent(limit) if proxy.logger else []
         dashboard_recent_requests = []
-        for log in recent_request_logs:
+        for log in reversed(recent_request_logs):
             token_accounting_status = _recent_request_token_accounting_status(log)
             dashboard_recent_requests.append(
                 {
@@ -3021,7 +3257,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     "tool_schema_saved_tokens": _tool_schema_saved_from_tags(log.get("tags")),
                 }
             )
-        dashboard_recent_requests = dashboard_recent_requests[-10:]
+        dashboard_recent_requests = dashboard_recent_requests[:25]
         return {
             "request_logs": recent_request_logs[-10:],
             "recent_requests": dashboard_recent_requests,
@@ -3659,7 +3895,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         only for loopback callers — the local dashboard. Network callers still
         get the aggregate counters but never the per-request metadata.
         """
-        include_sensitive = _request_is_loopback(request)
+        include_sensitive = _request_can_view_dashboard_metadata(
+            request,
+            trusted_dashboard_client_cidrs,
+        )
         if cached:
             payload = dict(await _get_cached_stats_payload())
             if include_sensitive:
@@ -3674,6 +3913,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             # _build_stats_payload bakes these in; strip for network callers.
             payload.pop("recent_requests", None)
             payload.pop("request_logs", None)
+        return payload
+
+    @app.get("/stats-lifetime")
+    async def stats_lifetime(request: Request):
+        """Return persisted lifetime aggregates with sensitive fields gated."""
+        payload = dict(proxy.metrics.savings_tracker.lifetime_response())
+        include_sensitive = _request_can_view_dashboard_metadata(
+            request,
+            trusted_dashboard_client_cidrs,
+        )
+        if not include_sensitive:
+            payload.pop("projects", None)
+            persistence = payload.get("persistence")
+            if isinstance(persistence, dict):
+                payload["persistence"] = {**persistence, "error": None}
         return payload
 
     @app.post("/stats/reset", dependencies=[Depends(_require_loopback)])

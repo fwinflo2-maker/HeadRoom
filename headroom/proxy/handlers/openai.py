@@ -2504,10 +2504,15 @@ class OpenAIHandlerMixin:
         # uses `request.headers.get(...)` above; memory user-id reads
         # `request.headers` below. From this point on, `headers` is the
         # upstream-bound copy.
-        from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
+        from headroom.proxy.helpers import (
+            _strip_internal_headers,
+            log_outbound_headers,
+            merge_extra_headers,
+        )
 
         _pre_strip_count_chat = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
         headers = _strip_internal_headers(headers)
+        headers = merge_extra_headers(headers, self.config.openai_extra_headers)
         log_outbound_headers(
             forwarder="openai_chat_completions",
             stripped_count=_pre_strip_count_chat,
@@ -2678,10 +2683,19 @@ class OpenAIHandlerMixin:
         optimized_messages = messages
         optimized_tokens = original_tokens
 
-        # Get prefix cache tracker for this session
-        openai_session_id = self.session_tracker_store.compute_session_id(request, model, messages)
-        openai_prefix_tracker = self.session_tracker_store.get_or_create(
-            openai_session_id, "openai"
+        # Get prefix cache tracker for this session, resolved by conversation
+        # lineage within the session id (#2085) so concurrent conversations
+        # sharing a fallback id (same model + system prompt) do not thrash one
+        # tracker's frozen-prefix state. Both the id and the lineage derive
+        # from the SAME original client bytes — pre image compression and
+        # pre_compress hook, both of which may rewrite history bytes
+        # differently turn-to-turn (a turn-dependent rewrite of the leading
+        # system text would rotate the id mid-conversation).
+        openai_session_id = self.session_tracker_store.compute_session_id(
+            request, model, original_client_messages
+        )
+        openai_prefix_tracker = self.session_tracker_store.resolve_tracker(
+            openai_session_id, "openai", messages=original_client_messages
         )
 
         # PR-A6 (P5-50, preps P0-6): session-sticky `OpenAI-Beta` merge.
@@ -2846,8 +2860,11 @@ class OpenAIHandlerMixin:
                 if result.waste_signals:
                     waste_signals_dict = result.waste_signals.to_dict()
             except Exception as e:
+                # Include type so TimeoutError vs other failures is distinguishable
+                # in bug reports — str(asyncio.TimeoutError()) is empty otherwise.
                 logger.warning(
-                    f"Optimization failed: {type(e).__name__}: {e}",
+                    f"[{request_id}] Optimization failed: {type(e).__name__}: {e} "
+                    f"(request forwarded unoptimized)",
                     exc_info=True,
                 )
                 # Flag compression failure for observability
@@ -3059,6 +3076,7 @@ class OpenAIHandlerMixin:
                                     decision="injected_live_zone_tail_chat",
                                     bytes_injected=bytes_appended,
                                     query=None,
+                                    tags=tags,
                                 )
                                 logger.info(
                                     f"[{request_id}] Memory: Injected {bytes_appended} chars "
@@ -4011,10 +4029,15 @@ class OpenAIHandlerMixin:
         # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
         # headers AFTER `_extract_tags` reads them. Memory user-id reads
         # `request.headers` below.
-        from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
+        from headroom.proxy.helpers import (
+            _strip_internal_headers,
+            log_outbound_headers,
+            merge_extra_headers,
+        )
 
         _pre_strip_count_resp = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
         headers = _strip_internal_headers(headers)
+        headers = merge_extra_headers(headers, self.config.openai_extra_headers)
         # Mirror the WS handler: never forward Codex's client-only lite header
         # upstream. OpenAI rejects newer Codex models when it leaks, and the HTTP
         # POST path (unlike the WS path) otherwise forwards request headers verbatim.
@@ -4203,6 +4226,7 @@ class OpenAIHandlerMixin:
                                     decision="injected_live_zone_tail_string",
                                     bytes_injected=len(memory_context),
                                     query=user_query,
+                                    tags=tags,
                                 )
                             elif isinstance(current_input, list):
                                 new_input, bytes_appended = append_text_to_latest_user_input_item(
@@ -4217,6 +4241,7 @@ class OpenAIHandlerMixin:
                                         decision="injected_live_zone_tail",
                                         bytes_injected=bytes_appended,
                                         query=user_query,
+                                        tags=tags,
                                     )
                                 else:
                                     log_memory_injection(
@@ -4923,7 +4948,8 @@ class OpenAIHandlerMixin:
 
         Newer Codex versions use WebSocket instead of HTTP POST for the
         Responses API.  This handler:
-        1. Accepts the client WebSocket
+        1. Validates origin and routing, then accepts ChatGPT-auth sessions
+           immediately or API-key sessions after the upstream handshake
         2. Receives the first message (``response.create`` request)
         3. Opens an upstream WebSocket to OpenAI
         4. Compresses eligible `response.create` text through the Python
@@ -5208,14 +5234,57 @@ class OpenAIHandlerMixin:
             f"{[k for k in upstream_headers if k.lower() != 'authorization']}, "
             f"subprotocols={client_subprotocols}"
         )
+        accept_subprotocol = client_subprotocols[0] if client_subprotocols else None
+        accepted_client_ws = False
+
+        def _register_accepted_session() -> None:
+            nonlocal session_handle
+            if session_handle is not None or ws_sessions is None:
+                return
+            client_addr: str | None = None
+            client_info = getattr(websocket, "client", None)
+            if client_info is not None:
+                host = getattr(client_info, "host", None)
+                port = getattr(client_info, "port", None)
+                if host is not None and port is not None:
+                    client_addr = f"{host}:{port}"
+                elif host is not None:
+                    client_addr = str(host)
+            session_handle = WSSessionHandle(
+                session_id=session_id,
+                request_id=request_id,
+                client_addr=client_addr,
+                upstream_url=upstream_url,
+            )
+            ws_sessions.register(session_handle)
+            metrics = getattr(self, "metrics", None)
+            if metrics is not None and hasattr(metrics, "inc_active_ws_sessions"):
+                try:
+                    metrics.inc_active_ws_sessions()
+                except Exception:  # pragma: no cover - defensive
+                    pass
+
+        def _schedule_usage_poll() -> None:
+            with contextlib.suppress(Exception):
+                from headroom.subscription.codex_rate_limits import (
+                    maybe_schedule_usage_poll,
+                )
+
+                maybe_schedule_usage_poll(ws_headers)
 
         try:
+            # ChatGPT-auth sessions no longer need upstream x-codex-* headers on
+            # the client-facing 101, so accept them before the upstream retry
+            # loop. API-key sessions still connect first so the allowlisted
+            # handshake headers remain attachable there.
+            if is_chatgpt_auth:
+                async with stage_timer.measure("accept"):
+                    await websocket.accept(subprotocol=accept_subprotocol)
+                accepted_client_ws = True
+                _register_accepted_session()
+                _schedule_usage_poll()
+
             # --- Connect to upstream OpenAI WebSocket ---
-            # NOTE: we connect *before* accepting the client. OpenAI delivers the
-            # Codex subscription/rate-limit window only on the upstream WS
-            # handshake response headers, so we must read them here and attach
-            # the x-codex-* subset to the client-facing 101 (below). Once accept()
-            # sends the 101 the headers can no longer be added.
             logger.info(f"[{request_id}] WS /v1/responses connecting to {upstream_url}")
 
             # Use ssl=True to let the websockets library handle SSL natively.
@@ -5230,6 +5299,11 @@ class OpenAIHandlerMixin:
             _upstream_connect_recorded = False
             _upstream_first_event_started: float | None = None
             upstream: Any = None
+            from headroom.proxy.helpers import merge_extra_headers
+
+            upstream_headers = merge_extra_headers(
+                upstream_headers, self.config.openai_extra_headers
+            )
 
             for ws_attempt in range(ws_connect_attempts):
                 try:
@@ -5285,11 +5359,9 @@ class OpenAIHandlerMixin:
                     )
                     await asyncio.sleep(delay_with_jitter / 1000)
 
-            # Accept the client WS, forwarding OpenAI's x-codex-* subscription
-            # window from the upstream handshake onto the client-facing 101 so
-            # Codex, /stats, and the headroom-desktop gauge can read the live
-            # window. In API-key mode the handshake carries no x-codex-* headers,
-            # so accept_headers stays empty and this behaves exactly as before.
+            # Preserve any upstream x-codex-* handshake headers for internal
+            # rate-limit state, and forward them onto the client-facing 101 only
+            # for API-key sessions that have not been accepted yet.
             accept_headers: list[tuple[bytes, bytes]] = []
             if ws_connected:
                 _codex_handshake = _extract_codex_handshake_headers(upstream)
@@ -5306,46 +5378,15 @@ class OpenAIHandlerMixin:
                     with contextlib.suppress(Exception):
                         get_codex_rate_limit_state().update_from_headers(dict(_codex_handshake))
 
-            # Current Codex no longer ships x-codex-* on the handshake, so the
-            # block above is usually a no-op. Pull the live subscription window
-            # from the dedicated usage endpoint instead (throttled, scoped to
-            # ChatGPT-session traffic, fire-and-forget so accept isn't blocked).
-            with contextlib.suppress(Exception):
-                from headroom.subscription.codex_rate_limits import (
-                    maybe_schedule_usage_poll,
-                )
-
-                maybe_schedule_usage_poll(ws_headers)
-            async with stage_timer.measure("accept"):
-                await websocket.accept(
-                    subprotocol=client_subprotocols[0] if client_subprotocols else None,
-                    headers=accept_headers or None,
-                )
-
-            # --- Unit 3: register the session as soon as accept succeeds ---
-            client_addr: str | None = None
-            client_info = getattr(websocket, "client", None)
-            if client_info is not None:
-                host = getattr(client_info, "host", None)
-                port = getattr(client_info, "port", None)
-                if host is not None and port is not None:
-                    client_addr = f"{host}:{port}"
-                elif host is not None:
-                    client_addr = str(host)
-            if ws_sessions is not None:
-                session_handle = WSSessionHandle(
-                    session_id=session_id,
-                    request_id=request_id,
-                    client_addr=client_addr,
-                    upstream_url=upstream_url,
-                )
-                ws_sessions.register(session_handle)
-                metrics = getattr(self, "metrics", None)
-                if metrics is not None and hasattr(metrics, "inc_active_ws_sessions"):
-                    try:
-                        metrics.inc_active_ws_sessions()
-                    except Exception:  # pragma: no cover - defensive
-                        pass
+            if not accepted_client_ws:
+                _schedule_usage_poll()
+                async with stage_timer.measure("accept"):
+                    await websocket.accept(
+                        subprotocol=accept_subprotocol,
+                        headers=accept_headers or None,
+                    )
+                accepted_client_ws = True
+                _register_accepted_session()
             # Receive the first message from client (the response.create request).
             # Bound the wait with WS_FIRST_FRAME_TIMEOUT_SECONDS so a zombie
             # client that opens the WS but never sends a frame cannot hold a
@@ -5541,7 +5582,7 @@ class OpenAIHandlerMixin:
 
             memory_user_id: str | None = None
             memory_request_ctx = None
-            from headroom.proxy.helpers import get_memory_injection_mode
+            from headroom.proxy.helpers import get_memory_injection_mode, log_memory_injection
             from headroom.proxy.memory_decision import MemoryDecision
             from headroom.proxy.memory_query import MemoryQuery
 
@@ -5655,6 +5696,14 @@ class OpenAIHandlerMixin:
                                 logger.info(
                                     f"[{request_id}] WS Memory: Injected {len(memory_context)} chars "
                                     f"into input tail (string-shaped input)"
+                                )
+                                log_memory_injection(
+                                    request_id=request_id,
+                                    session_id=session_id,
+                                    decision="injected_live_zone_tail_ws",
+                                    bytes_injected=len(memory_context),
+                                    query=None,
+                                    tags=ws_tags,
                                 )
                             else:
                                 # List-shaped WS input is owned by the
@@ -7084,10 +7133,23 @@ class OpenAIHandlerMixin:
                 # Session-end residual: tokens not captured by any
                 # per-turn record (e.g. signaling frames after the
                 # last response.completed). The funnel emits the full
-                # bookkeeping quartet for the residual; the explicit
-                # session-summary RequestLog below remains a separate
-                # entry (different semantics — cumulative session
-                # totals vs delta residual).
+                # bookkeeping quartet for the residual. This is the
+                # session's ONLY end-of-session RequestLog row: per-turn
+                # rows already carry the session's tokens as deltas, so a
+                # separate cumulative session-summary row would double-count
+                # Codex WS traffic in the recent-requests feed and every
+                # log-derived stat (savings, throughput).
+                from headroom.proxy.helpers import compute_turn_id
+
+                ws_messages_for_log: list[dict[str, Any]] = []
+                ws_input_for_log = ws_inner_for_telemetry.get("input")
+                ws_instructions_for_log = ws_inner_for_telemetry.get("instructions")
+                if isinstance(ws_instructions_for_log, str) and ws_instructions_for_log:
+                    ws_messages_for_log.append(
+                        {"role": "system", "content": ws_instructions_for_log}
+                    )
+                if isinstance(ws_input_for_log, str) and ws_input_for_log:
+                    ws_messages_for_log.append({"role": "user", "content": ws_input_for_log})
                 await self._record_request_outcome(
                     RequestOutcome(
                         request_id=request_id,
@@ -7108,44 +7170,6 @@ class OpenAIHandlerMixin:
                         transforms_applied=tuple(transforms_applied),
                         tags=ws_session_tags,
                         client=client,
-                    )
-                )
-                ws_recorded_overhead_ms_total = _current_ws_overhead_ms()
-                if final_ttfb_ms > 0:
-                    ws_recorded_ttfb_ms = True
-            if getattr(self, "logger", None) is not None:
-                from headroom.proxy.helpers import compute_turn_id
-                from headroom.proxy.models import RequestLog
-
-                ws_messages_for_log: list[dict[str, Any]] = []
-                ws_input_for_log = ws_inner_for_telemetry.get("input")
-                ws_instructions_for_log = ws_inner_for_telemetry.get("instructions")
-                if isinstance(ws_instructions_for_log, str) and ws_instructions_for_log:
-                    ws_messages_for_log.append(
-                        {"role": "system", "content": ws_instructions_for_log}
-                    )
-                if isinstance(ws_input_for_log, str) and ws_input_for_log:
-                    ws_messages_for_log.append({"role": "user", "content": ws_input_for_log})
-                self.logger.log(
-                    RequestLog(
-                        request_id=request_id,
-                        timestamp=datetime.now().isoformat(),
-                        provider="openai",
-                        model=model_name,
-                        input_tokens_original=ws_input_tokens_total + tokens_saved,
-                        input_tokens_optimized=ws_input_tokens_total,
-                        output_tokens=ws_output_tokens_total,
-                        tokens_saved=tokens_saved,
-                        savings_percent=(
-                            tokens_saved / (ws_input_tokens_total + tokens_saved) * 100
-                        )
-                        if ws_input_tokens_total + tokens_saved > 0
-                        else 0.0,
-                        optimization_latency_ms=_current_ws_overhead_ms(),
-                        total_latency_ms=ws_session_duration_ms,
-                        tags=ws_session_tags,
-                        cache_hit=False,
-                        transforms_applied=transforms_applied,
                         request_messages=ws_messages_for_log
                         if getattr(self.config, "log_full_messages", False)
                         else None,
@@ -7156,6 +7180,9 @@ class OpenAIHandlerMixin:
                         ),
                     )
                 )
+                ws_recorded_overhead_ms_total = _current_ws_overhead_ms()
+                if final_ttfb_ms > 0:
+                    ws_recorded_ttfb_ms = True
 
         except Exception as e:
             if "WebSocketDisconnect" in type(e).__name__:

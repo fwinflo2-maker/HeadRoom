@@ -22,6 +22,7 @@ pub mod detection;
 pub mod diff_compressor;
 pub mod live_zone;
 pub mod log_compressor;
+#[cfg(feature = "ml")]
 pub mod magika_detector;
 pub mod pipeline;
 pub mod recommendations;
@@ -29,6 +30,7 @@ pub mod safety;
 pub mod search_compressor;
 pub mod smart_crusher;
 pub mod tag_protector;
+pub mod text_crusher;
 pub mod unidiff_detector;
 
 pub use content_detector::{
@@ -48,6 +50,7 @@ pub use log_compressor::{
     LogCompressionResult, LogCompressor, LogCompressorConfig, LogCompressorStats, LogFormat,
     LogLevel, LogLine,
 };
+#[cfg(feature = "ml")]
 pub use magika_detector::{magika_detect, map_magika_label, MagikaDetectorError};
 pub use pipeline::{
     CompressionContext, CompressionPipeline, CompressionPipelineBuilder, DiffNoise, DiffOffload,
@@ -61,4 +64,5 @@ pub use search_compressor::{
     SearchCompressorStats, SearchMatch,
 };
 pub use tag_protector::{is_known_html_tag, protect_tags, restore_tags, ProtectStats};
+pub use text_crusher::{TextCrusher, TextCrusherConfig, TextCrusherResult};
 pub use unidiff_detector::{detect_diff, is_diff};

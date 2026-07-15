@@ -20,10 +20,21 @@ from contextvars import ContextVar
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
-from headroom.proxy.savings_tracker import sanitize_project_name
-
 PROJECT_HEADER = "x-headroom-project"
 PROJECT_PATH_PREFIX = "/p/"
+
+_PROJECT_NAME_MAX_LENGTH = 128
+
+
+def sanitize_project_name(value: Any) -> str | None:
+    """Normalize a client-supplied project name; ``None`` when unusable."""
+    if not isinstance(value, str):
+        return None
+    value = unquote(value)
+    cleaned = "".join(ch for ch in value if ch.isprintable()).strip()
+    if not cleaned:
+        return None
+    return cleaned[:_PROJECT_NAME_MAX_LENGTH]
 
 _current_project: ContextVar[str | None] = ContextVar("headroom_current_project", default=None)
 

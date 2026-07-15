@@ -55,6 +55,12 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     )
     assert 'digest_count="$(find "${DIGEST_DIR}" -maxdepth 1 -type f | wc -l)"' in manifest_script
     assert '"${digest_count}" -ne 2' in manifest_script
+    assert manifest_script.index('"${digest_count}" -ne 2') < manifest_script.index(
+        "docker buildx imagetools create"
+    )
+    guard_start = manifest_script.index('"${digest_count}" -ne 2')
+    create_start = manifest_script.index("docker buildx imagetools create")
+    assert guard_start < manifest_script.index("exit 1", guard_start) < create_start
 
 
 def test_release_workflow_publishes_both_node_packages_to_github_packages() -> None:

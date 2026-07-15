@@ -21,8 +21,11 @@ def test_docker_workflow_normalizes_repository_name_for_signing() -> None:
 def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "docker.yml").read_text())
     jobs = workflow["jobs"]
+    build = jobs["docker-build"]
     manifest = jobs["docker-manifest"]
     variants = manifest["strategy"]["matrix"]["variant"]
+    build_variants = build["strategy"]["matrix"]["variant"]
+    architectures = build["strategy"]["matrix"]["arch"]
     root = next(entry for entry in variants if entry["name"] == "")
     nonroot = next(entry for entry in variants if entry["name"] == "nonroot")
     promotion = next(
@@ -31,6 +34,9 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     command = promotion["run"]
 
     assert len(variants) == 8
+    assert [entry["name"] for entry in build_variants] == [entry["name"] for entry in variants]
+    assert len(architectures) == 2
+    assert {entry["platform"] for entry in architectures} == {"linux/amd64", "linux/arm64"}
     assert root["name"] == ""
     assert nonroot["name"] == "nonroot"
     assert "matrix.variant.name == ''" in promotion["if"]
@@ -40,8 +46,10 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     assert "promote-latest" not in jobs
     assert manifest["needs"] == "docker-build"
     assert manifest["if"] == "${{ always() }}"
-    assert "linux/amd64" in str(jobs["docker-build"])
-    assert "linux/arm64" in str(jobs["docker-build"])
+    step_names = [step["name"] for step in manifest["steps"]]
+    assert step_names.index("Sign multi-arch index manifest with cosign") < step_names.index(
+        "Re-tag root image as :latest"
+    )
 
 
 def test_release_workflow_publishes_both_node_packages_to_github_packages() -> None:

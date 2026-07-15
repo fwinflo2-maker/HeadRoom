@@ -1,10 +1,10 @@
-"""Grok Build MCP registrar.
+"""Grok CLI MCP registrar.
 
-Grok Build stores MCP server config in ``$GROK_HOME/config.toml`` when
-``GROK_HOME`` is set, otherwise ``~/.grok/config.toml``, as
-``[mcp_servers.<name>]`` tables (with optional ``[mcp_servers.<name>.env]``
-sub-tables). The on-disk shape matches Codex, so this module mirrors
-:class:`CodexRegistrar` with Grok-specific home-directory resolution.
+Grok stores MCP server config in ``$GROK_HOME/config.toml`` (default
+``~/.grok/config.toml``) as ``[mcp_servers.<name>]`` tables. There is no
+general-purpose CLI for adding entries, so we edit the file in place using
+marker-delimited blocks so we can idempotently inject, replace, and remove
+our entry without disturbing anything else the user has configured.
 """
 
 from __future__ import annotations
@@ -43,10 +43,10 @@ def _marker_end(server_name: str) -> str:
 
 
 class GrokRegistrar(MCPRegistrar):
-    """Register MCP servers with Grok Build."""
+    """Register MCP servers with the Grok CLI."""
 
     name = "grok"
-    display_name = "Grok Build"
+    display_name = "Grok CLI"
 
     def __init__(self, *, home_dir: Path | None = None) -> None:
         if home_dir is not None:

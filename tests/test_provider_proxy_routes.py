@@ -9,23 +9,8 @@ import httpx
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
+from headroom.providers.codex.runtime import CodexRoutingDecision
 from headroom.proxy.server import HeadroomProxy, ProxyConfig, create_app
-
-
-def _app() -> Any:
-    return create_app(
-        ProxyConfig(
-            optimize=False,
-            cache_enabled=False,
-            rate_limit_enabled=False,
-            http2=False,
-            anthropic_api_url="https://api.anthropic.test",
-            openai_api_url="https://api.openai.test",
-            gemini_api_url="https://api.gemini.test",
-            cloudcode_api_url="https://cloudcode.test",
-            vertex_api_url="https://vertex.test",
-        )
-    )
 
 
 class _RecordingOpenAIChatClient:
@@ -60,6 +45,21 @@ class _RecordingOpenAIChatClient:
 
     async def aclose(self) -> None:
         return None
+
+
+def _app() -> Any:
+    return create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            anthropic_api_url="https://api.anthropic.test",
+            openai_api_url="https://api.openai.test",
+            gemini_api_url="https://api.gemini.test",
+            cloudcode_api_url="https://cloudcode.test",
+            vertex_api_url="https://vertex.test",
+        )
+    )
 
 
 def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> None:
@@ -342,6 +342,10 @@ def test_proxy_route_helpers_prefer_legacy_targets_and_gemini_passthrough() -> N
     assert proxy_routes._select_passthrough_base_url(proxy, {"api-key": "azure"}) == (
         "https://legacy.anthropic.test"
     )
+    assert (
+        proxy_routes._select_passthrough_base_url(proxy, {"chatgpt-account-id": "acct"})
+        == "https://chatgpt.com"
+    )
     assert proxy_routes._select_passthrough_base_url(proxy, {}) == "https://legacy.anthropic.test"
 
 
@@ -511,33 +515,6 @@ def test_openai_response_websocket_aliases_delegate_to_openai_ws_handler(monkeyp
     ]
 
 
-def test_openai_chat_forwards_to_custom_upstream_path() -> None:
-    app = create_app(
-        ProxyConfig(
-            optimize=False,
-            cache_enabled=False,
-            rate_limit_enabled=False,
-            http2=False,
-            openai_api_url="https://open.bigmodel.cn/api/coding/paas",
-            openai_chat_path="v4/chat/completions",
-        )
-    )
-
-    with TestClient(app) as client:
-        fake_http = _RecordingOpenAIChatClient()
-        client.app.state.proxy.http_client = fake_http
-        response = client.post(
-            "/v1/chat/completions",
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": "ping"}],
-            },
-        )
-
-    assert response.status_code == 200, response.text
-    assert fake_http.urls == ["https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"]
-
-
 def test_openai_response_subpath_passthrough_returns_502_on_http_failure() -> None:
     class FailingAsyncClient:
         async def request(self, method, url, **kwargs):  # type: ignore[no-untyped-def]
@@ -548,12 +525,15 @@ def test_openai_response_subpath_passthrough_returns_502_on_http_failure() -> No
 
     with TestClient(_app()) as client:
         client.app.state.proxy.http_client = FailingAsyncClient()
-        with patch("headroom.providers.proxy_routes.logger") as logger:
+        with patch("headroom.providers.openai_responses.logger") as logger:
             response = client.post("/v1/responses/compact?trace=1", json={"model": "gpt-4o"})
 
     assert response.status_code == 502
-    assert "boom: POST https://api.openai.test/v1/responses/compact?trace=1" in response.text
+    assert response.text == "Upstream request failed."
     logger.error.assert_called_once()
+    assert "boom: POST https://api.openai.test/v1/responses/compact?trace=1" in str(
+        logger.error.call_args
+    )
 
 
 def test_openai_response_subpath_passthrough_uses_openai_target() -> None:
@@ -584,10 +564,37 @@ def test_openai_response_subpath_passthrough_uses_openai_target() -> None:
     assert headers["authorization"] == "Bearer sk-proj-test"
 
 
+def test_openai_chat_forwards_to_custom_upstream_path() -> None:
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            http2=False,
+            openai_api_url="https://open.bigmodel.cn/api/coding/paas",
+            openai_chat_path="v4/chat/completions",
+        )
+    )
+
+    with TestClient(app) as client:
+        fake_http = _RecordingOpenAIChatClient()
+        client.app.state.proxy.http_client = fake_http
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert fake_http.urls == ["https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"]
+
+
 def test_openai_response_subpath_aliases_and_chatgpt_auth_use_expected_targets(monkeypatch) -> None:
     monkeypatch.setattr(
-        "headroom.providers.proxy_routes._resolve_codex_routing_headers",
-        lambda headers: (headers, True),
+        "headroom.providers.codex.responses.resolve_codex_routing",
+        lambda headers: CodexRoutingDecision(headers=dict(headers), is_chatgpt_auth=True),
     )
 
     class FakeAsyncClient:
@@ -617,8 +624,11 @@ def test_openai_response_subpath_aliases_and_chatgpt_auth_use_expected_targets(m
 
 def test_openai_image_routes_use_codex_backend_under_chatgpt_auth(monkeypatch) -> None:
     monkeypatch.setattr(
-        "headroom.providers.proxy_routes._resolve_codex_routing_headers",
-        lambda headers: ({**headers, "ChatGPT-Account-ID": "acct_123"}, True),
+        "headroom.providers.codex.images.resolve_codex_routing",
+        lambda headers: CodexRoutingDecision(
+            headers={**headers, "ChatGPT-Account-ID": "acct_123"},
+            is_chatgpt_auth=True,
+        ),
     )
 
     class FakeAsyncClient:
@@ -689,8 +699,11 @@ def test_openai_image_codex_response_strips_stale_compression_headers(monkeypatc
     upstream_body = b'{"ok":true}'
     stale_content_length = "9999"
     monkeypatch.setattr(
-        "headroom.providers.proxy_routes._resolve_codex_routing_headers",
-        lambda headers: ({**headers, "ChatGPT-Account-ID": "acct_123"}, True),
+        "headroom.providers.codex.images.resolve_codex_routing",
+        lambda headers: CodexRoutingDecision(
+            headers={**headers, "ChatGPT-Account-ID": "acct_123"},
+            is_chatgpt_auth=True,
+        ),
     )
 
     class FakeAsyncClient:
@@ -790,8 +803,11 @@ def test_openai_image_edits_api_key_auth_falls_through_to_openai_passthrough(
 
 def test_openai_image_edits_preserves_multipart_body_under_chatgpt_auth(monkeypatch) -> None:
     monkeypatch.setattr(
-        "headroom.providers.proxy_routes._resolve_codex_routing_headers",
-        lambda headers: ({**headers, "ChatGPT-Account-ID": "acct_123"}, True),
+        "headroom.providers.codex.images.resolve_codex_routing",
+        lambda headers: CodexRoutingDecision(
+            headers={**headers, "ChatGPT-Account-ID": "acct_123"},
+            is_chatgpt_auth=True,
+        ),
     )
     boundary = "----headroom-boundary"
     body = (
@@ -879,10 +895,10 @@ def test_gemini_batch_embed_contents_passthrough_uses_gemini_target(monkeypatch)
 
 
 def test_v1_models_fetches_codex_registry_under_chatgpt_auth(monkeypatch) -> None:
-    proxy_routes = importlib.import_module("headroom.providers.proxy_routes")
+    model_metadata = importlib.import_module("headroom.providers.codex.model_metadata")
     debug_messages: list[tuple[str, tuple[object, ...]]] = []
     monkeypatch.setattr(
-        proxy_routes.logger,
+        model_metadata.logger,
         "debug",
         lambda message, *args: debug_messages.append((message, args)),
     )

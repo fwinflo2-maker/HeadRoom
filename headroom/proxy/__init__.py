@@ -1,27 +1,15 @@
-"""Headroom Proxy Server.
+"""Headroom Proxy.
 
-A transparent proxy that sits between LLM clients (Claude Code, Cursor, etc.)
-and LLM APIs (Anthropic, OpenAI), applying Headroom optimizations.
+The proxy request path is served by the Rust binary ``headroom-proxy``.
+``headroom proxy start`` (via ``headroom/cli/proxy.py``) discovers and
+exec-replaces into that binary.
 
-Usage:
-    # Start the proxy
-    python -m headroom.proxy.server
+Surviving Python modules in this package are utilities used by the CLI
+and agent-wrap infrastructure:
 
-    # Use with Claude Code
-    ANTHROPIC_BASE_URL=http://localhost:8787 claude
-
-    # Use with Cursor (if using Anthropic)
-    Set base URL in Cursor settings to http://localhost:8787
+- :mod:`headroom.proxy.modes` — token/cache mode normalization
+- :mod:`headroom.proxy.project_context` — per-request project attribution
+- :mod:`headroom.proxy.forwarded_headers` — X-Forwarded-* header helpers
+- :mod:`headroom.proxy.runtime_env` — runtime environment helpers
+- :mod:`headroom.proxy.ssl_context` — TLS context construction
 """
-
-__all__ = ["create_app", "run_server"]
-
-
-def __getattr__(name: str) -> object:
-    if name in ("create_app", "run_server"):
-        from .server import create_app, run_server  # noqa: F811
-
-        globals()["create_app"] = create_app
-        globals()["run_server"] = run_server
-        return globals()[name]
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -513,6 +513,8 @@ _OPENAI_TOOL_SCHEMA_DROP_KEYS = {
     "title",
     "writeOnly",
 }
+# Kept for backward compatibility with evals that import this symbol.
+# The canonical set lives in headroom.proxy.tool_schema_compaction.
 
 
 def _json_byte_len(value: Any) -> int:
@@ -598,45 +600,18 @@ def _compact_openai_tool_schema_value(
     value: Any,
     _parent_key: str | None = None,
 ) -> Any:
-    if isinstance(value, list):
-        return [_compact_openai_tool_schema_value(item, _parent_key) for item in value]
+    # Delegate to shared compaction logic.
+    from headroom.proxy.tool_schema_compaction import compact_tool_schema_value
 
-    if not isinstance(value, dict):
-        return value
-
-    compacted: dict[str, Any] = {}
-    for key, child in value.items():
-        # Don't drop keys that are property *names* inside a JSON Schema
-        # `properties` object — only drop them when they are schema annotations.
-        # e.g. a tool with a field literally named "title" must not be stripped.
-        if _parent_key != "properties" and key in _OPENAI_TOOL_SCHEMA_DROP_KEYS:
-            continue
-
-        if key == "description" and isinstance(child, str):
-            compacted[key] = " ".join(child.split())
-            continue
-
-        compacted[key] = _compact_openai_tool_schema_value(child, key)
-
-    return compacted
+    return compact_tool_schema_value(value, _parent_key)
 
 
 def _compact_openai_responses_tools(
     payload: dict[str, Any],
 ) -> tuple[dict[str, Any], bool, int, int]:
-    tools = payload.get("tools")
-    if not isinstance(tools, list) or not tools:
-        return payload, False, 0, 0
+    from headroom.proxy.tool_schema_compaction import compact_tools
 
-    compacted_tools = _compact_openai_tool_schema_value(tools)
-    before = _json_byte_len(tools)
-    after = _json_byte_len(compacted_tools)
-    if after >= before:
-        return payload, False, before, after
-
-    updated = copy.deepcopy(payload)
-    updated["tools"] = compacted_tools
-    return updated, True, before, after
+    return compact_tools(payload)
 
 
 def _responses_request_allows_memory_tool_continuation(payload: dict[str, Any]) -> bool:
@@ -1414,6 +1389,11 @@ class OpenAIHandlerMixin:
         if not isinstance(items, list):
             return payload, False, 0, [], {}, [], 0
         try:
+            from headroom.transforms.compression_batches import (
+                CompressionBatchEntry,
+                build_compression_batches,
+                compress_batch_with_router,
+            )
             from headroom.transforms.compression_units import (
                 CompressionUnit,
                 RoutedCompressionUnit,
@@ -1447,27 +1427,45 @@ class OpenAIHandlerMixin:
             )
             return payload, False, 0, [], {}, [], 0
 
-        def _slot_text(item: dict[str, Any]) -> tuple[str, tuple[str, int | None]] | None:
+        def _slot_texts(item: dict[str, Any]) -> list[tuple[str, tuple[str, int | None]]]:
             # Only tool-output items are eligible for in-place compression.
             # Message items (user/system/assistant) sit inside the request's
             # cacheable prefix; mutating them busts prefix caching on every
             # subsequent turn. Role-level guards in compression_units.py
             # remain as defense-in-depth.
             type_tag = item.get("type")
-            if type_tag in self.OPENAI_RESPONSES_OUTPUT_TYPES:
-                output_text = _responses_part_text(item.get("output"))
-                if output_text:
-                    return output_text, ("output", None)
-            return None
+            if type_tag not in self.OPENAI_RESPONSES_OUTPUT_TYPES:
+                return []
+            output = item.get("output")
+            if isinstance(output, str):
+                return [(output, ("output", None))]
+            if not isinstance(output, list):
+                return []
+            return [
+                (part["text"], ("output_part", index))
+                for index, part in enumerate(output)
+                if isinstance(part, dict)
+                and part.get("type") in {"input_text", "output_text"}
+                and isinstance(part.get("text"), str)
+            ]
 
         def _set_slot_text(
             item: dict[str, Any],
             slot: tuple[str, int | None],
             replacement: str,
-        ) -> None:
-            kind, _ = slot
+        ) -> bool:
+            kind, index = slot
             if kind == "output":
                 item["output"] = replacement
+                return True
+            if kind == "output_part" and isinstance(index, int):
+                output = item.get("output")
+                if isinstance(output, list) and 0 <= index < len(output):
+                    part = output[index]
+                    if isinstance(part, dict) and part.get("type") in {"input_text", "output_text"}:
+                        part["text"] = replacement
+                        return True
+            return False
 
         headroom_retrieve_call_ids: set[str] = set()
         # Map each Responses tool call to its name so that outputs belonging to
@@ -1599,25 +1597,25 @@ class OpenAIHandlerMixin:
                             }
                         )
                     continue
-                slot = _slot_text(item)
-                if slot is not None:
-                    text, slot_ref = slot
-                    candidates.append((idx, slot_ref, text))
-                    if debug_enabled:
-                        extraction_debug.append(
-                            {
-                                "index": idx,
-                                "eligible": True,
-                                "item_type": item_type,
-                                "role": item.get("role"),
-                                "slot": slot_ref,
-                                "text_chars": len(text),
-                                "text_bytes": len(text.encode("utf-8", errors="replace")),
-                                "text_json_shape": _json_shape(text),
-                                "item": item,
-                                "text": text,
-                            }
-                        )
+                slots = _slot_texts(item)
+                if slots:
+                    for text, slot_ref in slots:
+                        candidates.append((idx, slot_ref, text))
+                        if debug_enabled:
+                            extraction_debug.append(
+                                {
+                                    "index": idx,
+                                    "eligible": True,
+                                    "item_type": item_type,
+                                    "role": item.get("role"),
+                                    "slot": slot_ref,
+                                    "text_chars": len(text),
+                                    "text_bytes": len(text.encode("utf-8", errors="replace")),
+                                    "text_json_shape": _json_shape(text),
+                                    "item": item,
+                                    "text": text,
+                                }
+                            )
                 else:
                     if debug_enabled:
                         extraction_debug.append(
@@ -1689,24 +1687,6 @@ class OpenAIHandlerMixin:
 
         unit_build_started = time.perf_counter()
         unit_debug: list[dict[str, Any]] = []
-        # Aggregate-then-floor: the Responses payload splits each tool output
-        # into its own unit, so a per-item size floor would reject every unit
-        # in a session made of many small tool outputs (e.g. Codex), yielding
-        # 0% savings even when the combined compressible text is large. The
-        # Anthropic path compresses the whole message list as one batch and is
-        # not subject to a per-item floor. Match that: evaluate the floor once
-        # against the *aggregate* compressible bytes of the extracted group. If
-        # the group as a whole clears the threshold, disable the per-unit floor
-        # so small units still reach the router; if the whole group is below
-        # the threshold, keep the floor so trivially small payloads are skipped.
-        aggregate_compressible_bytes = sum(
-            len(text.encode("utf-8", errors="replace")) for _, _, text in candidates
-        )
-        effective_unit_min_bytes = (
-            0
-            if aggregate_compressible_bytes >= self.OPENAI_RESPONSES_ROUTER_MIN_BYTES
-            else self.OPENAI_RESPONSES_ROUTER_MIN_BYTES
-        )
         for item_idx, slot_ref, original_text in candidates:
             item = items[item_idx] if item_idx < len(items) else {}
             item_type = item.get("type", "unknown") if isinstance(item, dict) else "unknown"
@@ -1719,7 +1699,7 @@ class OpenAIHandlerMixin:
                 item_type=str(item_type),
                 cache_zone="live",
                 mutable=True,
-                min_bytes=effective_unit_min_bytes,
+                min_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
             )
             routed_units.append(RoutedCompressionUnit(unit=unit, slot=(item_idx, slot_ref)))
             if debug_enabled:
@@ -1773,9 +1753,25 @@ class OpenAIHandlerMixin:
 
         router_total_started = time.perf_counter()
         routed_results: list[tuple[object, Any, float] | None] = [None] * len(routed_units)
+        unit_index_by_slot = {routed.slot: unit_idx for unit_idx, routed in enumerate(routed_units)}
+        small_batch_entries: list[CompressionBatchEntry] = []
+        large_unit_indexes: list[int] = []
+        for unit_idx, routed in enumerate(routed_units):
+            text_bytes = len(routed.unit.text.encode("utf-8", errors="replace"))
+            if text_bytes < routed.unit.min_bytes:
+                small_batch_entries.append(
+                    CompressionBatchEntry(entry_id=f"u{unit_idx}", routed=routed)
+                )
+            else:
+                large_unit_indexes.append(unit_idx)
+        small_batches, small_batch_skipped = build_compression_batches(
+            small_batch_entries,
+            min_batch_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
+        )
         cache_misses: list[tuple[int, str, RoutedCompressionUnit]] = []
         cache_miss_followers: dict[str, list[int]] = {}
-        for unit_idx, routed in enumerate(routed_units):
+        for unit_idx in large_unit_indexes:
+            routed = routed_units[unit_idx]
             cache_key = _openai_responses_unit_cache_key(
                 routed.unit,
                 model=model,
@@ -1830,6 +1826,39 @@ class OpenAIHandlerMixin:
                     cache_key,
                     _compress_and_store(unit_idx, cache_key, routed)[2],
                 )
+
+        # Tail batches below the shared 512B floor keep the existing size-floor
+        # result without entering the router or the unit-result cache.
+        for entry in small_batch_skipped:
+            unit_idx = unit_index_by_slot[entry.routed.slot]
+            routed_results[unit_idx] = _compress_routed_unit(entry.routed)
+
+        def _compress_batch(batch: Any) -> tuple[list[tuple[object, Any]], float]:
+            batch_started = time.perf_counter()
+            results = compress_batch_with_router(
+                batch,
+                router=router,
+                tokenizer=tokenizer,
+                target_ratio=unit_target_ratio,
+            )
+            return results, (time.perf_counter() - batch_started) * 1000.0
+
+        def _record_batch_result(batch_result: tuple[list[tuple[object, Any]], float]) -> None:
+            batch_results, elapsed_ms = batch_result
+            elapsed_per_unit = elapsed_ms / len(batch_results) if batch_results else 0.0
+            for slot, result in batch_results:
+                routed_results[unit_index_by_slot[slot]] = (slot, result, elapsed_per_unit)
+
+        if len(small_batches) > 1 and parallelism > 1:
+            executor = _openai_responses_unit_executor()
+            for start in range(0, len(small_batches), parallelism):
+                batch_group = small_batches[start : start + parallelism]
+                futures = [executor.submit(_compress_batch, batch) for batch in batch_group]
+                for future in as_completed(futures):
+                    _record_batch_result(future.result())
+        else:
+            for batch in small_batches:
+                _record_batch_result(_compress_batch(batch))
 
         ordered_routed_results = [result for result in routed_results if result is not None]
 
@@ -1937,12 +1966,12 @@ class OpenAIHandlerMixin:
             target_item = updated_items[item_idx]
             if not isinstance(target_item, dict):
                 continue
-            _set_slot_text(target_item, slot_ref, result.compressed)
-            modified = True
-            tokens_saved_total += result.tokens_saved
-            for transform in result.transforms_applied:
-                if transform not in transforms:
-                    transforms.append(transform)
+            if _set_slot_text(target_item, slot_ref, result.compressed):
+                modified = True
+                tokens_saved_total += result.tokens_saved
+                for transform in result.transforms_applied:
+                    if transform not in transforms:
+                        transforms.append(transform)
         _add_timing("compression_unit_apply_results", apply_started)
 
         # Splice byte/data-lossless folds of excluded tool outputs (grep/log/
@@ -1952,8 +1981,8 @@ class OpenAIHandlerMixin:
             e_target = updated_items[e_idx] if e_idx < len(updated_items) else None
             if not isinstance(e_target, dict):
                 continue
-            _set_slot_text(e_target, e_slot, e_folded)
-            modified = True
+            if _set_slot_text(e_target, e_slot, e_folded):
+                modified = True
             e_before = tokenizer.count_text(e_orig)
             e_saved = e_before - tokenizer.count_text(e_folded)
             if e_saved > 0:
@@ -2094,6 +2123,48 @@ class OpenAIHandlerMixin:
                     tools_bytes_after=tools_after_bytes,
                     tools_bytes_saved=tools_before_bytes - tools_after_bytes,
                 )
+
+        # Layer 2: Tool description truncation (opt-in via
+        # HEADROOM_TOOL_DESC_MAX_CHARS).
+        try:
+            from headroom.proxy.tool_schema_compaction import (
+                compact_tool_descriptions,
+                tool_desc_max_chars,
+            )
+
+            _desc_max = tool_desc_max_chars()
+            if _desc_max > 0:
+                _desc_compact_started = time.perf_counter()
+                desc_payload, desc_modified, desc_before, desc_after = compact_tool_descriptions(
+                    working, _desc_max
+                )
+                _add_timing("compression_tool_desc_compaction", _desc_compact_started)
+                if desc_modified:
+                    working = desc_payload
+                    modified = True
+                    transforms.append("openai:responses:tool_desc_compaction")
+                    try:
+                        tokenizer = self.openai_provider.get_token_counter(model)
+                        tokens_saved += max(
+                            0,
+                            tokenizer.count_text(_json_debug_dumps(payload.get("tools")))
+                            - tokenizer.count_text(_json_debug_dumps(working.get("tools"))),
+                        )
+                    except Exception:
+                        pass
+                    if debug_enabled:
+                        _log_codex_compression_debug(
+                            "codex_tool_desc_compaction",
+                            request_id=request_id,
+                            pass_id=pass_id,
+                            model=model,
+                            modified=True,
+                            tools_bytes_before=desc_before,
+                            tools_bytes_after=desc_after,
+                            tools_bytes_saved=desc_before - desc_after,
+                        )
+        except Exception:
+            pass
 
         # Server-side Tool Search deferral (OpenAI Responses, gpt-5.4+): mark
         # non-core function/MCP tools defer_loading + inject {"type": "tool_search"}
@@ -2683,10 +2754,19 @@ class OpenAIHandlerMixin:
         optimized_messages = messages
         optimized_tokens = original_tokens
 
-        # Get prefix cache tracker for this session
-        openai_session_id = self.session_tracker_store.compute_session_id(request, model, messages)
-        openai_prefix_tracker = self.session_tracker_store.get_or_create(
-            openai_session_id, "openai"
+        # Get prefix cache tracker for this session, resolved by conversation
+        # lineage within the session id (#2085) so concurrent conversations
+        # sharing a fallback id (same model + system prompt) do not thrash one
+        # tracker's frozen-prefix state. Both the id and the lineage derive
+        # from the SAME original client bytes — pre image compression and
+        # pre_compress hook, both of which may rewrite history bytes
+        # differently turn-to-turn (a turn-dependent rewrite of the leading
+        # system text would rotate the id mid-conversation).
+        openai_session_id = self.session_tracker_store.compute_session_id(
+            request, model, original_client_messages
+        )
+        openai_prefix_tracker = self.session_tracker_store.resolve_tracker(
+            openai_session_id, "openai", messages=original_client_messages
         )
 
         # PR-A6 (P5-50, preps P0-6): session-sticky `OpenAI-Beta` merge.
@@ -3126,6 +3206,21 @@ class OpenAIHandlerMixin:
             if remembered_event.tools is not None:
                 tools = remembered_event.tools
 
+        tool_tokens_before_compaction = 0
+        tool_tokens_after_compaction = 0
+        if _decision.should_compress and not _bypass and tools is not None:
+            try:
+                compacted_tool_payload, tools_modified, _, _ = _compact_openai_responses_tools(
+                    {"tools": tools}
+                )
+                if tools_modified and compacted_tool_payload.get("tools") is not None:
+                    tool_tokens_before_compaction = tokenizer.count_text(_json_debug_dumps(tools))
+                    tools = compacted_tool_payload["tools"]
+                    if "openai:chat:tool_schema_compaction" not in transforms_applied:
+                        transforms_applied.append("openai:chat:tool_schema_compaction")
+            except Exception as e:
+                logger.debug(f"[{request_id}] tool schema compaction failed: {e}")
+
         body["messages"] = optimized_messages
         if tools or _original_tools is not None:
             body["tools"] = tools
@@ -3150,6 +3245,14 @@ class OpenAIHandlerMixin:
         if presend_event.headers is not None:
             headers = presend_event.headers
         optimized_tokens = tokenizer.count_messages(body["messages"])
+        if tool_tokens_before_compaction > 0:
+            try:
+                tool_tokens_after_compaction = tokenizer.count_text(_json_debug_dumps(tools))
+            except Exception:
+                tool_tokens_after_compaction = tool_tokens_before_compaction
+        if 0 < tool_tokens_after_compaction < tool_tokens_before_compaction:
+            original_tokens += tool_tokens_before_compaction
+            optimized_tokens += tool_tokens_after_compaction
         tokens_saved = original_tokens - optimized_tokens
 
         # Turn hooks (opt-in extensions): a registered hook may rewrite the
@@ -7634,6 +7737,52 @@ class OpenAIHandlerMixin:
                 },
             )
 
+    async def _maybe_compress_passthrough_responses(self, body: bytes) -> bytes:
+        """Compress an OpenAI Responses-shaped passthrough body, fail-open.
+
+        Reuses the native `/v1/responses` compression path so custom
+        wrapper-proxy routes get the same ContentRouter/Kompress treatment.
+        Any parse/compression failure returns the original body unchanged so a
+        catch-all request is never dropped by opting into compression.
+        """
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return body
+        if not isinstance(payload, dict) or "input" not in payload:
+            # Not a Responses payload (no `input` array) — leave it alone.
+            return body
+
+        model = str(payload.get("model") or "passthrough")
+        request_id = await self._next_request_id()
+        try:
+            (
+                compressed_payload,
+                modified,
+                *_rest,
+            ) = await self._compress_openai_responses_payload_in_executor(
+                payload,
+                model=model,
+                request_id=request_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — fail-open on any compressor error
+            logger.warning(
+                "[%s] passthrough Responses compression failed, forwarding verbatim: %s",
+                request_id,
+                exc,
+            )
+            return body
+        if not modified:
+            return body
+        try:
+            return json.dumps(
+                compressed_payload,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            return body
+
     async def handle_passthrough(
         self,
         request: Request,
@@ -7716,6 +7865,26 @@ class OpenAIHandlerMixin:
         )
         if body is not original_body:
             headers["content-length"] = str(len(body))
+
+        # Opt-in: compress requests that fall through here because their path
+        # doesn't match a built-in API route (custom wrapper-proxy paths like
+        # `/api/codex-proxy/<key>/v1/responses`). Off by default; only touches
+        # OpenAI Responses-shaped bodies (path ends in `/responses`) so we reuse
+        # the exact same ContentRouter/Kompress path the native handler runs.
+        _pt_config = getattr(self, "config", None)
+        if (
+            getattr(_pt_config, "compress_passthrough", False)
+            and getattr(_pt_config, "optimize", False)
+            and request.method == "POST"
+            and path.rstrip("/").endswith("/responses")
+            and body
+        ):
+            compressed = await self._maybe_compress_passthrough_responses(body)
+            if compressed != body:
+                body = compressed
+                # Body size changed — let httpx recompute Content-Length.
+                for _hk in [k for k in headers if k.lower() == "content-length"]:
+                    headers.pop(_hk, None)
 
         headers = await apply_copilot_api_auth(headers, url=url)
         # Cloudflare bot-management challenges our HTTP/2 fingerprint on

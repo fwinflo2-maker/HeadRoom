@@ -141,6 +141,7 @@ from headroom.proxy.helpers import (
     initialize_context_tool_session_baseline,
     is_anthropic_auth,  # noqa: F401
     jitter_delay_ms,
+    resolve_display_provider,
     retry_after_ms,
 )
 from headroom.proxy.loop_callback_failure_policy import is_known_websocket_callback_failure
@@ -148,6 +149,7 @@ from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
 # Data models (extracted to headroom/proxy/models.py for maintainability)
+from headroom.proxy.model_router import ModelRouter, ModelRouterConfig
 from headroom.proxy.models import CacheEntry, ProxyConfig, RateLimitState, RequestLog  # noqa: F401
 from headroom.proxy.modes import (
     PROXY_MODE_CACHE,
@@ -289,6 +291,23 @@ def _classify_agent_from_log(entry: dict[str, Any]) -> tuple[str, str, str]:
         return key, _agent_label(key), "provider"
 
     return "unknown", _agent_label("unknown"), "unknown"
+
+
+def _remap_provider_counts(counts: dict[str, int], config: ProxyConfig) -> dict[str, int]:
+    """Relabel ``openai`` upstream counts with the configured display provider.
+
+    Display only — the stored metrics key stays ``openai`` (issue #1533).
+    Collisions (none today) are summed defensively.
+    """
+    out: dict[str, int] = {}
+    for provider, count in counts.items():
+        display = resolve_display_provider(
+            provider,
+            openai_api_url=config.openai_api_url,
+            provider_name=config.provider_name,
+        )
+        out[display] = out.get(display, 0) + int(count)
+    return out
 
 
 def _build_agent_usage_summary(
@@ -689,6 +708,10 @@ class HeadroomProxy(
             else None
         )
         self.metrics = PrometheusMetrics(cost_tracker=self.cost_tracker, stateless=config.stateless)
+
+        # Cost-aware model routing (issue #1706). Disabled unless configured, so
+        # the default request path is unchanged.
+        self.model_router = ModelRouter(config.model_router)
 
         # Initialize transforms based on routing mode.
         #
@@ -3231,7 +3254,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 {
                     "request_id": log.get("request_id"),
                     "timestamp": log.get("timestamp"),
-                    "provider": log.get("provider"),
+                    "provider": resolve_display_provider(
+                        log.get("provider"),
+                        openai_api_url=proxy.config.openai_api_url,
+                        provider_name=proxy.config.provider_name,
+                    ),
                     "model": log.get("model"),
                     "input_tokens_original": _recent_request_optional_number(
                         log, "input_tokens_original"
@@ -3461,7 +3488,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 tool_schema_requests += 1
         agent_usage = _build_agent_usage_summary(
             recent_request_logs,
-            requests_by_provider=dict(m.requests_by_provider),
+            requests_by_provider=_remap_provider_counts(dict(m.requests_by_provider), proxy.config),
             requests_by_model=dict(m.requests_by_model),
             global_before_tokens=proxy_total_before_compression,
             global_after_tokens=m.tokens_input_total,
@@ -3580,7 +3607,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "cached": m.requests_cached,
                 "rate_limited": m.requests_rate_limited,
                 "failed": m.requests_failed,
-                "by_provider": dict(m.requests_by_provider),
+                "by_provider": _remap_provider_counts(dict(m.requests_by_provider), proxy.config),
                 "by_model": dict(m.requests_by_model),
                 "by_stack": dict(m.requests_by_stack),
             },
@@ -4016,7 +4043,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     {
                         "request_id": log.get("request_id"),
                         "timestamp": log.get("timestamp"),
-                        "provider": log.get("provider"),
+                        "provider": resolve_display_provider(
+                            log.get("provider"),
+                            openai_api_url=proxy.config.openai_api_url,
+                            provider_name=proxy.config.provider_name,
+                        ),
                         "model": log.get("model"),
                         "input_tokens_original": log.get("input_tokens_original"),
                         "input_tokens_optimized": log.get("input_tokens_optimized"),
@@ -4642,6 +4673,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         disable_kompress_openai=_get_env_optional_bool("HEADROOM_DISABLE_KOMPRESS_OPENAI"),
         force_kompress_all=_get_env_bool("HEADROOM_FORCE_KOMPRESS_ALL", False),
         lossless=_get_env_bool("HEADROOM_LOSSLESS", False),
+        compress_passthrough=_get_env_bool("HEADROOM_COMPRESS_PASSTHROUGH", False),
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", 500),
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", 100),
         keepalive_expiry=_get_env_float("HEADROOM_KEEPALIVE_EXPIRY", 90.0),
@@ -4662,6 +4694,10 @@ def _proxy_config_from_env() -> ProxyConfig:
         read_maturation_max_hold_turns=_get_env_int("HEADROOM_READ_MATURATION_MAX_HOLD_TURNS", 25),
         read_maturation_min_size_bytes=_get_env_int(
             "HEADROOM_READ_MATURATION_MIN_SIZE_BYTES", 2048
+        ),
+        model_router=ModelRouterConfig.from_env(
+            os.environ.get("HEADROOM_MODEL_ROUTER_ENABLED"),
+            os.environ.get("HEADROOM_MODEL_ROUTES"),
         ),
     )
 
@@ -5192,6 +5228,18 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--compress-passthrough",
+        action="store_true",
+        help=(
+            "Also compress requests that fall through to the catch-all "
+            "passthrough handler (custom proxy paths not matched by a built-in "
+            "API route, e.g. `/api/codex-proxy/<key>/v1/responses` behind "
+            "another proxy). Applies to OpenAI Responses-shaped bodies (paths "
+            "ending in `/responses`). Off by default; also settable via "
+            "HEADROOM_COMPRESS_PASSTHROUGH=1."
+        ),
+    )
+    parser.add_argument(
         "--exclude-tools",
         default=None,
         help="Comma-separated tool names whose output is never compressed, "
@@ -5273,6 +5321,9 @@ if __name__ == "__main__":
         "HEADROOM_FORCE_KOMPRESS_ALL", False
     )
     lossless = getattr(args, "lossless", False) or _get_env_bool("HEADROOM_LOSSLESS", False)
+    compress_passthrough = args.compress_passthrough or _get_env_bool(
+        "HEADROOM_COMPRESS_PASSTHROUGH", False
+    )
 
     # Set OpenRouter API key from CLI if provided
     if hasattr(args, "openrouter_api_key") and args.openrouter_api_key:
@@ -5329,6 +5380,7 @@ if __name__ == "__main__":
         disable_kompress_openai=disable_kompress_openai,
         force_kompress_all=force_kompress_all,
         lossless=lossless,
+        compress_passthrough=compress_passthrough,
         # Connection pool settings
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", args.max_connections),
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", args.max_keepalive),

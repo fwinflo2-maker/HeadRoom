@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
+from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
@@ -34,6 +35,7 @@ from headroom.proxy.helpers import extract_tags
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
+from headroom.proxy.model_router import estimate_input_tokens
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
@@ -513,6 +515,37 @@ class AnthropicHandlerMixin:
             "content": copy.deepcopy(resp_json.get("content", "")),
         }
 
+    def _maybe_route_model(
+        self,
+        model: str,
+        messages: object,
+        body: dict[str, Any],
+        body_mutation_tracker: Any,
+        bypass: bool,
+    ) -> str:
+        """Apply cost-aware model routing (#1706), returning the model to forward.
+
+        Fails closed to disabled when no ``model_router`` is present: alternate
+        mixin hosts and test doubles that do not run ``HeadroomProxy.__init__``
+        never set the attribute, and reading it unconditionally would crash them
+        even when routing is off. Also skipped under bypass/passthrough so a
+        byte-faithful request is never model-rewritten.
+        """
+        router = getattr(self, "model_router", None)
+        if router is None or not router.enabled or bypass:
+            return model
+        decision = router.select(
+            model=model,
+            input_tokens=estimate_input_tokens(messages, body.get("tools"), body.get("system")),
+            has_tools=bool(body.get("tools")),
+        )
+        logger.info("model routing decision: %s", decision.reason)
+        if not decision.changed:
+            return model
+        body["model"] = decision.routed_model
+        body_mutation_tracker.mark_mutated("model_router")
+        return decision.routed_model
+
     async def handle_anthropic_messages(
         self,
         request: Request,
@@ -768,6 +801,15 @@ class AnthropicHandlerMixin:
             preserve_tool_order = _bypass or not self.config.optimize
             if _bypass:
                 logger.info(f"[{request_id}] Bypass: skipping compression (header)")
+
+            # Cost-aware model routing (#1706). Opt-in and disabled by default;
+            # fail-closed and bypass handling live in the helper. A model override
+            # comes from a provider URL (for example Vertex rawPredict), where
+            # rewriting body["model"] would not change the upstream model.
+            if model_override is None:
+                model = self._maybe_route_model(
+                    model, messages, body, body_mutation_tracker, _bypass
+                )
 
             # NOTE: Upstream temporarily disabled broad image compression due to
             # token-counting inaccuracies. We only compress the latest non-frozen
@@ -1069,16 +1111,32 @@ class AnthropicHandlerMixin:
             # session id (and its sticky CCR/memory tools, beta headers, and
             # frozen-prefix state). This synthetic message only derives the id; it
             # is never forwarded.
+            # Both the session id and the conversation lineage derive from the
+            # SAME original client bytes (pre security-scan/hook mutation,
+            # which may rewrite messages differently turn-to-turn — a
+            # turn-dependent rewrite of the leading system text would rotate
+            # the id mid-conversation, orphaning all session-sticky state).
+            # The synthetic system message folds the top-level system prompt
+            # into both derivations, so conversations sharing an explicit
+            # header id but differing in system prompt keep separate lineages.
             system_prompt = body.get("system")
             session_messages = (
-                [{"role": "system", "content": system_prompt}, *messages]
+                [{"role": "system", "content": system_prompt}, *original_client_messages]
                 if system_prompt is not None
-                else messages
+                else original_client_messages
             )
             session_id = self.session_tracker_store.compute_session_id(
                 request, model, session_messages
             )
-            prefix_tracker = self.session_tracker_store.get_or_create(session_id, "anthropic")
+            # Resolve the tracker by conversation lineage within the session id
+            # (#2085): one model + system prompt spans a Claude Code session and
+            # all its parallel subagents, so concurrent conversations share this
+            # fallback id — on one shared tracker their interleaved histories
+            # thrash the frozen-prefix state and the provider prompt cache is
+            # re-written on nearly every call.
+            prefix_tracker = self.session_tracker_store.resolve_tracker(
+                session_id, "anthropic", messages=session_messages
+            )
             frozen_message_count = prefix_tracker.get_frozen_message_count()
             # Idle gap since the previous turn's response, snapshotted at fetch
             # (before get_or_create bumped the access clock). Forwarded to the
@@ -1918,6 +1976,16 @@ class AnthropicHandlerMixin:
                             store = get_compression_store()
                             entry = store.get_metadata(hash_key)
                             if entry:
+                                if looks_like_claude_code_compact_summary(
+                                    entry.get("query_context"),
+                                    entry.get("compressed_content"),
+                                    entry.get("original_content_preview"),
+                                ):
+                                    logger.info(
+                                        f"[{request_id}] CCR: skipping proactive "
+                                        f"tracking for Claude Code compact summary {hash_key}"
+                                    )
+                                    continue
                                 self.ccr_context_tracker.track_compression(
                                     hash_key=hash_key,
                                     turn_number=self._turn_counter,
@@ -2234,6 +2302,100 @@ class AnthropicHandlerMixin:
                     tools = forwarded_tools
                 if tools != _original_tools:
                     body["tools"] = tools
+
+            # Tool schema compaction: strip annotation keys ($schema, title,
+            # examples, etc.) and normalise description whitespace.  Runs
+            # after tools are finalised (sorting, CCR injection) but before
+            # the PRE_SEND pipeline event so extensions see the compacted
+            # schema.  Mirrors the same pass that the OpenAI handler applies.
+            _tools_compaction_started = time.time()
+            try:
+                from headroom.proxy.tool_schema_compaction import compact_tools
+
+                body, _tools_modified, _tools_before_bytes, _tools_after_bytes = compact_tools(body)
+                if _tools_modified:
+                    tools = body["tools"]
+                    transforms_applied.append("anthropic:tool_schema_compaction")
+                    _tools_compaction_ms = (time.time() - _tools_compaction_started) * 1000
+                    logger.debug(
+                        "[%s] tool schema compaction: %d -> %d bytes (%.0f%% saved) in %.1fms",
+                        request_id,
+                        _tools_before_bytes,
+                        _tools_after_bytes,
+                        (1 - _tools_after_bytes / max(_tools_before_bytes, 1)) * 100,
+                        _tools_compaction_ms,
+                    )
+            except Exception as _tools_compaction_exc:
+                _tools_modified = False
+                logger.warning(
+                    "[%s] tool schema compaction FAILED: %s", request_id, _tools_compaction_exc
+                )
+
+            # Layer 2: Tool description truncation (opt-in via
+            # HEADROOM_TOOL_DESC_MAX_CHARS).  Preserves first sentence
+            # of each description so tool selection still works.
+            try:
+                from headroom.proxy.tool_schema_compaction import (
+                    compact_tool_descriptions,
+                    tool_desc_max_chars,
+                )
+
+                _desc_max = tool_desc_max_chars()
+                if _desc_max > 0:
+                    body, _desc_modified, _desc_before, _desc_after = compact_tool_descriptions(
+                        body, _desc_max
+                    )
+                    if _desc_modified:
+                        tools = body["tools"]
+                        transforms_applied.append("anthropic:tool_desc_compaction")
+                        logger.debug(
+                            "[%s] tool description compaction: %d -> %d bytes (%.0f%% saved, max_chars=%d)",
+                            request_id,
+                            _desc_before,
+                            _desc_after,
+                            (1 - _desc_after / max(_desc_before, 1)) * 100,
+                            _desc_max,
+                        )
+            except Exception as _desc_compaction_exc:
+                _desc_modified = False
+                logger.warning(
+                    "[%s] tool desc compaction FAILED: %s", request_id, _desc_compaction_exc
+                )
+
+            # Layer 3: System prompt compaction (opt-in via
+            # HEADROOM_SYSTEM_COMPACT).  Uses CCR to compress large
+            # system content blocks (CLAUDE.md, rules, hooks, etc.)
+            # while preserving cache_control and short instruction blocks.
+            try:
+                from headroom.proxy.system_compaction import (
+                    compact_system_prompt,
+                    system_compact_enabled,
+                )
+                from headroom.transforms.compression_units import find_content_router
+
+                if system_compact_enabled():
+                    _sys_router = find_content_router(self.anthropic_pipeline)
+                    if _sys_router is not None:
+                        body, _sys_modified, _sys_before, _sys_after = compact_system_prompt(
+                            body,
+                            router=_sys_router,
+                            model=model,
+                            request_id=request_id,
+                        )
+                    if _sys_modified:
+                        transforms_applied.append("anthropic:system_prompt_compaction")
+                        logger.debug(
+                            "[%s] system prompt compaction: %d -> %d bytes (%.0f%% saved)",
+                            request_id,
+                            _sys_before,
+                            _sys_after,
+                            (1 - _sys_after / max(_sys_before, 1)) * 100,
+                        )
+            except Exception as _sys_compaction_exc:
+                _sys_modified = False
+                logger.warning(
+                    "[%s] system prompt compaction FAILED: %s", request_id, _sys_compaction_exc
+                )
 
             presend_event = self.pipeline_extensions.emit(
                 PipelineStage.PRE_SEND,

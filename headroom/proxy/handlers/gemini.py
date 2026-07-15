@@ -616,9 +616,22 @@ class GeminiHandlerMixin:
         def rebuild_tools(function_declarations: list[dict]) -> list[dict]:
             rebuilt_tools = []
             replaced = False
+            declaration_tools = [
+                tool for tool in body.get("tools") or [] if "functionDeclarations" in tool
+            ]
+            later_names = {
+                declaration.get("name")
+                for tool in declaration_tools[1:]
+                for declaration in tool["functionDeclarations"]
+            }
+            first_declarations = [
+                declaration
+                for declaration in function_declarations
+                if declaration.get("name") not in later_names
+            ]
             for tool in body.get("tools") or []:
                 if "functionDeclarations" in tool and not replaced:
-                    rebuilt_tools.append({**tool, "functionDeclarations": function_declarations})
+                    rebuilt_tools.append({**tool, "functionDeclarations": first_declarations})
                     replaced = True
                 else:
                     rebuilt_tools.append(tool)
@@ -629,10 +642,14 @@ class GeminiHandlerMixin:
         if self.config.ccr_inject_tool and tokens_saved > 0:
             from headroom.ccr import CCRToolInjector
 
+            seen_names = set()
+            native_function_declarations = []
             for tool in native_tools or []:
-                if "functionDeclarations" in tool:
-                    native_function_declarations = list(tool["functionDeclarations"])
-                    break
+                for declaration in tool.get("functionDeclarations", []):
+                    name = declaration.get("name")
+                    if name not in seen_names:
+                        native_function_declarations.append(declaration)
+                        seen_names.add(name)
             injector = CCRToolInjector(
                 provider="google",
                 inject_tool=True,
@@ -785,7 +802,16 @@ class GeminiHandlerMixin:
                                     "headers": dict(continuation.headers),
                                 }
                             }
-                        return continuation.json()
+                        try:
+                            return continuation.json()
+                        except (json.JSONDecodeError, ValueError, TypeError):
+                            return {
+                                "_headroom_continuation_error": {
+                                    "status_code": continuation.status_code,
+                                    "content": continuation.content,
+                                    "headers": dict(continuation.headers),
+                                }
+                            }
 
                     final_resp_json = await self.ccr_response_handler.handle_response(
                         resp_json,

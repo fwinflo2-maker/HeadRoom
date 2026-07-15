@@ -319,6 +319,36 @@ async def test_gemini_native_ccr_tools(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_gemini_native_ccr_does_not_duplicate_existing_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_native_gemini_compression(monkeypatch)
+    tools = [
+        {"functionDeclarations": [{"name": "client_tool"}]},
+        {"functionDeclarations": [{"name": "headroom_retrieve"}]},
+    ]
+    handler = NativeGeminiHandler(
+        [FakeResponse(json_data={"candidates": [{"content": {"parts": [{"text": "answer"}]}}]})]
+    )
+
+    await handler.handle_gemini_generate_content(
+        FakeRequest(
+            json.dumps(native_gemini_request(tools)),
+            headers={"content-type": "application/json"},
+            path="/v1beta/models/gemini-2.5-flash:generateContent",
+        ),
+        "gemini-2.5-flash",
+    )
+
+    names = [
+        declaration["name"]
+        for tool in handler.sent_bodies[0]["tools"]
+        for declaration in tool.get("functionDeclarations", [])
+    ]
+    assert names.count("headroom_retrieve") == 1
+
+
+@pytest.mark.asyncio
 async def test_gemini_native_ccr_mixed(monkeypatch: pytest.MonkeyPatch) -> None:
     install_native_gemini_compression(monkeypatch)
     response_json = {
@@ -407,10 +437,32 @@ async def test_gemini_native_ccr_continuation_error_preserves_upstream_response(
 
 
 @pytest.mark.asyncio
+async def test_gemini_native_ccr_continuation_non_json_preserves_upstream_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_native_gemini_compression(monkeypatch)
+    handler = NativeGeminiHandler(
+        [native_ccr_response(), FakeResponse(status_code=200, content=b"upstream")]
+    )
+
+    response = await handler.handle_gemini_generate_content(
+        FakeRequest(
+            json.dumps(native_gemini_request()),
+            headers={"content-type": "application/json"},
+            path="/v1beta/models/gemini-2.5-flash:generateContent",
+        ),
+        "gemini-2.5-flash",
+    )
+
+    assert response.status_code == 200
+    assert response.body == b"upstream"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "original_content",
-    [[{"type": "code", "text": "print('x')"}], "plain text", {"key": "value"}],
-    ids=["code-aware-array", "kompress-text", "mcp-object"],
+    [[{"type": "code", "text": "print('x')"}], "plain text", {"key": "value"}, 42],
+    ids=["code-aware-array", "kompress-text", "mcp-object", "mcp-scalar"],
 )
 async def test_gemini_native_ccr_uses_real_retrieval_result_shape(
     monkeypatch: pytest.MonkeyPatch, original_content

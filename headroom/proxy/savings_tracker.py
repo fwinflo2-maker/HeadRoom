@@ -18,7 +18,7 @@ from csv import DictWriter
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from headroom import paths as _paths
 from headroom.proxy import project_name_policy
@@ -605,6 +605,9 @@ class SavingsTracker:
         self._needs_schema_save = False
         self._state = self._load_state()
         self._persistent_metrics = PersistentMetricsState(self._state.pop("lifetime_metrics", None))
+        self._display_metrics = PersistentMetricsState(
+            self._state.pop("display_session_metrics", None)
+        )
 
     @property
     def storage_path(self) -> str:
@@ -861,6 +864,8 @@ class SavingsTracker:
     def record_lifetime_request(self, *, persist: bool = True, **metrics: Any) -> None:
         """Record one completed request in the durable Lifetime aggregate."""
 
+        metrics = dict(metrics)
+        metrics.pop("timestamp", None)
         model = _normalize_model(metrics.get("model"))
         input_tokens = _coerce_int(metrics.get("input_tokens"))
         cache_read_tokens = _coerce_int(metrics.get("cache_read_tokens"))
@@ -884,7 +889,12 @@ class SavingsTracker:
             "cache_savings_usd", _estimate_cache_savings_usd(model, cache_read_tokens)
         )
         with self._lock:
+            display_raw = self._display_metrics.to_dict()
+            last_activity = _parse_timestamp(display_raw.get("last_activity_at"))
+            if last_activity is not None and self._is_display_session_expired(last_activity):
+                self._display_metrics = PersistentMetricsState()
             self._persistent_metrics.record_request(**metrics)
+            self._display_metrics.record_request(**metrics)
             if persist:
                 self._maybe_save_locked()
 
@@ -893,6 +903,7 @@ class SavingsTracker:
 
         with self._lock:
             self._persistent_metrics.record_stack(stack)
+            self._display_metrics.record_stack(stack)
 
     def record_lifetime_failed(
         self, *, provider: str | None = None, model: str | None = None
@@ -901,6 +912,7 @@ class SavingsTracker:
 
         with self._lock:
             self._persistent_metrics.record_failed(provider=provider, model=model)
+            self._display_metrics.record_failed(provider=provider, model=model)
             self._maybe_save_locked()
 
     def record_lifetime_rate_limited(
@@ -910,16 +922,43 @@ class SavingsTracker:
 
         with self._lock:
             self._persistent_metrics.record_rate_limited(provider=provider, model=model)
+            self._display_metrics.record_rate_limited(provider=provider, model=model)
             self._maybe_save_locked()
 
     def record_lifetime_cache_bust(self, *, tokens_lost: int) -> None:
         with self._lock:
             self._persistent_metrics.record_cache_bust(tokens_lost=tokens_lost)
+            self._display_metrics.record_cache_bust(tokens_lost=tokens_lost)
             self._maybe_save_locked()
 
     def record_lifetime_cache_miss(self, *, provider: str | None, reason: str | None) -> None:
         with self._lock:
             self._persistent_metrics.record_cache_miss(provider=provider, reason=reason)
+            self._display_metrics.record_cache_miss(provider=provider, reason=reason)
+            self._maybe_save_locked()
+
+    def record_compression(self, **metrics: Any) -> None:
+        metrics = dict(metrics)
+        metrics.pop("timestamp", None)
+        with self._lock:
+            self._persistent_metrics.record_compression(**metrics)
+            self._display_metrics.record_compression(**metrics)
+            self._maybe_save_locked()
+
+    def record_codex_ws_unit(self, **metrics: Any) -> None:
+        metrics = dict(metrics)
+        metrics.pop("timestamp", None)
+        with self._lock:
+            self._persistent_metrics.record_codex_ws_unit(**metrics)
+            self._display_metrics.record_codex_ws_unit(**metrics)
+            self._maybe_save_locked()
+
+    def record_codex_ws_frame(self, **metrics: Any) -> None:
+        metrics = dict(metrics)
+        metrics.pop("timestamp", None)
+        with self._lock:
+            self._persistent_metrics.record_codex_ws_frame(**metrics)
+            self._display_metrics.record_codex_ws_frame(**metrics)
             self._maybe_save_locked()
 
     def _record_project_locked(
@@ -1049,6 +1088,28 @@ class SavingsTracker:
             response["projects"] = self._projects_snapshot_locked()
             return response
 
+    def display_session_response(self) -> dict[str, Any]:
+        """Return the current durable display-session aggregate."""
+
+        with self._lock:
+            last_activity = _parse_timestamp(
+                self._display_metrics.to_dict().get("last_activity_at")
+            )
+            if last_activity is not None and self._is_display_session_expired(last_activity):
+                self._display_metrics = PersistentMetricsState()
+            return self._display_metrics.snapshot(
+                persistence={
+                    "enabled": not self._stateless,
+                    "healthy": self._persistence_healthy,
+                    "error": (
+                        "Display-session metrics unavailable in stateless mode"
+                        if self._stateless
+                        else self._persistence_error
+                    ),
+                    "pending_records": 0 if self._stateless else self._since_save,
+                }
+            )
+
     def stats_preview(self, recent_points: int = 20) -> dict[str, Any]:
         """Return a compact preview for `/stats`."""
         snapshot = self.snapshot()
@@ -1064,6 +1125,15 @@ class SavingsTracker:
             "projects": snapshot["projects"],
             "projects_limit": DEFAULT_MAX_PROJECTS,
             "by_model": snapshot["by_model"],
+            "lifetime_metrics": self._persistent_metrics.snapshot(
+                persistence={
+                    "enabled": not self._stateless,
+                    "healthy": self._persistence_healthy,
+                    "error": self._persistence_error,
+                    "pending_records": 0 if self._stateless else self._since_save,
+                }
+            ),
+            "display_session_metrics": self.display_session_response(),
         }
 
     def history_response(self, history_mode: str = "compact") -> dict[str, Any]:
@@ -1182,6 +1252,8 @@ class SavingsTracker:
         }
 
     def _load_state(self) -> dict[str, Any]:
+        if self._stateless:
+            return self._default_state()
         if not self._path.exists():
             return self._default_state()
 
@@ -1286,6 +1358,27 @@ class SavingsTracker:
         else:
             state["lifetime_metrics"] = self._migrate_v4_lifetime_metrics(state)
             self._needs_schema_save = True
+        display_metrics = raw.get("display_session_metrics")
+        if not isinstance(display_metrics, dict):
+            display = cast(dict[str, Any], state["display_session"])
+            display_metrics = {
+                "started_at": display.get("started_at"),
+                "last_activity_at": display.get("last_activity_at"),
+                "tokens": {
+                    "input": display.get("total_input_tokens", 0),
+                    "attempted_input": display.get("total_input_tokens", 0)
+                    + display.get("tokens_saved", 0),
+                    "saved": display.get("tokens_saved", 0),
+                },
+                "cost": {
+                    "compression_savings_usd": display.get("compression_savings_usd", 0),
+                    "cache_savings_usd": display.get("cache_savings_usd", 0),
+                },
+                "requests": {"total": display.get("requests", 0)},
+                "prefix_cache": {"cache_read_tokens": display.get("cache_read_tokens", 0)},
+            }
+            self._needs_schema_save = True
+        state["display_session_metrics"] = display_metrics
 
         if normalized_history:
             reference_time = _parse_timestamp(normalized_history[-1]["timestamp"]) or _utc_now()
@@ -1440,14 +1533,20 @@ class SavingsTracker:
             saved_at = _to_utc_iso(_utc_now())
             lifetime_metrics = self._persistent_metrics.to_dict()
             lifetime_metrics["persistence"]["last_saved_at"] = saved_at
+            display_session = {
+                key: value
+                for key, value in self._state["display_session"].items()
+                if key != "aggregates"
+            }
             payload = {
                 "schema_version": SCHEMA_VERSION,
                 "lifetime": self._state["lifetime"],
-                "display_session": self._state["display_session"],
+                "display_session": display_session,
                 "history": self._state["history"],
                 "projects": self._state.get("projects", {}),
                 "by_model": self._state.get("by_model", {}),
                 "lifetime_metrics": lifetime_metrics,
+                "display_session_metrics": self._display_metrics.to_dict(),
             }
             json_data = json.dumps(payload, indent=2)
 

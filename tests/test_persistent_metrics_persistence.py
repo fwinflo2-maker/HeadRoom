@@ -65,6 +65,8 @@ def test_savings_tracker_migrates_v4_lifetime_to_v5_metrics_and_preserves_legacy
     assert saved["schema_version"] == 5
     assert saved["lifetime"] == legacy_state["lifetime"]
     assert saved["display_session"]["requests"] == 2
+    assert "aggregates" not in saved["lifetime"]
+    assert "aggregates" not in saved["display_session"]
     assert saved["projects"]["keep-me"]["requests"] == 1
     assert saved["lifetime_metrics"]["models"]["other"]["input_tokens"] == 80
     assert isinstance(saved["lifetime_metrics"]["persistence"]["last_saved_at"], str)

@@ -14,6 +14,7 @@ MAX_STACK_VALUES = 64
 MAX_TRACKED_MODELS = 200
 MAX_EXPOSED_MODELS = 100
 MAX_LABEL_LENGTH = 128
+MAX_SCOPE_LABELS = 64
 
 KNOWN_MISS_REASONS = frozenset({"ttl_expiry", "prefix_change", "unknown"})
 KNOWN_WASTE_SIGNALS = frozenset(
@@ -100,6 +101,8 @@ def _empty_state() -> dict[str, Any]:
             "cache_write_5m_tokens": 0,
             "cache_write_1h_tokens": 0,
             "uncached_input_tokens": 0,
+            "cache_write_5m_requests": 0,
+            "cache_write_1h_requests": 0,
             "bust_count": 0,
             "bust_tokens": 0,
             "misses_by_reason": {},
@@ -108,6 +111,37 @@ def _empty_state() -> dict[str, Any]:
         "cost": {"input_usd": 0.0, "compression_savings_usd": 0.0, "cache_savings_usd": 0.0},
         "waste_signals": {},
         "models": {"tracked": {}, "other": _model_entry()},
+        "compression": {
+            "compressions_by_strategy": {},
+            "tokens_saved_by_strategy": {},
+        },
+        "codex_ws": {
+            "units_total": 0,
+            "units_modified_total": 0,
+            "units_to_kompress_total": 0,
+            "units_kompress_attempted_total": 0,
+            "units_by_strategy": {},
+            "units_by_category": {},
+            "units_by_content_type": {},
+            "units_by_text_shape": {},
+            "unit_elapsed_ms_sum": 0.0,
+            "unit_elapsed_ms_max": 0.0,
+            "unit_bytes_sum": 0,
+            "unit_tokens_before_sum": 0,
+            "unit_tokens_after_sum": 0,
+            "unit_tokens_saved_sum": 0,
+            "frames_attempted_total": 0,
+            "frames_compressed_total": 0,
+            "frames_failed_total": 0,
+            "frames_to_kompress_total": 0,
+            "frames_kompress_attempted_total": 0,
+            "frame_elapsed_ms_sum": 0.0,
+            "frame_elapsed_ms_max": 0.0,
+            "frame_bytes_before_sum": 0,
+            "frame_bytes_after_sum": 0,
+            "frame_attempted_tokens_sum": 0,
+            "frame_tokens_saved_sum": 0,
+        },
         "persistence": {"last_saved_at": None},
     }
 
@@ -160,6 +194,8 @@ class PersistentMetricsState:
             "cache_write_5m_tokens",
             "cache_write_1h_tokens",
             "uncached_input_tokens",
+            "cache_write_5m_requests",
+            "cache_write_1h_requests",
             "bust_count",
             "bust_tokens",
         ):
@@ -170,6 +206,50 @@ class PersistentMetricsState:
         result["prefix_cache"]["misses_by_reason"] = self._normalize_enum_map(
             raw_cache.get("misses_by_reason"), KNOWN_MISS_REASONS
         )
+
+        raw_compression = _dict_or_empty(source.get("compression"))
+        for key in ("compressions_by_strategy", "tokens_saved_by_strategy"):
+            result["compression"][key] = self._normalize_count_map(
+                raw_compression.get(key), MAX_SCOPE_LABELS
+            )
+        raw_ws = _dict_or_empty(source.get("codex_ws"))
+        int_fields = [
+            "units_total",
+            "units_modified_total",
+            "units_to_kompress_total",
+            "units_kompress_attempted_total",
+            "unit_bytes_sum",
+            "unit_tokens_before_sum",
+            "unit_tokens_after_sum",
+            "unit_tokens_saved_sum",
+            "frames_attempted_total",
+            "frames_compressed_total",
+            "frames_failed_total",
+            "frames_to_kompress_total",
+            "frames_kompress_attempted_total",
+            "frame_bytes_before_sum",
+            "frame_bytes_after_sum",
+            "frame_attempted_tokens_sum",
+            "frame_tokens_saved_sum",
+        ]
+        float_fields = [
+            "unit_elapsed_ms_sum",
+            "unit_elapsed_ms_max",
+            "frame_elapsed_ms_sum",
+            "frame_elapsed_ms_max",
+        ]
+        map_fields = [
+            "units_by_strategy",
+            "units_by_category",
+            "units_by_content_type",
+            "units_by_text_shape",
+        ]
+        for key in int_fields:
+            result["codex_ws"][key] = _coerce_int(raw_ws.get(key))
+        for key in float_fields:
+            result["codex_ws"][key] = round(_coerce_float(raw_ws.get(key)), 6)
+        for key in map_fields:
+            result["codex_ws"][key] = self._normalize_count_map(raw_ws.get(key), MAX_SCOPE_LABELS)
 
         raw_cost = _dict_or_empty(source.get("cost"))
         for key in ("input_usd", "compression_savings_usd", "cache_savings_usd"):
@@ -303,8 +383,8 @@ class PersistentMetricsState:
     def record_request(
         self,
         *,
-        provider: str | None,
-        stack: str | None,
+        provider: str | None = None,
+        stack: str | None = None,
         model: str | None,
         input_tokens: Any = 0,
         output_tokens: Any = 0,
@@ -316,6 +396,8 @@ class PersistentMetricsState:
         cache_write_tokens: Any = 0,
         cache_write_5m_tokens: Any = 0,
         cache_write_1h_tokens: Any = 0,
+        cache_write_5m_requests: Any = 0,
+        cache_write_1h_requests: Any = 0,
         uncached_input_tokens: Any = 0,
         input_usd: Any = 0.0,
         compression_savings_usd: Any = 0.0,
@@ -346,14 +428,19 @@ class PersistentMetricsState:
         tokens["saved"] += saved_delta
 
         cache = self._state["prefix_cache"]
-        cache["requests"] += 1
-        cache["hit_requests"] += int(bool(cached))
-        cache["cache_read_tokens"] += _coerce_int(cache_read_tokens)
-        cache["cache_write_tokens"] += _coerce_int(cache_write_tokens)
-        cache["cache_write_5m_tokens"] += _coerce_int(cache_write_5m_tokens)
-        cache["cache_write_1h_tokens"] += _coerce_int(cache_write_1h_tokens)
-        cache["uncached_input_tokens"] += _coerce_int(uncached_input_tokens)
-        self._increment_count(cache["by_provider"], provider_label, MAX_PROVIDER_VALUES)
+        cache_read_delta = _coerce_int(cache_read_tokens)
+        cache_write_delta = _coerce_int(cache_write_tokens)
+        if cache_read_delta > 0 or cache_write_delta > 0:
+            cache["requests"] += 1
+            cache["hit_requests"] += int(cache_read_delta > 0)
+            cache["cache_read_tokens"] += cache_read_delta
+            cache["cache_write_tokens"] += cache_write_delta
+            cache["cache_write_5m_tokens"] += _coerce_int(cache_write_5m_tokens)
+            cache["cache_write_1h_tokens"] += _coerce_int(cache_write_1h_tokens)
+            cache["cache_write_5m_requests"] += _coerce_int(cache_write_5m_requests)
+            cache["cache_write_1h_requests"] += _coerce_int(cache_write_1h_requests)
+            cache["uncached_input_tokens"] += _coerce_int(uncached_input_tokens)
+            self._increment_count(cache["by_provider"], provider_label, MAX_PROVIDER_VALUES)
 
         cost = self._state["cost"]
         cost["input_usd"] = round(cost["input_usd"] + _coerce_float(input_usd), 6)
@@ -405,6 +492,95 @@ class PersistentMetricsState:
         cache = self._state["prefix_cache"]
         cache["bust_count"] += 1
         cache["bust_tokens"] += _coerce_int(tokens_lost)
+
+    def record_compression(
+        self, *, strategy: str, original_tokens: Any, compressed_tokens: Any
+    ) -> None:
+        self._record_activity()
+        key = _label(strategy)
+        self._increment_count(
+            self._state["compression"]["compressions_by_strategy"], key, MAX_SCOPE_LABELS
+        )
+        saved = max(_coerce_int(original_tokens) - _coerce_int(compressed_tokens), 0)
+        if saved:
+            values = self._state["compression"]["tokens_saved_by_strategy"]
+            values[key] = values.get(key, 0) + saved
+            self._compact_count_map(values, MAX_SCOPE_LABELS)
+
+    def record_codex_ws_unit(
+        self,
+        *,
+        strategy: str,
+        reason_category: str,
+        elapsed_ms: Any,
+        text_bytes: Any,
+        tokens_before: Any,
+        tokens_after: Any,
+        tokens_saved: Any,
+        modified: bool,
+        strategy_chain: list[str] | None = None,
+        content_type: str = "unknown",
+        text_shape: str = "unknown",
+    ) -> None:
+        self._record_activity()
+        ws = self._state["codex_ws"]
+        ws["units_total"] += 1
+        for field, value in (
+            ("units_by_strategy", strategy),
+            ("units_by_category", reason_category),
+            ("units_by_content_type", content_type),
+            ("units_by_text_shape", text_shape),
+        ):
+            self._increment_count(ws[field], _label(value), MAX_SCOPE_LABELS)
+        ws["units_modified_total"] += int(modified)
+        chain = strategy_chain or []
+        ws["units_to_kompress_total"] += int(strategy == "kompress")
+        ws["units_kompress_attempted_total"] += int(strategy == "kompress" or "kompress" in chain)
+        elapsed = _coerce_float(elapsed_ms)
+        ws["unit_elapsed_ms_sum"] = round(ws["unit_elapsed_ms_sum"] + elapsed, 6)
+        ws["unit_elapsed_ms_max"] = max(ws["unit_elapsed_ms_max"], elapsed)
+        for field, value in (
+            ("unit_bytes_sum", text_bytes),
+            ("unit_tokens_before_sum", tokens_before),
+            ("unit_tokens_after_sum", tokens_after),
+            ("unit_tokens_saved_sum", tokens_saved),
+        ):
+            ws[field] += _coerce_int(value)
+
+    def record_codex_ws_frame(
+        self,
+        *,
+        elapsed_ms: Any,
+        bytes_before: Any,
+        bytes_after: Any = 0,
+        attempted_tokens: Any = 0,
+        tokens_saved: Any = 0,
+        modified: bool = False,
+        failed: bool = False,
+        strategy_chain: list[str] | None = None,
+        final_strategies: list[str] | None = None,
+    ) -> None:
+        self._record_activity()
+        ws = self._state["codex_ws"]
+        ws["frames_attempted_total"] += 1
+        ws["frames_compressed_total"] += int(modified)
+        ws["frames_failed_total"] += int(failed)
+        chain = strategy_chain or []
+        strategies = final_strategies or []
+        ws["frames_to_kompress_total"] += int("kompress" in strategies)
+        ws["frames_kompress_attempted_total"] += int(
+            "kompress" in chain or "kompress" in strategies
+        )
+        elapsed = _coerce_float(elapsed_ms)
+        ws["frame_elapsed_ms_sum"] = round(ws["frame_elapsed_ms_sum"] + elapsed, 6)
+        ws["frame_elapsed_ms_max"] = max(ws["frame_elapsed_ms_max"], elapsed)
+        for field, value in (
+            ("frame_bytes_before_sum", bytes_before),
+            ("frame_bytes_after_sum", bytes_after),
+            ("frame_attempted_tokens_sum", attempted_tokens),
+            ("frame_tokens_saved_sum", tokens_saved),
+        ):
+            ws[field] += _coerce_int(value)
 
     def record_cache_miss(self, *, provider: str | None, reason: str | None) -> None:
         self._record_activity()
@@ -461,6 +637,8 @@ class PersistentMetricsState:
                 "ttl_5m_percent": self._percent(cache["cache_write_5m_tokens"], cache_write_total),
             },
             "cost": deepcopy(self._state["cost"]),
+            "compression": deepcopy(self._state["compression"]),
+            "codex_ws": deepcopy(self._state["codex_ws"]),
             "waste_signals": deepcopy(self._state["waste_signals"]),
             "by_model": self._by_model_snapshot(),
             "persistence": {

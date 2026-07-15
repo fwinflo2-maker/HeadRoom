@@ -13,7 +13,7 @@ import asyncio
 import logging
 import threading
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -226,6 +226,9 @@ class PrometheusMetrics:
         self.ws_session_duration_sum_ms: dict[str, float] = defaultdict(float)
         self.ws_session_duration_count: dict[str, int] = defaultdict(int)
         self.ws_session_duration_max_ms: dict[str, float] = defaultdict(float)
+        self.process_started_at = (
+            datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        )
 
         # Aggregate waste signals
         self.waste_signals_total: dict[str, int] = defaultdict(int)
@@ -397,6 +400,9 @@ class PrometheusMetrics:
             self.cache_bust_count = 0
             self.cache_miss_attribution_by_provider.clear()
             self.savings_history = []
+            self.process_started_at = (
+                datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            )
 
         with self._stage_timing_lock:
             self.stage_timing_sum.clear()
@@ -496,6 +502,11 @@ class PrometheusMetrics:
         saved = original_tokens - compressed_tokens
         if saved > 0:
             self.tokens_saved_by_strategy[strategy] += saved
+        self.savings_tracker.record_compression(
+            strategy=strategy,
+            original_tokens=original_tokens,
+            compressed_tokens=compressed_tokens,
+        )
 
     def record_extension_savings(self, key: str, saved: int) -> None:
         """Accumulate tokens saved by a proxy extension, keyed by ``key``.
@@ -604,6 +615,19 @@ class PrometheusMetrics:
         self.codex_ws_unit_tokens_before_sum += max(0, int(tokens_before))
         self.codex_ws_unit_tokens_after_sum += max(0, int(tokens_after))
         self.codex_ws_unit_tokens_saved_sum += max(0, int(tokens_saved))
+        self.savings_tracker.record_codex_ws_unit(
+            strategy=strategy,
+            reason_category=reason_category,
+            elapsed_ms=elapsed_ms,
+            text_bytes=text_bytes,
+            tokens_before=tokens_before,
+            tokens_after=tokens_after,
+            tokens_saved=tokens_saved,
+            modified=modified,
+            strategy_chain=strategy_chain,
+            content_type=content_type,
+            text_shape=text_shape,
+        )
 
     def record_codex_ws_frame(
         self,
@@ -640,6 +664,17 @@ class PrometheusMetrics:
         self.codex_ws_frame_bytes_after_sum += max(0, int(bytes_after))
         self.codex_ws_frame_attempted_tokens_sum += max(0, int(attempted_tokens))
         self.codex_ws_frame_tokens_saved_sum += max(0, int(tokens_saved))
+        self.savings_tracker.record_codex_ws_frame(
+            elapsed_ms=elapsed_ms,
+            bytes_before=bytes_before,
+            bytes_after=bytes_after,
+            attempted_tokens=attempted_tokens,
+            tokens_saved=tokens_saved,
+            modified=modified,
+            failed=failed,
+            strategy_chain=strategy_chain,
+            final_strategies=final_strategies,
+        )
 
     def record_inbound_request(self, *, method: str, path: str) -> None:
         self.inbound_requests_total += 1
@@ -785,6 +820,10 @@ class PrometheusMetrics:
             if len(self.savings_history) > 500:
                 self.savings_history = self.savings_history[-500:]
 
+            persistent_uncached_input_tokens = (
+                uncached_input_tokens if cache_read_tokens > 0 or cache_write_tokens > 0 else 0
+            )
+
             self.savings_tracker.record_lifetime_request(
                 persist=False,
                 provider=provider,
@@ -800,7 +839,9 @@ class PrometheusMetrics:
                 cache_write_tokens=cache_write_tokens,
                 cache_write_5m_tokens=cache_write_5m_tokens,
                 cache_write_1h_tokens=cache_write_1h_tokens,
-                uncached_input_tokens=uncached_input_tokens,
+                cache_write_5m_requests=int(cache_write_5m_tokens > 0),
+                cache_write_1h_requests=int(cache_write_1h_tokens > 0),
+                uncached_input_tokens=persistent_uncached_input_tokens,
                 waste_signals=waste_signals,
             )
             total_input_tokens, total_input_cost_usd = self._current_savings_tracker_totals()
@@ -812,7 +853,7 @@ class PrometheusMetrics:
                 project=project,
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
-                uncached_input_tokens=uncached_input_tokens,
+                uncached_input_tokens=persistent_uncached_input_tokens,
                 total_input_tokens=total_input_tokens,
                 total_input_cost_usd=total_input_cost_usd,
                 output_tokens_saved=output_tokens_saved,
@@ -995,6 +1036,8 @@ class PrometheusMetrics:
             stage_timing_max_snapshot = dict(self.stage_timing_max)
         async with self._lock:
             lifetime_savings = self.savings_tracker.snapshot()["lifetime"]
+            lifetime_metrics = self.savings_tracker.lifetime_response()
+            lifetime_cache = lifetime_metrics.get("prefix_cache", {})
             lines: list[str] = []
             _append_metric(
                 lines,
@@ -1103,6 +1146,48 @@ class PrometheusMetrics:
                     "proxy savings tracker"
                 ),
                 value=lifetime_savings["compression_savings_usd"],
+            )
+            _append_metric(
+                lines,
+                name="headroom_persistent_savings_cache_read_tokens_total",
+                metric_type="counter",
+                help_text="Durable lifetime cache read tokens recorded by the proxy savings tracker",
+                value=lifetime_cache.get("cache_read_tokens", 0),
+            )
+            _append_metric(
+                lines,
+                name="headroom_persistent_savings_cache_write_tokens_total",
+                metric_type="counter",
+                help_text="Durable lifetime cache write tokens recorded by the proxy savings tracker",
+                value=lifetime_cache.get("cache_write_tokens", 0),
+            )
+            _append_metric(
+                lines,
+                name="headroom_persistent_savings_cache_requests_total",
+                metric_type="counter",
+                help_text="Durable lifetime cache-eligible requests recorded by the proxy savings tracker",
+                value=lifetime_cache.get("requests", 0),
+            )
+            _append_metric(
+                lines,
+                name="headroom_persistent_savings_cache_hit_requests_total",
+                metric_type="counter",
+                help_text="Durable lifetime cache-hit requests recorded by the proxy savings tracker",
+                value=lifetime_cache.get("hit_requests", 0),
+            )
+            _append_metric(
+                lines,
+                name="headroom_persistent_savings_cache_bust_total",
+                metric_type="counter",
+                help_text="Durable lifetime cache busts recorded by the proxy savings tracker",
+                value=lifetime_cache.get("bust_count", 0),
+            )
+            _append_metric(
+                lines,
+                name="headroom_persistent_savings_cache_bust_tokens_lost_total",
+                metric_type="counter",
+                help_text="Durable lifetime cache-bust tokens lost recorded by the proxy savings tracker",
+                value=lifetime_cache.get("bust_tokens", 0),
             )
             # NOTE: per-strategy compression breakdown is tracked
             # internally on `self.compressions_by_strategy` and

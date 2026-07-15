@@ -4447,7 +4447,10 @@ def unwrap_claude(
     "--wire-api",
     type=click.Choice(["completions", "responses"]),
     default=None,
-    help="OpenAI-compatible Copilot wire API. Defaults to 'completions' when provider-type resolves to openai.",
+    help=(
+        "OpenAI-compatible Copilot wire API. Hosted Copilot OAuth/subscription "
+        "defaults by model; BYOK OpenAI-compatible routing defaults to completions."
+    ),
 )
 @click.option(
     "--subscription",
@@ -4590,8 +4593,11 @@ def copilot(
                 "automatic model selection."
             )
 
-        effective_wire_api = wire_api or (
-            _copilot_default_wire_api_for_model(selected_model) if subscription else "completions"
+        env_wire_api = env.get("COPILOT_PROVIDER_WIRE_API")
+        if env_wire_api not in {"completions", "responses"}:
+            env_wire_api = None
+        effective_wire_api = (
+            wire_api or env_wire_api or _copilot_default_wire_api_for_model(selected_model)
         )
         env["COPILOT_PROVIDER_TYPE"] = "openai"
         # Per-project savings: the Copilot CLI cannot send custom headers, so

@@ -360,6 +360,74 @@ def test_wrap_copilot_subscription_defaults_to_responses_for_reasoning_model(
     assert "COPILOT_PROVIDER_WIRE_API=responses" in captured["env_vars_display"]
 
 
+def test_wrap_copilot_oauth_defaults_to_responses_for_reasoning_model(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Implicit reusable OAuth is also hosted Copilot API routing.
+
+    It must use the same model-aware wire-API default as explicit
+    ``--subscription`` so GPT-5.4 is sent over Responses instead of the
+    completions path that Copilot rejects for newer reasoning models.
+    """
+    _wrap_cli, main = wrap_modules
+    _clear_copilot_env(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.resolve_client_bearer_token", return_value="gho-oauth"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=True),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            ["wrap", "copilot", "--no-rtk", "--", "--model", "gpt-5.4"],
+        )
+
+    assert result.exit_code == 0, result.output
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["COPILOT_PROVIDER_TYPE"] == "openai"
+    assert env["COPILOT_PROVIDER_WIRE_API"] == "responses"
+    assert "COPILOT_PROVIDER_WIRE_API=responses" in captured["env_vars_display"]
+
+
+def test_wrap_copilot_oauth_honors_wire_api_env_override(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _wrap_cli, main = wrap_modules
+    _clear_copilot_env(monkeypatch)
+    monkeypatch.setenv("COPILOT_PROVIDER_WIRE_API", "responses")
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.resolve_client_bearer_token", return_value="gho-oauth"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=True),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            ["wrap", "copilot", "--no-rtk", "--", "--model", "gpt-4.1"],
+        )
+
+    assert result.exit_code == 0, result.output
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["COPILOT_PROVIDER_WIRE_API"] == "responses"
+    assert "COPILOT_PROVIDER_WIRE_API=responses" in captured["env_vars_display"]
+
+
 def test_wrap_copilot_subscription_keeps_gpt4_on_completions(
     runner: CliRunner,
     wrap_modules: tuple[types.ModuleType, click.Group],

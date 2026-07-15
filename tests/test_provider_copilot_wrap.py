@@ -92,6 +92,7 @@ def test_validate_configuration_rejects_invalid_combinations() -> None:
     ("model", "expected"),
     [
         ("gpt-5.5", True),
+        ("gpt-5.6-sol", True),
         ("gpt-5-codex", True),
         ("openai/gpt-5.4", True),
         ("o1", True),

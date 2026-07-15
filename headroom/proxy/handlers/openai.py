@@ -1467,7 +1467,24 @@ class OpenAIHandlerMixin:
         ) -> None:
             kind, _ = slot
             if kind == "output":
-                item["output"] = replacement
+                current = item.get("output")
+                if isinstance(current, list):
+                    # Content-part array: preserve structure by updating the
+                    # single output_text part's text in-place. Non-text parts
+                    # (images, refusals) are left unchanged.
+                    text_part = None
+                    for part in current:
+                        if isinstance(part, dict) and part.get("type") == "output_text":
+                            if text_part is None:
+                                text_part = part
+                            else:
+                                text_part = None  # 2+ text parts → skip
+                                break
+                    if text_part is not None:
+                        text_part["text"] = replacement
+                    # else: zero or 2+ output_text parts — leave unchanged
+                else:
+                    item["output"] = replacement
 
         headroom_retrieve_call_ids: set[str] = set()
         # Map each Responses tool call to its name so that outputs belonging to

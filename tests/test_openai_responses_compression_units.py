@@ -3,6 +3,8 @@ from __future__ import annotations
 import threading
 from types import MethodType, SimpleNamespace
 
+import pytest
+
 from headroom.proxy.handlers import openai as openai_handler
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
 from headroom.transforms.compression_units import UnitCompressionResult
@@ -210,7 +212,12 @@ def test_openai_responses_adapter_compresses_output_content_parts():
 
     assert modified is True
     assert saved > 0
-    assert new_payload["input"][0]["output"] == "content part output summary"
+    output_val = new_payload["input"][0]["output"]
+    assert isinstance(output_val, list), "content-part output must remain a list"
+    assert len(output_val) == 1
+    assert isinstance(output_val[0], dict)
+    assert output_val[0].get("type") == "output_text"
+    assert output_val[0].get("text") == "content part output summary"
     assert "router:openai:responses:function_call_output:kompress" in transforms
     assert units_by_category == {"applied": 1}
     assert strategy_chain == []
@@ -565,8 +572,14 @@ def test_openai_responses_adapter_losslessly_folds_excluded_output_content_parts
     assert saved >= 0
     assert "router:excluded:lossless" in transforms
     folded = new_payload["input"][1]["output"]
-    assert len(folded) < len(grep_out)
-    assert search_unheading(folded) == grep_out
+    # Content-part array is preserved after compression
+    assert isinstance(folded, list), "output must remain a list for content-part arrays"
+    assert len(folded) == 1
+    assert isinstance(folded[0], dict)
+    assert folded[0].get("type") == "output_text"
+    folded_text = folded[0].get("text", "")
+    assert len(folded_text) < len(grep_out)
+    assert search_unheading(folded_text) == grep_out
 
 
 def test_openai_responses_adapter_excludes_tool_case_insensitively_with_debug(monkeypatch):
@@ -891,3 +904,357 @@ def test_openai_responses_adapter_floors_when_aggregate_below_threshold():
     assert saved == 0
     assert units_by_category == {"size_floor": len(outputs)}
     assert new_payload == payload
+
+
+def test_openai_responses_adapter_preserves_non_text_parts_in_content_parts():
+    """Regression for #2235: when output is a content-part array with non-text
+    parts (input_image), compression updates only the output_text part's text
+    field and preserves all other parts unchanged.
+    """
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed="compressed summary",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    long_text = " ".join(f"word{i}" for i in range(180))
+    original_image_part = {
+        "type": "input_image",
+        "image_url": "data:image/png;base64,iVBORw0KGgo=",
+    }
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": [
+                    {"type": "output_text", "text": long_text},
+                    original_image_part,
+                ],
+            }
+        ],
+    }
+
+    new_payload, modified, saved, transforms, *_ = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_non_text_preserved",
+        )
+    )
+
+    assert modified is True
+    assert saved > 0
+    output = new_payload["input"][0]["output"]
+    assert isinstance(output, list), "output must remain a list"
+    assert len(output) == 2, "both parts must be preserved"
+
+    # First part: output_text with compressed text
+    assert output[0]["type"] == "output_text"
+    assert output[0]["text"] == "compressed summary"
+
+    # Second part: input_image preserved byte-for-byte
+    assert output[1] == original_image_part
+
+
+def test_openai_responses_adapter_losslessly_folds_excluded_content_part_with_image():
+    """Excluded tool (grep) with content-part output containing both text and
+    an image: the text part should be losslessly folded, and the image part
+    must remain byte-identical.
+    """
+    from headroom.transforms.lossless_compaction import search_unheading
+
+    router = ContentRouter()
+    router.config.exclude_tools = {"grep"}
+    handler = _handler_with_router(router)
+    grep_out = "\n".join(
+        f"src/file_{f}.py:{ln}:some grep output here"
+        for f in range(8)
+        for ln in range(6)
+    )
+    original_image_part = {
+        "type": "input_image",
+        "image_url": "data:image/png;base64,iVBORw0KGgo=",
+    }
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {"type": "function_call", "call_id": "call_1", "name": "grep", "arguments": "{}"},
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": [
+                    {"type": "output_text", "text": grep_out},
+                    original_image_part,
+                ],
+            },
+        ],
+    }
+
+    new_payload, modified, saved, transforms, *_ = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_excluded_content_img",
+        )
+    )
+
+    assert modified is True
+    assert "router:excluded:lossless" in transforms
+    output = new_payload["input"][1]["output"]
+    # Content-part array preserved
+    assert isinstance(output, list), "output must remain a list"
+    assert len(output) == 2, "both parts must be preserved"
+
+    # Text part: losslessly folded
+    assert output[0]["type"] == "output_text"
+    folded_text = output[0]["text"]
+    assert isinstance(folded_text, str)
+    assert len(folded_text) < len(grep_out)
+    assert search_unheading(folded_text) == grep_out
+
+    # Image part: preserved byte-for-byte
+    assert output[1] == original_image_part
+
+
+@pytest.mark.parametrize(
+    "desc,payload_output,expect_modified,expect_saved,checks",
+    [
+        (
+            "multiple output_text parts: unchanged",
+            [
+                {"type": "output_text", "text": " ".join(f"word{i}" for i in range(180))},
+                {"type": "output_text", "text": "second block"},
+            ],
+            True,   # compression ran but write-back skipped
+            181,    # Router tokens saved, even though write-back is skipped
+            [("output is unchanged", lambda o: o == [
+                {"type": "output_text", "text": " ".join(f"word{i}" for i in range(180))},
+                {"type": "output_text", "text": "second block"},
+            ])],
+        ),
+        (
+            "empty output array: unchanged",
+            [],
+            False,  # no compression attempted
+            0,
+            [("output is empty list", lambda o: o == [])],
+        ),
+    ],
+)
+def test_openai_responses_adapter_content_part_safety_guards(
+    desc: str,
+    payload_output: list,
+    expect_modified: bool,
+    expect_saved: int,
+    checks: list[tuple[str, object]],
+):
+    """Content-part arrays that cannot be safely compressed in-place must
+    be left unchanged."""
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed="compressed",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": payload_output,
+            }
+        ],
+    }
+
+    new_payload, modified, saved, *_ = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_" + desc.replace(" ", "_"),
+        )
+    )
+
+    assert modified is expect_modified
+    assert saved == expect_saved
+    output = new_payload["input"][0]["output"]
+    for label, check in checks:
+        assert check(output), f"Check failed: {label}"
+
+# ──────────────────────────────────────────────
+# 对抗性测试 — content-part array 写回
+# 验证 _set_slot_text 在各种异常/边缘输入下
+# 不崩溃，不破坏数据
+# ──────────────────────────────────────────────
+
+_ADVERSARIAL_LONG_TEXT = "long " * 120  # 600 chars, enough to trigger compression
+
+
+@pytest.mark.parametrize(
+    "desc,payload_output,expect_output",
+    [
+        # ── 异常 part 结构 ──
+        (
+            "output_text at position 1 (not 0)",
+            [
+                {"type": "input_image", "image_url": "data:img/png;base64,abc"},
+                {"type": "output_text", "text": _ADVERSARIAL_LONG_TEXT},
+            ],
+            # text at idx 1 should be compressed, image at idx 0 preserved
+            lambda out: (
+                out[0]["image_url"] == "data:img/png;base64,abc"
+                and out[1]["text"] == "compressed_adversarial"
+            ),
+        ),
+        (
+            "output_text with extra keys preserved",
+            [
+                {"type": "output_text", "text": _ADVERSARIAL_LONG_TEXT, "annotations": [1, 2], "extra": "keep"},
+                {"type": "input_image", "image_url": "data:img/png;base64,def"},
+            ],
+            lambda out: (
+                out[0].get("annotations") == [1, 2]
+                and out[0].get("extra") == "keep"
+                and out[0]["text"] == "compressed_adversarial"
+            ),
+        ),
+        (
+            "non-dict element in list preserved",
+            [
+                {"type": "output_text", "text": _ADVERSARIAL_LONG_TEXT},
+                "bare-string-survivor",
+            ],
+            lambda out: (
+                out[0]["text"] == "compressed_adversarial"
+                and out[1] == "bare-string-survivor"
+            ),
+        ),
+        (
+            "unknown part type preserved",
+            [
+                {"type": "output_text", "text": _ADVERSARIAL_LONG_TEXT},
+                {"type": "weird_new_type", "data": "unknown-data"},
+            ],
+            lambda out: (
+                out[0]["text"] == "compressed_adversarial"
+                and out[1]["type"] == "weird_new_type"
+                and out[1]["data"] == "unknown-data"
+            ),
+        ),
+        (
+            "output_text sandwiched between non-text parts",
+            [
+                {"type": "input_image", "image_url": "data:img/png;base64,img1"},
+                {"type": "output_text", "text": _ADVERSARIAL_LONG_TEXT},
+                {"type": "input_image", "image_url": "data:img/png;base64,img2"},
+            ],
+            lambda out: (
+                out[0]["image_url"] == "data:img/png;base64,img1"
+                and out[1]["text"] == "compressed_adversarial"
+                and out[2]["image_url"] == "data:img/png;base64,img2"
+            ),
+        ),
+        # ── 2+ output_text variants ──
+        (
+            "3 output_text parts interspersed with non-text (unchanged, data safety)",
+            [
+                {"type": "output_text", "text": _ADVERSARIAL_LONG_TEXT},
+                {"type": "input_image", "image_url": "data:img/png;base64,img1"},
+                {"type": "output_text", "text": "middle text"},
+                {"type": "input_image", "image_url": "data:img/png;base64,img2"},
+                {"type": "output_text", "text": "last text"},
+            ],
+            lambda out: out == [
+                {"type": "output_text", "text": _ADVERSARIAL_LONG_TEXT},
+                {"type": "input_image", "image_url": "data:img/png;base64,img1"},
+                {"type": "output_text", "text": "middle text"},
+                {"type": "input_image", "image_url": "data:img/png;base64,img2"},
+                {"type": "output_text", "text": "last text"},
+            ],
+        ),
+        # ── 大数组压力 ──
+        (
+            "1000 parts (1 text + 999 images) - stress test",
+            # Start with output_text, then 999 image parts
+            [{"type": "output_text", "text": _ADVERSARIAL_LONG_TEXT}]
+            + [{"type": "input_image", "image_url": f"data:img/png;base64,{i}"} for i in range(999)],
+            lambda out: (
+                out[0]["text"] == "compressed_adversarial"
+                and len(out) == 1000
+            ),
+        ),
+        # ── output_text with null/edge text ──
+        (
+            "output_text with text=None — should not be compressed",
+            [
+                {"type": "output_text", "text": None},
+                {"type": "input_image", "image_url": "data:img/png;base64,abc"},
+            ],
+            lambda out: (
+                out[0]["type"] == "output_text"
+                and out[0].get("text") is None
+                and out[1]["image_url"] == "data:img/png;base64,abc"
+            ),
+        ),
+        (
+            "output_text with text=0 (int) — should not be compressed",
+            [
+                {"type": "output_text", "text": 0},
+            ],
+            lambda out: (
+                out[0]["type"] == "output_text"
+                and out[0]["text"] == 0
+            ),
+        ),
+    ],
+)
+def test_openai_responses_adversarial_content_part_writeback(
+    desc: str,
+    payload_output: list,
+    expect_output,
+):
+    """Adversarial / fuzz-style tests for _set_slot_text content-part
+    writeback. Ensures no crash and no data corruption regardless
+    of output part structure."""
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed="compressed_adversarial",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": payload_output,
+            }
+        ],
+    }
+
+    new_payload, *_ = handler._compress_openai_responses_live_text_units_with_router(
+        payload,
+        model="gpt-5",
+        request_id="req_adv_" + desc.replace(" ", "_"),
+    )
+
+    result = new_payload["input"][0]["output"]
+    assert expect_output(result), f"[{desc}] Adversarial check failed. Got: {result}"

@@ -7,6 +7,7 @@ Usage:
     headroom wrap aider                     # Start proxy + aider
     headroom wrap openclaude                # Start proxy + OpenClaude
     headroom wrap vibe                      # Start proxy + Mistral Vibe
+    headroom wrap grok                      # Start proxy + Grok CLI
     headroom wrap cursor                    # Start proxy + print Cursor config instructions
     headroom wrap openclaw                  # Install + configure OpenClaw plugin
     headroom wrap claude --no-context-tool  # Without CLI context-tool setup
@@ -108,7 +109,12 @@ from headroom.providers.copilot import (
     validate_configuration as _validate_copilot_configuration,
 )
 from headroom.providers.cursor import render_setup_lines as _render_cursor_setup_lines
+from headroom.providers.grok import build_launch_env as _build_grok_launch_env
 from headroom.providers.mistral_vibe import build_launch_env as _build_mistral_vibe_launch_env
+from headroom.providers.omp import build_launch_env as _build_omp_launch_env
+from headroom.providers.omp import inject_models_override as _inject_omp_models_override
+from headroom.providers.omp import models_yml_path as _omp_models_yml_path
+from headroom.providers.omp import restore_models_override as _restore_omp_models_override
 from headroom.providers.openclaw import (
     OPENCLAW_NPM_PACKAGE,
 )
@@ -179,7 +185,7 @@ _CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
 _CONTEXT_TOOL_RTK = "rtk"
 _CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
 _VALID_CONTEXT_TOOLS = {_CONTEXT_TOOL_RTK, _CONTEXT_TOOL_LEAN_CTX}
-_AGENT_SAVINGS_TARGET_AGENTS = {"claude", "codex", "cursor", "opencode"}
+_AGENT_SAVINGS_TARGET_AGENTS = {"claude", "codex", "cursor", "grok", "opencode"}
 _WRAP_PROXY_TIMEOUT_ENV = "HEADROOM_WRAP_PROXY_TIMEOUT"
 _WRAP_PROXY_TIMEOUT_DEFAULT_SECONDS = 45
 _WRAP_PROXY_TIMEOUT_ML_DEFAULT_SECONDS = 90
@@ -194,7 +200,7 @@ _WRAP_PROXY_TIMEOUT_ML_MODULES = ("torch", "sentence_transformers", "spacy")
 # `init` and `install` via the Claude provider package to prevent drift.
 _TOOL_SEARCH_ENV = TOOL_SEARCH_ENV
 _TOOL_SEARCH_DEFAULT = TOOL_SEARCH_DEFAULT
-_AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor"}
+_AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor", "grok"}
 
 # 1M context window for `wrap claude` (#1158). Claude Code only sends the
 # `context-1m` beta header — unlocking the 1M window for entitled subscription
@@ -3855,6 +3861,7 @@ def wrap() -> None:
         headroom wrap aider               # Aider
         headroom wrap openclaude          # OpenClaude
         headroom wrap vibe                # Mistral Vibe
+        headroom wrap grok                # Grok CLI (xAI)
         headroom wrap cursor              # Cursor (prints config instructions)
         headroom wrap cline               # Cline (VS Code; prints config instructions)
         headroom wrap continue            # Continue (VS Code/JetBrains; injects systemMessage)
@@ -3862,6 +3869,8 @@ def wrap() -> None:
         headroom wrap openhands           # OpenHands CLI
         headroom wrap openclaw            # OpenClaw plugin bootstrap
         headroom wrap opencode            # OpenCode CLI
+        headroom wrap omp                 # Oh My Pi CLI
+        headroom wrap zcode               # ZCode desktop app setup
 
     \b
     `wrap` vs `proxy`:
@@ -5340,6 +5349,149 @@ def vibe(
 
 
 # =============================================================================
+# Grok CLI
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup",
+)
+@click.option("--no-mcp", is_flag=True, help="Skip headroom MCP server registration")
+@click.option(
+    "--no-tokensave",
+    is_flag=True,
+    help="Skip the tokensave code-graph MCP server (primary coding-task compressor)",
+)
+@click.option(
+    "--serena",
+    is_flag=True,
+    help="Force the Serena MCP backup compressor on (registered automatically when "
+    "tokensave is unavailable)",
+)
+@click.option("--no-serena", is_flag=True, help="Never register the Serena backup compressor")
+@click.option(
+    "--code-graph",
+    is_flag=True,
+    help="Force a tokensave code-graph index now (tokensave is the default compressor)",
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--backend",
+    default=None,
+    help="API backend for the proxy: 'anthropic' (default), 'litellm-xai', etc.",
+)
+@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
+@click.option("--region", default=None, help="Cloud region for Vertex/Bedrock backends")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("grok_args", nargs=-1, type=click.UNPROCESSED)
+def grok(
+    port: int,
+    no_rtk: bool,
+    no_mcp: bool,
+    no_tokensave: bool,
+    serena: bool,
+    no_serena: bool,
+    code_graph: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    backend: str | None,
+    anyllm_provider: str | None,
+    region: str | None,
+    verbose: bool,
+    prepare_only: bool,
+    grok_args: tuple,
+) -> None:
+    """Launch Grok CLI through Headroom proxy.
+
+    \b
+    Sets ``GROK_CLI_CHAT_PROXY_BASE_URL`` so Grok routes inference traffic
+    through Headroom. Registers the headroom MCP server in ``~/.grok/config.toml``
+    so Grok can call ``headroom_retrieve`` on compression markers.
+
+    \b
+    Examples:
+        headroom wrap grok                         # Start proxy + context tool + grok
+        headroom wrap grok -- -p "fix the bug"     # Pass prompt to grok
+        headroom wrap grok --no-context-tool       # Skip CLI context-tool setup
+        headroom wrap grok --no-mcp                # Skip MCP retrieve tool registration
+        headroom wrap grok --port 9999             # Custom proxy port
+    """
+    agents_md: Path | None = Path.cwd() / "AGENTS.md" if not no_rtk else None
+    if not no_rtk:
+        _setup_context_tool_for_agent(
+            agent="grok",
+            agent_display="Grok",
+            marker_path=agents_md,
+            on_rtk_ready=lambda _rtk: _inject_rtk_instructions(
+                cast(Path, agents_md), verbose=verbose
+            ),
+            verbose=verbose,
+        )
+
+    if not no_mcp:
+        from headroom.mcp_registry import GrokRegistrar
+
+        _setup_headroom_mcp(GrokRegistrar(), port, verbose=verbose, force=True)
+    elif verbose:
+        click.echo("  Skipping MCP retrieve tool (--no-mcp)")
+
+    from headroom.mcp_registry import GrokRegistrar
+
+    _setup_coding_compressor(
+        GrokRegistrar(),
+        serena_context="grok",
+        serena=serena,
+        no_serena=no_serena,
+        no_tokensave=no_tokensave,
+        verbose=verbose,
+        force=True,
+    )
+
+    if prepare_only:
+        return
+
+    grok_bin = shutil.which("grok")
+    if not grok_bin:
+        click.echo("Error: 'grok' not found in PATH.")
+        click.echo("Install Grok CLI: https://docs.x.ai/docs/grok-cli")
+        raise SystemExit(1)
+
+    env, env_vars_display = _build_grok_launch_env(
+        port, os.environ, project=_project_name_from_cwd()
+    )
+
+    _launch_tool(
+        binary=grok_bin,
+        args=grok_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="GROK",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="grok",
+        code_graph=code_graph,
+        backend=backend,
+        anyllm_provider=anyllm_provider,
+        region=region,
+        openai_api_url="https://api.x.ai",
+    )
+
+
+# =============================================================================
 # Cursor
 # =============================================================================
 
@@ -5615,7 +5767,7 @@ def zcode(
     upstream = _detect_zcode_upstream()
     anthropic_url, openai_url = _zcode_upstream_to_urls(upstream)
 
-    def _print_zcode_setup(actual_port: int) -> None:
+    def _print_zcode_setup(actual_port: int = port) -> None:
         click.echo(f"  Detected provider: {upstream.provider_name}")
         click.echo(f"  Upstream: {upstream.base_url}")
         click.echo()
@@ -6754,6 +6906,204 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
     click.echo()
     click.echo("✓ Codex is no longer routed through the Headroom proxy.")
     if not no_stop_proxy and status != "noop":
+        _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
+    click.echo()
+
+
+# =============================================================================
+# Oh My Pi (omp)
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup",
+)
+@click.option(
+    "--code-graph",
+    is_flag=True,
+    help="Enable code graph indexing via codebase-memory-mcp (optional)",
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("omp_args", nargs=-1, type=click.UNPROCESSED)
+def omp(
+    port: int,
+    no_rtk: bool,
+    code_graph: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    verbose: bool,
+    prepare_only: bool,
+    omp_args: tuple,
+) -> None:
+    """Launch Oh My Pi (omp) through Headroom proxy.
+
+    \b
+    Points omp's built-in `anthropic` provider at Headroom by injecting a
+    marker-fenced `providers.anthropic.baseUrl` override into
+    ~/.omp/agent/models.yml (pre-wrap file backed up byte-for-byte; undo with
+    `headroom unwrap omp`). omp resolves its Anthropic chat endpoint from
+    models.yml — ANTHROPIC_BASE_URL only affects its web-search helper — and a
+    same-ID override keeps omp's bundled model catalog and stored credentials.
+    omp's other providers (OpenAI-direct, Gemini, ...) keep their normal
+    endpoints; route those via your own custom provider in models.yml.
+
+    \b
+    Examples:
+        headroom wrap omp                       # Start proxy + context tool + omp
+        headroom wrap omp -- -p "fix the bug"   # omp in non-interactive print mode
+        headroom wrap omp -- --model opus       # Pick a model (fuzzy match)
+        headroom wrap omp --no-context-tool     # Skip CLI context-tool setup
+        headroom unwrap omp                     # Restore pre-wrap models.yml
+    """
+    # Setup CLI context tool for omp — it reads AGENTS.md from the project root.
+    if not no_rtk:
+        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+            click.echo("  Setting up lean-ctx for omp...")
+            _setup_lean_ctx_agent("omp", verbose=verbose)
+        else:
+            click.echo("  Setting up rtk for omp...")
+            rtk_path = _ensure_rtk_binary(verbose=verbose)
+            if rtk_path:
+                agents_md = Path.cwd() / "AGENTS.md"
+                _inject_rtk_instructions(agents_md, verbose=verbose)
+
+    if prepare_only:
+        _inject_omp_models_override(port, _project_name_from_cwd())
+        return
+
+    omp_bin = shutil.which("omp")
+    if not omp_bin:
+        click.echo("Error: 'omp' not found in PATH.")
+        click.echo("Install Oh My Pi: npm install -g @oh-my-pi/pi-coding-agent")
+        raise SystemExit(1)
+
+    env, env_vars_display = _build_omp_launch_env(
+        port, os.environ, project=_project_name_from_cwd()
+    )
+
+    # Durable endpoint redirect (survives omp-spawned child sessions, which
+    # re-read models.yml rather than inheriting a parent env) — same durable
+    # wrap + backup + unwrap contract as the Codex config.toml injection.
+    models_file, _ = _inject_omp_models_override(port, _project_name_from_cwd())
+    click.echo(f"  models.yml override written: {models_file}")
+
+    _launch_tool(
+        binary=omp_bin,
+        args=omp_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="OMP",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="omp",
+        code_graph=code_graph,
+    )
+
+
+@unwrap.command("omp")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
+@click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
+def unwrap_omp(port: int, no_stop_proxy: bool) -> None:
+    """Undo ``headroom wrap omp`` edits to omp's models.yml.
+
+    Restores the byte-for-byte pre-wrap backup when one exists, or removes the
+    wrap-created file when there was no models.yml before wrapping. A
+    models.yml the wrap does not manage is never touched. Also removes the
+    marker-fenced rtk guidance from the current project's AGENTS.md.
+    """
+    status = _restore_omp_models_override()
+    if status == "restored":
+        click.echo(f"  Restored pre-wrap models.yml from backup: {_omp_models_yml_path()}")
+    elif status == "removed":
+        click.echo(f"  Removed wrap-created models.yml: {_omp_models_yml_path()}")
+    else:
+        click.echo("  No Headroom-managed models.yml found — nothing to restore.")
+
+    if _remove_rtk_instructions(Path.cwd() / "AGENTS.md"):
+        click.echo("  Removed Headroom rtk instructions from AGENTS.md.")
+
+    click.echo()
+    click.echo("✓ omp is no longer routed through the Headroom proxy.")
+    if not no_stop_proxy and status != "noop":
+        _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
+    click.echo()
+
+
+# =============================================================================
+# Grok CLI (unwrap)
+# =============================================================================
+
+
+@unwrap.command("grok")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
+@click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
+def unwrap_grok(port: int, no_stop_proxy: bool) -> None:
+    """Undo durable ``headroom wrap grok`` MCP and guidance edits.
+
+    Grok API routing is session-scoped via ``GROK_CLI_CHAT_PROXY_BASE_URL`` and
+    does not require config restoration. This command removes Headroom MCP
+    servers from ``~/.grok/config.toml`` and strips injected RTK guidance from
+    the project ``AGENTS.md``.
+    """
+    click.echo()
+    click.echo("  ╔═══════════════════════════════════════════════╗")
+    click.echo("  ║            HEADROOM UNWRAP: GROK              ║")
+    click.echo("  ╚═══════════════════════════════════════════════╝")
+    click.echo()
+
+    from headroom.mcp_registry import GrokRegistrar
+
+    grok_registrar = GrokRegistrar()
+    removed_any = False
+    if grok_registrar.detect():
+        tokensave_status = _remove_headroom_installed_tokensave_mcp(grok_registrar)
+        if tokensave_status == "removed":
+            click.echo("  Removed Headroom-installed tokensave MCP server from Grok.")
+            removed_any = True
+        elif tokensave_status == "failed":
+            click.echo("  tokensave MCP server matched Headroom ledger but could not be removed.")
+
+        serena_status = _remove_headroom_installed_serena_mcp(grok_registrar)
+        if serena_status == "removed":
+            click.echo("  Removed Headroom-installed Serena MCP server from Grok.")
+            removed_any = True
+        elif serena_status == "failed":
+            click.echo("  Serena MCP server matched Headroom ledger but could not be removed.")
+
+        if grok_registrar.unregister_server("headroom"):
+            click.echo("  Removed Headroom MCP server from Grok config.")
+            removed_any = True
+
+    if _remove_rtk_instructions(Path.cwd() / "AGENTS.md"):
+        click.echo("  Removed Headroom rtk instructions from project AGENTS.md.")
+        removed_any = True
+
+    if not removed_any:
+        click.echo("  Nothing to undo: no Headroom MCP markers or rtk guidance found.")
+
+    click.echo()
+    click.echo("✓ Grok is no longer configured for Headroom MCP retrieval.")
+    click.echo("  Start Grok without `headroom wrap grok` so API traffic skips the proxy.")
+    if not no_stop_proxy and removed_any:
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
     click.echo()
 

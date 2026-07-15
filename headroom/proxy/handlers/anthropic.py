@@ -798,10 +798,15 @@ class AnthropicHandlerMixin:
             # uses `request.headers.get(...)` directly above; memory user-id
             # is read from `request.headers` below if needed. From this
             # point on, `headers` is the upstream-bound copy.
-            from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
+            from headroom.proxy.helpers import (
+                _strip_internal_headers,
+                log_outbound_headers,
+                merge_extra_headers,
+            )
 
             _pre_strip_count = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
             headers = _strip_internal_headers(headers)
+            headers = merge_extra_headers(headers, self.config.anthropic_extra_headers)
             log_outbound_headers(
                 forwarder="anthropic_messages",
                 stripped_count=_pre_strip_count
@@ -1064,16 +1069,32 @@ class AnthropicHandlerMixin:
             # session id (and its sticky CCR/memory tools, beta headers, and
             # frozen-prefix state). This synthetic message only derives the id; it
             # is never forwarded.
+            # Both the session id and the conversation lineage derive from the
+            # SAME original client bytes (pre security-scan/hook mutation,
+            # which may rewrite messages differently turn-to-turn — a
+            # turn-dependent rewrite of the leading system text would rotate
+            # the id mid-conversation, orphaning all session-sticky state).
+            # The synthetic system message folds the top-level system prompt
+            # into both derivations, so conversations sharing an explicit
+            # header id but differing in system prompt keep separate lineages.
             system_prompt = body.get("system")
             session_messages = (
-                [{"role": "system", "content": system_prompt}, *messages]
+                [{"role": "system", "content": system_prompt}, *original_client_messages]
                 if system_prompt is not None
-                else messages
+                else original_client_messages
             )
             session_id = self.session_tracker_store.compute_session_id(
                 request, model, session_messages
             )
-            prefix_tracker = self.session_tracker_store.get_or_create(session_id, "anthropic")
+            # Resolve the tracker by conversation lineage within the session id
+            # (#2085): one model + system prompt spans a Claude Code session and
+            # all its parallel subagents, so concurrent conversations share this
+            # fallback id — on one shared tracker their interleaved histories
+            # thrash the frozen-prefix state and the provider prompt cache is
+            # re-written on nearly every call.
+            prefix_tracker = self.session_tracker_store.resolve_tracker(
+                session_id, "anthropic", messages=session_messages
+            )
             frozen_message_count = prefix_tracker.get_frozen_message_count()
             # Idle gap since the previous turn's response, snapshotted at fetch
             # (before get_or_create bumped the access clock). Forwarded to the
@@ -2092,6 +2113,7 @@ class AnthropicHandlerMixin:
                                         decision="injected_live_zone_tail",
                                         bytes_injected=len(memory_context),
                                         query=user_query,
+                                        tags=tags,
                                     )
                                 else:
                                     log_memory_injection(
@@ -2450,6 +2472,8 @@ class AnthropicHandlerMixin:
                             optimization_latency,
                             pipeline_timing=pipeline_timing,
                             original_messages=original_client_messages,
+                            prefix_tracker=prefix_tracker,
+                            optimized_messages=optimized_messages,
                         )
                     else:
                         async with stage_timer.measure("upstream_connect"):
@@ -2533,6 +2557,44 @@ class AnthropicHandlerMixin:
                         )
                         uncached_input_tokens = max(
                             0, attempted_input_tokens - cr_tokens - cw_tokens
+                        )
+
+                        # Update prefix cache tracker for next turn. Mirrors the
+                        # direct-Anthropic-API branch below (~line 3011) — without
+                        # this, PrefixCacheTracker never sees a turn 2+ update on
+                        # the Bedrock path, extract_cache_stable_delta() always
+                        # returns None (no previous_original_messages), and cache
+                        # mode falls back to full unmodified passthrough every
+                        # turn instead of compressing the append-only delta.
+                        next_original_messages = copy.deepcopy(original_client_messages)
+                        next_forwarded_messages = copy.deepcopy(optimized_messages)
+                        assistant_message = self._assistant_message_from_response_json(
+                            backend_response.body
+                        )
+                        if assistant_message is not None:
+                            next_original_messages.append(copy.deepcopy(assistant_message))
+                            next_forwarded_messages.append(copy.deepcopy(assistant_message))
+                        if hasattr(prefix_tracker, "classify_cache_miss"):
+                            miss = prefix_tracker.classify_cache_miss(
+                                cache_read_tokens=cr_tokens,
+                                current_forwarded_messages=optimized_messages,
+                            )
+                            if miss.is_miss:
+                                logger.info(
+                                    f"[{request_id}] CACHE-MISS-ATTRIBUTION: reason={miss.reason} "
+                                    f"idle={miss.idle_seconds:.0f}s ttl={miss.cache_ttl_seconds}s "
+                                    f"expected_cached={miss.expected_cached_tokens:,} "
+                                    f"prefix_changed={miss.prefix_changed} "
+                                    f"ttl_exceeded={miss.ttl_exceeded}"
+                                )
+                                await self.metrics.record_cache_miss_attribution(
+                                    provider_name, miss.reason
+                                )
+                        prefix_tracker.update_from_response(
+                            cache_read_tokens=cr_tokens,
+                            cache_write_tokens=cw_tokens,
+                            messages=next_forwarded_messages,
+                            original_messages=next_original_messages,
                         )
 
                         await self._record_request_outcome(
@@ -2774,8 +2836,11 @@ class AnthropicHandlerMixin:
 
                                 # Sanitize headers (redact API keys)
                                 safe_headers = {}
+                                _sensitive_header_names = {"x-api-key", "authorization"} | {
+                                    k.lower() for k in (self.config.anthropic_extra_headers or {})
+                                }
                                 for k, v in headers.items():
-                                    if k.lower() in ("x-api-key", "authorization"):
+                                    if k.lower() in _sensitive_header_names:
                                         safe_headers[k] = v[:12] + "..." if v else ""
                                     else:
                                         safe_headers[k] = v
@@ -3517,10 +3582,15 @@ class AnthropicHandlerMixin:
         client = classify_client(headers, default="claude")
         tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
-        from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
+        from headroom.proxy.helpers import (
+            _strip_internal_headers,
+            log_outbound_headers,
+            merge_extra_headers,
+        )
 
         _pre_strip_count = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
         headers = _strip_internal_headers(headers)
+        headers = merge_extra_headers(headers, self.config.anthropic_extra_headers)
         log_outbound_headers(
             forwarder="anthropic_batch",
             stripped_count=_pre_strip_count,
@@ -3796,10 +3866,15 @@ class AnthropicHandlerMixin:
         client = classify_client(headers, default="claude")
         tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
-        from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
+        from headroom.proxy.helpers import (
+            _strip_internal_headers,
+            log_outbound_headers,
+            merge_extra_headers,
+        )
 
         _pre_strip_count = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
         headers = _strip_internal_headers(headers)
+        headers = merge_extra_headers(headers, self.config.anthropic_extra_headers)
         log_outbound_headers(
             forwarder="anthropic_batch_passthrough",
             stripped_count=_pre_strip_count,
@@ -3927,10 +4002,15 @@ class AnthropicHandlerMixin:
         client = classify_client(headers, default="claude")
         tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
-        from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
+        from headroom.proxy.helpers import (
+            _strip_internal_headers,
+            log_outbound_headers,
+            merge_extra_headers,
+        )
 
         _pre_strip_count = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
         headers = _strip_internal_headers(headers)
+        headers = merge_extra_headers(headers, self.config.anthropic_extra_headers)
         log_outbound_headers(
             forwarder="anthropic_batch_results",
             stripped_count=_pre_strip_count,

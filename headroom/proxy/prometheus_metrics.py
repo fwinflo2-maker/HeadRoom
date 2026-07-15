@@ -60,6 +60,12 @@ def _append_metric(
     )
 
 
+# The proxy persists savings state on every request. Batch that write so a busy
+# event loop isn't blocked re-serializing + fsyncing the whole history each time;
+# the tracker still flushes on graceful shutdown (see HeadroomProxy.shutdown).
+PROXY_SAVINGS_FLUSH_EVERY = 25
+
+
 class PrometheusMetrics:
     """Prometheus-compatible metrics."""
 
@@ -68,7 +74,11 @@ class PrometheusMetrics:
         savings_tracker: SavingsTracker | None = None,
         cost_tracker: CostTracker | None = None,
         otel_metrics: HeadroomOtelMetrics | None = None,
+        stateless: bool = False,
     ):
+        # Stateless mode: keep live in-memory metrics but never write the
+        # durable savings files (proxy_savings.json, savings_events.jsonl).
+        self._stateless = stateless
         self.requests_total = 0
         self.requests_by_provider: dict[str, int] = defaultdict(int)
         self.requests_by_model: dict[str, int] = defaultdict(int)
@@ -106,6 +116,29 @@ class PrometheusMetrics:
         # counter shows it on day 1, not week 3.
         self.compressions_by_strategy: dict[str, int] = defaultdict(int)
         self.tokens_saved_by_strategy: dict[str, int] = defaultdict(int)
+
+        # Fail-open compression failures, keyed by reason ("timeout",
+        # "error"). The proxy fails open on any optimization error so the
+        # request still succeeds; without this counter the failure is only
+        # visible as a log line. Splitting timeout from other errors tells us
+        # whether the compression budget is too tight vs. a real bug.
+        self.compression_failed_by_reason: dict[str, int] = defaultdict(int)
+
+        # Kompress size-gate outcomes, keyed by outcome ("within",
+        # "exceeded"). The gate routes oversized blocks away from ML
+        # compression (ContentRouter._kompress_max_tokens, #1171). This
+        # counter proves whether the gate ever fires on live traffic.
+        self.kompress_size_gate_by_outcome: dict[str, int] = defaultdict(int)
+
+        # These two counters are mutated from the compression thread-pool
+        # worker (record_kompress_size_gate runs inside ContentRouter, which
+        # the proxy runs in an executor), while export()/reset_runtime() read
+        # and clear them from the event-loop thread. asyncio.Lock can't be
+        # taken off-loop, so guard them with a plain threading.Lock, mirroring
+        # _stage_timing_lock below. Without it a first-time key insert can race
+        # an export iteration ("dictionary changed size during iteration") and
+        # concurrent increments can be lost.
+        self._obs_counter_lock = threading.Lock()
 
         # Codex WebSocket compression observability. These are intentionally
         # aggregate counters/sums, not per-unit storage, so /stats can answer
@@ -224,9 +257,21 @@ class PrometheusMetrics:
         self.cache_bust_tokens_lost: int = 0
         self.cache_bust_count: int = 0
 
+        # Cache-miss attribution (#1313): when a turn expected a prompt-cache
+        # hit but got none, why? Bucketed by reason so operators can tell a
+        # TTL lapse (idle longer than the cache lifetime → consider a longer
+        # TTL) from a prefix-content change (the cacheable prefix shifted).
+        # Reasons are the MISS_* literals from prefix_tracker. Per provider so
+        # the dashboard can scope; populated by `record_cache_miss_attribution`.
+        self.cache_miss_attribution_by_provider: dict[str, dict[str, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
+
         # Cumulative savings history (timestamp → cumulative tokens saved)
         self.savings_history: list[tuple[str, int]] = []
-        self.savings_tracker = savings_tracker or SavingsTracker()
+        self.savings_tracker = savings_tracker or SavingsTracker(
+            stateless=stateless, save_flush_every=PROXY_SAVINGS_FLUSH_EVERY
+        )
         self.cost_tracker = cost_tracker
         tracker_lifetime = self.savings_tracker.snapshot()["lifetime"]
         self._savings_tracker_input_tokens_offset = max(
@@ -272,6 +317,9 @@ class PrometheusMetrics:
 
             self.compressions_by_strategy.clear()
             self.tokens_saved_by_strategy.clear()
+            with self._obs_counter_lock:
+                self.compression_failed_by_reason.clear()
+                self.kompress_size_gate_by_outcome.clear()
 
             self.codex_ws_units_total = 0
             self.codex_ws_units_modified_total = 0
@@ -328,6 +376,7 @@ class PrometheusMetrics:
             self.prefix_freeze_compression_foregone = 0
             self.cache_bust_tokens_lost = 0
             self.cache_bust_count = 0
+            self.cache_miss_attribution_by_provider.clear()
             self.savings_history = []
 
         with self._stage_timing_lock:
@@ -397,6 +446,7 @@ class PrometheusMetrics:
         ):
             return
         self.requests_by_stack[slug] += 1
+        self.savings_tracker.record_lifetime_stack(slug)
 
     def record_compression(
         self,
@@ -427,6 +477,30 @@ class PrometheusMetrics:
         saved = original_tokens - compressed_tokens
         if saved > 0:
             self.tokens_saved_by_strategy[strategy] += saved
+
+    def record_compression_failed(self, reason: str) -> None:
+        """Record one fail-open compression failure, bucketed by ``reason``.
+
+        Called from the optimization fail-open site (handlers/anthropic.py)
+        with ``reason`` in ``{"timeout", "error"}``. Guarded by
+        ``_obs_counter_lock`` so it stays consistent with the off-thread
+        ``record_kompress_size_gate`` writer and the export/reset readers.
+        """
+        with self._obs_counter_lock:
+            self.compression_failed_by_reason[reason or "error"] += 1
+
+    def record_kompress_size_gate(self, outcome: str) -> None:
+        """Record one kompress size-gate decision, bucketed by ``outcome``.
+
+        Called from ContentRouter via the observer hook with ``outcome`` in
+        ``{"within", "exceeded"}`` — "exceeded" when an eligible block is too
+        large and routed off ML, "within" when it passes the gate. Proves
+        whether the size gate (#1171) ever fires on live traffic. Runs on the
+        compression executor thread, so the increment is guarded by
+        ``_obs_counter_lock`` to stay safe against the export/reset readers.
+        """
+        with self._obs_counter_lock:
+            self.kompress_size_gate_by_outcome[outcome or "within"] += 1
 
     def record_router_route_counts(self, counts: dict[str, int]) -> None:
         """Accumulate ContentRouter routing-category counts for a single
@@ -563,10 +637,24 @@ class PrometheusMetrics:
         cache_write_1h_tokens: int = 0,
         uncached_input_tokens: int = 0,
         attempted_input_tokens: int = 0,
+        output_tokens_saved: int = 0,
         project: str | None = None,
         client: str | None = None,
     ):
         """Record metrics for a request."""
+        # Post-guard invariant (all providers): Headroom never forwards a request
+        # larger than the original — handlers revert any inflation before sending
+        # (verified clean on the wire). So compression savings are >= 0; a negative
+        # here is an intermediate/hook token-count artifact that never reached the
+        # model. Clamp so total_tokens_removed / avg_compression_pct reflect the
+        # actually-forwarded bytes instead of surfacing spurious negatives.
+        if tokens_saved < 0:
+            logger.debug(
+                "metrics.record: clamping negative tokens_saved=%d to 0 for %s (artifact; wire not inflated)",
+                tokens_saved,
+                model,
+            )
+            tokens_saved = 0
         async with self._lock:
             self.requests_total += 1
             self.requests_by_provider[provider] += 1
@@ -646,6 +734,24 @@ class PrometheusMetrics:
             if len(self.savings_history) > 500:
                 self.savings_history = self.savings_history[-500:]
 
+            self.savings_tracker.record_lifetime_request(
+                persist=False,
+                provider=provider,
+                stack=None,
+                record_stack=False,
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                attempted_input_tokens=attempted_input_tokens,
+                tokens_saved=tokens_saved,
+                cached=cached,
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
+                cache_write_5m_tokens=cache_write_5m_tokens,
+                cache_write_1h_tokens=cache_write_1h_tokens,
+                uncached_input_tokens=uncached_input_tokens,
+                waste_signals=waste_signals,
+            )
             total_input_tokens, total_input_cost_usd = self._current_savings_tracker_totals()
             self.savings_tracker.record_request(
                 model=model,
@@ -658,6 +764,7 @@ class PrometheusMetrics:
                 uncached_input_tokens=uncached_input_tokens,
                 total_input_tokens=total_input_tokens,
                 total_input_cost_usd=total_input_cost_usd,
+                output_tokens_saved=output_tokens_saved,
             )
 
             # Also append to the durable, multi-process savings ledger so
@@ -666,10 +773,19 @@ class PrometheusMetrics:
             # client is the harness classified from the User-Agent / X-Client
             # (claude-code, codex, cursor, ...); it falls back to "proxy" only
             # when the harness is unidentified.
-            if tokens_saved > 0:
+            if tokens_saved > 0 and not self._stateless:
+                # `input_tokens` here is the optimized (post-compression) count
+                # that was actually forwarded — see emit_request_outcome, which
+                # passes `input_tokens=outcome.optimized_tokens`. The ledger's
+                # `before` is the pre-compression original and `after` is what we
+                # forwarded, and `headroom savings` derives the reduction percent
+                # as saved / before. Passing the forwarded count as `before`
+                # understated the original by `tokens_saved`, inflating that
+                # percentage (e.g. a real 40% reduction was reported as ~67%).
+                # Reconstruct the original as forwarded + saved.
                 savings_ledger.record_savings_event(
-                    tokens_before=input_tokens,
-                    tokens_after=max(input_tokens - tokens_saved, 0),
+                    tokens_before=input_tokens + tokens_saved,
+                    tokens_after=input_tokens,
                     model=model,
                     client=client or "proxy",
                     source="proxy",
@@ -733,7 +849,21 @@ class PrometheusMetrics:
         async with self._lock:
             self.cache_bust_tokens_lost += tokens_lost
             self.cache_bust_count += 1
+        self.savings_tracker.record_lifetime_cache_bust(tokens_lost=tokens_lost)
         self._get_otel_metrics().record_proxy_cache_bust(tokens_lost=tokens_lost)
+
+    async def record_cache_miss_attribution(self, provider: str, reason: str) -> None:
+        """Record why a turn that expected a prompt-cache hit missed instead.
+
+        ``reason`` is one of the MISS_* literals produced by
+        ``PrefixCacheTracker.classify_cache_miss`` (``ttl_expiry``,
+        ``prefix_change``, ``unknown``). Cold starts and hits are not recorded
+        — only actual misses against a previously-cached prefix reach here.
+        Bucketed per provider so the dashboard can scope or aggregate.
+        """
+        async with self._lock:
+            self.cache_miss_attribution_by_provider[provider][reason] += 1
+        self.savings_tracker.record_lifetime_cache_miss(provider=provider, reason=reason)
 
     # ------------------------------------------------------------------
     # Unit 3: WS session lifecycle gauges / histogram
@@ -779,11 +909,13 @@ class PrometheusMetrics:
     async def record_rate_limited(self, *, provider: str | None = None, model: str | None = None):
         async with self._lock:
             self.requests_rate_limited += 1
+        self.savings_tracker.record_lifetime_rate_limited(provider=provider, model=model)
         self._get_otel_metrics().record_proxy_rate_limited(provider=provider, model=model)
 
     async def record_failed(self, *, provider: str | None = None, model: str | None = None):
         async with self._lock:
             self.requests_failed += 1
+        self.savings_tracker.record_lifetime_failed(provider=provider, model=model)
         self._get_otel_metrics().record_proxy_failed(provider=provider, model=model)
 
     async def export(self) -> str:
@@ -798,6 +930,7 @@ class PrometheusMetrics:
             stage_timing_count_snapshot = dict(self.stage_timing_count)
             stage_timing_max_snapshot = dict(self.stage_timing_max)
         async with self._lock:
+            lifetime_savings = self.savings_tracker.snapshot()["lifetime"]
             lines: list[str] = []
             _append_metric(
                 lines,
@@ -869,15 +1002,51 @@ class PrometheusMetrics:
                 help_text="Tokens saved by optimization",
                 value=self.tokens_saved_total,
             )
+            _append_metric(
+                lines,
+                name="headroom_persistent_savings_requests_total",
+                metric_type="counter",
+                help_text="Durable lifetime requests recorded by the proxy savings tracker",
+                value=lifetime_savings["requests"],
+            )
+            _append_metric(
+                lines,
+                name="headroom_persistent_savings_tokens_saved_total",
+                metric_type="counter",
+                help_text="Durable lifetime input tokens saved by proxy compression",
+                value=lifetime_savings["tokens_saved"],
+            )
+            _append_metric(
+                lines,
+                name="headroom_persistent_savings_input_tokens_total",
+                metric_type="counter",
+                help_text="Durable lifetime input tokens recorded by the proxy savings tracker",
+                value=lifetime_savings["total_input_tokens"],
+            )
+            _append_metric(
+                lines,
+                name="headroom_persistent_savings_input_cost_usd_total",
+                metric_type="counter",
+                help_text="Durable lifetime input spend in USD estimated by the proxy savings tracker",
+                value=lifetime_savings["total_input_cost_usd"],
+            )
+            _append_metric(
+                lines,
+                name="headroom_persistent_savings_compression_savings_usd_total",
+                metric_type="counter",
+                help_text=(
+                    "Durable lifetime compression savings in USD estimated by the "
+                    "proxy savings tracker"
+                ),
+                value=lifetime_savings["compression_savings_usd"],
+            )
             # NOTE: per-strategy compression breakdown is tracked
             # internally on `self.compressions_by_strategy` and
             # `self.tokens_saved_by_strategy` (populated by
             # `record_compression`) but **deliberately not exported
-            # here**. The proxy's metric→Supabase pipeline treats
-            # each metric name as a column, and we cannot add new
-            # columns. The state is still observable for tests +
-            # programmatic introspection; if/when a non-column-
-            # adding export path exists, surface it there.
+            # here** as individual Prometheus series. The state is
+            # still observable via /stats + tests + programmatic
+            # introspection.
             _append_metric(
                 lines,
                 name="headroom_latency_ms_sum",
@@ -976,6 +1145,54 @@ class PrometheusMetrics:
                 help_text="Tokens that lost provider cache discount because of compression",
                 value=self.cache_bust_tokens_lost,
             )
+
+            if self.cache_miss_attribution_by_provider:
+                lines.extend(
+                    [
+                        "# HELP headroom_cache_miss_attribution_total Cache misses on an "
+                        "expected-cached prefix, bucketed by reason (ttl_expiry|prefix_change|unknown)",
+                        "# TYPE headroom_cache_miss_attribution_total counter",
+                    ]
+                )
+                for _provider, _reasons in self.cache_miss_attribution_by_provider.items():
+                    for _reason, _count in _reasons.items():
+                        lines.append(
+                            f'headroom_cache_miss_attribution_total{{provider="{_provider}",'
+                            f'reason="{_reason}"}} {_count}'
+                        )
+                lines.append("")
+
+            # Snapshot the off-thread observer counters under their own lock,
+            # then format outside it (see _obs_counter_lock).
+            with self._obs_counter_lock:
+                compression_failed = dict(self.compression_failed_by_reason)
+                kompress_size_gate = dict(self.kompress_size_gate_by_outcome)
+
+            if compression_failed:
+                lines.extend(
+                    [
+                        "# HELP headroom_compression_failed_total Fail-open compression failures by reason",
+                        "# TYPE headroom_compression_failed_total counter",
+                    ]
+                )
+                for reason, count in compression_failed.items():
+                    lines.append(
+                        f'headroom_compression_failed_total{{reason="{_escape_label_value(reason)}"}} {count}'
+                    )
+                lines.append("")
+
+            if kompress_size_gate:
+                lines.extend(
+                    [
+                        "# HELP headroom_kompress_size_gate_total Kompress size-gate decisions by outcome; within counts a gate pass, not whether ML compression then ran",
+                        "# TYPE headroom_kompress_size_gate_total counter",
+                    ]
+                )
+                for outcome, count in kompress_size_gate.items():
+                    lines.append(
+                        f'headroom_kompress_size_gate_total{{outcome="{_escape_label_value(outcome)}"}} {count}'
+                    )
+                lines.append("")
 
             lines.extend(
                 [

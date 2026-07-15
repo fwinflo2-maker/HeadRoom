@@ -22,6 +22,7 @@ from headroom.pricing.litellm_pricing import resolve_litellm_model
 log = logging.getLogger(__name__)
 
 LOG_DIR = _paths.log_dir()
+DEFAULT_SLOW_OPTIMIZATION_MS = 500.0
 
 # Matches: 2026-03-07 13:38:31,009 - headroom.proxy - INFO - [hr_...] PERF model=... ...
 _PERF_RE = re.compile(
@@ -210,6 +211,10 @@ class PerfReport:
     oldest_kept_ts: str | None = None
     newest_kept_ts: str | None = None
     records_filtered_out: int = 0
+    # True when no time cutoff was applied (--hours 0, or a value so large it
+    # overflows datetime arithmetic). The header says "all data" instead of a
+    # misleading "last 0h".
+    window_all_data: bool = False
 
 
 # Log timestamps are emitted by Python's `logging` formatter as
@@ -249,7 +254,17 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
     if not log_dir.exists():
         return report
 
-    cutoff = datetime.now() - timedelta(hours=last_n_hours) if last_n_hours > 0 else None
+    # A huge --hours value (e.g. 1e9) overflows datetime arithmetic. Since
+    # "look back a billion hours" is effectively "all data", treat overflow as
+    # no cutoff rather than crashing with a raw OverflowError traceback.
+    if last_n_hours > 0:
+        try:
+            cutoff: datetime | None = datetime.now() - timedelta(hours=last_n_hours)
+        except OverflowError:
+            cutoff = None
+    else:
+        cutoff = None
+    report.window_all_data = cutoff is None
 
     def _within_window(ts_str: str | None) -> bool:
         # Fail-open: records without a parseable timestamp are kept. The
@@ -426,29 +441,87 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
     return report
 
 
+def _context_tool_lifetime_savings() -> dict | None:
+    """Lifetime savings from the configured CLI context tool (RTK / lean-ctx).
+
+    ``perf`` reports a windowed view of the proxy's *compression* logs. The CLI
+    context tool (RTK) keeps its own lifetime counter that never lands in
+    ``proxy.log``, so without this it stays invisible in ``headroom perf`` even
+    when it dwarfs proxy-side savings. Lifetime (not session) is the right scope
+    here: ``perf`` is a one-shot CLI, so the proxy-session baseline ``/stats``
+    subtracts is meaningless out of process.
+
+    Best-effort: returns ``None`` when no tool is installed or its stats cannot
+    be read, so the report degrades to proxy-only rather than erroring.
+    """
+    try:
+        from headroom.proxy.helpers import _get_context_tool_stats
+
+        stats = _get_context_tool_stats()
+    except Exception:
+        return None
+    if not stats or not stats.get("installed", False):
+        return None
+    lifetime = stats.get("lifetime") or {}
+    tokens_saved = int(lifetime.get("tokens_saved", 0) or 0)
+    if tokens_saved <= 0:
+        return None
+    return {
+        "tool": str(stats.get("tool", "rtk")),
+        "label": str(stats.get("label", "RTK")),
+        "tokens_saved": tokens_saved,
+        "commands": int(lifetime.get("commands", 0) or 0),
+        "savings_pct": round(float(lifetime.get("savings_pct", 0.0) or 0.0), 1),
+    }
+
+
+def _cli_filtering_report_lines() -> list[str]:
+    """Render the context-tool (RTK) lifetime savings section, or [] if absent."""
+    cli = _context_tool_lifetime_savings()
+    if not cli:
+        return []
+    return [
+        f"{cli['label']} CLI Filtering (lifetime, all-time)",
+        "-" * 40,
+        f"  Tokens saved:  {cli['tokens_saved']:,} ({cli['savings_pct']:.1f}%)",
+        f"  Commands:      {cli['commands']:,}",
+        f"  Note: {cli['label']}'s own lifetime counter — not limited to the --hours window.",
+        "",
+    ]
+
+
 def format_report(report: PerfReport) -> str:
     """Format a PerfReport into a human-readable string."""
     lines: list[str] = []
+    cli_filtering_lines = _cli_filtering_report_lines()
 
     if not report.perf_records and not report.router_records:
-        lines.append("No performance data found in ~/.headroom/logs/")
-        lines.append("")
-        lines.append("Start the proxy to begin collecting data:")
-        lines.append("  headroom proxy")
+        if cli_filtering_lines:
+            # RTK savings are independent of proxy logs — surface them even when
+            # there is no proxy traffic in the window.
+            lines.append("No proxy performance data in ~/.headroom/logs/ for this window.")
+            lines.append("")
+            lines.extend(cli_filtering_lines)
+        else:
+            lines.append("No performance data found in ~/.headroom/logs/")
+            lines.append("")
+            lines.append("Start the proxy to begin collecting data:")
+            lines.append("  headroom proxy")
         return "\n".join(lines)
 
     # Header
     lines.append("Headroom Performance Report")
     lines.append("=" * 60)
     if report.requested_hours is not None:
+        window_label = "all data" if report.window_all_data else f"last {report.requested_hours:g}h"
         if report.oldest_kept_ts and report.newest_kept_ts:
             window_str = (
-                f"Window: last {report.requested_hours:g}h "
+                f"Window: {window_label} "
                 f"(actual data: {report.oldest_kept_ts[:19]} → "
                 f"{report.newest_kept_ts[:19]})"
             )
         else:
-            window_str = f"Window: last {report.requested_hours:g}h (no records found in window)"
+            window_str = f"Window: {window_label} (no records found in window)"
         lines.append(window_str)
         if report.records_filtered_out > 0:
             lines.append(
@@ -536,15 +609,31 @@ def format_report(report: PerfReport) -> str:
         # Optimization latency
         opt_times = [r.optimization_ms for r in records if r.optimization_ms > 0]
         if opt_times:
-            avg_opt = sum(opt_times) / len(opt_times)
-            max_opt = max(opt_times)
+            overhead = build_overhead_summary(report)
+            opt_stats = overhead["optimization_ms"]
             lines.append("Optimization Overhead")
             lines.append("-" * 40)
-            lines.append(f"  Average:  {avg_opt:.0f}ms")
-            lines.append(f"  Max:      {max_opt:.0f}ms")
-            slow = [t for t in opt_times if t > 500]
-            if slow:
-                lines.append(f"  >500ms:   {len(slow)} requests")
+            lines.append(f"  Average:     {opt_stats['average_ms']:.0f}ms")
+            lines.append(
+                "  p50/p95/p99: "
+                f"{opt_stats['p50_ms']:.0f} / "
+                f"{opt_stats['p95_ms']:.0f} / "
+                f"{opt_stats['p99_ms']:.0f}ms"
+            )
+            lines.append(f"  Max:         {opt_stats['max_ms']:.0f}ms")
+            if opt_stats["slow_request_count"]:
+                lines.append(
+                    f"  >{overhead['slow_threshold_ms']:.0f}ms:      "
+                    f"{opt_stats['slow_request_count']} requests "
+                    f"({opt_stats['slow_request_pct']:.1f}%)"
+                )
+            if overhead["stage_breakdown"]:
+                lines.append("  Slowest stages:")
+                for stage in overhead["stage_breakdown"][:3]:
+                    lines.append(
+                        f"    {stage['stage']}: total {stage['total_ms']:.0f}ms, "
+                        f"p95 {stage['p95_ms']:.0f}ms, max {stage['max_ms']:.0f}ms"
+                    )
             lines.append("")
 
         # Throughput
@@ -662,6 +751,10 @@ def format_report(report: PerfReport) -> str:
             lines.append(f"  {i}. {rec}")
         lines.append("")
 
+    # CLI context-tool (RTK) lifetime savings — its own counter never reaches
+    # proxy.log, so surface it here or it stays invisible in `headroom perf`.
+    lines.extend(cli_filtering_lines)
+
     # Footer
     lines.append(
         f"Log files: {report.log_files_read} | Lines parsed: {report.total_lines_parsed:,}"
@@ -721,6 +814,102 @@ def _percentile(data: list[float], pct: float) -> float:
     if upper < len(sorted_data):
         return sorted_data[lower] * (1.0 - weight) + sorted_data[upper] * weight
     return sorted_data[lower]
+
+
+def _latency_stats(values: list[float]) -> dict[str, float | int]:
+    if not values:
+        return {
+            "count": 0,
+            "average_ms": 0.0,
+            "p50_ms": 0.0,
+            "p95_ms": 0.0,
+            "p99_ms": 0.0,
+            "max_ms": 0.0,
+        }
+    return {
+        "count": len(values),
+        "average_ms": round(sum(values) / len(values), 2),
+        "p50_ms": round(_percentile(values, 0.50), 2),
+        "p95_ms": round(_percentile(values, 0.95), 2),
+        "p99_ms": round(_percentile(values, 0.99), 2),
+        "max_ms": round(max(values), 2),
+    }
+
+
+def _slowest_stage(record: PerfRecord) -> tuple[str | None, float]:
+    stages = [(name, value) for name, value in record.stages.items() if value > 0]
+    if not stages:
+        return None, 0.0
+    return max(stages, key=lambda item: item[1])
+
+
+def build_overhead_summary(
+    report: PerfReport,
+    *,
+    slow_threshold_ms: float = DEFAULT_SLOW_OPTIMIZATION_MS,
+    limit: int = 10,
+) -> dict:
+    """Aggregate optimization latency and stage-level bottlenecks."""
+    records = report.perf_records
+    opt_times = [r.optimization_ms for r in records if r.optimization_ms > 0]
+    total_times = [r.total_ms for r in records if r.total_ms > 0]
+    slow_records = [r for r in records if r.optimization_ms > slow_threshold_ms]
+
+    stage_values: dict[str, list[float]] = {}
+    for record in records:
+        for stage, value in record.stages.items():
+            if value > 0:
+                stage_values.setdefault(stage, []).append(value)
+
+    stage_breakdown = []
+    for stage, values in stage_values.items():
+        stats = _latency_stats(values)
+        stage_breakdown.append(
+            {
+                "stage": stage,
+                **stats,
+                "total_ms": round(sum(values), 2),
+            }
+        )
+    stage_breakdown.sort(key=lambda row: row["total_ms"], reverse=True)
+
+    top_slow_requests = []
+    for record in sorted(
+        [r for r in records if r.optimization_ms > 0],
+        key=lambda r: r.optimization_ms,
+        reverse=True,
+    )[:limit]:
+        slowest_stage, slowest_stage_ms = _slowest_stage(record)
+        top_slow_requests.append(
+            {
+                "timestamp": record.timestamp,
+                "request_id": record.request_id,
+                "model": record.model,
+                "client": record.client,
+                "optimization_ms": record.optimization_ms,
+                "total_ms": record.total_ms,
+                "tokens_before": record.tokens_before,
+                "tokens_after": record.tokens_after,
+                "tokens_saved": record.tokens_saved,
+                "slowest_stage": slowest_stage,
+                "slowest_stage_ms": slowest_stage_ms,
+                "transforms": record.transforms,
+            }
+        )
+
+    return {
+        "slow_threshold_ms": slow_threshold_ms,
+        "optimization_ms": {
+            **_latency_stats(opt_times),
+            "slow_request_count": len(slow_records),
+            "slow_request_pct": round(len(slow_records) / len(records) * 100, 1)
+            if records
+            else 0.0,
+        },
+        "total_ms": _latency_stats(total_times),
+        "stage_breakdown": stage_breakdown,
+        "top_slow_requests": top_slow_requests,
+    }
 
 
 def calculate_throughput(report: PerfReport) -> dict:
@@ -902,9 +1091,13 @@ def build_perf_summary(report: PerfReport) -> dict:
         "cache_hit_pct": cache_hit_pct,
         "by_model": by_model,
         "by_transform": by_transform,
+        "overhead": build_overhead_summary(report),
         "throughput": calculate_throughput(report),
         "log_files_read": report.log_files_read,
         "total_lines_parsed": report.total_lines_parsed,
+        # RTK/CLI context-tool lifetime savings (its own counter, not in
+        # proxy.log) — None when no tool is installed. Mirrors the text report.
+        "cli_filtering": _context_tool_lifetime_savings(),
     }
 
 
@@ -1027,11 +1220,18 @@ def _generate_recommendations(report: PerfReport) -> list[str]:
                     )
 
         # Optimization latency
-        slow = [r for r in report.perf_records if r.optimization_ms > 500]
-        if len(slow) > len(report.perf_records) * 0.2:
+        overhead = build_overhead_summary(report)
+        opt_stats = overhead["optimization_ms"]
+        slow_count = int(opt_stats["slow_request_count"])
+        if slow_count > len(report.perf_records) * 0.2:
+            stage_hint = ""
+            if overhead["stage_breakdown"]:
+                stage_hint = f"; top stage: {overhead['stage_breakdown'][0]['stage']}"
             recs.append(
-                f"{len(slow)} requests took >500ms for optimization — "
-                "consider reducing transform pipeline"
+                f"{slow_count} requests took >{overhead['slow_threshold_ms']:.0f}ms "
+                "for optimization"
+                f"{stage_hint} — consider reducing heavy transforms or lowering "
+                "HEADROOM_COMPRESSION_TIMEOUT_SECONDS"
             )
 
     if report.router_records:

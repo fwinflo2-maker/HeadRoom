@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
@@ -43,8 +45,13 @@ def _install_fake_client(proxy) -> MagicMock:
 
 def _forwarded_model(client: MagicMock) -> str:
     """Parse the outgoing model from the content forwarded upstream."""
+    return _forwarded_body(client)["model"]
+
+
+def _forwarded_body(client: MagicMock) -> dict:
+    """Parse the JSON body forwarded upstream."""
     content = client.post.call_args.kwargs["content"]
-    return json.loads(content)["model"]
+    return json.loads(content)
 
 
 def _router_config() -> ModelRouterConfig:
@@ -152,6 +159,34 @@ def test_maybe_route_model_routes_when_enabled() -> None:
     tracker.mark_mutated.assert_called_once_with("model_router")
 
 
+@pytest.mark.parametrize(
+    ("routes", "expected_reason"),
+    [
+        ((ModelRoute(to_model="keep", from_models=("keep",), name="exempt"),), "exempt"),
+        ((ModelRoute(to_model="cheap", from_models=("other",)),), "no rule matched"),
+    ],
+)
+def test_maybe_route_model_logs_unchanged_decision(
+    caplog: pytest.LogCaptureFixture,
+    routes: tuple[ModelRoute, ...],
+    expected_reason: str,
+) -> None:
+    host = _RouterHost()
+    host.model_router = ModelRouter(ModelRouterConfig(enabled=True, routes=routes))
+
+    with caplog.at_level(logging.INFO, logger="headroom.proxy"):
+        out = host._maybe_route_model(
+            "keep", [{"content": "hi"}], {"model": "keep"}, MagicMock(), False
+        )
+
+    assert out == "keep"
+    decisions = [
+        record.message for record in caplog.records if "model routing decision" in record.message
+    ]
+    assert len(decisions) == 1
+    assert expected_reason in decisions[0]
+
+
 def test_maybe_route_model_skips_on_bypass() -> None:
     host = _RouterHost()
     host.model_router = ModelRouter(
@@ -210,3 +245,22 @@ def test_bypass_request_is_never_model_rewritten() -> None:
     assert resp.status_code == 200
     # Byte-faithful passthrough must keep the client's original model.
     assert _forwarded_model(http) == "claude-sonnet-4-6"
+
+
+def test_vertex_raw_predict_model_is_not_rewritten_in_body() -> None:
+    # When the model comes from the provider URL (Vertex rawPredict), the upstream
+    # model is set by the path, so routing must not rewrite body["model"].
+    app = create_app(_messages_config())
+    with TestClient(app) as client:
+        http = _install_fake_client(client.app.state.proxy)
+        resp = client.post(
+            "/v1/projects/p/locations/us-central1/publishers/anthropic/models/"
+            "claude-sonnet-4-6:rawPredict",
+            json={
+                "anthropic_version": "vertex-2023-10-16",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+    assert resp.status_code == 200
+    assert "model" not in _forwarded_body(http)

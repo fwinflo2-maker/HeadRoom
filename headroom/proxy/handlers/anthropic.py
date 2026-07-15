@@ -538,11 +538,11 @@ class AnthropicHandlerMixin:
             input_tokens=estimate_input_tokens(messages, body.get("tools"), body.get("system")),
             has_tools=bool(body.get("tools")),
         )
+        logger.info("model routing decision: %s", decision.reason)
         if not decision.changed:
             return model
         body["model"] = decision.routed_model
         body_mutation_tracker.mark_mutated("model_router")
-        logger.info("model routing applied: %s", decision.reason)
         return decision.routed_model
 
     async def handle_anthropic_messages(
@@ -802,8 +802,13 @@ class AnthropicHandlerMixin:
                 logger.info(f"[{request_id}] Bypass: skipping compression (header)")
 
             # Cost-aware model routing (#1706). Opt-in and disabled by default;
-            # fail-closed and bypass handling live in the helper.
-            model = self._maybe_route_model(model, messages, body, body_mutation_tracker, _bypass)
+            # fail-closed and bypass handling live in the helper. A model override
+            # comes from a provider URL (for example Vertex rawPredict), where
+            # rewriting body["model"] would not change the upstream model.
+            if model_override is None:
+                model = self._maybe_route_model(
+                    model, messages, body, body_mutation_tracker, _bypass
+                )
 
             # NOTE: Upstream temporarily disabled broad image compression due to
             # token-counting inaccuracies. We only compress the latest non-frozen

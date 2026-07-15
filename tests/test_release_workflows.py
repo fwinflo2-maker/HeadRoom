@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -15,6 +16,30 @@ def test_docker_workflow_normalizes_repository_name_for_signing() -> None:
     assert "id: image-name" in content
     assert "tr '[:upper:]' '[:lower:]'" in content
     assert "steps.image-name.outputs.image_name" in content
+
+
+def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "docker.yml").read_text())
+    jobs = workflow["jobs"]
+    manifest = jobs["docker-manifest"]
+    variants = manifest["strategy"]["matrix"]["include"]
+    root = next(entry for entry in variants if entry["suffix"] == "")
+    nonroot = next(entry for entry in variants if entry["variant"]["name"] == "nonroot")
+    promotion = next(
+        step for step in manifest["steps"] if step["name"] == "Re-tag root image as :latest"
+    )
+    command = promotion["run"]
+
+    assert root["variant"]["name"] == ""
+    assert nonroot["suffix"] == "nonroot"
+    assert "matrix.suffix == ''" in promotion["if"]
+    assert "steps.version.outputs.version != ''" in promotion["if"]
+    assert '"${IMAGE}:latest"' in command
+    assert '"${IMAGE}:${VERSION}"' in command
+    assert "promote-latest" not in jobs
+    assert manifest["needs"] == "docker-build"
+    assert "linux/amd64" in str(jobs["docker-build"])
+    assert "linux/arm64" in str(jobs["docker-build"])
 
 
 def test_release_workflow_publishes_both_node_packages_to_github_packages() -> None:

@@ -2430,7 +2430,10 @@ class ContentRouter(Transform):
                 else:
                     fallback_compressed = compressed
                     fallback_tokens = compressed_tokens
-                if fallback_tokens < compressed_tokens:
+                fallback_saved_tokens = (
+                    fallback_compressed != content and fallback_tokens < compressed_tokens
+                )
+                if fallback_saved_tokens:
                     compressed = fallback_compressed
                     compressed_tokens = fallback_tokens
                     actual_strategy = CompressionStrategy.KOMPRESS

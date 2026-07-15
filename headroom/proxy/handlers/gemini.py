@@ -643,7 +643,11 @@ class GeminiHandlerMixin:
                 rebuilt_tools.append({"functionDeclarations": function_declarations})
             return rebuilt_tools
 
-        if self.config.ccr_inject_tool and tokens_saved > 0 and not is_streaming:
+        ccr_inject_tool = getattr(self.config, "ccr_inject_tool", True)
+        ccr_inject_system_instructions = getattr(
+            self.config, "ccr_inject_system_instructions", False
+        )
+        if ccr_inject_tool and tokens_saved > 0 and not is_streaming:
             from headroom.ccr import CCRToolInjector
 
             seen_names = set()
@@ -657,7 +661,7 @@ class GeminiHandlerMixin:
             injector = CCRToolInjector(
                 provider="google",
                 inject_tool=True,
-                inject_system_instructions=self.config.ccr_inject_system_instructions,
+                inject_system_instructions=ccr_inject_system_instructions,
             )
             optimized_messages, injected_funcs, was_injected = injector.process_request(
                 optimized_messages, native_function_declarations

@@ -268,3 +268,39 @@ def test_build_manifest_extra_env_overrides_derived_defaults() -> None:
     # telemetry_enabled=False in _base_manifest_kwargs would normally set "off";
     # an explicit --env must win.
     assert manifest.base_env["HEADROOM_TELEMETRY"] == "on"
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "ANTHROPIC_TARGET_API_URL",
+        "OPENAI_TARGET_API_URL",
+        "VERTEX_TARGET_API_URL",
+    ],
+)
+def test_build_manifest_snapshots_target_api_urls(monkeypatch, key: str) -> None:
+    monkeypatch.setenv(key, "https://example.test")
+
+    manifest = build_manifest(**_base_manifest_kwargs())
+
+    assert manifest.base_env[key] == "https://example.test"
+
+
+def test_build_manifest_omits_missing_or_empty_target_api_urls(monkeypatch) -> None:
+    monkeypatch.delenv("ANTHROPIC_TARGET_API_URL", raising=False)
+    monkeypatch.setenv("OPENAI_TARGET_API_URL", "")
+
+    manifest = build_manifest(**_base_manifest_kwargs())
+
+    assert "ANTHROPIC_TARGET_API_URL" not in manifest.base_env
+    assert "OPENAI_TARGET_API_URL" not in manifest.base_env
+
+
+def test_build_manifest_extra_env_overrides_target_api_url(monkeypatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_TARGET_API_URL", "https://environment.example")
+
+    manifest = build_manifest(
+        **_base_manifest_kwargs(extra_env={"ANTHROPIC_TARGET_API_URL": "https://explicit.example"})
+    )
+
+    assert manifest.base_env["ANTHROPIC_TARGET_API_URL"] == "https://explicit.example"

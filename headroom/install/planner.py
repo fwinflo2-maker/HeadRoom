@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from collections.abc import Iterable
 
@@ -164,6 +165,13 @@ def build_manifest(
     base_env["HEADROOM_TELEMETRY"] = "on" if telemetry_enabled else "off"
     if memory_enabled:
         base_env["HEADROOM_MEMORY_ENABLED"] = "1"
+    for key in (
+        "ANTHROPIC_TARGET_API_URL",
+        "OPENAI_TARGET_API_URL",
+        "VERTEX_TARGET_API_URL",
+    ):
+        if value := os.environ.get(key):
+            base_env[key] = value
     # Applied last so explicit --env overrides win over the auto-derived
     # defaults above (e.g. a custom HEADROOM_WORKSPACE_DIR).
     if extra_env:

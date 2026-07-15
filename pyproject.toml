@@ -7,7 +7,7 @@ name = "headroom-ai"
 version = "0.32.0"
 description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
 readme = "README.md"
-license = "Apache-2.0"
+license = "Apache-2.0"  
 requires-python = ">=3.10"
 authors = [
     { name = "Headroom Contributors" }
@@ -54,11 +54,13 @@ dependencies = [
     # ImportError-guarded. Marking it 3.14-optional lets headroom install on Python 3.14
     # (core compression + the Anthropic proxy path never import litellm). See GH #956.
     "litellm>=1.86.2,<2.0; python_version < '3.14'",  # model registry, pricing, providers (lazy)
-    "click>=8.3.3",               # CLI framework
+    "click>=8.3.3",               # CLI framework; PYSEC-2026-2132 fix (command injection in click.edit())
     "rich>=13.0.0",               # Rich terminal output
     "opentelemetry-api>=1.24.0",  # Safe no-op OTEL API for instrumentation
     "ast-grep-cli>=0.30.0",       # AST-aware code slicing (CodeCompressor); binary wheel
+    "pyyaml>=6.0",                # omp wrap: parse/merge omp's models.yml registry
     "tomli>=2.0.0; python_version < '3.11'",  # tomllib backport for helper scripts
+    "tomlkit>=0.13.0,<1.0",       # Loss-minimizing Codex config recovery
 ]
 
 [project.optional-dependencies]
@@ -76,7 +78,7 @@ proxy = [
     "zstandard>=0.20.0",          # Decompress zstd request bodies (Codex, etc.)
     "websockets>=13.0",           # WebSocket proxy for /v1/responses (Codex gpt-5.4+)
     "onnxruntime>=1.16.0",        # Kompress ONNX INT8 text compression (no torch needed)
-    "transformers>=4.30.0,<6.0",  # Tokenizer only (for Kompress)
+    "transformers>=5.5.0,<6.0",   # Tokenizer only (for Kompress)
     "watchdog>=4.0.0",            # File watcher for live code graph reindexing (--code-graph)
     "sqlite-vec>=0.1.6",          # Vector index for memory (--memory). Lightweight, no torch.
 ]
@@ -105,7 +107,7 @@ ml = [
     # PyTorch does not publish wheels for macOS 15 x86_64 at this floor, which
     # makes `headroom-ai[all]` unsatisfiable on Intel Macs (#1931).
     "torch>=2.12.1; sys_platform != 'darwin' or platform_machine != 'x86_64'",
-    "transformers>=4.30.0,<6.0",
+    "transformers>=5.5.0,<6.0",
     # transformers >= 5.x requires huggingface-hub >= 1.5.0,<2.0; pinning
     # the floor here prevents Kompress from silently falling back to
     # "unavailable" when a sibling install (e.g. `pip install
@@ -165,7 +167,7 @@ relevance = [
 # `headroom/image/compressor.py` adapts both API shapes at runtime via
 # a try/except cascade. See issue #372 for context.
 image = [
-    "pillow>=12.3.0",
+    "pillow>=12.3.0",         # PYSEC-2026-2253/2254/2255/2256/2257 fixes (decompression-bomb + cmd-injection)
     "sentencepiece>=0.1.99",  # Required by SigLIP tokenizer (SiglipTokenizer)
     # Python 3.6–3.12: keep the proven ORT-bundled package directly.
     # ~15 MB ONNX models auto-downloaded on first use.
@@ -208,6 +210,14 @@ agno = [
 strands = [
     "strands-agents>=0.1.0",
 ]
+# CrewAI agent framework integration
+crewai = [
+    "crewai>=1.0",
+]
+# AutoGen agent framework integration
+autogen = [
+    "autogen-agentchat>=0.7",
+]
 # MCP server for Claude Code integration
 mcp = [
     "mcp>=1.0.0",
@@ -218,7 +228,7 @@ mcp = [
 # Voice filler detection
 voice = [
     "onnxruntime>=1.16.0",
-    "transformers>=4.30.0,<6.0",
+    "transformers>=5.5.0,<6.0",
     "torch>=2.12.1; sys_platform != 'darwin' or platform_machine != 'x86_64'",
 ]
 # Voice training (includes voice deps + training extras)

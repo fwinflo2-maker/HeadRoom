@@ -1162,9 +1162,9 @@ def _ensure_claude_wrap_selfheal_hook(settings_path: Path) -> None:
     if not isinstance(payload, dict):
         payload = {}
     hooks = dict(payload.get("hooks") or {}) if isinstance(payload.get("hooks"), dict) else {}
-    entries = list(hooks.get("SessionStart") or []) if isinstance(
-        hooks.get("SessionStart"), list
-    ) else []
+    entries = (
+        list(hooks.get("SessionStart") or []) if isinstance(hooks.get("SessionStart"), list) else []
+    )
     already = any(
         isinstance(entry, dict)
         and isinstance(entry.get("hooks"), list)

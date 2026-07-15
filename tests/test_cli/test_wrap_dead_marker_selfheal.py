@@ -88,9 +88,7 @@ def test_dead_port_restores_previous_value(tmp_path: Path) -> None:
 def test_dead_port_removes_key_when_no_previous(tmp_path: Path) -> None:
     path = _settings(tmp_path)
     wrap_cli._write_claude_wrap_base_url("http://127.0.0.1:8787", settings_path=path)
-    wrap_cli._write_wrap_marker(
-        path, port=_closed_port(), key="ANTHROPIC_BASE_URL", previous=None
-    )
+    wrap_cli._write_wrap_marker(path, port=_closed_port(), key="ANTHROPIC_BASE_URL", previous=None)
 
     restored = wrap_cli._check_and_clear_dead_wrap_marker(path, key="ANTHROPIC_BASE_URL")
     assert restored is None
@@ -103,9 +101,7 @@ def test_live_port_is_never_cleared(tmp_path: Path) -> None:
     path = _settings(tmp_path)
     with _listening_port() as port:
         wrap_cli._write_claude_wrap_base_url("http://127.0.0.1:8787", settings_path=path)
-        wrap_cli._write_wrap_marker(
-            path, port=port, key="ANTHROPIC_BASE_URL", previous=None
-        )
+        wrap_cli._write_wrap_marker(path, port=port, key="ANTHROPIC_BASE_URL", previous=None)
 
         restored = wrap_cli._check_and_clear_dead_wrap_marker(path, key="ANTHROPIC_BASE_URL")
         assert restored is None
@@ -288,9 +284,7 @@ def test_selfheal_command_clears_dead_marker(tmp_path: Path, monkeypatch) -> Non
     wrap_cli._write_claude_wrap_base_url("http://127.0.0.1:8787", settings_path=path)
     wrap_cli._write_wrap_marker(path, port=_closed_port(), key="ANTHROPIC_BASE_URL", previous=None)
 
-    result = CliRunner().invoke(
-        wrap_cli.wrap, ["selfheal", "--marker", "headroom-wrap-selfheal"]
-    )
+    result = CliRunner().invoke(wrap_cli.wrap, ["selfheal", "--marker", "headroom-wrap-selfheal"])
     assert result.exit_code == 0
     # env held only our key, so the now-empty settings file is removed entirely.
     assert not path.exists()

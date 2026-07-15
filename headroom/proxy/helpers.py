@@ -353,6 +353,7 @@ def log_memory_injection(
     decision: str,
     bytes_injected: int,
     query: str | None = None,
+    tags: dict[str, str] | None = None,
 ) -> None:
     """Emit a structured log line for every memory-context routing decision.
 
@@ -360,6 +361,8 @@ def log_memory_injection(
     Never log raw query content or Authorization header — only a stable
     hash of the query.
     """
+    if tags is not None and bytes_injected > 0:
+        tags["memory_injected"] = "true"
     query_hash = hash_query_for_log(query) if query else ""
     logger.info(
         "event=memory_injection request_id=%s session_id=%s decision=%s "
@@ -1128,6 +1131,10 @@ def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
             _rtk_gain_command(rtk_path, scope),
             capture_output=True,
             text=True,
+            # rtk output is UTF-8 (emoji etc.); without this, Windows decodes
+            # with cp1252 and the reader thread dies with UnicodeDecodeError.
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
         )
         if result.returncode == 0 and result.stdout.strip():
@@ -1177,6 +1184,9 @@ def _read_lean_ctx_lifetime_stats() -> dict[str, Any] | None:
             [str(lean_ctx_path), "gain", "--json"],
             capture_output=True,
             text=True,
+            # UTF-8 regardless of the Windows console code page (cp1252).
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
         )
         # Failed reads return None ("no data") — mirrors the rtk reader so
@@ -1505,6 +1515,24 @@ def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
     shadow tracing only and is documented as a per-deploy choice.
     """
     return strip_internal_headers(headers, mode=get_strip_internal_headers_mode())
+
+
+def merge_extra_headers(headers: dict[str, str], extra: dict[str, str] | None) -> dict[str, str]:
+    """Merge configured extra headers into ``headers``, overriding same-named keys.
+
+    ``extra`` comes from ``ProxyConfig.anthropic_extra_headers``/``openai_extra_headers``
+    (settings-panel/CLI-configured, for gateways that need one extra header alongside the
+    client's own auth). Returns ``headers`` unchanged (no copy) when nothing is configured.
+    """
+    if not extra:
+        return headers
+    # HTTP header names are case-insensitive: drop any existing key that
+    # case-insensitively collides with a configured extra so the extra wins.
+    # A plain {**headers, **extra} would emit both casings upstream.
+    lowered = {k.lower() for k in extra}
+    merged = {k: v for k, v in headers.items() if k.lower() not in lowered}
+    merged.update(extra)
+    return merged
 
 
 def log_outbound_headers(

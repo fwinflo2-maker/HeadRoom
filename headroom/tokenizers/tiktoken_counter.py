@@ -176,11 +176,18 @@ def get_encoding_for_model(model: str) -> str:
     # o200k_base instead of cl100k_base for unknown gpt-4 snapshots.
     for prefix, encoding in (
         ("gpt-4o", "o200k_base"),
+        # gpt-4.1 / gpt-4.5 use o200k_base and MUST precede the "gpt-4" prefix,
+        # which they would otherwise match and be mis-encoded as cl100k_base.
+        ("gpt-4.1", "o200k_base"),
+        ("gpt-4.5", "o200k_base"),
         ("gpt-4-turbo", "cl100k_base"),
         ("gpt-4", "cl100k_base"),
         ("gpt-3.5", "cl100k_base"),
         ("o1", "o200k_base"),
         ("o3", "o200k_base"),
+        # o4 reasoning models use o200k_base; without this they fell through to
+        # the cl100k_base default.
+        ("o4", "o200k_base"),
     ):
         if model.startswith(prefix):
             return encoding
@@ -234,7 +241,15 @@ class TiktokenCounter(BaseTokenizer):
         """
         if not text:
             return 0
-        return len(self.encoding.encode(text))
+        try:
+            return len(self.encoding.encode(text))
+        except ValueError:
+            # Passthrough content can legitimately contain strings that look
+            # like tiktoken special tokens (e.g. "<|endoftext|>" or FIM markers
+            # in code/tool output). Treat them as ordinary text instead of
+            # raising, which would otherwise abort token counting for the whole
+            # request. Matches AnthropicTokenCounter.count_text.
+            return len(self.encoding.encode(text, disallowed_special=()))
 
     def count_messages(self, messages: list[dict[str, Any]]) -> int:
         """Count tokens in messages using OpenAI's exact formula.
@@ -274,7 +289,15 @@ class TiktokenCounter(BaseTokenizer):
                                     else:
                                         total += 170  # Base for high detail
                                 else:
-                                    total += self.count_text(str(part))
+                                    # Any other block shape (Anthropic
+                                    # image/tool_result/tool_use, Strands blocks)
+                                    # is priced by the base handler, which uses a
+                                    # bounded per-image/document estimate. Stringifying
+                                    # it here would json-serialize a base64 blob and
+                                    # count it as text — a 1MB image becomes ~330K
+                                    # phantom tokens (the exact overcount base.py
+                                    # _count_content_parts exists to prevent).
+                                    total += self._count_content_parts([part])
                             elif isinstance(part, str):
                                 total += self.count_text(part)
                 elif key == "role":
@@ -311,7 +334,13 @@ class TiktokenCounter(BaseTokenizer):
         Returns:
             List of token IDs.
         """
-        return self.encoding.encode(text)
+        try:
+            return self.encoding.encode(text)
+        except ValueError:
+            # See count_text: literal special-token strings in passthrough
+            # content must be encoded as ordinary text, not rejected. The
+            # round-trip through decode() is unaffected.
+            return self.encoding.encode(text, disallowed_special=())
 
     def decode(self, tokens: list[int]) -> str:
         """Decode token IDs to text.

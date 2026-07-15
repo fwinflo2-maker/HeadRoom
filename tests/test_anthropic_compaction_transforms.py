@@ -114,12 +114,14 @@ class TestAnthropicToolDescCompactionTransforms:
     ``anthropic:tool_desc_compaction`` must appear in ``transforms_applied``."""
 
     def test_l2_appends_transform_label(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import headroom.proxy.tool_schema_compaction as _mod
         from headroom.proxy.tool_schema_compaction import (
             compact_tool_descriptions,
             tool_desc_max_chars,
         )
 
         # Opt-in with a very short max so truncation triggers.
+        monkeypatch.setattr(_mod, "_TOOL_DESC_MAX_CHARS", None)
         monkeypatch.setenv("HEADROOM_TOOL_DESC_MAX_CHARS", "20")
 
         payload = _make_anthropic_payload_with_tools()

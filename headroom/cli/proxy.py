@@ -4,12 +4,12 @@ import logging
 import os
 import sys
 import warnings
-from typing import Any, Literal, cast
+from typing import Any
 
 import click
 
 from headroom import paths as _paths
-from headroom.providers.registry import resolve_api_overrides, resolve_api_targets
+from headroom.providers.registry import resolve_api_overrides
 from headroom.proxy.modes import PROXY_MODE_TOKEN, normalize_proxy_mode
 
 from .main import main
@@ -907,80 +907,71 @@ def proxy(
     Usage with OpenAI-compatible clients:
         OPENAI_BASE_URL=http://localhost:8787/v1 your-app
     """
-    # Import here to avoid slow startup
-    try:
-        from headroom.proxy.server import (
-            ProxyConfig,
-            _parse_csv_tools,
-            _parse_exclude_tools,
-            _parse_tool_profiles,
-            run_server,
-        )
-    except ImportError as e:
-        click.secho(
-            "Error: Proxy dependencies not installed. Run: pip install headroom-ai[proxy]",
-            fg="red",
-            err=True,
-        )
-        click.secho(f"Details: {e}", fg="red", err=True)
-        raise SystemExit(1) from None
+    # Phase H1: the Python proxy server is retired. This function now locates
+    # the headroom-proxy Rust binary and execs it, inheriting all env vars
+    # that Click has already validated. The binary reads its configuration
+    # exclusively from env vars (HEADROOM_PROXY_*); this shim maps the legacy
+    # Click flags to those vars for backward compatibility.
+    import pathlib
+    import shutil
 
-    # Warn if --learn and --no-learn are both set (--no-learn wins, per docstring)
-    if learn and no_learn:
-        click.secho(
-            "Warning: both --learn and --no-learn were specified; --no-learn takes precedence "
-            "and traffic learning will be disabled.",
-            fg="yellow",
-            err=True,
-        )
-
-    # Warn on contradictory / no-op flag combinations. The resolved value still
-    # applies; the warning just prevents a silently-ignored flag.
-    if no_rate_limit and (rpm is not None or tpm is not None):
-        click.secho(
-            "Warning: --rpm/--tpm have no effect because --no-rate-limit disables rate limiting.",
-            fg="yellow",
-            err=True,
-        )
-    if no_optimize and target_ratio is not None:
-        click.secho(
-            "Warning: --target-ratio has no effect because --no-optimize disables compression.",
-            fg="yellow",
-            err=True,
-        )
+    # Telemetry opt-in/out (env vars read by the Rust binary)
     if telemetry and no_telemetry:
         click.secho(
-            "Warning: both --telemetry and --no-telemetry were specified; --no-telemetry "
-            "takes precedence and telemetry will be disabled.",
+            "Warning: both --telemetry and --no-telemetry specified; --no-telemetry wins.",
+            fg="yellow",
+            err=True,
+        )
+    if telemetry:
+        os.environ["HEADROOM_TELEMETRY"] = "on"
+    if no_telemetry:
+        os.environ["HEADROOM_TELEMETRY"] = "off"
+
+    # Stateless: suppress TOIN filesystem persistence
+    _is_stateless = stateless or os.environ.get("HEADROOM_STATELESS", "").lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    )
+    if _is_stateless:
+        os.environ["HEADROOM_TOIN_BACKEND"] = "none"
+
+    # Wire debug
+    if codex_wire_debug or codex_wire_debug_dir:
+        os.environ["HEADROOM_CODEX_WIRE_DEBUG"] = "1"
+        os.environ["HEADROOM_CODEX_WIRE_DEBUG_DIR"] = codex_wire_debug_dir or str(
+            _paths.codex_wire_debug_dir()
+        )
+
+    # Warn on retired Python-proxy-only flags so callers know they are ignored.
+    _retired: list[str] = []
+    if memory:
+        _retired.append("--memory")
+    if no_cache:
+        _retired.append("--no-cache")
+    if no_rate_limit:
+        _retired.append("--no-rate-limit")
+    if rpm is not None:
+        _retired.append("--rpm")
+    if tpm is not None:
+        _retired.append("--tpm")
+    if intercept_tool_results:
+        _retired.append("--intercept-tool-results")
+    if workers != 1:
+        _retired.append("--workers")
+    if embedding_server:
+        _retired.append("--embedding-server")
+    if _retired:
+        click.secho(
+            f"Warning: {', '.join(_retired)}: "
+            "these flags are not supported by the Rust proxy and are ignored. "
+            "See docs/operations/python-to-rust-migration.md",
             fg="yellow",
             err=True,
         )
 
-    # Opt-in: turn on tool_result interceptors (ast-grep Read outline, etc.).
-    # Only fetch the bundled CLI tool binaries when the feature is enabled —
-    # otherwise we'd pay a network round-trip and risk a readonly-FS failure
-    # for capabilities the user hasn't asked for. The TransformPipeline reads
-    # this env var at construction time.
-    if intercept_tool_results:
-        from headroom.binaries import ensure_tools
-
-        resolved_tools = ensure_tools()
-        critical_tools = ["ast-grep"]
-        missing = [t for t in critical_tools if not resolved_tools.get(t)]
-        if missing:
-            # User explicitly opted in — fail fast rather than silently starting
-            # with non-functional interceptors. They can retry with the tool
-            # installed, or drop the flag if they want pass-through behavior.
-            click.secho(
-                f"error: --intercept-tool-results requires tool(s) that could not "
-                f"be installed: {missing}. Run `headroom tools doctor` to diagnose, "
-                "or omit the flag to start the proxy without interceptors.",
-                fg="red",
-                err=True,
-            )
-            sys.exit(1)
-        os.environ["HEADROOM_INTERCEPT_ENABLED"] = "1"
-
+    # Resolve upstream URL from provider flags (Anthropic is the default)
     provider_api_overrides = resolve_api_overrides(
         anthropic_api_url=anthropic_api_url,
         openai_api_url=openai_api_url,
@@ -990,444 +981,72 @@ def proxy(
         environ=os.environ,
     )
 
-    # Resolve anyllm provider: env var takes precedence over CLI default (matches argparse path)
-    effective_anyllm_provider = os.environ.get("HEADROOM_ANYLLM_PROVIDER") or anyllm_provider
+    # Map Click flags → Rust env vars (setdefault so explicit env vars from the
+    # operator's shell always win over CLI-derived values).
+    os.environ.setdefault("HEADROOM_PROXY_LISTEN", f"{host}:{port}")
+    _upstream = provider_api_overrides.anthropic or "https://api.anthropic.com"
+    os.environ.setdefault("HEADROOM_PROXY_UPSTREAM", _upstream)
 
-    # Resolve mode: CLI flag > env var > default
-    effective_mode: str = normalize_proxy_mode(
-        mode or os.environ.get("HEADROOM_MODE") or PROXY_MODE_TOKEN
-    )
-
-    # Stateless mode: CLI flag or env var
-    is_stateless = stateless or os.environ.get("HEADROOM_STATELESS", "").lower() in (
-        "true",
-        "1",
-        "yes",
-        "on",
-    )
-
-    # Telemetry is opt-in (off by default). --telemetry opts in; --no-telemetry
-    # forces it off. If both are passed, the explicit opt-out wins (fail-closed).
-    if telemetry:
-        os.environ["HEADROOM_TELEMETRY"] = "on"
-    if no_telemetry:
-        os.environ["HEADROOM_TELEMETRY"] = "off"
-
-    if codex_wire_debug or codex_wire_debug_dir:
-        os.environ["HEADROOM_CODEX_WIRE_DEBUG"] = "1"
-        os.environ["HEADROOM_CODEX_WIRE_DEBUG_DIR"] = codex_wire_debug_dir or str(
-            _paths.codex_wire_debug_dir()
-        )
-
-    # Stateless mode: suppress TOIN filesystem persistence
-    if is_stateless:
-        os.environ["HEADROOM_TOIN_BACKEND"] = "none"
-
-    # License key for managed/enterprise deployments (optional)
-    license_key = os.environ.get("HEADROOM_LICENSE_KEY")
-
-    # Qdrant connection for the qdrant-neo4j backend. CLI flags default
-    # to None; when omitted we let ProxyConfig's default_factory resolve
-    # HEADROOM_QDRANT_* env vars. Explicit CLI values win over env.
-    qdrant_overrides: dict[str, Any] = {}
-    if memory_qdrant_url is not None:
-        qdrant_overrides["memory_qdrant_url"] = memory_qdrant_url
-    if memory_qdrant_host is not None:
-        qdrant_overrides["memory_qdrant_host"] = memory_qdrant_host
-    if memory_qdrant_port is not None:
-        qdrant_overrides["memory_qdrant_port"] = memory_qdrant_port
-    if memory_qdrant_api_key is not None:
-        qdrant_overrides["memory_qdrant_api_key"] = memory_qdrant_api_key
-
-    config = ProxyConfig(
-        host=host,
-        port=port,
-        anthropic_api_url=provider_api_overrides.anthropic,
-        openai_api_url=provider_api_overrides.openai,
-        gemini_api_url=provider_api_overrides.gemini,
-        cloudcode_api_url=provider_api_overrides.cloudcode,
-        vertex_api_url=provider_api_overrides.vertex,
-        mode=effective_mode,
-        optimize=not no_optimize,
-        cache_enabled=not no_cache,
-        rate_limit_enabled=not no_rate_limit,
-        rate_limit_requests_per_minute=rpm if rpm is not None else 60,
-        rate_limit_tokens_per_minute=tpm if tpm is not None else 100_000,
-        compress_user_messages=_get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
-        min_tokens_to_crush=_get_env_int_optional("HEADROOM_MIN_TOKENS") or 500,
-        max_items_after_crush=_get_env_int_optional("HEADROOM_MAX_ITEMS") or 50,
-        exclude_tools=_parse_exclude_tools(None) or None,
-        protect_tool_results=frozenset(_parse_csv_tools(protect_tool_results))
-        if protect_tool_results
-        else frozenset(),
-        tool_profiles=_parse_tool_profiles([]) or None,
-        smart_crusher_with_compaction=_get_env_bool_optional("HEADROOM_SMART_CRUSHER_COMPACTION"),
-        savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or None,
-        target_ratio=target_ratio,
-        compress_system_messages=_get_env_bool_optional("HEADROOM_COMPRESS_SYSTEM_MESSAGES"),
-        protect_recent=_get_env_int_optional("HEADROOM_PROTECT_RECENT"),
-        protect_analysis_context=_get_env_bool_optional("HEADROOM_PROTECT_ANALYSIS_CONTEXT"),
-        accuracy_guard=os.environ.get("HEADROOM_ACCURACY_GUARD") or None,
-        # CCR opt-outs for compression-only deployments (streaming / non-MCP
-        # clients that can't resolve the injected retrieve tool). Defaults keep
-        # CCR fully on; each flag flips one dataclass default to False.
-        ccr_inject_tool=not no_ccr_inject_tool,
-        ccr_inject_marker=not no_ccr_marker,
-        ccr_proactive_expansion=not no_ccr_proactive_expansion,
-        # Flatten repeat-flag tuple AND any comma-separated values inside it.
-        # `--proxy-extension a,b --proxy-extension c` and `HEADROOM_PROXY_EXTENSIONS=a,b,c`
-        # both yield ["a", "b", "c"]. None when nothing was supplied.
-        proxy_extensions=(
-            [part.strip() for chunk in proxy_extension for part in chunk.split(",") if part.strip()]
-            or None
-        ),
-        subscription_tracking_enabled=not no_subscription_tracking,
-        subscription_poll_interval_s=(
-            subscription_poll_interval if subscription_poll_interval is not None else 300
-        ),
-        retry_max_attempts=retry_max_attempts if retry_max_attempts is not None else 3,
-        request_timeout_seconds=request_timeout_seconds
-        if request_timeout_seconds is not None and request_timeout_seconds > 0
-        else 300,
-        connect_timeout_seconds=connect_timeout_seconds
-        if connect_timeout_seconds is not None
-        else 10,
-        anthropic_buffered_request_timeout_seconds=(
-            anthropic_buffered_request_timeout_seconds
-            if anthropic_buffered_request_timeout_seconds is not None
-            else 600
-        ),
-        max_connections=max_connections,
-        max_keepalive_connections=max_keepalive_connections,
-        keepalive_expiry=keepalive_expiry,
-        http2=http2,
-        log_file=None if is_stateless else log_file,
-        log_full_messages=log_messages
-        or os.environ.get("HEADROOM_LOG_MESSAGES", "").lower() in ("true", "1", "yes", "on"),
-        budget_limit_usd=budget,
-        budget_period=cast(Literal["hourly", "daily", "monthly"], budget_period),
-        # Code-aware compression resolution:
-        # 1. Explicit --code-aware / --no-code-aware always wins.
-        # 2. Otherwise read HEADROOM_CODE_AWARE_ENABLED (truthy = on).
-        # 3. Otherwise default off — matches the prior cli/proxy.py behavior so
-        #    existing users see no change unless they opt in.
-        code_aware_enabled=(
-            bool(code_aware_flag)
-            if code_aware_flag is not None
-            else os.environ.get("HEADROOM_CODE_AWARE_ENABLED", "").strip().lower()
-            in ("true", "1", "yes", "on")
-        ),
-        disable_kompress=disable_kompress,
-        disable_kompress_fallback=disable_kompress_fallback,
-        disable_kompress_anthropic=disable_kompress_anthropic,
-        disable_kompress_openai=disable_kompress_openai,
-        # Code graph: live file watcher for incremental reindexing
-        code_graph_watcher=code_graph,
-        # Read lifecycle: ON by default (use --no-read-lifecycle to disable)
-        read_lifecycle=not no_read_lifecycle,
-        # Read maturation (Mechanism B): experimental, OFF by default
-        read_maturation=read_maturation,
-        read_maturation_quiesce_turns=read_maturation_quiesce_turns,
-        read_maturation_max_hold_turns=read_maturation_max_hold_turns,
-        read_maturation_min_size_bytes=read_maturation_min_size_bytes,
-        # Memory System (Multi-Provider with auto-detection)
-        # --learn implies --memory (need backend for storing patterns)
-        # Stateless mode disables memory (requires SQLite on disk)
-        memory_enabled=False if is_stateless else (memory or (learn and not no_learn)),
-        memory_db_path=memory_db_path,
-        memory_storage_mode=cast(Literal["project", "user", "global"], memory_storage.lower()),
-        memory_project_root_override=memory_project_root,
-        memory_inject_tools=not no_memory_tools,
-        memory_inject_context=not no_memory_context,
-        memory_top_k=memory_top_k,
-        **qdrant_overrides,
-        # Traffic Learning: only with --learn, never with --no-learn
-        # Stateless mode disables learning (requires filesystem)
-        traffic_learning_enabled=False if is_stateless else (learn and not no_learn),
-        traffic_learning_agent_type=os.environ.get("HEADROOM_AGENT_TYPE", "unknown"),
-        traffic_learning_min_evidence=min_evidence if min_evidence is not None else 5,
-        # Backend (Anthropic direct, Bedrock, LiteLLM, or any-llm)
-        backend=backend,
-        bedrock_region=bedrock_region or region,
-        bedrock_profile=bedrock_profile,
-        # CLI flag > env > unset. Matches the BEDROCK_TARGET_API_URL naming of
-        # the sibling *_TARGET_API_URL passthrough overrides.
-        bedrock_api_url=bedrock_api_url or os.environ.get("BEDROCK_TARGET_API_URL"),
-        anyllm_provider=effective_anyllm_provider,
-        # License / Usage Reporting (managed/enterprise)
-        license_key=license_key,
-        # Stateless mode: disable all filesystem writes
-        stateless=is_stateless,
-        # Unit 4: bounded pre-upstream concurrency on the Anthropic HTTP
-        # path. ``None`` -> HeadroomProxy computes ``max(2, min(8,
-        # os.cpu_count() or 4))``; ``<= 0`` -> disabled (unbounded).
-        # Precedence: CLI > env > auto-compute (click's ``envvar``
-        # handles the env-var fallback).
-        anthropic_pre_upstream_concurrency=anthropic_pre_upstream_concurrency,
-        anthropic_pre_upstream_acquire_timeout_seconds=(
-            anthropic_pre_upstream_acquire_timeout_seconds
-            if anthropic_pre_upstream_acquire_timeout_seconds is not None
-            else 15.0
-        ),
-        anthropic_pre_upstream_memory_context_timeout_seconds=(
-            anthropic_pre_upstream_memory_context_timeout_seconds
-            if anthropic_pre_upstream_memory_context_timeout_seconds is not None
-            else 2.0
-        ),
-    )
-
-    memory_status = "DISABLED"
-    if config.memory_enabled:
-        memory_status = "ENABLED (multi-provider)"
-
-    license_status = "OSS (no license key)"
-    if license_key:
-        license_status = f"MANAGED (key={license_key[:8]}...)"
-
-    provider_api_targets = resolve_api_targets(config.provider_api_overrides)
-    anthropic_url = provider_api_targets.anthropic
-    openai_url = provider_api_targets.openai
-    cloudcode_url = provider_api_targets.cloudcode
-    vertex_url = provider_api_targets.vertex
-    backend_section = ""
-
-    if config.backend == "anyllm" or config.backend.startswith("anyllm-"):
-        # any-llm backend
-        backend_section = """
-  Set credentials for your provider (e.g., OPENAI_API_KEY, MISTRAL_API_KEY)
-  Providers: https://mozilla-ai.github.io/any-llm/providers/
-"""
-    elif config.backend != "anthropic":
-        # LiteLLM backend
-        from headroom.backends.litellm import get_provider_config
-
-        provider = config.backend.replace("litellm-", "")
-        provider_config = get_provider_config(provider)
-
-        # Build usage instructions from provider config
-        env_vars_str = (
-            ", ".join(provider_config.env_vars) if provider_config.env_vars else "See docs"
-        )
-        backend_section = f"""
-IMPORTANT for {provider_config.display_name} users:
-  1. Set credentials: {env_vars_str}
-  2. Set a dummy Anthropic key: ANTHROPIC_API_KEY="sk-ant-dummy"
-     (Headroom ignores this - it uses your {provider_config.display_name} credentials)
-  3. Set base URL: ANTHROPIC_BASE_URL=http://{config.host}:{config.port}"""
-        if provider_config.model_format_hint:
-            backend_section += f"\n  4. Use model names: {provider_config.model_format_hint}"
-        backend_section += "\n"
-
-    # Build memory section if enabled
-    memory_section = ""
-    if config.memory_enabled:
-        memory_section = f"""
-Memory (Multi-Provider):
-  - Auto-detects provider from request (Anthropic, OpenAI, Gemini, etc.)
-  - Anthropic: Uses native memory tool (memory_20250818) - subscription safe
-  - OpenAI/Gemini/Others: Uses function calling format
-  - All providers share the same semantic vector store backend
-  - Storage mode: {config.memory_storage_mode} (per-project DB by default — set x-headroom-project-id / x-headroom-cwd to override)
-  - Tools: {"ENABLED" if config.memory_inject_tools else "DISABLED"}
-  - Context injection: {"ENABLED" if config.memory_inject_context else "DISABLED"}
-  - Database: {config.memory_db_path} (legacy / global-mode DB)
-"""
-
-    # Stateless mode warning
-    stateless_line = ""
-    if is_stateless:
-        stateless_line = (
-            "  Stateless:    YES (no filesystem writes — memory, logs, TOIN disabled)\n"
-        )
-
-    from headroom.telemetry.beacon import is_telemetry_enabled
-
-    # Build telemetry section for the startup banner. Telemetry is opt-in
-    # (off by default); the disabled line surfaces how to opt in.
-    if is_telemetry_enabled():
-        telemetry_line = (
-            "  Telemetry:    ENABLED (anonymous aggregate stats — you opted in)\n"
-            "                Disable: HEADROOM_TELEMETRY=off or headroom proxy --no-telemetry"
-        )
+    if no_optimize:
+        os.environ["HEADROOM_PROXY_COMPRESSION"] = "false"
     else:
-        telemetry_line = (
-            "  Telemetry:    DISABLED (opt in: HEADROOM_TELEMETRY=on or headroom proxy --telemetry)"
+        os.environ["HEADROOM_PROXY_COMPRESSION"] = "true"
+        _effective_mode = normalize_proxy_mode(
+            mode or os.environ.get("HEADROOM_MODE") or PROXY_MODE_TOKEN
+        )
+        os.environ.setdefault("HEADROOM_PROXY_COMPRESSION_MODE", _effective_mode)
+
+    if bedrock_region or region:
+        os.environ.setdefault("HEADROOM_PROXY_BEDROCK_REGION", bedrock_region or region)
+    if bedrock_profile:
+        os.environ.setdefault("HEADROOM_PROXY_AWS_PROFILE", bedrock_profile)
+    if target_ratio is not None:
+        os.environ.setdefault("HEADROOM_TARGET_RATIO", str(target_ratio))
+    if request_timeout_seconds is not None:
+        os.environ.setdefault(
+            "HEADROOM_PROXY_UPSTREAM_TIMEOUT", f"{request_timeout_seconds}s"
         )
 
-    # Discover proxy extensions (third-party packages registered via the
-    # `headroom.proxy_extension` entry-point group). Surfaced in the banner
-    # so operators can see what's available + what's currently opted-in.
-    # Discovery does NOT run extension code; only the explicitly-enabled
-    # set in config.proxy_extensions actually installs.
-    try:
-        from headroom.proxy.extensions import discover as _discover_extensions
-
-        _ext_available = sorted(name for name, _ in _discover_extensions())
-    except Exception:  # noqa: BLE001 — banner must never crash startup
-        _ext_available = []
-    _ext_enabled = config.proxy_extensions or []
-    if not _ext_available:
-        extensions_line = "  Extensions:   (none discovered)"
-    elif not _ext_enabled:
-        extensions_line = (
-            f"  Extensions:   discovered={','.join(_ext_available)} "
-            f"(opt-in: --proxy-extension <name> or HEADROOM_PROXY_EXTENSIONS=<n>)"
+    # Locate the headroom-proxy Rust binary.
+    # 1. On PATH (installed via pip wheel or cargo install).
+    # 2. Dev worktree: <repo-root>/target/release/headroom-proxy.
+    rust_binary = shutil.which("headroom-proxy")
+    if not rust_binary:
+        _dev = pathlib.Path(__file__).parents[3] / "target" / "release" / "headroom-proxy"
+        if _dev.is_file():
+            rust_binary = str(_dev)
+    if not rust_binary:
+        click.secho(
+            "Error: headroom-proxy binary not found on PATH.\n"
+            "  Installed users: pip install --upgrade headroom-ai\n"
+            "  Developers:      cargo build -p headroom-proxy --release",
+            fg="red",
+            err=True,
         )
-    elif "*" in _ext_enabled:
-        extensions_line = f"  Extensions:   ENABLED (wildcard) {','.join(_ext_available)}"
-    else:
-        extensions_line = (
-            f"  Extensions:   ENABLED {','.join(sorted(_ext_enabled))} "
-            f"(available: {','.join(_ext_available)})"
-        )
+        raise SystemExit(1)
 
-    # Code-aware status line — same logic the inner banner uses, surfaced here
-    # so the click-CLI banner is a complete picture (avoids the dual-banner
-    # confusion this branch retired).
-    from headroom.proxy.server import _get_code_aware_banner_status
-
-    code_aware_line = f"  Code-Aware:   {_get_code_aware_banner_status(config)}"
-    context_tool_line = f"  Context Tool: {_selected_context_tool()}"
-
-    # Performance tuning section — only shown when at least one tuning var is active.
-    _stable_turn = _get_env_int_optional("HEADROOM_COMPRESSION_STABLE_AFTER_TURN") or 0
-    _stale_turns = _get_env_int_optional("HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS") or 0
-    _embed_socket = os.environ.get("HEADROOM_EMBEDDING_SERVER_SOCKET") or (
-        embedding_server and (embedding_server_socket or f"/tmp/headroom-embed-{port}.sock")
+    # Print startup banner
+    _mode_display = (
+        "DISABLED (passthrough)"
+        if no_optimize
+        else normalize_proxy_mode(mode or os.environ.get("HEADROOM_MODE") or PROXY_MODE_TOKEN)
     )
-    _tuning_lines: list[str] = []
-    if _stable_turn:
-        _tuning_lines.append(
-            f"  Prefix stability:        conservative for first {_stable_turn} turns"
-            f"  (HEADROOM_COMPRESSION_STABLE_AFTER_TURN={_stable_turn})"
-        )
-    if _stale_turns:
-        _tuning_lines.append(
-            f"  Stale read compression:  reads older than {_stale_turns} turns eligible"
-            f"  (HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS={_stale_turns})"
-        )
-    if _embed_socket:
-        _tuning_lines.append(f"  Embedding sidecar:       {_embed_socket}")
-    if _tuning_lines:
-        tuning_section = "\nPerformance Tuning:\n" + "\n".join(_tuning_lines)
-    else:
-        tuning_section = (
-            "\nPerformance Tuning:  (all defaults — set HEADROOM_COMPRESSION_STABLE_AFTER_TURN"
-            " / HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS to tune)"
-        )
-
     click.echo(f"""
-╔═══════════════════════════════════════════════════════════════════════╗
-║                         HEADROOM PROXY                                 ║
-║           The Context Optimization Layer for LLM Applications          ║
-╚═══════════════════════════════════════════════════════════════════════╝
+\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
+\u2551                         HEADROOM PROXY                                 \u2551
+\u2551           The Context Optimization Layer for LLM Applications          \u2551
+\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d
 
-Starting proxy server...
-
-  URL:          http://{config.host}:{config.port}
-  Mode:         {config.mode}
-  Optimization: {"ENABLED" if config.optimize else "DISABLED"}
-  Caching:      {"ENABLED" if config.cache_enabled else "DISABLED"}
-  Rate Limit:   {"ENABLED" if config.rate_limit_enabled else "DISABLED"}
-  Memory:       {memory_status}
-  License:      {license_status}
-{code_aware_line}
-{context_tool_line}
-{extensions_line}
-{stateless_line}{telemetry_line}
-{backend_section}{tuning_section}
-
-Routing:
-  /v1/messages                    → {anthropic_url}
-  /v1/chat/completions            → {openai_url}
-  /v1/responses                   → {openai_url}  (HTTP + WebSocket)
-  /v1internal:streamGenerateContent → {cloudcode_url}
-  /v1/projects/.../publishers/... → {vertex_url}
-
-Usage:
-  Claude Code:   ANTHROPIC_BASE_URL=http://{config.host}:{config.port} claude
-  Codex / OpenAI: OPENAI_BASE_URL=http://{config.host}:{config.port}/v1 your-app
-{memory_section}
-Endpoints:
-  GET  /livez      Process liveness
-  GET  /readyz     Traffic readiness
-  GET  /health     Aggregate health
-  GET  /stats      Detailed statistics
-  GET  /stats-history Durable compression history + display session
-  GET  /metrics    Prometheus metrics
-
-Press Ctrl+C to stop.
+  URL:          http://{host}:{port}
+  Mode:         {_mode_display}
+  Binary:       {rust_binary}
+  Upstream:     {_upstream}
 """)
 
-    # Surface an "update available" notice (reads cache only; no network here).
-    # Best-effort: a broken update check must never block proxy startup.
+    # Replace this process with the Rust binary; it inherits the env vars set above.
     try:
-        from headroom.update_check import format_update_notice
+        os.execvp(rust_binary, [rust_binary])
+    except OSError as exc:
+        click.secho(f"Error: failed to exec {rust_binary!r}: {exc}", fg="red", err=True)
+        raise SystemExit(1) from exc
 
-        _update_notice = format_update_notice()
-        if _update_notice:
-            click.echo(f"\n{_update_notice}\n")
-    except Exception:  # noqa: BLE001 — banner must never crash startup
-        pass
-
-    # -----------------------------------------------------------------------
-    # Option E: start embedding server sidecar if requested
-    # -----------------------------------------------------------------------
-    _embed_watchdog = None
-    if embedding_server:
-        _embed_socket = embedding_server_socket or f"/tmp/headroom-embed-{config.port}.sock"
-        # Pass socket path to all worker processes via environment variable
-        os.environ["HEADROOM_EMBEDDING_SERVER_SOCKET"] = _embed_socket
-        click.echo(f"  Embedding server: starting sidecar on {_embed_socket}...")
-
-        import asyncio as _asyncio
-
-        async def _start_embed_watchdog() -> Any:
-            # Import lazily inside the guarded coroutine. The sidecar module is
-            # optional and may be absent; keeping the import here lets the
-            # try/except below fall back to the per-worker embedder instead of
-            # crashing the proxy at startup with ModuleNotFoundError.
-            from headroom.memory.adapters.watchdog import EmbeddingServerWatchdog
-
-            wd = EmbeddingServerWatchdog(socket_path=_embed_socket)
-            await wd.start()
-            ok = await wd.wait_until_healthy(timeout=30.0)
-            if not ok:
-                click.echo(
-                    "  WARNING: Embedding server did not become healthy within 30s. "
-                    "Memory features may be unavailable.",
-                    err=True,
-                )
-            else:
-                click.echo("  Embedding server: ready.")
-            return wd
-
-        try:
-            _embed_watchdog = _asyncio.run(_start_embed_watchdog())
-        except Exception as _exc:
-            click.echo(
-                f"  WARNING: Failed to start embedding server sidecar: {_exc}. "
-                "Falling back to per-worker embedder.",
-                err=True,
-            )
-            os.environ.pop("HEADROOM_EMBEDDING_SERVER_SOCKET", None)
-
-    try:
-        run_kwargs: dict[str, Any] = {}
-        if workers != 1:
-            run_kwargs["workers"] = workers
-        if limit_concurrency != 1000:
-            run_kwargs["limit_concurrency"] = limit_concurrency
-        # Suppress run_server's legacy banner — the click CLI already printed
-        # a richer one above. Direct `python -m headroom.proxy.server` keeps
-        # the legacy banner via run_server's default.
-        run_kwargs["print_banner"] = False
-        run_server(config, **run_kwargs)
-    except KeyboardInterrupt:
-        click.echo("\nShutting down...")
-        raise SystemExit(130) from None
-    finally:
-        if _embed_watchdog is not None:
-            import asyncio as _asyncio2
-
-            _asyncio2.run(_embed_watchdog.stop())

@@ -35,6 +35,14 @@ def _usage_int(value: Any, default: int = 0) -> int:
     return int(value)
 
 
+class _GeminiContinuationError(Exception):
+    def __init__(self, status_code: int, content: bytes, headers: dict[str, str]) -> None:
+        super().__init__(f"Gemini continuation failed with HTTP {status_code}")
+        self.status_code = status_code
+        self.content = content
+        self.headers = headers
+
+
 class GeminiHandlerMixin:
     """Mixin providing Gemini API handler methods for HeadroomProxy."""
 
@@ -604,12 +612,26 @@ class GeminiHandlerMixin:
 
         native_tools = body.get("tools")
         native_function_declarations = None
+
+        def rebuild_tools(function_declarations: list[dict]) -> list[dict]:
+            rebuilt_tools = []
+            replaced = False
+            for tool in body.get("tools") or []:
+                if "functionDeclarations" in tool and not replaced:
+                    rebuilt_tools.append({**tool, "functionDeclarations": function_declarations})
+                    replaced = True
+                else:
+                    rebuilt_tools.append(tool)
+            if not replaced:
+                rebuilt_tools.append({"functionDeclarations": function_declarations})
+            return rebuilt_tools
+
         if self.config.ccr_inject_tool and tokens_saved > 0:
             from headroom.ccr import CCRToolInjector
 
             for tool in native_tools or []:
                 if "functionDeclarations" in tool:
-                    native_function_declarations = tool["functionDeclarations"]
+                    native_function_declarations = list(tool["functionDeclarations"])
                     break
             injector = CCRToolInjector(
                 provider="google",
@@ -621,17 +643,7 @@ class GeminiHandlerMixin:
             )
             if was_injected:
                 native_function_declarations = injected_funcs
-                rebuilt_tools = []
-                replaced = False
-                for tool in native_tools or []:
-                    if "functionDeclarations" in tool:
-                        rebuilt_tools.append({**tool, "functionDeclarations": injected_funcs})
-                        replaced = True
-                    else:
-                        rebuilt_tools.append(tool)
-                if not replaced:
-                    rebuilt_tools.append({"functionDeclarations": injected_funcs})
-                body["tools"] = rebuilt_tools
+                body["tools"] = rebuild_tools(injected_funcs)
             elif native_function_declarations is not None:
                 native_function_declarations = list(native_function_declarations)
 
@@ -755,24 +767,7 @@ class GeminiHandlerMixin:
                     ) -> dict[str, Any]:
                         continuation_body = {**body, "contents": native_contents}
                         if function_declarations is not None:
-                            continuation_tools = []
-                            replaced = False
-                            for tool in body.get("tools") or []:
-                                if "functionDeclarations" in tool:
-                                    continuation_tools.append(
-                                        {
-                                            **tool,
-                                            "functionDeclarations": function_declarations,
-                                        }
-                                    )
-                                    replaced = True
-                                else:
-                                    continuation_tools.append(tool)
-                            if not replaced:
-                                continuation_tools.append(
-                                    {"functionDeclarations": function_declarations}
-                                )
-                            continuation_body["tools"] = continuation_tools
+                            continuation_body["tools"] = rebuild_tools(function_declarations)
                         continuation_headers = {
                             key: value
                             for key, value in headers.items()
@@ -782,6 +777,14 @@ class GeminiHandlerMixin:
                         continuation = await self._retry_request(
                             "POST", url, continuation_headers, continuation_body
                         )
+                        if continuation.status_code >= 400:
+                            return {
+                                "_headroom_continuation_error": {
+                                    "status_code": continuation.status_code,
+                                    "content": continuation.content,
+                                    "headers": dict(continuation.headers),
+                                }
+                            }
                         return continuation.json()
 
                     final_resp_json = await self.ccr_response_handler.handle_response(
@@ -791,6 +794,13 @@ class GeminiHandlerMixin:
                         api_call_fn,
                         provider="google",
                     )
+                    continuation_error = final_resp_json.get("_headroom_continuation_error")
+                    if isinstance(continuation_error, dict):
+                        raise _GeminiContinuationError(
+                            continuation_error["status_code"],
+                            continuation_error["content"],
+                            continuation_error["headers"],
+                        )
                     from headroom.ccr.response_handler import RESIDUAL_CCR_ERROR
 
                     if (
@@ -877,6 +887,12 @@ class GeminiHandlerMixin:
                     status_code=response.status_code,
                     headers=response_headers,
                 )
+        except _GeminiContinuationError as e:
+            await self.metrics.record_failed(provider=provider_name)
+            response_headers = dict(e.headers)
+            response_headers.pop("content-encoding", None)
+            response_headers.pop("content-length", None)
+            return Response(content=e.content, status_code=e.status_code, headers=response_headers)
         except Exception as e:
             await self.metrics.record_failed(provider=provider_name)
             logger.error(f"[{request_id}] Gemini request failed: {type(e).__name__}: {e}")

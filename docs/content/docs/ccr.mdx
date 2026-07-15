@@ -76,7 +76,9 @@ The client never sees CCR tool calls on the Anthropic and OpenAI proxy paths; He
 <Callout type="warning" title="Gemini CCR boundary">
   Buffered native Gemini requests resolve `headroom_retrieve` server-side and
   return the model's final response. Streaming native Gemini requests keep the
-  existing forwarding behavior. Google's OpenAI-compatible Gemini endpoint can
+  existing forwarding behavior. When a response contains `headroom_retrieve`
+  alongside a client-owned function call, Headroom preserves both calls for the
+  client instead of resolving the mixed response. Google's OpenAI-compatible Gemini endpoint can
   also return `finish_reason=MALFORMED_FUNCTION_CALL` on large function-response
   continuations after CCR retrieval; that separate limitation remains tracked in
   [issue #2041](https://github.com/headroomlabs-ai/headroom/issues/2041).

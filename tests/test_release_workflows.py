@@ -22,22 +22,24 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "docker.yml").read_text())
     jobs = workflow["jobs"]
     manifest = jobs["docker-manifest"]
-    variants = manifest["strategy"]["matrix"]["include"]
-    root = next(entry for entry in variants if entry["suffix"] == "")
-    nonroot = next(entry for entry in variants if entry["variant"]["name"] == "nonroot")
+    variants = manifest["strategy"]["matrix"]["variant"]
+    root = next(entry for entry in variants if entry["name"] == "")
+    nonroot = next(entry for entry in variants if entry["name"] == "nonroot")
     promotion = next(
         step for step in manifest["steps"] if step["name"] == "Re-tag root image as :latest"
     )
     command = promotion["run"]
 
-    assert root["variant"]["name"] == ""
-    assert nonroot["suffix"] == "nonroot"
-    assert "matrix.suffix == ''" in promotion["if"]
+    assert len(variants) == 8
+    assert root["name"] == ""
+    assert nonroot["name"] == "nonroot"
+    assert "matrix.variant.name == ''" in promotion["if"]
     assert "steps.version.outputs.version != ''" in promotion["if"]
     assert '"${IMAGE}:latest"' in command
     assert '"${IMAGE}:${VERSION}"' in command
     assert "promote-latest" not in jobs
     assert manifest["needs"] == "docker-build"
+    assert manifest["if"] == "${{ always() }}"
     assert "linux/amd64" in str(jobs["docker-build"])
     assert "linux/arm64" in str(jobs["docker-build"])
 

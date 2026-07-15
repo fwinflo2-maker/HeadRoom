@@ -58,15 +58,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { variant: { name: "", bake_target: runtime }, suffix: "" }
-          - { variant: { name: nonroot, bake_target: runtime-nonroot }, suffix: nonroot }
-          - { variant: { name: code, bake_target: runtime-code }, suffix: code }
-          - { variant: { name: code-nonroot, bake_target: runtime-code-nonroot }, suffix: code-nonroot }
-          - { variant: { name: slim, bake_target: runtime-slim }, suffix: slim }
-          - { variant: { name: slim-nonroot, bake_target: runtime-slim-nonroot }, suffix: slim-nonroot }
-          - { variant: { name: code-slim, bake_target: runtime-code-slim }, suffix: code-slim }
-          - { variant: { name: code-slim-nonroot, bake_target: runtime-code-slim-nonroot }, suffix: code-slim-nonroot }
+        variant:
+          - { name: "", bake_target: runtime }
+          - { name: nonroot, bake_target: runtime-nonroot }
+          - { name: code, bake_target: runtime-code }
+          - { name: code-nonroot, bake_target: runtime-code-nonroot }
+          - { name: slim, bake_target: runtime-slim }
+          - { name: slim-nonroot, bake_target: runtime-slim-nonroot }
+          - { name: code-slim, bake_target: runtime-code-slim }
+          - { name: code-slim-nonroot, bake_target: runtime-code-slim-nonroot }
         arch:
           - { name: amd64, runs_on: ubuntu-24.04, platform: linux/amd64 }
           - { name: arm64, runs_on: ubuntu-24.04-arm, platform: linux/arm64 }
@@ -220,20 +220,21 @@ jobs:
   # tags, and that manifest is what users pull by `:tag`.
   docker-manifest:
     needs: docker-build
+    if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { variant: { name: "", bake_target: runtime }, suffix: "" }
-          - { variant: { name: nonroot, bake_target: runtime-nonroot }, suffix: nonroot }
-          - { variant: { name: code, bake_target: runtime-code }, suffix: code }
-          - { variant: { name: code-nonroot, bake_target: runtime-code-nonroot }, suffix: code-nonroot }
-          - { variant: { name: slim, bake_target: runtime-slim }, suffix: slim }
-          - { variant: { name: slim-nonroot, bake_target: runtime-slim-nonroot }, suffix: slim-nonroot }
-          - { variant: { name: code-slim, bake_target: runtime-code-slim }, suffix: code-slim }
-          - { variant: { name: code-slim-nonroot, bake_target: runtime-code-slim-nonroot }, suffix: code-slim-nonroot }
+        variant:
+          - { name: "", bake_target: runtime }
+          - { name: nonroot, bake_target: runtime-nonroot }
+          - { name: code, bake_target: runtime-code }
+          - { name: code-nonroot, bake_target: runtime-code-nonroot }
+          - { name: slim, bake_target: runtime-slim }
+          - { name: slim-nonroot, bake_target: runtime-slim-nonroot }
+          - { name: code-slim, bake_target: runtime-code-slim }
+          - { name: code-slim-nonroot, bake_target: runtime-code-slim-nonroot }
 
     steps:
       # No `actions/checkout` here: the manifest job only calls
@@ -383,7 +384,7 @@ jobs:
           done
 
       - name: Re-tag root image as :latest
-        if: steps.manifest.outputs.index_digest != '' && matrix.suffix == '' && steps.version.outputs.version != ''
+        if: steps.manifest.outputs.index_digest != '' && matrix.variant.name == '' && steps.version.outputs.version != ''
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}
           VERSION: ${{ steps.version.outputs.version }}

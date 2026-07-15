@@ -132,7 +132,6 @@ def opencode_config_path() -> Path:
     env_path = os.environ.get("OPENCODE_CONFIG", "").strip()
     if env_path:
         return Path(env_path).expanduser()
-
     base_dir = Path.home() / ".config" / "opencode"
     jsonc_path = base_dir / "opencode.jsonc"
 
@@ -140,3 +139,9 @@ def opencode_config_path() -> Path:
         return jsonc_path
 
     return base_dir / "opencode.json"
+
+
+def zcode_config_dir() -> Path:
+    """Return the ZCode user configuration directory."""
+
+    return Path.home() / ".zcode"

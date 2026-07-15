@@ -610,6 +610,10 @@ class GeminiHandlerMixin:
             except Exception as e:
                 logger.warning(f"[{request_id}] Memory injection failed (gemini): {e}")
 
+        query_params = dict(request.query_params)
+        is_streaming = query_params.get("alt") == "sse" or request.url.path.endswith(
+            ":streamGenerateContent"
+        )
         native_tools = body.get("tools")
         native_function_declarations = None
 
@@ -639,7 +643,7 @@ class GeminiHandlerMixin:
                 rebuilt_tools.append({"functionDeclarations": function_declarations})
             return rebuilt_tools
 
-        if self.config.ccr_inject_tool and tokens_saved > 0:
+        if self.config.ccr_inject_tool and tokens_saved > 0 and not is_streaming:
             from headroom.ccr import CCRToolInjector
 
             seen_names = set()
@@ -677,12 +681,6 @@ class GeminiHandlerMixin:
                 body["systemInstruction"] = optimized_system
             elif "systemInstruction" in body:
                 del body["systemInstruction"]
-
-        # Check if streaming requested via query param
-        query_params = dict(request.query_params)
-        is_streaming = query_params.get("alt") == "sse" or request.url.path.endswith(
-            ":streamGenerateContent"
-        )
 
         # Build URL - model is extracted from path. Vertex publisher
         # routes use the request's full path under the Vertex base URL;

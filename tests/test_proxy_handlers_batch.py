@@ -238,6 +238,7 @@ def native_ccr_response() -> FakeResponse:
                             {
                                 "functionCall": {
                                     "name": "headroom_retrieve",
+                                    "id": "call-1",
                                     "args": {"hash": "aaaaaaaaaaaaaaaaaaaaaaaa"},
                                 }
                             }
@@ -262,10 +263,11 @@ async def test_gemini_native_ccr_continuation(monkeypatch: pytest.MonkeyPatch) -
     )
     handler = NativeGeminiHandler([native_ccr_response(), final])
     handler.ccr_response_handler._execute_retrieval = lambda call: CCRToolResult(
-        "headroom_retrieve",
+        call.tool_call_id,
         json.dumps({"hash": call.hash_key, "original_content": [{"type": "code"}]}),
         True,
         1,
+        "headroom_retrieve",
     )
 
     response = await handler.handle_gemini_generate_content(
@@ -287,6 +289,7 @@ async def test_gemini_native_ccr_continuation(monkeypatch: pytest.MonkeyPatch) -
     assert continuation[-2]["parts"][0]["functionCall"]["name"] == "headroom_retrieve"
     assert continuation[-1]["role"] == "user"
     assert continuation[-1]["parts"][0]["functionResponse"]["name"] == "headroom_retrieve"
+    assert continuation[-1]["parts"][0]["functionResponse"]["id"] == "call-1"
 
 
 @pytest.mark.asyncio
@@ -346,6 +349,38 @@ async def test_gemini_native_ccr_does_not_duplicate_existing_declaration(
         for declaration in tool.get("functionDeclarations", [])
     ]
     assert names.count("headroom_retrieve") == 1
+
+
+@pytest.mark.asyncio
+async def test_gemini_native_ccr_does_not_inject_into_streaming_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_native_gemini_compression(monkeypatch)
+    handler = NativeGeminiHandler([FakeResponse()])
+    captured: dict[str, object] = {}
+
+    async def fake_stream(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        captured["body"] = args[2]
+        return FakeResponse()
+
+    monkeypatch.setattr(handler, "_stream_response", fake_stream, raising=False)
+    tools = [{"functionDeclarations": [{"name": "client_tool"}]}]
+    await handler.handle_gemini_generate_content(
+        FakeRequest(
+            json.dumps(native_gemini_request(tools)),
+            headers={"content-type": "application/json"},
+            path="/v1beta/models/gemini-2.5-flash:streamGenerateContent",
+        ),
+        "gemini-2.5-flash",
+    )
+
+    streamed_tools = captured["body"]["tools"]  # type: ignore[index]
+    names = [
+        declaration["name"]
+        for tool in streamed_tools
+        for declaration in tool.get("functionDeclarations", [])
+    ]
+    assert names == ["client_tool"]
 
 
 @pytest.mark.asyncio

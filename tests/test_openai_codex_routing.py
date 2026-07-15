@@ -169,6 +169,7 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
             retry_base_delay_ms=10,
             retry_max_delay_ms=50,
             connect_timeout_seconds=10,
+            openai_extra_headers=None,
         )
         self.usage_reporter = None
         self.openai_provider = SimpleNamespace(get_context_limit=lambda model: 128_000)
@@ -313,39 +314,8 @@ def test_handle_openai_responses_routes_chatgpt_auth_to_backend_api(monkeypatch)
     assert url == "https://chatgpt.com/backend-api/codex/responses"
     assert headers["ChatGPT-Account-ID"] == "acct-from-jwt"
     assert body["input"] == "hello"
-    assert response.status_code == 200
-
-
-def test_handle_openai_responses_chatgpt_auth_skips_memory_tools(monkeypatch):
-    token = _jwt(
-        {
-            "https://api.openai.com/auth": {
-                "chatgpt_account_id": "acct-from-jwt",
-            }
-        }
-    )
-    request = _build_request(
-        {"model": "gpt-5.4", "input": "hello", "store": False},
-        {"Authorization": f"Bearer {token}", "x-headroom-user-id": "user-1"},
-    )
-    handler = _DummyOpenAIHandler()
-    memory_handler = _MemoryToolsOnlyHandler()
-    handler.memory_handler = memory_handler
-    handler.session_tracker_store = SimpleNamespace(
-        compute_session_id=lambda *a, **k: "sess-chatgpt-no-memory-tools",
-    )
-
-    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
-
-    response = anyio.run(handler.handle_openai_responses, request)
-
-    assert response.status_code == 200
-    assert handler.captured_request is not None
-    _, url, _, body = handler.captured_request
-    assert url == "https://chatgpt.com/backend-api/codex/responses"
     assert body["store"] is False
-    assert "tools" not in body
-    assert memory_handler.compute_calls == 0
+    assert response.status_code == 200
 
 
 def test_handle_openai_responses_strips_codex_lite_header_upstream(monkeypatch):
@@ -381,6 +351,38 @@ def test_handle_openai_responses_strips_codex_lite_header_upstream(monkeypatch):
     assert lowered.get("x-openai-debug") == "keep-me"
 
 
+def test_handle_openai_responses_chatgpt_auth_skips_memory_tools(monkeypatch):
+    token = _jwt(
+        {
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct-from-jwt",
+            }
+        }
+    )
+    request = _build_request(
+        {"model": "gpt-5.4", "input": "hello", "store": True},
+        {"Authorization": f"Bearer {token}", "x-headroom-user-id": "user-1"},
+    )
+    handler = _DummyOpenAIHandler()
+    memory_handler = _MemoryToolsOnlyHandler()
+    handler.memory_handler = memory_handler
+    handler.session_tracker_store = SimpleNamespace(
+        compute_session_id=lambda *a, **k: "sess-chatgpt-no-memory-tools",
+    )
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert response.status_code == 200
+    assert handler.captured_request is not None
+    _, url, _, body = handler.captured_request
+    assert url == "https://chatgpt.com/backend-api/codex/responses"
+    assert body["store"] is False
+    assert "tools" not in body
+    assert memory_handler.compute_calls == 0
+
+
 def test_handle_openai_responses_chatgpt_codex_timeout_fails_open(monkeypatch):
     token = _jwt(
         {
@@ -410,11 +412,37 @@ def test_handle_openai_responses_chatgpt_codex_timeout_fails_open(monkeypatch):
     assert method == "POST"
     assert url == "https://chatgpt.com/backend-api/codex/responses"
     assert body["input"] == "large context"
+    assert body["store"] is False
+
+
+def test_handle_openai_responses_api_auth_store_false_skips_memory_tools(monkeypatch):
+    request = _build_request(
+        {"model": "gpt-4o-mini", "input": "hello", "store": False},
+        {"Authorization": "Bearer sk-test", "x-headroom-user-id": "user-1"},
+    )
+    handler = _DummyOpenAIHandler()
+    memory_handler = _MemoryToolsOnlyHandler()
+    handler.memory_handler = memory_handler
+    handler.session_tracker_store = SimpleNamespace(
+        compute_session_id=lambda *a, **k: "sess-api-memory-tools",
+    )
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert response.status_code == 200
+    assert handler.captured_request is not None
+    _, url, _, body = handler.captured_request
+    assert url == "https://api.openai.com/v1/responses"
+    assert body["store"] is False
+    assert "tools" not in body
+    assert memory_handler.compute_calls == 1
 
 
 def test_handle_openai_responses_api_auth_keeps_memory_tools(monkeypatch):
     request = _build_request(
-        {"model": "gpt-4o-mini", "input": "hello", "store": False},
+        {"model": "gpt-4o-mini", "input": "hello", "store": True},
         {"Authorization": "Bearer sk-test", "x-headroom-user-id": "user-1"},
     )
     handler = _DummyOpenAIHandler()

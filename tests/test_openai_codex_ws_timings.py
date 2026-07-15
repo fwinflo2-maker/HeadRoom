@@ -38,6 +38,7 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
             retry_base_delay_ms=1,
             retry_max_delay_ms=1,
             connect_timeout_seconds=10,
+            openai_extra_headers=None,
         )
         self.usage_reporter = None
         self.openai_provider = SimpleNamespace(get_context_limit=lambda model: 128_000)
@@ -261,7 +262,7 @@ def test_codex_ws_chatgpt_auth_skips_memory_tools(stage_log_capture):
     first_frame = json.dumps(
         {
             "type": "response.create",
-            "response": {"model": "gpt-5.4", "input": "hello", "store": False},
+            "response": {"model": "gpt-5.4", "input": "hello", "store": True},
         }
     )
     client_ws = _FakeWebSocket(

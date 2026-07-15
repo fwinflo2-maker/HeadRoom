@@ -22,7 +22,28 @@ import math
 import os
 from dataclasses import dataclass
 
-from headroom.proxy.auth_mode import AuthMode
+import enum
+
+
+class AuthMode(str, enum.Enum):
+    """Three auth-mode classes Headroom routes compression policy through.
+
+    Direct port of ``crates/headroom-core/src/auth_mode.rs``. Phase H1
+    relocated this enum here after ``headroom/proxy/auth_mode.py`` was
+    retired with the Python proxy server.
+
+    Subclasses :class:`str` so members serialize into structured logs /
+    metric labels identically to the Rust ``AuthMode::as_str()`` output.
+    """
+
+    #: Pay-as-you-go API key. Aggressive live-zone compression OK.
+    PAYG = "payg"
+
+    #: OAuth bearer / Bedrock IAM / Vertex ADC. Lossless-only path.
+    OAUTH = "oauth"
+
+    #: Subscription-bound CLI / IDE. Same as OAuth plus stealth headers.
+    SUBSCRIPTION = "subscription"
 
 # ── F2.2 per-mode default values (CONSERVATIVE pending bake telemetry) ──
 # Mirrors the Rust ``pub(crate) const`` block in

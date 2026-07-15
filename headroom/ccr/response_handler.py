@@ -24,6 +24,52 @@ from .tool_injection import CCR_TOOL_NAME, parse_tool_call
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# SSE byte-buffer parser (inlined from headroom/proxy/helpers.py in Phase H1)
+# ---------------------------------------------------------------------------
+
+_SSE_EVENT_TERMINATORS = (b"\n\n", b"\r\n\r\n")
+
+
+def _find_sse_event_terminator(buf: bytearray) -> tuple[int, int] | None:
+    matches = [
+        (idx, len(term))
+        for term in _SSE_EVENT_TERMINATORS
+        if (idx := buf.find(term)) != -1
+    ]
+    if not matches:
+        return None
+    return min(matches, key=lambda m: m[0])
+
+
+def _parse_sse_events_from_byte_buffer(buf: bytearray) -> list[tuple[str | None, str]]:
+    """Drain complete SSE events from *buf*, mutating it in-place.
+
+    Returns ``(event_name, data_str)`` tuples.  Operates on bytes; only
+    decodes complete events as UTF-8 so multi-byte chars split across TCP
+    reads are preserved intact.
+    """
+    events: list[tuple[str | None, str]] = []
+    while True:
+        match = _find_sse_event_terminator(buf)
+        if match is None:
+            break
+        idx, term_len = match
+        event_text = bytes(buf[:idx]).decode("utf-8")
+        del buf[: idx + term_len]
+        event_name: str | None = None
+        data_lines: list[str] = []
+        for line in event_text.splitlines():
+            if not line or line.startswith(":"):
+                continue
+            if line.startswith("event:"):
+                event_name = line[len("event:") :].lstrip()
+            elif line.startswith("data:"):
+                data_lines.append(line[len("data:") :].lstrip())
+        if data_lines:
+            events.append((event_name, "\n".join(data_lines)))
+    return events
+
 
 @dataclass
 class CCRToolCall:
@@ -716,16 +762,9 @@ class StreamingCCRHandler:
         event is an upstream protocol bug — surfaced loudly, not
         silently corrupted.
         """
-        from headroom.proxy.helpers import parse_sse_events_from_byte_buffer
-
-        # Accumulate all event data via the canonical bytes-buffer
-        # splitter. ``data`` is a closed payload here, so any partial
-        # tail bytes left in ``buf`` indicate the upstream truncated
-        # mid-event — log and ignore (already handled at the streaming
-        # layer above).
         buf = bytearray(data)
         events: list[dict[str, Any]] = []
-        for _event_name, data_str in parse_sse_events_from_byte_buffer(buf):
+        for _event_name, data_str in _parse_sse_events_from_byte_buffer(buf):
             stripped = data_str.strip()
             if not stripped or stripped == "[DONE]":
                 continue

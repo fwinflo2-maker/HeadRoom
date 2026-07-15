@@ -125,9 +125,12 @@ class TransformPipeline:
         if getattr(self.config, "intercept_tool_results", False) or _os.environ.get(
             "HEADROOM_INTERCEPT_ENABLED"
         ):
-            from headroom.proxy.interceptors import ToolResultInterceptorTransform
+            import logging as _logging
 
-            transforms.append(ToolResultInterceptorTransform())
+            _logging.getLogger(__name__).warning(
+                "intercept_tool_results / HEADROOM_INTERCEPT_ENABLED is retired in Phase H1 "
+                "(Python proxy interceptors deleted). The flag is ignored."
+            )
 
         # 1. Cache Aligner (prefix stabilization)
         if self.config.cache_aligner.enabled:

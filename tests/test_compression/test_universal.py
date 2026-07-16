@@ -415,3 +415,22 @@ class TestSecurityAuditRegressions:
             content = json.dumps({"msg": payload_value})
             res = compressor.compress(content, content_type=ContentType.JSON)
             json.loads(res.compressed)  # must not raise, regardless of prefix_len
+
+    def test_sec04_json_fallback_does_not_split_unicode_escape(self):
+        """SEC-04: the truncation cut must not land inside a \\uXXXX escape.
+
+        SEC-03 covered the 2-character escapes (\\n, \\", \\\\); a non-ASCII
+        character serialized by json.dumps() (ensure_ascii=True by default)
+        becomes a 6-character \\uXXXX escape, and a cut landing among its hex
+        digits (not immediately after the backslash) is just as invalid, but
+        isn't caught by a backslash-run check alone. Sweeps prefix lengths so
+        the cut lands inside the escape at least once.
+        """
+        compressor = UniversalCompressor(
+            config=UniversalCompressorConfig(use_magika=False, use_kompress=False, ccr_enabled=False)
+        )
+        for prefix_len in range(60, 75):
+            payload_value = ("x" * prefix_len) + "é" + ("y" * 300)
+            content = json.dumps({"msg": payload_value})
+            res = compressor.compress(content, content_type=ContentType.JSON)
+            json.loads(res.compressed)  # must not raise, regardless of prefix_len

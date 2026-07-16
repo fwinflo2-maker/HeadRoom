@@ -198,25 +198,34 @@ class UniversalCompressor:
 
     @staticmethod
     def _safe_truncate_boundary(text: str, pos: int) -> int:
-        """Nudge a truncation boundary past a backslash escape pair it would split.
+        """Nudge a truncation boundary to the next position that doesn't split
+        a JSON backslash escape.
 
         A span passed here may be raw JSON string content (quotes and escapes
-        intact, not decoded), so cutting between a backslash and the character
-        it escapes (e.g. "...\\" | "n..." -> a dangling "\\") produces invalid
-        JSON. Counting the run of backslashes immediately before `pos` is
-        enough to tell: an odd run means `pos` sits mid-escape (including
-        mid "\\uXXXX", though only the first character of the pair is
-        realigned there), an even run means every backslash before `pos`
-        already pairs off cleanly.
+        intact, not decoded), so cutting inside an escape - a 2-character form
+        like "\\n"/"\\""/"\\\\", or the 6-character "\\uXXXX" unicode form -
+        produces invalid JSON (a dangling backslash, or a truncated \\u with
+        fewer than 4 hex digits).
+
+        Walks `text` as a sequence of JSON string tokens from the start,
+        treating "\\" + the next character as one atomic unit (expanded to 6
+        characters when that next character is "u"), and returns the first
+        token boundary at or after `pos`. Backslash-run parity alone isn't
+        enough here: it correctly flags a split 2-character escape, but a cut
+        landing among the hex digits of "\\uXXXX" (after the "u", not
+        immediately after the backslash) has no backslash immediately before
+        it at all, so a purely backward-looking check misses it.
         """
         if pos <= 0 or pos >= len(text):
             return pos
-        backslash_run = 0
-        i = pos - 1
-        while i >= 0 and text[i] == "\\":
-            backslash_run += 1
-            i -= 1
-        return pos + 1 if backslash_run % 2 == 1 else pos
+        i = 0
+        n = len(text)
+        while i < pos:
+            if text[i] == "\\" and i + 1 < n:
+                i += 6 if text[i + 1] == "u" else 2
+            else:
+                i += 1
+        return i
 
     def _simple_compress(self, text: str) -> str:
         """Simple compression fallback (truncation with indicator).

@@ -397,3 +397,21 @@ class TestSecurityAuditRegressions:
             ).compress(payload, content_type=ContentType.JSON)
             assert "\n" not in res.compressed, f"raw newline leaked (use_kompress={use_kompress})"
             json.loads(res.compressed)  # must not raise
+
+    def test_sec03_json_fallback_does_not_split_escape_pair(self):
+        """SEC-03: the truncation cut itself must not land inside an escape pair.
+
+        SEC-02 fixed the separator between the kept portions; the boundaries of
+        the cut can independently land between a backslash and the character it
+        escapes (e.g. splitting "\\n" into a trailing "\\" plus "n..."), which is
+        just as invalid. Sweeps prefix lengths so the cut point lands on the
+        escape at least once regardless of the exact keep_start/keep_end math.
+        """
+        compressor = UniversalCompressor(
+            config=UniversalCompressorConfig(use_magika=False, use_kompress=False, ccr_enabled=False)
+        )
+        for prefix_len in range(90, 105):
+            payload_value = ("x" * prefix_len) + "\n" + ("y" * 200)
+            content = json.dumps({"msg": payload_value})
+            res = compressor.compress(content, content_type=ContentType.JSON)
+            json.loads(res.compressed)  # must not raise, regardless of prefix_len

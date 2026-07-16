@@ -196,6 +196,28 @@ class UniversalCompressor:
             logger.warning("Kompress compression failed: %s", e)
             return self._simple_compress(text)
 
+    @staticmethod
+    def _safe_truncate_boundary(text: str, pos: int) -> int:
+        """Nudge a truncation boundary past a backslash escape pair it would split.
+
+        A span passed here may be raw JSON string content (quotes and escapes
+        intact, not decoded), so cutting between a backslash and the character
+        it escapes (e.g. "...\\" | "n..." -> a dangling "\\") produces invalid
+        JSON. Counting the run of backslashes immediately before `pos` is
+        enough to tell: an odd run means `pos` sits mid-escape (including
+        mid "\\uXXXX", though only the first character of the pair is
+        realigned there), an even run means every backslash before `pos`
+        already pairs off cleanly.
+        """
+        if pos <= 0 or pos >= len(text):
+            return pos
+        backslash_run = 0
+        i = pos - 1
+        while i >= 0 and text[i] == "\\":
+            backslash_run += 1
+            i -= 1
+        return pos + 1 if backslash_run % 2 == 1 else pos
+
     def _simple_compress(self, text: str) -> str:
         """Simple compression fallback (truncation with indicator).
 
@@ -214,6 +236,18 @@ class UniversalCompressor:
         # JSON string value, and a raw newline there produces invalid JSON.
         keep_start = target_len * 2 // 3
         keep_end = target_len // 3
+
+        # Same reasoning applies to where the cut itself falls: nudge both
+        # boundaries off a split backslash escape pair (e.g. a truncated
+        # "\n" or "\"") rather than just the separator between them. Cap the
+        # end boundary so a nudge can't zero out an originally-nonzero
+        # keep_end (text[-0:] is the whole string, not empty).
+        keep_start = self._safe_truncate_boundary(text, keep_start)
+        end_boundary = self._safe_truncate_boundary(text, len(text) - keep_end)
+        if keep_end > 0:
+            end_boundary = min(end_boundary, len(text) - 1)
+        keep_start = min(keep_start, end_boundary)
+        keep_end = len(text) - end_boundary
 
         return text[:keep_start] + " ...[compressed]... " + text[-keep_end:]
 

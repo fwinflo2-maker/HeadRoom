@@ -348,6 +348,223 @@ class TestCompressEndpointCompression:
         assert outcome.tokens_saved == 0
 
 
+class TestCompressEndpointConfig:
+    """Per-request CompressConfig on /v1/compress.
+
+    The ``config`` body object exposes the user-facing CompressConfig
+    knobs over HTTP. Unknown keys and mistyped values are a 400 — never
+    a silent no-op — so callers can't believe an option took effect
+    when it didn't.
+    """
+
+    @staticmethod
+    def _recording_apply(proxy, monkeypatch):
+        """Patch the pipeline to record the kwargs apply() receives."""
+        captured: dict = {}
+
+        def fake_apply(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                messages=kwargs["messages"],
+                tokens_before=10,
+                tokens_after=10,
+                transforms_applied=[],
+                transforms_summary={},
+                markers_inserted=[],
+            )
+
+        monkeypatch.setattr(proxy.openai_pipeline, "apply", fake_apply)
+        return captured
+
+    def test_all_config_knobs_reach_pipeline(self, client, monkeypatch):
+        """Every documented config field must be forwarded to apply()."""
+        captured = self._recording_apply(client.app.state.proxy, monkeypatch)
+
+        response = client.post(
+            "/v1/compress",
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "model": "gpt-4",
+                "config": {
+                    "compress_user_messages": True,
+                    "compress_system_messages": False,
+                    "protect_recent": 2,
+                    "protect_analysis_context": False,
+                    "frozen_message_count": 3,
+                    "min_tokens_to_compress": 100,
+                    "target_ratio": 0.5,
+                },
+            },
+        )
+
+        assert response.status_code == 200
+        assert captured["compress_user_messages"] is True
+        assert captured["compress_system_messages"] is False
+        assert captured["protect_recent"] == 2
+        assert captured["protect_analysis_context"] is False
+        assert captured["frozen_message_count"] == 3
+        assert captured["min_tokens_to_compress"] == 100
+        assert captured["target_ratio"] == 0.5
+
+    def test_omitted_config_uses_server_defaults(self, client, monkeypatch):
+        """No config object → apply() sees only server-level kwargs."""
+        captured = self._recording_apply(client.app.state.proxy, monkeypatch)
+
+        response = client.post(
+            "/v1/compress",
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "model": "gpt-4",
+            },
+        )
+
+        assert response.status_code == 200
+        # None of the request-level keys were sent, so none may appear
+        # unless the server config/profile set them.
+        assert "frozen_message_count" not in captured
+
+    def test_partial_config_only_sends_given_keys(self, client, monkeypatch):
+        """Keys the caller didn't send must not be forced onto apply()."""
+        captured = self._recording_apply(client.app.state.proxy, monkeypatch)
+
+        response = client.post(
+            "/v1/compress",
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "model": "gpt-4",
+                "config": {"protect_recent": 0},
+            },
+        )
+
+        assert response.status_code == 200
+        assert captured["protect_recent"] == 0
+        assert "min_tokens_to_compress" not in captured or captured["min_tokens_to_compress"] != 0
+
+    def test_unknown_config_key_returns_400(self, client):
+        response = client.post(
+            "/v1/compress",
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "model": "gpt-4",
+                "config": {"tarrget_ratio": 0.5},
+            },
+        )
+        assert response.status_code == 400
+        data = response.json()
+        assert data["error"]["type"] == "invalid_request"
+        assert "tarrget_ratio" in data["error"]["message"]
+        # The error is actionable: it lists the allowed keys.
+        assert "target_ratio" in data["error"]["message"]
+
+    def test_config_must_be_object(self, client):
+        response = client.post(
+            "/v1/compress",
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "model": "gpt-4",
+                "config": "aggressive",
+            },
+        )
+        assert response.status_code == 400
+        assert response.json()["error"]["type"] == "invalid_request"
+
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            ("compress_user_messages", "yes"),
+            ("compress_system_messages", 1),
+            ("protect_analysis_context", "true"),
+        ],
+    )
+    def test_bool_fields_reject_non_bool(self, client, key, value):
+        response = client.post(
+            "/v1/compress",
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "model": "gpt-4",
+                "config": {key: value},
+            },
+        )
+        assert response.status_code == 400
+        assert key in response.json()["error"]["message"]
+
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            ("protect_recent", -1),
+            ("protect_recent", "4"),
+            ("frozen_message_count", 1.5),
+            ("frozen_message_count", True),
+            ("min_tokens_to_compress", -250),
+        ],
+    )
+    def test_int_fields_reject_invalid(self, client, key, value):
+        response = client.post(
+            "/v1/compress",
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "model": "gpt-4",
+                "config": {key: value},
+            },
+        )
+        assert response.status_code == 400
+        assert key in response.json()["error"]["message"]
+
+    @pytest.mark.parametrize("value", [0, 0.0, -0.5, 1.5, "0.5", True])
+    def test_target_ratio_rejects_out_of_range(self, client, value):
+        response = client.post(
+            "/v1/compress",
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "model": "gpt-4",
+                "config": {"target_ratio": value},
+            },
+        )
+        assert response.status_code == 400
+        assert "target_ratio" in response.json()["error"]["message"]
+
+    def test_target_ratio_accepts_boundary_one(self, client, monkeypatch):
+        """1.0 (keep everything) is a legal keep-ratio."""
+        captured = self._recording_apply(client.app.state.proxy, monkeypatch)
+
+        response = client.post(
+            "/v1/compress",
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "model": "gpt-4",
+                "config": {"target_ratio": 1.0},
+            },
+        )
+        assert response.status_code == 200
+        assert captured["target_ratio"] == 1.0
+
+    def test_request_config_overrides_server_profile(self, monkeypatch):
+        """Request-level config must win over HEADROOM_SAVINGS_PROFILE knobs."""
+        config = ProxyConfig(
+            optimize=True,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            savings_profile="agent-90",
+        )
+        app = create_app(config)
+        with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+            captured = self._recording_apply(app.state.proxy, monkeypatch)
+
+            response = client.post(
+                "/v1/compress",
+                json={
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "model": "gpt-4",
+                    "config": {"protect_recent": 9, "compress_user_messages": False},
+                },
+            )
+
+            assert response.status_code == 200
+            assert captured["protect_recent"] == 9
+            assert captured["compress_user_messages"] is False
+
+
 class TestCompressEndpointDoesNotBlockLoop:
     """/v1/compress must offload to the compression executor so a slow/large
     payload cannot freeze the single event loop (#718)."""

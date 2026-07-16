@@ -285,9 +285,39 @@ Compression-only endpoint. Compresses messages without calling any LLM. Used by 
 ```json
 {
   "messages": [{ "role": "user", "content": "..." }],
-  "model": "gpt-4o"
+  "model": "gpt-4o",
+  "token_budget": 8000,
+  "config": {
+    "compress_user_messages": true,
+    "compress_system_messages": false,
+    "protect_recent": 2,
+    "protect_analysis_context": true,
+    "frozen_message_count": 0,
+    "min_tokens_to_compress": 250,
+    "target_ratio": 0.5
+  }
 }
 ```
+
+`token_budget` (optional) overrides the model's context limit as the
+compression target. `config` (optional) exposes the user-facing
+`CompressConfig` knobs per request; any key left unset falls back to the
+server-level configuration (including `HEADROOM_SAVINGS_PROFILE`), and
+request-level keys win over it. Validation is strict: unknown keys or
+mistyped values return `400 invalid_request` instead of being silently
+ignored. `kompress_model` and `savings_profile` are deliberately not
+accepted over HTTP — model selection and the savings posture stay
+operator-level settings.
+
+| `config` key | Type | Constraint |
+|---|---|---|
+| `compress_user_messages` | boolean | — |
+| `compress_system_messages` | boolean | — |
+| `protect_analysis_context` | boolean | — |
+| `protect_recent` | integer | ≥ 0 |
+| `frozen_message_count` | integer | ≥ 0 |
+| `min_tokens_to_compress` | integer | ≥ 0 |
+| `target_ratio` | number | in `(0, 1]` |
 
 **Response:**
 ```json

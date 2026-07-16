@@ -68,6 +68,40 @@ def _strip_index_from_content_blocks(content: Any) -> None:
             _strip_index_from_content_blocks(block.get("content"))
 
 
+def _contains_thinking_blocks(messages: list[dict]) -> bool:
+    """Check if any message contains ``thinking``/``redacted_thinking`` blocks.
+
+    These blocks carry an Anthropic server-side cryptographic signature bound
+    to their exact byte representation. Any re-serialization invalidates the
+    signature and causes the upstream to reject the request with 400.
+    Recurses into ``tool_result`` nested content arrays (which may appear
+    in user messages when the client echoes back assistant tool-call results).
+    """
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            if _has_thinking_blocks_in_list(content):
+                return True
+    return False
+
+
+def _has_thinking_blocks_in_list(blocks: list) -> bool:
+    """Recursively scan a content block list for thinking/redacted_thinking blocks."""
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") in ("thinking", "redacted_thinking"):
+            return True
+        # tool_result can nest its own content array
+        nested = block.get("content")
+        if isinstance(nested, list):
+            if _has_thinking_blocks_in_list(nested):
+                return True
+    return False
+
+
 class AnthropicHandlerMixin:
     """Mixin providing Anthropic API handler methods for HeadroomProxy."""
 
@@ -751,6 +785,19 @@ class AnthropicHandlerMixin:
             # original, forwarded, and the recorded/replayed prefix are all identical)
             # keeps it cache-safe: overlay_cached_prefix replays the same stripped bytes.
             _strip_streaming_only_content_fields(messages)
+            # Detect extended-thinking blocks early — before any transform runs.
+            # These blocks carry an Anthropic server-side signature bound to the
+            # exact original bytes. If present, we force byte-preserving passthrough
+            # so the signature is never invalidated by canonical re-serialization.
+            _force_preserve_original = False
+            _thinking_block_ctx = _contains_thinking_blocks(messages)
+            if _thinking_block_ctx:
+                _force_preserve_original = True
+                logger.info(
+                    "[%s] Extended-thinking blocks detected — forcing byte-preserving "
+                    "passthrough for signed content integrity",
+                    request_id,
+                )
             pipeline_provider = provider_name
             pipeline_path = request.url.path if upstream_base_url else "/v1/messages"
             pipeline_stream = bool(body.get("stream", False) or force_stream)
@@ -831,6 +878,10 @@ class AnthropicHandlerMixin:
             # body is undecipherable → 502.
             headers.pop("accept-encoding", None)
             tags = extract_tags(headers)
+            # Tag extended-thinking presence for observability (detected earlier
+            # before transforms ran).
+            if _thinking_block_ctx:
+                tags["extended_thinking"] = "present"
             # Identify the harness (codex / claude-code / aider / etc.)
             # from User-Agent or X-Client. Surfaced via the funnel into
             # PERF logs and RequestLog.tags — see RequestOutcome.client.
@@ -2509,8 +2560,15 @@ class AnthropicHandlerMixin:
             # it touched the body, mark mutated; we additionally compare the
             # final body against the parsed original bytes as a structural
             # safety net so any silent mutation we missed still triggers
-            # canonical re-serialization.
-            if not body_mutation_tracker.mutated and original_body_bytes is not None:
+            # canonical re-serialization.  When extended-thinking blocks are
+            # present the structural diff is unreliable (transforms may change
+            # dict structure without touching message content) and the original
+            # bytes must be preserved for signature integrity — skip the check.
+            if (
+                not body_mutation_tracker.mutated
+                and original_body_bytes is not None
+                and not _force_preserve_original
+            ):
                 try:
                     parsed_original = json.loads(original_body_bytes)
                     if parsed_original != body:
@@ -2822,6 +2880,7 @@ class AnthropicHandlerMixin:
                         memory_request_ctx=memory_request_ctx,
                         outcome_provider=provider_name,
                         session_key=session_key,
+                        force_preserve_original=_force_preserve_original,
                     )
                 else:
                     async with stage_timer.measure("upstream_connect"):
@@ -2837,6 +2896,7 @@ class AnthropicHandlerMixin:
                             forwarder_name="anthropic_messages",
                             path_for_log="/v1/messages",
                             timeout=self._anthropic_buffered_request_timeout(),
+                            force_preserve_original=_force_preserve_original,
                         )
                     self.pipeline_extensions.emit(
                         PipelineStage.POST_SEND,

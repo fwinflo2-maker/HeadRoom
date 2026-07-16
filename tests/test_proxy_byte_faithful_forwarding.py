@@ -38,6 +38,9 @@ from headroom.proxy.body_forwarding import (
     select_outbound_body,
     serialize_body_canonical,
 )
+from headroom.proxy.handlers.anthropic import (
+    _contains_thinking_blocks,
+)
 from headroom.proxy.helpers import (
     _reset_session_beta_tracker_for_test,
     append_text_to_latest_user_chat_message,
@@ -1311,3 +1314,532 @@ def test_ws_http_fallback_uses_canonical_serializer() -> None:
     assert b"\\u" not in out
     # Round-trip equality via JSON parse.
     assert json.loads(out.decode("utf-8")) == body
+
+
+# ---------------------------------------------------------------------------
+# Extended-thinking block detection and force_preserve_original
+# ---------------------------------------------------------------------------
+
+
+class TestContainsThinkingBlocks:
+    """Unit tests for _contains_thinking_blocks detection."""
+
+    def test_detects_thinking_block(self) -> None:
+        messages = [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "...", "signature": "sig..."},
+                    {"type": "text", "text": "answer"},
+                ],
+            },
+        ]
+        assert _contains_thinking_blocks(messages) is True
+
+    def test_detects_redacted_thinking_block(self) -> None:
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "redacted_thinking", "data": "base64data..."},
+                ],
+            },
+        ]
+        assert _contains_thinking_blocks(messages) is True
+
+    def test_no_thinking_blocks_returns_false(self) -> None:
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+        ]
+        assert _contains_thinking_blocks(messages) is False
+
+    def test_string_content_does_not_crash(self) -> None:
+        messages = [
+            {"role": "assistant", "content": "plain text"},
+        ]
+        assert _contains_thinking_blocks(messages) is False
+
+    def test_empty_messages_returns_false(self) -> None:
+        assert _contains_thinking_blocks([]) is False
+
+    def test_content_none_does_not_crash(self) -> None:
+        messages = [{"role": "assistant", "content": None}]
+        assert _contains_thinking_blocks(messages) is False
+
+    def test_content_list_with_nulls_does_not_crash(self) -> None:
+        messages = [
+            {
+                "role": "assistant",
+                "content": [None, {}, {"type": "text", "text": "hi"}],
+            },
+        ]
+        assert _contains_thinking_blocks(messages) is False
+
+    def test_malformed_message_dict_does_not_crash(self) -> None:
+        messages = [{"role": "user"}, {"role": "assistant", "content": "hi"}, {}]
+        assert _contains_thinking_blocks(messages) is False
+
+    def test_thinking_in_tool_result_nested_three_levels(self) -> None:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "content": [
+                                    {"type": "thinking", "thinking": "deep", "signature": "s"},
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+        ]
+        assert _contains_thinking_blocks(messages) is True
+
+    def test_non_assistant_role_with_content_list_scanned(self) -> None:
+        """All messages with content lists are scanned, not just assistant."""
+        # A system role is unlikely to have thinking blocks, but the scan
+        # should cover every message regardless (safer than role-filtering).
+        messages = [
+            {
+                "role": "system",
+                "content": [{"type": "thinking", "thinking": "x", "signature": "s"}],
+            },
+        ]
+        assert _contains_thinking_blocks(messages) is True
+
+    def test_nested_tool_result_content(self) -> None:
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "let me check"},
+                    {
+                        "type": "tool_use",
+                        "name": "bash",
+                        "input": {"cmd": "ls"},
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu_01",
+                        "content": [
+                            {"type": "thinking", "thinking": "nested", "signature": "sig"},
+                            {"type": "text", "text": "output"},
+                        ],
+                    },
+                ],
+            },
+        ]
+        assert _contains_thinking_blocks(messages) is True
+
+
+class TestForcePreserveOriginal:
+    """Unit tests for the force_preserve_original parameter."""
+
+    def test_force_preserve_original_passthrough(self) -> None:
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+        original = json.dumps(body, separators=(",", ":")).encode()
+        result = select_outbound_body(
+            body=body,
+            original_body_bytes=original,
+            body_mutated=True,
+            force_preserve_original=True,
+        )
+        assert result.content == original
+        assert result.source == "passthrough"
+
+    def test_force_preserve_original_requires_original_bytes(self) -> None:
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+        result = select_outbound_body(
+            body=body,
+            original_body_bytes=None,
+            body_mutated=True,
+            force_preserve_original=True,
+        )
+        assert result.source == "canonical"
+
+    def test_force_preserve_original_false_normal_behavior(self) -> None:
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+        # Use original bytes with pretty-printed JSON, which differs from
+        # canonical (compact) output when force_preserve_original=False.
+        original = json.dumps(body, indent=2).encode()
+        result = select_outbound_body(
+            body=body,
+            original_body_bytes=original,
+            body_mutated=True,
+            force_preserve_original=False,
+        )
+        assert result.source == "canonical"
+        assert result.content != original
+
+    def test_prepare_outbound_body_bytes_forwards_flag(self) -> None:
+        body = {"key": "value"}
+        original = json.dumps(body, separators=(",", ":")).encode()
+        content, source = prepare_outbound_body_bytes(
+            body=body,
+            original_body_bytes=original,
+            body_mutated=True,
+            force_preserve_original=True,
+        )
+        assert source == "passthrough"
+        assert content == original
+
+    def test_structural_diff_surrogate_guarded(self) -> None:
+        """Structural diff would fire on tool-reordering noise, but
+        force_preserve_original prevents canonical re-serialization.
+
+        This tests the path: thinking blocks detected → force_preserve=True
+        → select_outbound_body returns original bytes even when
+        body_mutated=True (from tool reorder, not content change).
+        """
+        body = {
+            "model": "claude-sonnet-4",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "...", "signature": "sig"},
+                        {"type": "text", "text": "answer"},
+                    ],
+                },
+            ],
+        }
+        # Encode with pretty-print so canonical output differs from original.
+        original = json.dumps(body, indent=2).encode()
+
+        # body_mutated=True simulates a tool-reorder that triggered
+        # structural_diff_vs_original. force_preserve_original=True
+        # (thinking blocks detected) must override it.
+        result = select_outbound_body(
+            body=body,
+            original_body_bytes=original,
+            body_mutated=True,
+            force_preserve_original=True,
+        )
+        assert result.content == original
+        assert result.source == "passthrough"
+
+
+# ---------------------------------------------------------------------------
+# Adversarial / fuzz tests for thinking-block detection
+# ---------------------------------------------------------------------------
+
+
+class TestAdversarialThinkingBlockDetection:
+    """Adversarial inputs that should not confuse _contains_thinking_blocks."""
+
+    def test_fake_thinking_type_misspelled(self) -> None:
+        """Similar but not equal to 'thinking' — must NOT match."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "think", "thinking": "...", "signature": "sig"},
+                ],
+            },
+        ]
+        assert _contains_thinking_blocks(messages) is False
+
+    def test_fake_thinking_type_camelcase(self) -> None:
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "Thinking", "thinking": "...", "signature": "sig"},
+                ],
+            },
+        ]
+        assert _contains_thinking_blocks(messages) is False
+
+    def test_fake_type_is_unicode_normalized(self) -> None:
+        """Unicode escapes in the JSON source decode to 'thinking' at parse time."""
+        import json as _json
+
+        raw = '{"type": "thinking", "thinking": "x", "signature": "s"}'
+        block = _json.loads(raw)
+        messages = [{"role": "assistant", "content": [block]}]
+        assert _contains_thinking_blocks(messages) is True
+
+    def test_message_without_content_key(self) -> None:
+        messages = [{"role": "assistant"}]
+        assert _contains_thinking_blocks(messages) is False
+
+    def test_message_with_non_dict_content(self) -> None:
+        messages = [{"role": "assistant", "content": "string"}]
+        assert _contains_thinking_blocks(messages) is False
+        messages = [{"role": "assistant", "content": 42}]
+        assert _contains_thinking_blocks(messages) is False
+        messages = [{"role": "assistant", "content": True}]
+        assert _contains_thinking_blocks(messages) is False
+
+    def test_very_deeply_nested_content(self) -> None:
+        """Deep nesting should not blow the stack or miss a block."""
+        # Build 500 levels of tool_result wrapping a thinking block
+        inner: dict = {"type": "thinking", "thinking": "deep", "signature": "s"}
+        for _ in range(500):
+            inner = {"type": "tool_result", "content": [inner]}
+        messages = [{"role": "user", "content": [inner]}]
+        assert _contains_thinking_blocks(messages) is True
+
+    def test_very_long_content_list(self) -> None:
+        """1000 text blocks + 1 thinking block at the end must still detect."""
+        blocks: list[dict] = [{"type": "text", "text": f"block_{i}"} for i in range(1000)]
+        blocks.append({"type": "thinking", "thinking": "found", "signature": "s"})
+        messages = [{"role": "assistant", "content": blocks}]
+        assert _contains_thinking_blocks(messages) is True
+
+    def test_very_long_content_list_no_match(self) -> None:
+        """1000 text blocks with no thinking block."""
+        blocks: list[dict] = [{"type": "text", "text": f"block_{i}"} for i in range(1000)]
+        messages = [{"role": "assistant", "content": blocks}]
+        assert _contains_thinking_blocks(messages) is False
+
+    def test_all_message_roles_examined(self) -> None:
+        """Every role that could carry content must be scanned."""
+        for role in ("user", "assistant", "system", "tool"):
+            messages = [
+                {
+                    "role": role,
+                    "content": [
+                        {"type": "thinking", "thinking": "x", "signature": "s"},
+                    ],
+                },
+            ]
+            assert _contains_thinking_blocks(messages) is True, f"role={role} not scanned"
+
+    def test_messages_with_role_as_non_string(self) -> None:
+        """role field is a list or dict — should not crash."""
+        messages = [{"role": ["assistant"], "content": [{"type": "thinking", "thinking": "x"}]}]
+        assert _contains_thinking_blocks(messages) is True
+
+    def test_content_list_with_heterogeneous_types(self) -> None:
+        """Mixed types in content list: strings, None, ints, dicts."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    "plain string",
+                    None,
+                    42,
+                    {"type": "text", "text": "ok"},
+                    {"type": "thinking", "thinking": "found", "signature": "s"},
+                ],
+            },
+        ]
+        assert _contains_thinking_blocks(messages) is True
+
+    def test_thinking_block_with_extra_fields(self) -> None:
+        """Extra unknown fields on the thinking block should not confuse."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "...",
+                        "signature": "sig",
+                        "extra_field_1": "value1",
+                        "extra_field_2": ["a", "b"],
+                        "extra_field_3": {"nested": "object"},
+                    },
+                ],
+            },
+        ]
+        assert _contains_thinking_blocks(messages) is True
+
+    def test_redacted_thinking_with_extra_fields(self) -> None:
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "redacted_thinking",
+                        "data": "base64",
+                        "extra": "field",
+                    },
+                ],
+            },
+        ]
+        assert _contains_thinking_blocks(messages) is True
+
+    def test_empty_content_list(self) -> None:
+        messages = [{"role": "assistant", "content": []}]
+        assert _contains_thinking_blocks(messages) is False
+
+    def test_tool_result_empty_content(self) -> None:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_01", "content": []},
+                ],
+            },
+        ]
+        assert _contains_thinking_blocks(messages) is False
+
+    def test_separator_field_no_type(self) -> None:
+        """Content block without a 'type' key should not crash or falsely match."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"text": "I have no type"},
+                ],
+            },
+        ]
+        assert _contains_thinking_blocks(messages) is False
+
+    def test_thinking_signature_is_none(self) -> None:
+        """A real thinking block always has a signature, but if None it's still a thinking block."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "x", "signature": None},
+                ],
+            },
+        ]
+        assert _contains_thinking_blocks(messages) is True
+
+    def test_unknown_block_type_is_safe(self) -> None:
+        """Unknown block types (future Anthropic API) should not crash."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "unknown_future_block_type", "data": "something"},
+                    {"type": "thinking", "thinking": "x", "signature": "s"},
+                ],
+            },
+        ]
+        assert _contains_thinking_blocks(messages) is True
+
+    def test_content_fields_with_none_type(self) -> None:
+        """Block with type=None should not crash or falsely match."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": None, "text": "no type"},
+                ],
+            },
+        ]
+        assert _contains_thinking_blocks(messages) is False
+
+    def test_message_dict_with_null_content(self) -> None:
+        messages = [{"role": "assistant", "content": None}]
+        assert _contains_thinking_blocks(messages) is False
+
+    def test_all_messages_have_thinking_detected(self) -> None:
+        """Multiple messages each with thinking blocks: all should be found."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "a", "signature": "s1"},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "b", "signature": "s2"},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "c", "signature": "s3"},
+                ],
+            },
+        ]
+        assert _contains_thinking_blocks(messages) is True
+
+
+class TestAdversarialForcePreserveOriginal:
+    """Adversarial inputs for force_preserve_original forwarding decisions."""
+
+    def test_force_preserve_with_missing_original_bytes_falls_back(self) -> None:
+        """When original_body_bytes is None, force_preserve_original cannot
+        passthrough and must fall back to canonical."""
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+        result = select_outbound_body(
+            body=body,
+            original_body_bytes=None,
+            body_mutated=True,
+            force_preserve_original=True,
+        )
+        assert result.source == "canonical"
+
+    def test_force_preserve_with_binary_original_bytes(self) -> None:
+        """Original bytes can be any bytes — passthrough does not parse them."""
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+        original = b"not valid json at all \xff\xfe"
+        result = select_outbound_body(
+            body=body,
+            original_body_bytes=original,
+            body_mutated=True,
+            force_preserve_original=True,
+        )
+        assert result.source == "passthrough"
+        assert result.content == original
+
+    def test_force_preserve_with_empty_original_bytes(self) -> None:
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+        result = select_outbound_body(
+            body=body,
+            original_body_bytes=b"",
+            body_mutated=True,
+            force_preserve_original=True,
+        )
+        assert result.source == "passthrough"
+        assert result.content == b""
+
+    def test_force_preserve_ignores_body_mutated_even_when_false(self) -> None:
+        """force_preserve_original=True dominates: even body_mutated=False passthrough."""
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+        original = json.dumps(body, separators=(",", ":")).encode()
+        result = select_outbound_body(
+            body=body,
+            original_body_bytes=original,
+            body_mutated=False,
+            force_preserve_original=True,
+        )
+        assert result.source == "passthrough"
+        assert result.content == original
+
+    def test_force_preserve_overrides_every_mutation_reason(self) -> None:
+        """All mutation reasons — including legitimate compression — are
+        overridden by force_preserve_original."""
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+        original = json.dumps(body, separators=(",", ":")).encode()
+        for reason in (
+            "image_compression",
+            "tool_search_deferral",
+            "memory_injection",
+            "output_shaper",
+            "structural_diff_vs_original",
+            "sanitize_model_id",
+            "model_router",
+        ):
+            tracker = BodyMutationTracker()
+            tracker.mark_mutated(reason)
+            result = select_outbound_body(
+                body=body,
+                original_body_bytes=original,
+                body_mutated=tracker.mutated,
+                force_preserve_original=True,
+            )
+            assert result.source == "passthrough", f"reason={reason} bypassed force_preserve"
+            assert result.content == original

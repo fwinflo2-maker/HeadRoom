@@ -82,8 +82,20 @@ def select_outbound_body(
     original_body_bytes: bytes | None,
     body_mutated: bool,
     forwarder_mode: PythonForwarderMode | None = None,
+    force_preserve_original: bool = False,
 ) -> OutboundBody:
-    """Select the exact bytes to forward upstream."""
+    """Select the exact bytes to forward upstream.
+
+    When ``force_preserve_original`` is ``True`` and ``original_body_bytes``
+    is available, the original client bytes are forwarded verbatim regardless
+    of ``body_mutated``. This is used when the request contains signed content
+    (e.g. Anthropic extended-thinking ``thinking``/``redacted_thinking`` blocks)
+    whose cryptographic signature is bound to the exact original bytes — any
+    re-serialization would invalidate it.
+    """
+    if force_preserve_original and original_body_bytes is not None:
+        return OutboundBody(content=original_body_bytes, source="passthrough")
+
     mode = forwarder_mode if forwarder_mode is not None else get_python_forwarder_mode()
     if mode == "legacy_json_kwarg":
         content = json.dumps(body, separators=(", ", ": "), ensure_ascii=True).encode("utf-8")
@@ -100,6 +112,7 @@ def prepare_outbound_body_bytes(
     original_body_bytes: bytes | None,
     body_mutated: bool,
     forwarder_mode: PythonForwarderMode | None = None,
+    force_preserve_original: bool = False,
 ) -> tuple[bytes, OutboundBodySource]:
     """Compatibility tuple wrapper around :func:`select_outbound_body`."""
     outbound = select_outbound_body(
@@ -107,5 +120,6 @@ def prepare_outbound_body_bytes(
         original_body_bytes=original_body_bytes,
         body_mutated=body_mutated,
         forwarder_mode=forwarder_mode,
+        force_preserve_original=force_preserve_original,
     )
     return outbound.content, outbound.source

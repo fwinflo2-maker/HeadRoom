@@ -991,6 +991,7 @@ class StreamingMixin:
         outcome_provider: str | None = None,
         waste_signals: dict[str, int] | None = None,
         session_key: str | None = None,
+        force_preserve_original: bool = False,
     ) -> Response | StreamingResponse:
         """Stream response with metrics tracking and memory tool handling.
 
@@ -1036,6 +1037,7 @@ class StreamingMixin:
                 outcome_provider=outcome_provider,
                 waste_signals=waste_signals,
                 session_key=session_key,
+                force_preserve_original=force_preserve_original,
             )
         except (Exception, asyncio.CancelledError):
             self._cleanup_mid_turn_stream(session_key)
@@ -1066,6 +1068,7 @@ class StreamingMixin:
         outcome_provider: str | None,
         waste_signals: dict[str, int] | None,
         session_key: str,
+        force_preserve_original: bool = False,
     ) -> Response | StreamingResponse:
         """Actual streaming implementation, guarded by _stream_response's cleanup wrapper."""
         from fastapi.responses import Response, StreamingResponse
@@ -1094,6 +1097,7 @@ class StreamingMixin:
             body=body,
             original_body_bytes=original_body_bytes,
             body_mutated=body_mutated,
+            force_preserve_original=force_preserve_original,
         )
         outbound_headers = {**headers, "content-type": "application/json"}
         log_outbound_request(

@@ -1807,6 +1807,7 @@ class HeadroomProxy(
         forwarder_name: str = "server",
         path_for_log: str | None = None,
         timeout: httpx.Timeout | float | None = None,
+        force_preserve_original: bool = False,
     ) -> httpx.Response:
         """Make request with retry and exponential backoff.
 
@@ -1834,6 +1835,7 @@ class HeadroomProxy(
             body=body,
             original_body_bytes=original_body_bytes,
             body_mutated=body_mutated,
+            force_preserve_original=force_preserve_original,
         )
         outbound_headers = {**headers, "content-type": "application/json"}
 

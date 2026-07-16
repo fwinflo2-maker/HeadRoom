@@ -51,8 +51,10 @@ import asyncio
 import hashlib
 import logging
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Any
 
 from headroom.memory import qdrant_env
@@ -60,6 +62,9 @@ from headroom.memory.models import Memory
 from headroom.memory.ports import MemorySearchResult
 
 logger = logging.getLogger(__name__)
+
+_MAX_TASK_RESULTS = 1000
+_TASK_RESULT_TTL_SECONDS = 60 * 60
 
 
 def _utcnow() -> datetime:
@@ -155,10 +160,11 @@ class DirectMem0Adapter:
         self._neo4j_driver: Any = None
         self._qdrant_client: Any = None
         self._initialized = False
+        self._closing = False
 
         # Background task tracking
-        self._background_tasks: dict[str, asyncio.Task] = {}
-        self._task_results: dict[str, dict[str, Any]] = {}
+        self._background_tasks: dict[str, asyncio.Task[Memory]] = {}
+        self._task_results: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
 
     async def _ensure_initialized(self) -> None:
         """Ensure all clients are initialized."""
@@ -335,6 +341,60 @@ class DirectMem0Adapter:
         """Generate a unique task ID for background processing."""
         return f"task_{uuid.uuid4().hex[:12]}"
 
+    def _prune_task_results(self, now: float | None = None) -> None:
+        """Remove expired task results and enforce the retention limit."""
+        current_time = monotonic() if now is None else now
+        while self._task_results:
+            _task_id, (completed_at, _result) = next(iter(self._task_results.items()))
+            if completed_at + _TASK_RESULT_TTL_SECONDS > current_time:
+                break
+            self._task_results.popitem(last=False)
+
+        while len(self._task_results) > _MAX_TASK_RESULTS:
+            self._task_results.popitem(last=False)
+
+    def _store_task_result(self, task_id: str, result: dict[str, Any]) -> None:
+        """Store a completed task result with bounded, time-limited retention."""
+        completed_at = monotonic()
+        self._prune_task_results(completed_at)
+        self._task_results[task_id] = (completed_at, result)
+        self._prune_task_results(completed_at)
+
+    def _handle_background_task_done(
+        self,
+        task_id: str,
+        task: asyncio.Future[Memory],
+    ) -> None:
+        """Capture a background save outcome and release the task reference."""
+        if self._background_tasks.get(task_id) is not task:
+            return
+
+        del self._background_tasks[task_id]
+        if task.cancelled():
+            self._store_task_result(task_id, {"status": "cancelled"})
+            return
+
+        try:
+            result = task.result()
+        except Exception as error:
+            logger.warning("DirectMem0 background save failed task_id=%s: %s", task_id, error)
+            self._store_task_result(
+                task_id,
+                {"status": "failed", "error": str(error)},
+            )
+        else:
+            self._store_task_result(
+                task_id,
+                {"status": "completed", "result": result},
+            )
+
+    def _track_background_task(self, task_id: str, task: asyncio.Task[Memory]) -> None:
+        """Track a background save until its completion callback runs."""
+        self._background_tasks[task_id] = task
+        task.add_done_callback(
+            lambda completed_task: self._handle_background_task_done(task_id, completed_task)
+        )
+
     def get_task_status(self, task_id: str) -> dict[str, Any]:
         """Get the status of a background save task.
 
@@ -344,34 +404,28 @@ class DirectMem0Adapter:
         Returns:
             Dict with status and result if completed.
         """
-        if task_id in self._task_results:
-            return self._task_results[task_id]
+        self._prune_task_results()
+        retained_result = self._task_results.get(task_id)
+        if retained_result is not None:
+            return retained_result[1]
 
         if task_id in self._background_tasks:
             task = self._background_tasks[task_id]
             if task.done():
-                try:
-                    result = task.result()
-                    self._task_results[task_id] = {
-                        "status": "completed",
-                        "result": result,
-                    }
-                    del self._background_tasks[task_id]
-                    return self._task_results[task_id]
-                except Exception as e:
-                    self._task_results[task_id] = {
-                        "status": "failed",
-                        "error": str(e),
-                    }
-                    del self._background_tasks[task_id]
-                    return self._task_results[task_id]
-            else:
-                return {"status": "processing", "task_id": task_id}
+                self._handle_background_task_done(task_id, task)
+                retained_result = self._task_results.get(task_id)
+                if retained_result is not None:
+                    return retained_result[1]
+                return {"status": "not_found", "task_id": task_id}
+            return {"status": "processing", "task_id": task_id}
 
         return {"status": "not_found", "task_id": task_id}
 
     def get_pending_tasks(self) -> list[str]:
         """Get list of pending background task IDs."""
+        for task_id, task in list(self._background_tasks.items()):
+            if task.done():
+                self._handle_background_task_done(task_id, task)
         return list(self._background_tasks.keys())
 
     async def wait_for_task(self, task_id: str, timeout: float = 30.0) -> dict[str, Any]:
@@ -389,16 +443,18 @@ class DirectMem0Adapter:
 
         task = self._background_tasks[task_id]
         try:
-            await asyncio.wait_for(task, timeout=timeout)
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
             return self.get_task_status(task_id)
         except asyncio.TimeoutError:
             return {"status": "timeout", "task_id": task_id}
+        except Exception:
+            return self.get_task_status(task_id)
 
-    async def flush_pending(self, timeout: float = 60.0) -> dict[str, Any]:
+    async def flush_pending(self, timeout: float | None = 60.0) -> dict[str, Any]:
         """Wait for all pending background tasks to complete.
 
         Args:
-            timeout: Maximum seconds to wait for all tasks.
+            timeout: Maximum seconds to wait for all tasks, or None to wait indefinitely.
 
         Returns:
             Summary of completed and failed tasks.
@@ -412,14 +468,13 @@ class DirectMem0Adapter:
         try:
             done, pending = await asyncio.wait(tasks, timeout=timeout)
 
-            completed = 0
-            failed = 0
+            completed = sum(1 for task in done if not task.cancelled() and task.exception() is None)
+            failed = len(done) - completed
+
             for task_id in task_ids:
-                status = self.get_task_status(task_id)
-                if status["status"] == "completed":
-                    completed += 1
-                elif status["status"] == "failed":
-                    failed += 1
+                task = self._background_tasks.get(task_id)
+                if task is not None and task.done():
+                    self._handle_background_task_done(task_id, task)
 
             return {
                 "completed": completed,
@@ -576,6 +631,9 @@ class DirectMem0Adapter:
         """
         await self._ensure_initialized()
 
+        if self._closing:
+            raise RuntimeError("DirectMem0 adapter is closing")
+
         # Determine if we should run in background
         run_in_background = background if background is not None else self._config.async_writes
 
@@ -599,7 +657,7 @@ class DirectMem0Adapter:
                     extracted_relationships=extracted_relationships,
                 )
             )
-            self._background_tasks[task_id] = task
+            self._track_background_task(task_id, task)
 
             # Return immediately with task info
             primary_id = self._generate_id(facts[0] if facts else content, user_id)
@@ -951,7 +1009,14 @@ class DirectMem0Adapter:
 
     async def close(self) -> None:
         """Close connections and release resources."""
-        if self._neo4j_driver:
-            self._neo4j_driver.close()
-        self._mem0_client = None
-        self._initialized = False
+        self._closing = True
+        try:
+            await self.flush_pending(timeout=None)
+            self._background_tasks.clear()
+            self._task_results.clear()
+            if self._neo4j_driver:
+                self._neo4j_driver.close()
+            self._mem0_client = None
+            self._initialized = False
+        finally:
+            self._closing = False

@@ -66,10 +66,15 @@ from headroom.providers.vertex import (
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
-from headroom.proxy.request_scope import normalize_request_path
-from headroom.proxy.upstream_guard import is_safe_upstream_url_async
+from headroom.proxy.request_scope import add_scope_header, normalize_request_path
+from headroom.proxy.upstream_guard import is_safe_upstream_url, is_safe_upstream_url_async
 
 logger = logging.getLogger("headroom.proxy.routes")
+
+# Internal routing headers consumed (and stripped before upstream) by the
+# OpenAI chat handler; kept in sync with ``headroom/proxy/handlers/openai.py``.
+_HEADROOM_BASE_URL_HEADER = "x-headroom-base-url"
+_HEADROOM_ORIGINAL_PATH_HEADER = "x-headroom-original-path"
 
 
 async def _handle_chatgpt_codex_alpha_search(request: Request, proxy: Any) -> Response | None:
@@ -296,6 +301,40 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         @app.post("/model/{model_id:path}/invoke-with-response-stream")
         async def bedrock_invoke_stream(request: Request, model_id: str):
             return await proxy.handle_bedrock_invoke(request, model_id, stream=True)
+
+    # Factory Droid inference passthrough. Registered ONLY when an upstream is
+    # configured (`--factory-api-url` / FACTORY_TARGET_API_URL). Factory exposes
+    # two inference shapes and Droid picks per model: Anthropic Messages at
+    # `/api/llm/a/v1/messages` (e.g. Bedrock-backed models) and OpenAI Chat
+    # Completions at `/api/llm/o/v1/chat/completions` (e.g. Fireworks-backed
+    # Droid Core / Kimi). Both are compressed by reusing the matching pipeline;
+    # auth (`Authorization: Bearer fk-...`) passes through untouched and all
+    # other Factory REST paths fall through to the catch-all, which
+    # `select_passthrough_base_url` points at the same upstream.
+    factory_api_url = getattr(proxy.config, "factory_api_url", None)
+    if factory_api_url:
+        _factory_base = factory_api_url.rstrip("/")
+
+        @app.post("/api/llm/a/v1/messages")
+        async def factory_llm_messages(request: Request):
+            return await proxy.handle_anthropic_messages(
+                request,
+                upstream_base_url=_factory_base,
+                provider_name="factory",
+            )
+
+        # The OpenAI chat handler resolves its upstream + upstream path from the
+        # `x-headroom-base-url` / `x-headroom-original-path` headers it already
+        # honors for OpenAI-compatible gateways (and strips them before
+        # forwarding). Injecting them here routes the request to
+        # `<factory>/api/llm/o/v1/chat/completions` and tags telemetry `factory`
+        # via `custom_base_passthrough_telemetry`, mirroring the `/a/` route
+        # without touching the handler.
+        @app.post("/api/llm/o/v1/chat/completions")
+        async def factory_llm_chat(request: Request):
+            add_scope_header(request, _HEADROOM_BASE_URL_HEADER, _factory_base)
+            add_scope_header(request, _HEADROOM_ORIGINAL_PATH_HEADER, request.url.path)
+            return await proxy.handle_openai_chat(request)
 
     _register_openai_responses_routes(app, proxy)
 

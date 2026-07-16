@@ -22,3 +22,15 @@ def normalize_request_path(request: Request, path: str) -> None:
     normalize_scope_path(request.scope, path)
     if hasattr(request, "_url"):
         delattr(request, "_url")
+
+
+def add_scope_header(request: Request, name: str, value: str) -> None:
+    """Append a header to the ASGI scope and invalidate any cached ``Headers``.
+
+    Starlette materializes ``request.headers`` from ``scope["headers"]`` lazily
+    and caches it on ``_headers``; middleware/routing may have already built it,
+    so the cache is cleared to keep a later ``request.headers`` read consistent.
+    """
+    request.scope["headers"].append((name.lower().encode("latin-1"), value.encode("latin-1")))
+    if hasattr(request, "_headers"):
+        delattr(request, "_headers")

@@ -62,6 +62,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
+    // Savings ledger: background persistence while serving, one
+    // final flush after the server drains so the last few requests
+    // survive shutdown.
+    let stats_ledger = state.stats.clone();
+    if config.stats {
+        tracing::info!(
+            event = "stats_enabled",
+            path = ?stats_ledger.path().map(|p| p.display().to_string()),
+            "native savings stats active (/stats, /dashboard)"
+        );
+        headroom_proxy::observability::ledger::spawn_flusher(stats_ledger.clone());
+    }
+
     let app = build_app(state).into_make_service_with_connect_info::<SocketAddr>();
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -78,6 +91,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tokio::time::sleep(grace).await;
         })
         .await?;
+
+    stats_ledger.flush().await;
 
     Ok(())
 }

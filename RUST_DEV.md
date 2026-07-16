@@ -90,6 +90,43 @@ curl -si http://127.0.0.1:8787/v1/models
 | `--log-level` |  | `info` | `RUST_LOG`-style filter |
 | `--rewrite-host` / `--no-rewrite-host` | | rewrite | rewrite Host to upstream (default) |
 | `--graceful-shutdown-timeout` | | `30s` | wait for in-flight on SIGTERM/SIGINT |
+| `--stats` | `HEADROOM_PROXY_STATS` | `true` | native savings stats + `/dashboard` (below) |
+| `--stats-path` | `HEADROOM_PROXY_STATS_PATH` | `~/.headroom/native_stats.json` | ledger persistence (honours `HEADROOM_WORKSPACE_DIR`) |
+
+### Savings stats & dashboard (native)
+
+The Rust proxy records per-request savings/cost telemetry on every
+lane it forwards — Anthropic `/v1/messages`, OpenAI Chat/Responses,
+all four native Bedrock routes, and Vertex `rawPredict` /
+`streamRawPredict` — and serves it locally (never tunnelled
+upstream):
+
+```bash
+curl -s http://127.0.0.1:8787/stats | jq '.session'         # since-boot totals
+curl -s http://127.0.0.1:8787/stats | jq '.lifetime_by_model'
+curl -s "http://127.0.0.1:8787/stats/timeseries?bucket=day" | jq '.points[-7:]'
+curl -s "http://127.0.0.1:8787/stats/events?limit=5"         # recent-request feed
+open http://127.0.0.1:8787/dashboard                          # embedded UI, zero deps
+```
+
+Recording is deferred until the response is fully observed, so
+streaming output/cache token counts come from the real SSE /
+EventStream usage frames. USD figures come from the vendored LiteLLM
+price table (`data/model_prices_and_context_window.json`); a model
+missing from it records $0 and logs one WARN — refresh via
+`scripts/refresh_model_limits.sh`. Failed upstreams count as
+failures and accrue no savings. Aggregates (lifetime, per-model,
+48 h hourly + ~13 mo daily buckets) persist as one atomic snapshot
+written off the hot path every 10 s and on shutdown.
+
+> **What reads 0 today.** Spend, token counts, and prompt-cache
+> savings are live. `tokens_saved` / `compression_savings_usd` are
+> wired end-to-end but will report 0 on real traffic until the
+> live-zone per-type compressors are implemented — the dispatcher
+> currently returns `NoCompression` for every well-formed body
+> (`live_zone_mode_with_valid_body_returns_no_compression_pr_b2`
+> pins that invariant). Nothing needs changing here when they land;
+> the numbers start flowing on their own.
 
 ### Picking the next port: invocation telemetry
 

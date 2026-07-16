@@ -51,6 +51,7 @@ use url::Url;
 
 use crate::bedrock::envelope::BedrockEnvelope;
 use crate::bedrock::sigv4::{sign_request, SigningInputs};
+use crate::bedrock::CompressionStats;
 use crate::compression::{
     compress_anthropic_request, Outcome as AnthropicOutcome, PassthroughReason,
 };
@@ -173,8 +174,9 @@ pub async fn handle_invoke(
         "bedrock invoke route received request"
     );
 
+    let stats_started = std::time::Instant::now();
     let is_anthropic = is_anthropic_model_id(&model_id);
-    let outbound_body: Bytes = if is_anthropic {
+    let (outbound_body, compression_stats): (Bytes, CompressionStats) = if is_anthropic {
         run_anthropic_compression(&body, &state, auth_mode, &request_id)
     } else {
         tracing::info!(
@@ -184,7 +186,7 @@ pub async fn handle_invoke(
             reason = "non_anthropic_vendor",
             "bedrock invoke: skipping live-zone compression for non-anthropic vendor"
         );
-        body.clone()
+        (body.clone(), CompressionStats::default())
     };
 
     // Resolve the Bedrock action from the inbound path so `/converse`
@@ -321,6 +323,28 @@ pub async fn handle_invoke(
         }
     };
 
+    // Savings ledger: build the pending event now that we're about
+    // to attempt the upstream. Finalized when the response body is
+    // fully observed (usage parsed from the sync JSON) or the
+    // transport fails.
+    let mut pending_stats = if state.config.stats {
+        let mut ev = crate::observability::ledger::RequestEvent::new(
+            crate::observability::ledger::provider::BEDROCK,
+            &model_id,
+            &request_id,
+        );
+        ev.tokens_before = compression_stats.tokens_before;
+        ev.tokens_after = compression_stats.tokens_after;
+        ev.transforms = compression_stats.transforms;
+        Some(crate::observability::capture::PendingRecord::new(
+            state.stats.clone(),
+            ev,
+            stats_started,
+        ))
+    } else {
+        None
+    };
+
     let upstream_resp = state
         .client
         .request(reqwest_method, upstream_url.clone())
@@ -332,6 +356,9 @@ pub async fn handle_invoke(
     let upstream_resp = match upstream_resp {
         Ok(r) => r,
         Err(e) => {
+            if let Some(p) = pending_stats.take() {
+                p.finalize_failed();
+            }
             tracing::warn!(
                 event = "bedrock_upstream_error",
                 request_id = %request_id,
@@ -349,6 +376,11 @@ pub async fn handle_invoke(
 
     let status =
         StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    if !status.is_success() {
+        if let Some(p) = pending_stats.as_mut() {
+            p.mark_failed();
+        }
+    }
     let resp_headers = filter_response_headers(upstream_resp.headers());
 
     tracing::info!(
@@ -360,10 +392,26 @@ pub async fn handle_invoke(
         "bedrock invoke: response forwarded"
     );
 
-    // Stream the response body back without buffering.
-    let stream = upstream_resp
-        .bytes_stream()
-        .map(|r| r.map_err(std::io::Error::other));
+    // Stream the response body back without buffering. When the
+    // savings ledger is recording, tee the bytes into a bounded
+    // capture task that parses the sync response's usage block
+    // (InvokeModel snake_case / Converse camelCase) at body end —
+    // best-effort, never blocking the client byte path.
+    let capture_tx = pending_stats.take().map(|p| {
+        crate::observability::capture::spawn_json_usage_capture(
+            crate::observability::capture::ResponseShape::Bedrock,
+            p,
+        )
+    });
+    let stream = upstream_resp.bytes_stream().map(move |r| match r {
+        Ok(b) => {
+            if let Some(tx) = &capture_tx {
+                let _ = tx.try_send(b.clone());
+            }
+            Ok(b)
+        }
+        Err(e) => Err(std::io::Error::other(e)),
+    });
     let body_out = Body::from_stream(stream);
 
     let mut builder = Response::builder().status(status);
@@ -401,7 +449,7 @@ fn run_anthropic_compression(
     state: &AppState,
     _auth_mode: AuthMode,
     request_id: &str,
-) -> Bytes {
+) -> (Bytes, CompressionStats) {
     // Detect envelope shape. A parseable InvokeModel envelope takes the
     // re-emit path below (anthropic_version pinned first); a non-envelope
     // body (e.g. a Converse-shaped payload) still runs through the
@@ -437,7 +485,7 @@ fn run_anthropic_compression(
         request_id,
     );
     match outcome {
-        AnthropicOutcome::NoCompression => body.clone(),
+        AnthropicOutcome::NoCompression => (body.clone(), CompressionStats::default()),
         AnthropicOutcome::Passthrough { reason } => {
             tracing::info!(
                 event = "bedrock_compression_passthrough",
@@ -448,15 +496,26 @@ fn run_anthropic_compression(
             // The compressor's passthrough variants all leave bytes
             // unchanged. Forward the original.
             let _ = (PassthroughReason::ModeOff, PassthroughReason::NoMessages); // pin types
-            body.clone()
+            (body.clone(), CompressionStats::default())
         }
-        AnthropicOutcome::Compressed { body: new_body, .. } => {
+        AnthropicOutcome::Compressed {
+            body: new_body,
+            tokens_before,
+            tokens_after,
+            strategies_applied,
+            ..
+        } => {
+            let stats = CompressionStats {
+                tokens_before: tokens_before as u64,
+                tokens_after: tokens_after as u64,
+                transforms: strategies_applied.iter().map(|s| s.to_string()).collect(),
+            };
             if parsed_envelope {
                 // Defence-in-depth: re-emit so anthropic_version is the
                 // first key. With preserve_order this is a no-op on the
                 // happy path.
                 match BedrockEnvelope::ensure_anthropic_version_first(&new_body) {
-                    Ok(b) => b,
+                    Ok(b) => (b, stats),
                     Err(e) => {
                         tracing::error!(
                             event = "bedrock_envelope_reemit_failed",
@@ -464,11 +523,13 @@ fn run_anthropic_compression(
                             error = %e,
                             "bedrock invoke: failed to re-emit envelope; falling back to original body"
                         );
-                        body.clone()
+                        // Original bytes forwarded ⇒ no compression
+                        // happened as far as the wire is concerned.
+                        (body.clone(), CompressionStats::default())
                     }
                 }
             } else {
-                new_body
+                (new_body, stats)
             }
         }
     }
@@ -618,6 +679,10 @@ mod tests {
             vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
                 "test".to_string(),
             )),
+            // Savings ledger: these URL-builder unit tests never
+            // record, but `AppState` is one struct — an in-memory
+            // ledger keeps them off the filesystem.
+            stats: std::sync::Arc::new(crate::observability::ledger::Ledger::in_memory()),
         };
         let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/converse"
             .parse()
@@ -655,6 +720,10 @@ mod tests {
             vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
                 "test".to_string(),
             )),
+            // Savings ledger: these URL-builder unit tests never
+            // record, but `AppState` is one struct — an in-memory
+            // ledger keeps them off the filesystem.
+            stats: std::sync::Arc::new(crate::observability::ledger::Ledger::in_memory()),
         };
         let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/invoke"
             .parse()
@@ -690,6 +759,10 @@ mod tests {
             vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
                 "test".to_string(),
             )),
+            // Savings ledger: these URL-builder unit tests never
+            // record, but `AppState` is one struct — an in-memory
+            // ledger keeps them off the filesystem.
+            stats: std::sync::Arc::new(crate::observability::ledger::Ledger::in_memory()),
         };
         let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/invoke"
             .parse()

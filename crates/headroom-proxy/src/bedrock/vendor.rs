@@ -15,16 +15,25 @@
 /// mistaken for an Anthropic inference profile.
 const GEO_PREFIXES: [&str; 4] = ["eu.", "us.", "apac.", "global."];
 
+/// Strip a cross-region inference-profile geo prefix, if present.
+/// `eu.anthropic.claude-…` → `anthropic.claude-…`; ids without a
+/// known geo prefix return unchanged. Shared with
+/// `observability::pricing` so price lookups see the same canonical
+/// id the vendor gate sees.
+pub(crate) fn strip_geo_prefix(model_id: &str) -> &str {
+    GEO_PREFIXES
+        .iter()
+        .find_map(|p| model_id.strip_prefix(p))
+        .unwrap_or(model_id)
+}
+
 /// Resolve the canonical vendor of a Bedrock model id, stripping a
 /// cross-region inference-profile geo prefix first.
 ///
 /// `eu.anthropic.claude-…` → `anthropic`; `amazon.titan-…` → `amazon`;
 /// `global.amazon.nova-…` → `amazon`.
 pub fn canonical_vendor(model_id: &str) -> &str {
-    let stripped = GEO_PREFIXES
-        .iter()
-        .find_map(|p| model_id.strip_prefix(p))
-        .unwrap_or(model_id);
+    let stripped = strip_geo_prefix(model_id);
     stripped.split('.').next().unwrap_or(stripped)
 }
 

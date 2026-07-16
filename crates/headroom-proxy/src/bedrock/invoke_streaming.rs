@@ -61,6 +61,7 @@ use crate::bedrock::eventstream_to_sse::{
     translate_message, OutputMode, TranslateError, TranslateOutcome,
 };
 use crate::bedrock::sigv4::{sign_request, SigningInputs};
+use crate::bedrock::CompressionStats;
 use crate::compression::{
     compress_anthropic_request, Outcome as AnthropicOutcome, PassthroughReason,
 };
@@ -152,8 +153,9 @@ pub async fn handle_invoke_streaming(
     );
 
     // 1. Live-zone compression for Anthropic-shape bodies (same as D1).
+    let stats_started = Instant::now();
     let is_anthropic = is_anthropic_model_id(&model_id);
-    let outbound_body: Bytes = if is_anthropic {
+    let (outbound_body, compression_stats): (Bytes, CompressionStats) = if is_anthropic {
         run_anthropic_compression(&body, &state, auth_mode, &request_id)
     } else {
         tracing::info!(
@@ -163,7 +165,7 @@ pub async fn handle_invoke_streaming(
             reason = "non_anthropic_vendor",
             "bedrock invoke-streaming: skipping compression for non-anthropic vendor"
         );
-        body.clone()
+        (body.clone(), CompressionStats::default())
     };
 
     // 2. Resolve the Bedrock streaming action from the inbound path and
@@ -291,6 +293,27 @@ pub async fn handle_invoke_streaming(
         }
     };
 
+    // Savings ledger: pending event, finalized when the response
+    // stream fully closes (usage parsed from the stream frames) or
+    // the transport fails.
+    let mut pending_stats = if state.config.stats {
+        let mut ev = crate::observability::ledger::RequestEvent::new(
+            crate::observability::ledger::provider::BEDROCK,
+            &model_id,
+            &request_id,
+        );
+        ev.tokens_before = compression_stats.tokens_before;
+        ev.tokens_after = compression_stats.tokens_after;
+        ev.transforms = compression_stats.transforms.clone();
+        Some(crate::observability::capture::PendingRecord::new(
+            state.stats.clone(),
+            ev,
+            stats_started,
+        ))
+    } else {
+        None
+    };
+
     let upstream_resp = state
         .client
         .request(reqwest_method, upstream_url.clone())
@@ -302,6 +325,9 @@ pub async fn handle_invoke_streaming(
     let upstream_resp = match upstream_resp {
         Ok(r) => r,
         Err(e) => {
+            if let Some(p) = pending_stats.take() {
+                p.finalize_failed();
+            }
             tracing::warn!(
                 event = "bedrock_upstream_error",
                 request_id = %request_id,
@@ -319,6 +345,11 @@ pub async fn handle_invoke_streaming(
 
     let status =
         StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    if !status.is_success() {
+        if let Some(p) = pending_stats.as_mut() {
+            p.mark_failed();
+        }
+    }
     let upstream_content_type = upstream_resp
         .headers()
         .get(http::header::CONTENT_TYPE)
@@ -358,10 +389,25 @@ pub async fn handle_invoke_streaming(
         // Even here we drop content-length: the proxy streams the
         // body and reqwest's transparent decompression may already
         // have changed the byte length on the way in.
+        // Usage capture: this is typically an error envelope (the
+        // pending event is already marked failed on non-2xx); parse
+        // it as JSON anyway so a 2xx JSON body still yields usage.
         resp_headers.remove(http::header::CONTENT_LENGTH);
-        let stream = upstream_resp
-            .bytes_stream()
-            .map(|r| r.map_err(std::io::Error::other));
+        let capture_tx = pending_stats.take().map(|p| {
+            crate::observability::capture::spawn_json_usage_capture(
+                crate::observability::capture::ResponseShape::Bedrock,
+                p,
+            )
+        });
+        let stream = upstream_resp.bytes_stream().map(move |r| match r {
+            Ok(b) => {
+                if let Some(tx) = &capture_tx {
+                    let _ = tx.try_send(b.clone());
+                }
+                Ok(b)
+            }
+            Err(e) => Err(std::io::Error::other(e)),
+        });
         let body_out = Body::from_stream(stream);
         return finish(status, resp_headers, body_out, &request_id);
     }
@@ -395,7 +441,20 @@ pub async fn handle_invoke_streaming(
                     resp_headers.insert(http::header::CONTENT_TYPE, v);
                 }
             }
-            let body_out = Body::from_stream(upstream_stream);
+            // Usage capture: nothing else parses the frames in
+            // passthrough mode, so tee the raw bytes into a bounded
+            // EventStream telemetry parser (chunk / metadata usage;
+            // finalizes the ledger event when the stream closes).
+            let capture_tx = pending_stats
+                .take()
+                .map(crate::observability::capture::spawn_eventstream_usage_capture);
+            let teed = upstream_stream.map(move |r| {
+                if let (Ok(b), Some(tx)) = (&r, &capture_tx) {
+                    let _ = tx.try_send(b.clone());
+                }
+                r
+            });
+            let body_out = Body::from_stream(teed);
             finish(status, resp_headers, body_out, &request_id)
         }
         OutputMode::Sse => {
@@ -414,7 +473,8 @@ pub async fn handle_invoke_streaming(
                 model_id.clone(),
                 region.clone(),
             );
-            let translated = tee_to_anthropic_state(translated, request_id.clone());
+            let translated =
+                tee_to_anthropic_state(translated, request_id.clone(), pending_stats.take());
             let body_out = Body::from_stream(translated);
             finish(status, resp_headers, body_out, &request_id)
         }
@@ -698,6 +758,7 @@ where
 fn tee_to_anthropic_state<S>(
     upstream: S,
     request_id: String,
+    pending_stats: Option<crate::observability::capture::PendingRecord>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>>
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
@@ -705,7 +766,7 @@ where
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(SSE_PARSER_QUEUE_DEPTH);
     let parser_request_id = request_id.clone();
     tokio::spawn(async move {
-        run_anthropic_state_machine(rx, parser_request_id).await;
+        run_anthropic_state_machine(rx, parser_request_id, pending_stats).await;
     });
 
     upstream.map(move |r| {
@@ -732,17 +793,34 @@ const SSE_PARSER_QUEUE_DEPTH: usize = 256;
 async fn run_anthropic_state_machine(
     mut rx: tokio::sync::mpsc::Receiver<Bytes>,
     request_id: String,
+    pending_stats: Option<crate::observability::capture::PendingRecord>,
 ) {
     use crate::sse::anthropic::AnthropicStreamState;
     use crate::sse::framing::SseFramer;
 
     let mut framer = SseFramer::new();
     let mut state = AnthropicStreamState::new();
+    // Converse-native frames (`metadata`, `messageStart`, …) carry no
+    // Anthropic `type`, so they arrive here as event-name-less frames
+    // the Anthropic state machine drops. Their camelCase usage block
+    // is the ONLY usage signal on a native Converse stream — scan
+    // them separately so `/converse-stream` requests don't record
+    // zero tokens.
+    let mut converse_usage = crate::observability::ledger::Usage::default();
     while let Some(chunk) = rx.recv().await {
         framer.push(&chunk);
         while let Some(ev_result) = framer.next_event() {
             match ev_result {
                 Ok(ev) => {
+                    if ev.event_name.is_none() {
+                        if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&ev.data) {
+                            crate::observability::capture::merge_stream_usage(
+                                &mut converse_usage,
+                                &payload,
+                            );
+                        }
+                        continue;
+                    }
                     if let Err(e) = state.apply(ev) {
                         tracing::warn!(
                             request_id = %request_id,
@@ -772,6 +850,11 @@ async fn run_anthropic_state_machine(
         blocks = state.blocks.len(),
         "bedrock translated stream: closed"
     );
+    if let Some(p) = pending_stats {
+        let mut usage = crate::observability::capture::usage_from_anthropic_state(&state);
+        crate::observability::capture::merge_max(&mut usage, converse_usage);
+        p.finalize(usage);
+    }
 }
 
 /// True when the content-type is `application/vnd.amazon.eventstream`
@@ -851,7 +934,7 @@ fn run_anthropic_compression(
     state: &AppState,
     _auth_mode: AuthMode,
     request_id: &str,
-) -> Bytes {
+) -> (Bytes, CompressionStats) {
     use crate::bedrock::envelope::BedrockEnvelope;
 
     let parsed_envelope = BedrockEnvelope::parse(body).is_ok();
@@ -873,7 +956,7 @@ fn run_anthropic_compression(
         request_id,
     );
     match outcome {
-        AnthropicOutcome::NoCompression => body.clone(),
+        AnthropicOutcome::NoCompression => (body.clone(), CompressionStats::default()),
         AnthropicOutcome::Passthrough { reason } => {
             tracing::info!(
                 event = "bedrock_compression_passthrough",
@@ -882,12 +965,23 @@ fn run_anthropic_compression(
                 "bedrock invoke-streaming: passthrough"
             );
             let _ = (PassthroughReason::ModeOff, PassthroughReason::NoMessages);
-            body.clone()
+            (body.clone(), CompressionStats::default())
         }
-        AnthropicOutcome::Compressed { body: new_body, .. } => {
+        AnthropicOutcome::Compressed {
+            body: new_body,
+            tokens_before,
+            tokens_after,
+            strategies_applied,
+            ..
+        } => {
+            let stats = CompressionStats {
+                tokens_before: tokens_before as u64,
+                tokens_after: tokens_after as u64,
+                transforms: strategies_applied.iter().map(|s| s.to_string()).collect(),
+            };
             if parsed_envelope {
                 match BedrockEnvelope::ensure_anthropic_version_first(&new_body) {
-                    Ok(b) => b,
+                    Ok(b) => (b, stats),
                     Err(e) => {
                         tracing::error!(
                             event = "bedrock_envelope_reemit_failed",
@@ -895,11 +989,13 @@ fn run_anthropic_compression(
                             error = %e,
                             "bedrock invoke-streaming: failed to re-emit envelope"
                         );
-                        body.clone()
+                        // Original bytes forwarded ⇒ no compression
+                        // happened as far as the wire is concerned.
+                        (body.clone(), CompressionStats::default())
                     }
                 }
             } else {
-                new_body
+                (new_body, stats)
             }
         }
     }
@@ -1020,6 +1116,10 @@ mod tests {
             vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
                 "test".to_string(),
             )),
+            // Savings ledger: these URL-builder unit tests never
+            // record, but `AppState` is one struct — an in-memory
+            // ledger keeps them off the filesystem.
+            stats: std::sync::Arc::new(crate::observability::ledger::Ledger::in_memory()),
         };
         let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/invoke-with-response-stream"
             .parse()
@@ -1059,6 +1159,10 @@ mod tests {
             vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
                 "test".to_string(),
             )),
+            // Savings ledger: these URL-builder unit tests never
+            // record, but `AppState` is one struct — an in-memory
+            // ledger keeps them off the filesystem.
+            stats: std::sync::Arc::new(crate::observability::ledger::Ledger::in_memory()),
         };
         let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/converse-stream"
             .parse()

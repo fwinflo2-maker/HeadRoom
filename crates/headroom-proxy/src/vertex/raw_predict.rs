@@ -75,6 +75,7 @@ pub(crate) async fn forward_vertex_request(
     attach_sse_tee: bool,
 ) -> Response {
     let path_for_log = uri.path().to_string();
+    let stats_started = std::time::Instant::now();
 
     // ─── 1. BUFFER BODY ────────────────────────────────────────────────
     let max = state.config.compression_max_body_bytes as usize;
@@ -133,6 +134,7 @@ pub(crate) async fn forward_vertex_request(
     // The dispatcher uses RawValue-based surgery so `anthropic_version`
     // (and any other non-`messages` top-level field) round-trips
     // byte-equal. Compression off → buffered bytes used unchanged.
+    let mut stats_compression: (u64, u64, Vec<String>) = (0, 0, Vec::new());
     let body_to_send = if state.config.compression {
         // PR-E3: Vertex uses GCP ADC bearer-token auth downstream, not
         // Anthropic credentials, so the PAYG/OAuth/subscription
@@ -176,6 +178,11 @@ pub(crate) async fn forward_vertex_request(
                     strategies = ?strategies_applied,
                     markers = markers_inserted.len(),
                     "vertex live-zone compression applied"
+                );
+                stats_compression = (
+                    tokens_before as u64,
+                    tokens_after as u64,
+                    strategies_applied.iter().map(|s| s.to_string()).collect(),
                 );
                 body
             }
@@ -311,6 +318,25 @@ pub(crate) async fn forward_vertex_request(
             return error_response(StatusCode::BAD_REQUEST, "vertex method invalid");
         }
     };
+
+    // Savings ledger: pending event, finalized once the response is
+    // fully observed (JSON body end or SSE stream close).
+    let mut pending_stats = if state.config.stats {
+        let mut ev = crate::observability::ledger::RequestEvent::new(
+            crate::observability::ledger::provider::VERTEX,
+            &ctx.model_id,
+            &request_id,
+        );
+        (ev.tokens_before, ev.tokens_after, ev.transforms) = stats_compression;
+        Some(crate::observability::capture::PendingRecord::new(
+            state.stats.clone(),
+            ev,
+            stats_started,
+        ))
+    } else {
+        None
+    };
+
     let upstream_resp = match state
         .client
         .request(reqwest_method, upstream_url.clone())
@@ -321,6 +347,9 @@ pub(crate) async fn forward_vertex_request(
     {
         Ok(r) => r,
         Err(e) => {
+            if let Some(p) = pending_stats.take() {
+                p.finalize_failed();
+            }
             tracing::warn!(
                 event = "vertex_upstream_error",
                 request_id = %request_id,
@@ -335,6 +364,11 @@ pub(crate) async fn forward_vertex_request(
     // ─── 8. STREAM RESPONSE ────────────────────────────────────────────
     let upstream_status = upstream_resp.status();
     let status = StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    if !upstream_status.is_success() {
+        if let Some(p) = pending_stats.as_mut() {
+            p.mark_failed();
+        }
+    }
     let resp_headers = filter_response_headers(upstream_resp.headers());
 
     // PR-C1 reuse: when `attach_sse_tee` is set AND the upstream
@@ -355,7 +389,11 @@ pub(crate) async fn forward_vertex_request(
     let parser_tx = if attach_sse_tee && is_sse {
         let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(VERTEX_SSE_QUEUE_DEPTH);
         let rid = request_id.clone();
-        tokio::spawn(run_anthropic_sse_state_machine(rx, rid));
+        tokio::spawn(run_anthropic_sse_state_machine(
+            rx,
+            rid,
+            pending_stats.take(),
+        ));
         tracing::info!(
             event = "vertex_sse_tee_engaged",
             request_id = %request_id,
@@ -363,7 +401,15 @@ pub(crate) async fn forward_vertex_request(
         );
         Some(tx)
     } else {
-        None
+        // Non-SSE (rawPredict, or a JSON error on the streaming
+        // verb): tee the body into a bounded buffer and parse the
+        // Anthropic-shape usage block when it completes.
+        pending_stats.take().map(|p| {
+            crate::observability::capture::spawn_json_usage_capture(
+                crate::observability::capture::ResponseShape::Anthropic,
+                p,
+            )
+        })
     };
 
     use futures_util::StreamExt as _;
@@ -448,6 +494,7 @@ const VERTEX_SSE_QUEUE_DEPTH: usize = 256;
 async fn run_anthropic_sse_state_machine(
     mut rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
     request_id: String,
+    pending_stats: Option<crate::observability::capture::PendingRecord>,
 ) {
     use crate::sse::framing::SseFramer;
     let mut framer = SseFramer::new();
@@ -487,4 +534,9 @@ async fn run_anthropic_sse_state_machine(
         blocks = state.blocks.len(),
         "vertex sse stream closed"
     );
+    if let Some(p) = pending_stats {
+        p.finalize(crate::observability::capture::usage_from_anthropic_state(
+            &state,
+        ));
+    }
 }

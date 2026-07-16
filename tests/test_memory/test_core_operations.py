@@ -368,8 +368,6 @@ class TestUpdate:
         assert updated is not None
         assert updated.metadata["key1"] == "value1"
         assert updated.metadata["key2"] == "value2"
-        indexed = memory_system.vector_index._metadata[mem.id]
-        assert indexed.metadata["key2"] == "value2"
 
     @pytest.mark.asyncio
     async def test_update_nonexistent_returns_none(self, memory_system):

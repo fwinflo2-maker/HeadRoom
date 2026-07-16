@@ -776,6 +776,10 @@ class _FakeBackend:
 
         self._config = _types.SimpleNamespace(db_path=str(db_path))
         self._db_path = str(db_path)
+        self.refreshed_ids = []
+
+    async def refresh_memory_indexes(self, memory_id: str):
+        self.refreshed_ids.append(memory_id)
 
     async def save_memory(
         self,
@@ -1297,6 +1301,7 @@ class TestBumpEdgeCases:
         learner = TrafficLearner(backend=backend, min_evidence=1)
         await learner._bump_persisted_evidence("no-such-id")
         assert _read_traffic_rows(db) == []
+        assert backend.refreshed_ids == []
 
 
 # =============================================================================
@@ -1924,6 +1929,7 @@ class TestBumpPersistsLastSeenAt:
         # Should be parseable back.
         parsed = _parse_iso_timestamp(meta["last_seen_at"])
         assert parsed is not None
+        assert backend.refreshed_ids == ["row-1"]
 
 
 class TestHydrateLegacyRow:

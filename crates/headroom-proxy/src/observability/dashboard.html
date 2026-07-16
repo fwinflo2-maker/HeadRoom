@@ -4,8 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Headroom Proxy — Savings</title>
-<!-- Inline icon: without it the browser requests /favicon.ico, which
-     has no local route and gets tunnelled to the upstream provider. -->
+<!-- Inline icon: keeps the page fully self-contained (the proxy's
+     /favicon.ico route serves a generic icon; this one is the
+     dashboard's own). -->
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%232a78d6'/%3E%3Cpath d='M4 11.5V4.5M8 11.5V7M12 11.5V6' stroke='white' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E">
 <style>
   :root {
@@ -18,15 +19,16 @@
     --grid: #e1e0d9;
     --baseline: #c3c2b7;
     --border: rgba(11, 11, 11, 0.10);
-    --series-1: #2a78d6;   /* compression savings */
-    --series-2: #008300;   /* cache savings */
+    --series-1: #2a78d6;   /* spent (also anthropic/bedrock keys) */
+    --series-2: #008300;   /* saved (also openai/vertex keys) */
     --good: #0ca30c;
     --good-text: #006300;
     --critical: #d03b3b;
     --wash: rgba(11, 11, 11, 0.04);
+    --shadow: rgba(0, 0, 0, 0.18);
   }
   @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
+    :root {
       color-scheme: dark;
       --page: #0d0d0d;
       --surface: #1a1a19;
@@ -39,23 +41,13 @@
       --series-1: #3987e5;
       --series-2: #008300;
       --good-text: #0ca30c;
+      /* #d03b3b is 3.6:1 on this surface — under AA for text, and
+         --critical IS text here (the "✕ N failed" badge), not a dot.
+         Lightened to clear 4.5:1 on #1a1a19. */
+      --critical: #f26a6a;
       --wash: rgba(255, 255, 255, 0.06);
+      --shadow: rgba(0, 0, 0, 0.6);
     }
-  }
-  :root[data-theme="dark"] {
-    color-scheme: dark;
-    --page: #0d0d0d;
-    --surface: #1a1a19;
-    --ink: #ffffff;
-    --ink-2: #c3c2b7;
-    --muted: #898781;
-    --grid: #2c2c2a;
-    --baseline: #383835;
-    --border: rgba(255, 255, 255, 0.10);
-    --series-1: #3987e5;
-    --series-2: #008300;
-    --good-text: #0ca30c;
-    --wash: rgba(255, 255, 255, 0.06);
   }
 
   * { box-sizing: border-box; }
@@ -113,12 +105,15 @@
      Bars are <path> (rounded data-end), so key off the class alone. */
   #chart .bar { transition: filter 90ms ease-out; }
   #chart g.col:hover .bar, #chart g.col:focus .bar { filter: brightness(1.15); }
+  /* Keyboard focus needs a visible indicator beyond the brightness
+     lift (WCAG 2.4.7): stroke the focused column's marks in ink. */
   #chart g.col:focus { outline: none; }
+  #chart g.col:focus .bar { stroke: var(--ink); stroke-width: 1.5; }
   @media (prefers-reduced-motion: reduce) { #chart .bar { transition: none; } }
   .tooltip {
     position: absolute; pointer-events: none; z-index: 5; display: none;
     background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
-    padding: 8px 10px; box-shadow: 0 4px 14px rgba(0,0,0,0.18); font-size: 12px; min-width: 170px;
+    padding: 8px 10px; box-shadow: 0 4px 14px var(--shadow); font-size: 12px; min-width: 170px;
   }
   .tooltip .t-when { color: var(--muted); margin-bottom: 4px; }
   .tooltip .t-row { display: flex; align-items: center; gap: 7px; margin-top: 2px; }
@@ -212,15 +207,18 @@
 "use strict";
 (() => {
   const $ = (id) => document.getElementById(id);
-  const state = { scope: "session", bucket: "day", stats: null, series: null, events: null };
+  const state = { scope: "session", bucket: "day", stats: null, series: null, events: null, seq: 0 };
 
   // ── formatting ──────────────────────────────────────────────
+  const COMPACT = new Intl.NumberFormat("en-US", {
+    notation: "compact",
+    maximumFractionDigits: 1,
+  });
+  // Full digits below 10k — "9,999 tokens" reads better than "10K",
+  // and compact notation alone would abbreviate from 1,000.
   const fmtInt = (n) => {
     n = Number(n) || 0;
-    if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(1) + "B";
-    if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(1) + "M";
-    if (Math.abs(n) >= 1e4) return (n / 1e3).toFixed(1) + "K";
-    return n.toLocaleString("en-US");
+    return Math.abs(n) >= 1e4 ? COMPACT.format(n) : n.toLocaleString("en-US");
   };
   // Spend spans many orders of magnitude here: a dev smoke-testing
   // sees fractions of a cent, a fleet sees dollars. Fixed decimals
@@ -257,17 +255,38 @@
     return r.json();
   }
   async function refresh() {
-    try {
-      const [stats, series, events] = await Promise.all([
-        getJson("/stats"),
-        getJson("/stats/timeseries?bucket=" + state.bucket),
-        getJson("/stats/events?limit=30"),
-      ]);
-      state.stats = stats; state.series = series; state.events = events;
+    // Monotonic sequence guard: a bucket-toggle fetch racing a slow
+    // interval fetch must not let the stale response win.
+    const seq = ++state.seq;
+    // allSettled, not all: the three endpoints fail independently.
+    // /stats/events is loopback-only, so viewing this page from
+    // another host 404s it by design — that must not blank the spend
+    // panels that answered perfectly well.
+    const [stats, series, events] = await Promise.allSettled([
+      getJson("/stats"),
+      getJson("/stats/timeseries?bucket=" + state.bucket),
+      getJson("/stats/events?limit=30"),
+    ]);
+    if (seq !== state.seq) return; // superseded by a newer refresh
+    if (stats.status === "fulfilled") state.stats = stats.value;
+    if (series.status === "fulfilled") state.series = series.value;
+    state.events = events.status === "fulfilled" ? events.value : null;
+    // The feed is the only endpoint whose 404 is a policy, not a
+    // fault — tell the reader which it was.
+    state.feedLocalOnly = events.status === "rejected" && /→ 404$/.test(events.reason.message);
+
+    if (stats.status === "fulfilled") {
       render();
       $("meta-updated").textContent = "updated " + new Date().toLocaleTimeString();
-    } catch (e) {
-      $("meta-updated").textContent = "unreachable — retrying";
+      return;
+    }
+    $("meta-updated").textContent = "unreachable — retrying";
+    if (!state.stats) {
+      // Cold load with the proxy down: say so in the page body,
+      // not just the header corner.
+      const kpis = $("kpis");
+      kpis.textContent = "";
+      kpis.appendChild(el("div", "empty", "Waiting for the proxy at " + location.origin + " …"));
     }
   }
 
@@ -303,27 +322,30 @@
     ));
     persist.title = p.path || "";
   }
-  function sparkline(points, key) {
-    const vals = points.slice(-12).map((p) => Number(p[key]) || 0);
+  // Shared SVG element factory (sparklines + the main chart).
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  function mk(tag, attrs) {
+    const e = document.createElementNS(SVG_NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+    return e;
+  }
+  function sparkline(points) {
+    const vals = points.slice(-12).map(
+      (p) => (Number(p.input_cost_usd) || 0) + (Number(p.output_cost_usd) || 0));
     if (vals.length < 2) return null;
     const w = 120, h = 28, max = Math.max(...vals, 1);
     const step = w / (vals.length - 1);
     const y = (v) => h - 3 - (v / max) * (h - 6);
     const d = vals.map((v, i) => (i ? "L" : "M") + (i * step).toFixed(1) + " " + y(v).toFixed(1)).join(" ");
-    const ns = "http://www.w3.org/2000/svg";
-    const svg = document.createElementNS(ns, "svg");
-    svg.setAttribute("class", "spark"); svg.setAttribute("width", w); svg.setAttribute("height", h);
-    svg.setAttribute("aria-hidden", "true");
-    const path = document.createElementNS(ns, "path");
-    path.setAttribute("d", d); path.setAttribute("fill", "none");
-    path.setAttribute("stroke", "var(--muted)"); path.setAttribute("stroke-width", "2");
-    path.setAttribute("stroke-linecap", "round"); path.setAttribute("stroke-linejoin", "round");
-    svg.appendChild(path);
-    const dotEl = document.createElementNS(ns, "circle");
-    dotEl.setAttribute("cx", (vals.length - 1) * step); dotEl.setAttribute("cy", y(vals[vals.length - 1]));
-    dotEl.setAttribute("r", "4"); dotEl.setAttribute("fill", "var(--series-1)");
-    dotEl.setAttribute("stroke", "var(--surface)"); dotEl.setAttribute("stroke-width", "2");
-    svg.appendChild(dotEl);
+    const svg = mk("svg", { class: "spark", width: w, height: h, "aria-hidden": "true" });
+    svg.appendChild(mk("path", {
+      d, fill: "none", stroke: "var(--muted)", "stroke-width": 2,
+      "stroke-linecap": "round", "stroke-linejoin": "round",
+    }));
+    svg.appendChild(mk("circle", {
+      cx: (vals.length - 1) * step, cy: y(vals[vals.length - 1]), r: 4,
+      fill: "var(--series-1)", stroke: "var(--surface)", "stroke-width": 2,
+    }));
     return svg;
   }
   function tile({ label, value, hero, subParts, spark }) {
@@ -357,12 +379,12 @@
     }));
     kpis.appendChild(tile({
       label: "Spend",
-      value: fmtUsd(t.input_cost_usd),
+      value: fmtUsd(t.total_cost_usd),
       subParts: [
-        fmtInt(t.input_tokens) + " in",
-        fmtInt(t.output_tokens) + " out",
+        fmtUsd(t.input_cost_usd) + " in",
+        fmtUsd(t.output_cost_usd) + " out",
       ],
-      spark: hours.length ? sparkline(hours, "input_cost_usd") : null,
+      spark: hours.length ? sparkline(hours) : null,
     }));
     const failed = Number(t.failed) || 0;
     kpis.appendChild(tile({
@@ -378,7 +400,7 @@
       value: fmtInt(t.cache_read_tokens),
       subParts: [
         fmtPct(t.cache_hit_percent) + " of input from cache",
-        fmtUsd(t.cache_savings_usd) + " saved",
+        fmtUsd(t.cache_savings_usd) + " net saved",
       ],
     }));
     $("scope-label-1").textContent = state.scope;
@@ -394,7 +416,7 @@
   const SERIES = [
     {
       name: "Spent", color: "var(--series-1)",
-      usd: (p) => Number(p.input_cost_usd) || 0,
+      usd: (p) => (Number(p.input_cost_usd) || 0) + (Number(p.output_cost_usd) || 0),
       tok: (p) => (Number(p.input_tokens) || 0) + (Number(p.cache_read_tokens) || 0) +
                   (Number(p.cache_write_tokens) || 0),
     },
@@ -447,19 +469,16 @@
     svg.setAttribute("viewBox", "0 0 " + W + " " + H);
     const iw = W - m.left - m.right, ih = H - m.top - m.bottom;
     const max = niceMax(Math.max(...points.map((p) => SERIES.reduce((a, s) => a + valOf(p, s), 0))));
-    const ns = "http://www.w3.org/2000/svg";
-    const mk = (t, attrs) => {
-      const e = document.createElementNS(ns, t);
-      for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
-      return e;
-    };
-
     // Gridlines + ticks (hairline, recessive; clean numbers).
-    for (let i = 0; i <= 4; i++) {
-      const v = (max / 4) * i, y = m.top + ih - (v / max) * ih;
+    // Token counts are integers, so quartering a niceMax of 10 would
+    // print "2.5 tokens". Drop to whole steps when the axis is small
+    // enough that quarters aren't whole.
+    const ticks = mode === "usd" || max % 4 === 0 ? 4 : Math.min(4, max);
+    for (let i = 0; i <= ticks; i++) {
+      const v = (max / ticks) * i, y = m.top + ih - (v / max) * ih;
       if (i > 0) svg.appendChild(mk("line", { x1: m.left, x2: W - m.right, y1: y, y2: y, stroke: "var(--grid)", "stroke-width": 1 }));
       const t = mk("text", { x: m.left - 8, y: y + 4, "text-anchor": "end", fill: "var(--muted)", "font-size": 11 });
-      t.textContent = mode === "usd" ? fmtUsd(v) : fmtInt(v);
+      t.textContent = mode === "usd" ? fmtUsd(v) : fmtInt(Math.round(v));
       svg.appendChild(t);
     }
     svg.appendChild(mk("line", { x1: m.left, x2: W - m.right, y1: m.top + ih, y2: m.top + ih, stroke: "var(--baseline)", "stroke-width": 1 }));
@@ -470,11 +489,24 @@
     const gap = 2; // surface gap between stack segments
     const tipEl = $("tooltip");
 
+    // Per-column keyboard stops are useful at hour/week/month density
+    // but hostile at daily density (up to 400 Tab presses to cross
+    // the chart). Past this cap, columns stay hoverable and the data
+    // remains reachable via /stats/timeseries; the svg's own
+    // aria-label summarizes the series.
+    const focusableColumns = n <= 90;
+    svg.setAttribute(
+      "aria-label",
+      "Spend vs savings, " + n + " " + state.bucket + " buckets" +
+        (focusableColumns ? "" : " — full data at /stats/timeseries?bucket=" + state.bucket)
+    );
     points.forEach((p, i) => {
       const x = m.left + i * band + (band - barW) / 2;
       const colLabel = p.timestamp + ": " + fmtInt(p.requests) + " requests, " +
         SERIES.map((s) => s.name + " " + fmtVal(valOf(p, s))).join(", ");
-      const col = mk("g", { class: "col", tabindex: "0", role: "img", "aria-label": colLabel });
+      const colAttrs = { class: "col", role: "img", "aria-label": colLabel };
+      if (focusableColumns) colAttrs.tabindex = "0";
+      const col = mk("g", colAttrs);
       let yCursor = m.top + ih;
       const segs = [];
       SERIES.forEach((s, si) => {
@@ -483,8 +515,15 @@
         if (hpx <= 0) return;
         const isTop = si === SERIES.length - 1 ||
           SERIES.slice(si + 1).every((s2) => valOf(p, s2) <= 0);
-        const y = yCursor - hpx;
-        const drawH = Math.max(1, hpx - (isTop ? 0 : gap));
+        // Segment occupies [stackTop, bottom]; the 2px surface gap is
+        // shaved off THIS segment's top when another segment sits
+        // above it, so the sliver of background appears BETWEEN
+        // segments — never between the stack and the axis. The next
+        // segment still starts from the un-shaved stackTop.
+        const bottom = yCursor;
+        const stackTop = yCursor - hpx;
+        const y = stackTop + (isTop ? 0 : Math.min(gap, hpx - 1));
+        const drawH = Math.max(1, bottom - y);
         const r = isTop ? Math.min(4, barW / 2, drawH) : 0;
         // Rounded data-end (top) only; square at the baseline.
         const path = "M" + x + " " + (y + drawH) +
@@ -494,7 +533,7 @@
           " Q" + (x + barW) + " " + y + " " + (x + barW) + " " + (y + r) +
           " L" + (x + barW) + " " + (y + drawH) + " Z";
         segs.push(mk("path", { d: path, fill: s.color, class: "bar" }));
-        yCursor = y;
+        yCursor = stackTop;
       });
       segs.reverse().forEach((sEl) => col.appendChild(sEl));
       // Hit target wider than the mark (full band, full height).
@@ -554,7 +593,11 @@
     if (!rows.length) return el("div", "empty", emptyMsg);
     const t = el("table");
     const tr = el("tr");
-    headers.forEach((h) => tr.appendChild(el("th", null, h)));
+    headers.forEach((h) => {
+      const th = el("th", null, h);
+      th.setAttribute("scope", "col");
+      tr.appendChild(th);
+    });
     t.appendChild(tr);
     rows.forEach((cells) => {
       const r = el("tr");
@@ -564,7 +607,7 @@
     return t;
   }
   const PROVIDER_COLOR = {
-    anthropic: "var(--series-1)", openai: "var(--series-2)",
+    anthropic: "var(--series-1)", openai_chat: "var(--series-2)",
     openai_responses: "var(--series-2)", bedrock: "var(--series-1)", vertex: "var(--series-2)",
   };
   function renderProviders() {
@@ -590,7 +633,7 @@
   function renderModels() {
     const s = state.stats;
     const entries = Object.entries(s.lifetime_by_model || {})
-      .sort((a, b) => (b[1].savings_usd + b[1].input_cost_usd) - (a[1].savings_usd + a[1].input_cost_usd))
+      .sort((a, b) => (b[1].savings_usd + b[1].total_cost_usd) - (a[1].savings_usd + a[1].total_cost_usd))
       .slice(0, 10);
     const rows = entries.map(([name, t]) => [
       el("td", "name", name),
@@ -598,7 +641,7 @@
       el("td", null, fmtInt(t.tokens_saved)),
       el("td", null, fmtInt(t.cache_read_tokens)),
       el("td", null, fmtUsd(t.savings_usd)),
-      el("td", null, fmtUsd(t.input_cost_usd)),
+      el("td", null, fmtUsd(t.total_cost_usd)),
     ]);
     const holder = $("models");
     holder.textContent = "";
@@ -618,7 +661,7 @@
       model.title = e.request_id || "";
       const status = el("td");
       if (e.failed) status.appendChild(el("span", "badge-fail", "✕ failed"));
-      else status.appendChild(el("span", null, fmtPct(e.savings_percent)));
+      else status.appendChild(el("span", null, fmtPct(e.compression_percent)));
       // Input column: the provider-billed (uncached) input is the
       // number that always exists. Only show the compression
       // before→after arrow when compression actually ran — otherwise
@@ -639,8 +682,17 @@
     });
     const holder = $("feed");
     holder.textContent = "";
+    if (state.feedLocalOnly) {
+      // Not an error: the per-request feed is served to local callers
+      // only. Say which, so nobody debugs a working proxy.
+      holder.appendChild(el("div", "empty",
+        "The per-request feed is available to local callers only. " +
+        "Totals above cover all traffic; open this dashboard on the proxy host " +
+        "(or over a tunnel to it) to see individual requests."));
+      return;
+    }
     holder.appendChild(table(
-      ["Time", "Lane · model", "Input tok", "Saved", "Cache r/w", "Out tok", "Saved $", "Latency", "Saved %"],
+      ["Time", "Lane · model", "Input tok", "Saved", "Cache r/w", "Out tok", "Saved $", "Latency", "Compr %"],
       rows, "No requests yet — point a client at this proxy and refresh."));
   }
 

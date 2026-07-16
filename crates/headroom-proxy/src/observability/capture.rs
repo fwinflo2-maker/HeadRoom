@@ -1,4 +1,4 @@
-//! Response-usage capture, shared by every lane.
+//! Response-usage capture — Phase H. Shared by every lane.
 //!
 //! Recording a request's savings needs the *response's* token usage,
 //! which arrives in four wire shapes:
@@ -20,6 +20,12 @@
 //! tasks that feed it. Every capture path is a bounded, best-effort
 //! tee off the client byte path — a stalled or hostile response can
 //! delay telemetry, never the client.
+//!
+//! Best-effort has one deliberate edge: capture tasks are plain
+//! `tokio::spawn`s with no shutdown drain, so requests still
+//! in-flight when the process exits are dropped without recording.
+//! Tracking them against shutdown would couple the byte path to
+//! telemetry lifetime — the wrong trade for a stats ledger.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -34,9 +40,11 @@ use super::ledger::{Ledger, RequestEvent, Usage};
 /// compression estimates only) rather than growing memory.
 const JSON_CAPTURE_CAP: usize = 2 * 1024 * 1024;
 
-/// Queue depth for capture tees — same rationale as the SSE parser
-/// queue in `proxy.rs`.
-const CAPTURE_QUEUE_DEPTH: usize = 256;
+/// Queue depth for every telemetry tee (capture bodies and the SSE
+/// parser feeds in proxy/bedrock/vertex). Bounded so a stalled
+/// parser task can never make the byte path wait: senders `try_send`
+/// and drop on a full queue.
+pub(crate) const TEE_QUEUE_DEPTH: usize = 256;
 
 /// A request's ledger event, waiting for its response to finish.
 ///
@@ -106,6 +114,37 @@ impl PendingRecord {
     }
 }
 
+/// Build the pending ledger event for a request entering a handler
+/// (`None` when `--stats` is off). One call site per lane keeps the
+/// "constructed at handler entry so every exit records exactly once"
+/// rule easy to audit.
+pub fn start_pending(
+    state: &crate::proxy::AppState,
+    provider: &'static str,
+    model: &str,
+    request_id: &str,
+) -> Option<PendingRecord> {
+    state.config.stats.then(|| {
+        PendingRecord::new(
+            state.stats.clone(),
+            RequestEvent::new(provider, model, request_id),
+            Instant::now(),
+        )
+    })
+}
+
+/// Finalize a pending record as failed on a proxy-side rejection
+/// (bad path, missing credentials, signing failure, oversized body,
+/// …). Sugar for handler early-return paths, so "every request that
+/// enters a handler produces exactly one record" survives rejects: a
+/// credentials outage must show in `/stats` as a failure spike, not
+/// as zero traffic.
+pub fn finalize_rejected(pending: Option<PendingRecord>) {
+    if let Some(p) = pending {
+        p.finalize_failed();
+    }
+}
+
 /// Which JSON body shape to expect when parsing a non-streaming
 /// response for usage.
 #[derive(Debug, Clone, Copy)]
@@ -120,7 +159,7 @@ pub enum ResponseShape {
 
 /// Extract usage from a complete response body. `None` when the
 /// body has no recognisable usage block (error envelopes, non-JSON).
-pub fn usage_from_response_json(shape: ResponseShape, v: &Value) -> Option<Usage> {
+fn usage_from_response_json(shape: ResponseShape, v: &Value) -> Option<Usage> {
     usage_from_usage_block(shape, v.get("usage")?)
 }
 
@@ -133,14 +172,6 @@ pub fn usage_from_usage_block(shape: ResponseShape, usage: &Value) -> Option<Usa
         ResponseShape::OpenAiResponses => openai_responses_usage(usage),
         ResponseShape::Bedrock => snake_usage(usage).or_else(|| camel_usage(usage)),
     }
-}
-
-/// Model id as reported by the response envelope. Anthropic,
-/// OpenAI Chat/Responses, and Bedrock InvokeModel all echo `model`
-/// at the top level. (Bedrock Converse doesn't — its handler
-/// already knows the id from the URL path.)
-pub fn model_from_response_json(v: &Value) -> Option<&str> {
-    v.get("model").and_then(Value::as_str)
 }
 
 fn u64_at(v: &Value, key: &str) -> Option<u64> {
@@ -165,6 +196,12 @@ fn snake_usage(usage: &Value) -> Option<Usage> {
 
 /// Bedrock Converse `usage` block: camelCase, and `inputTokens`
 /// likewise excludes cache tokens.
+///
+/// The cache fields fall back to the `*InputTokenCount` spelling
+/// after `*InputTokens`. Reading only one name would silently report
+/// zero cache tokens against a response that uses the other, and a
+/// miss costs one map lookup — cheap insurance on a field whose
+/// whole job is to be believed.
 fn camel_usage(usage: &Value) -> Option<Usage> {
     let input = u64_at(usage, "inputTokens");
     let output = u64_at(usage, "outputTokens");
@@ -238,11 +275,30 @@ pub fn usage_from_anthropic_state(state: &crate::sse::anthropic::AnthropicStream
 /// - Bedrock InvokeModel EventStream chunks: `{"bytes": "<base64>"}`
 ///   wrapping an Anthropic SSE event (recursed after decode).
 pub fn merge_stream_usage(acc: &mut Usage, payload: &Value) {
+    merge_stream_usage_depth(acc, payload, 0);
+}
+
+/// Real Bedrock wraps exactly once (`{"bytes": <b64 of the Anthropic
+/// event>}`); the recursion exists only for that unwrap. Cap it so a
+/// crafted deeply-nested base64 payload can't blow the stack — a
+/// stack overflow aborts the whole process, not just this task.
+const MAX_BYTES_UNWRAP_DEPTH: u8 = 4;
+
+fn merge_stream_usage_depth(acc: &mut Usage, payload: &Value, depth: u8) {
     // InvokeModel EventStream chunk: base64-wrapped inner event.
     if let Some(b64) = payload.get("bytes").and_then(Value::as_str) {
+        if depth >= MAX_BYTES_UNWRAP_DEPTH {
+            tracing::warn!(
+                event = "stats_capture_bytes_depth_exceeded",
+                depth = depth,
+                "nested {{\"bytes\": …}} wrapping exceeded the unwrap cap; \
+                 ignoring the payload (real Bedrock wraps exactly once)"
+            );
+            return;
+        }
         if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64) {
             if let Ok(inner) = serde_json::from_slice::<Value>(&decoded) {
-                merge_stream_usage(acc, &inner);
+                merge_stream_usage_depth(acc, &inner, depth + 1);
             }
         }
         return;
@@ -279,7 +335,7 @@ pub fn spawn_json_usage_capture(
     shape: ResponseShape,
     mut pending: PendingRecord,
 ) -> tokio::sync::mpsc::Sender<bytes::Bytes> {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(CAPTURE_QUEUE_DEPTH);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(TEE_QUEUE_DEPTH);
     tokio::spawn(async move {
         let mut buf: Vec<u8> = Vec::new();
         let mut truncated = false;
@@ -288,6 +344,15 @@ pub fn spawn_json_usage_capture(
                 continue; // keep draining so the tee never backpressures
             }
             if buf.len() + chunk.len() > JSON_CAPTURE_CAP {
+                // No silent fallbacks: the request still records, but
+                // its usage will read zero — say why, once.
+                tracing::warn!(
+                    event = "stats_capture_body_too_large",
+                    cap_bytes = JSON_CAPTURE_CAP,
+                    "response body exceeded the usage-capture buffer; \
+                     this request records with compression-side numbers \
+                     only (tokens/USD from usage read as 0)"
+                );
                 truncated = true;
                 buf.clear();
                 continue;
@@ -296,11 +361,34 @@ pub fn spawn_json_usage_capture(
         }
         let mut usage = Usage::default();
         if !truncated {
-            if let Ok(v) = serde_json::from_slice::<Value>(&buf) {
-                if let Some(model) = model_from_response_json(&v) {
-                    pending.set_model_if_unknown(model);
+            match serde_json::from_slice::<Value>(&buf) {
+                Ok(v) => {
+                    if let Some(model) = v.get("model").and_then(Value::as_str) {
+                        pending.set_model_if_unknown(model);
+                    }
+                    // A 2xx from an LLM endpoint carries a usage block
+                    // in every shape we know. A miss means the wire
+                    // format moved (or this isn't the body we think it
+                    // is), and the request would silently record $0 —
+                    // the phantom-zero this module exists to avoid.
+                    // Same no-silent-fallbacks rule as the cap above.
+                    match usage_from_response_json(shape, &v) {
+                        Some(u) => usage = u,
+                        None => tracing::warn!(
+                            event = "stats_capture_no_usage_block",
+                            shape = ?shape,
+                            "response parsed as JSON but carried no recognisable \
+                             usage block; recording this request with zero tokens \
+                             and $0 spend"
+                        ),
+                    }
                 }
-                usage = usage_from_response_json(shape, &v).unwrap_or_default();
+                Err(e) => tracing::warn!(
+                    event = "stats_capture_body_not_json",
+                    error = %e,
+                    "response body did not parse as JSON; recording this request \
+                     with zero tokens and $0 spend"
+                ),
             }
         }
         pending.finalize(usage);
@@ -316,7 +404,7 @@ pub fn spawn_eventstream_usage_capture(
     pending: PendingRecord,
 ) -> tokio::sync::mpsc::Sender<bytes::Bytes> {
     use crate::bedrock::eventstream::{CrcValidation, EventStreamParser};
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(CAPTURE_QUEUE_DEPTH);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(TEE_QUEUE_DEPTH);
     tokio::spawn(async move {
         let mut parser = EventStreamParser::new().with_crc_validation(CrcValidation::No);
         let mut usage = Usage::default();
@@ -331,8 +419,11 @@ pub fn spawn_eventstream_usage_capture(
                     }
                     Ok(None) => break,
                     Err(_) => {
-                        // Telemetry parser out of sync — stop parsing,
-                        // drain the channel, record what we have.
+                        // Telemetry parser out of sync — stop and
+                        // record what accumulated so far. The channel
+                        // is simply dropped; the tee's `try_send` on a
+                        // closed channel is a no-op, so the byte path
+                        // never notices.
                         break 'outer;
                     }
                 }
@@ -406,6 +497,25 @@ mod tests {
         assert_eq!(u.cache_write_tokens, 2);
     }
 
+    /// The cache fields accept the `*InputTokenCount` spelling too.
+    /// Untested, this fallback reads as dead code and invites
+    /// deletion — at which point any response using that spelling
+    /// silently reports zero cache tokens.
+    #[test]
+    fn bedrock_camel_usage_accepts_token_count_suffix() {
+        let v = json!({"usage": {"inputTokens": 11, "outputTokens": 6,
+            "cacheReadInputTokenCount": 4, "cacheWriteInputTokenCount": 2}});
+        let u = usage_from_response_json(ResponseShape::Bedrock, &v).unwrap();
+        assert_eq!(u.cache_read_tokens, 4);
+        assert_eq!(u.cache_write_tokens, 2);
+
+        // The unsuffixed spelling wins when both are present.
+        let both = json!({"usage": {"inputTokens": 11, "outputTokens": 6,
+            "cacheReadInputTokens": 9, "cacheReadInputTokenCount": 4}});
+        let u = usage_from_response_json(ResponseShape::Bedrock, &both).unwrap();
+        assert_eq!(u.cache_read_tokens, 9);
+    }
+
     #[test]
     fn error_envelope_yields_none() {
         let v = json!({"error": {"type": "overloaded_error"}});
@@ -439,6 +549,32 @@ mod tests {
         assert_eq!(acc.output_tokens, 42);
         assert_eq!(acc.cache_read_tokens, 9);
         assert_eq!(acc.cache_write_tokens, 3);
+    }
+
+    /// A crafted payload nesting `{"bytes": …}` inside itself must
+    /// hit the unwrap cap instead of recursing until the stack blows
+    /// (a stack overflow aborts the whole process). Real Bedrock
+    /// wraps exactly once.
+    #[test]
+    fn stream_merge_bounds_nested_base64_depth() {
+        let engine = &base64::engine::general_purpose::STANDARD;
+        // usage buried 10 wraps deep — far past the cap.
+        let mut v = json!({"type": "message_delta", "usage": {"output_tokens": 99}});
+        for _ in 0..10 {
+            v = json!({"bytes": engine.encode(v.to_string())});
+        }
+        let mut acc = Usage::default();
+        merge_stream_usage(&mut acc, &v); // must return, not overflow
+        assert_eq!(
+            acc.output_tokens, 0,
+            "usage beyond the unwrap cap is ignored, not chased"
+        );
+        // …while the real single-wrap shape still works.
+        let single = json!({"bytes": engine.encode(
+            json!({"type": "message_delta", "usage": {"output_tokens": 7}}).to_string()
+        )});
+        merge_stream_usage(&mut acc, &single);
+        assert_eq!(acc.output_tokens, 7);
     }
 
     #[test]

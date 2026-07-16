@@ -25,6 +25,7 @@ use crate::config::Config;
 use crate::error::ProxyError;
 use crate::headers::{build_forward_request_headers, filter_response_headers};
 use crate::health::{healthz, healthz_upstream};
+use crate::observability::{capture, ledger};
 use crate::websocket::ws_handler;
 // Phase F PR-F1: imported as `classify_auth_mode` to make the call
 // site self-documenting. `AuthMode` is re-exported under the same
@@ -78,7 +79,7 @@ pub struct AppState {
     /// request; `/stats*` and `/dashboard` read from it. Recording
     /// call sites gate on `Config::stats` — when stats are disabled
     /// this is an inert in-memory ledger.
-    pub stats: Arc<crate::observability::ledger::Ledger>,
+    pub stats: Arc<ledger::Ledger>,
 }
 
 /// PR-E6: maximum number of sessions tracked by the drift detector
@@ -110,11 +111,11 @@ impl AppState {
 
         let stats = if config.stats {
             match config.stats_path.clone() {
-                Some(path) => Arc::new(crate::observability::ledger::Ledger::load(path)),
-                None => Arc::new(crate::observability::ledger::Ledger::in_memory()),
+                Some(path) => Arc::new(ledger::Ledger::load(path)),
+                None => Arc::new(ledger::Ledger::in_memory()),
             }
         } else {
-            Arc::new(crate::observability::ledger::Ledger::in_memory())
+            Arc::new(ledger::Ledger::in_memory())
         };
 
         Ok(Self {
@@ -595,10 +596,10 @@ pub(crate) async fn forward_http(
     // controls what the buffered branch does (currently both `Off`
     // and `LiveZone` passthrough); Phase B will branch on it inside
     // `compress_anthropic_request`.
-    let should_intercept = state.config.compression
-        && method == axum::http::Method::POST
+    let is_llm_json_post = method == axum::http::Method::POST
         && compression::is_compressible_path(uri.path())
         && is_application_json(req.headers());
+    let should_intercept = state.config.compression && is_llm_json_post;
 
     // PR-E6: capture a header snapshot BEFORE the body is consumed so
     // the drift detector can derive a per-session key from
@@ -616,42 +617,29 @@ pub(crate) async fn forward_http(
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|e| ProxyError::InvalidHeader(e.to_string()))?;
 
-    // ─── SAVINGS LEDGER ────────────────────────────────────────────────
-    //
-    // Deliberately NOT gated on `should_intercept`: compression is
-    // off by default, and "what am I spending / how well is the
-    // prompt cache working" is worth answering on a pure passthrough
-    // deployment too (compression savings are simply 0 there — which
-    // is the truth, not a gap). So the gate is the LLM-endpoint shape
-    // alone, and the model id is learned from the *response* when the
-    // compression buffer didn't parse it off the request. The byte
-    // path is untouched either way.
-    //
-    // The event is finalized exactly once, when the response is fully
-    // observed (SSE close / body end / transport failure), so
-    // streaming token counts are real instead of zero.
-    let should_record = state.config.stats
-        && method == axum::http::Method::POST
-        && compression::is_compressible_path(uri.path())
-        && is_application_json(req.headers());
+    // Savings ledger. Deliberately NOT gated on `should_intercept`:
+    // spend/caching stats are worth answering on a pure passthrough
+    // deployment too (compression savings are truthfully 0 there),
+    // so the gate is the LLM-endpoint shape alone and the model id
+    // is learned from the response when the request didn't carry it.
+    // Finalized exactly once, when the response is fully observed.
+    let should_record = state.config.stats && is_llm_json_post;
     let mut pending_stats = should_record
         .then(|| compression::classify_compressible_path(uri.path()))
         .flatten()
         .map(|endpoint| {
             let provider = match endpoint {
-                compression::CompressibleEndpoint::AnthropicMessages => {
-                    crate::observability::ledger::provider::ANTHROPIC
-                }
+                compression::CompressibleEndpoint::AnthropicMessages => ledger::provider::ANTHROPIC,
                 compression::CompressibleEndpoint::OpenAiChatCompletions => {
-                    crate::observability::ledger::provider::OPENAI_CHAT
+                    ledger::provider::OPENAI_CHAT
                 }
                 compression::CompressibleEndpoint::OpenAiResponses => {
-                    crate::observability::ledger::provider::OPENAI_RESPONSES
+                    ledger::provider::OPENAI_RESPONSES
                 }
             };
-            crate::observability::capture::PendingRecord::new(
+            capture::PendingRecord::new(
                 state.stats.clone(),
-                crate::observability::ledger::RequestEvent::new(provider, "", &request_id),
+                ledger::RequestEvent::new(provider, "", &request_id),
                 start,
             )
         });
@@ -681,13 +669,9 @@ pub(crate) async fn forward_http(
                     "compression: Content-Length exceeds buffer limit; \
                      returning 413 without consuming body"
                 );
-                // A proxy-side rejection is still an outcome for this
-                // request: record it as failed (no tokens, no USD)
-                // rather than dropping it, so every LLM request that
-                // enters this function produces exactly one record.
-                if let Some(p) = pending_stats.take() {
-                    p.finalize_failed();
-                }
+                // A proxy-side rejection is still an outcome:
+                // record it as failed rather than dropping it.
+                capture::finalize_rejected(pending_stats.take());
                 return Err(ProxyError::PayloadTooLarge(format!(
                     "request Content-Length {len} exceeds compression \
                      buffer limit ({max} bytes)"
@@ -705,9 +689,7 @@ pub(crate) async fn forward_http(
                     "compression: body exceeds buffer limit; failing loudly (cannot \
                      resume streaming once the body has been partially consumed)"
                 );
-                if let Some(p) = pending_stats.take() {
-                    p.finalize_failed();
-                }
+                capture::finalize_rejected(pending_stats.take());
                 return Err(ProxyError::PayloadTooLarge(format!(
                     "request body exceeds compression buffer limit ({max} bytes): {e}"
                 )));
@@ -1050,11 +1032,8 @@ pub(crate) async fn forward_http(
             Ok(resp) => resp,
             Err(e) => {
                 // Transport/connect failures are request outcomes
-                // too — record them so outages are visible in
-                // /stats instead of silently missing.
-                if let Some(p) = pending_stats.take() {
-                    p.finalize_failed();
-                }
+                // too — record them so outages are visible in /stats.
+                capture::finalize_rejected(pending_stats.take());
                 return Err(e.into());
             }
         }
@@ -1073,11 +1052,8 @@ pub(crate) async fn forward_http(
         {
             Ok(resp) => resp,
             Err(e) => {
-                // Same contract as the buffered arm: a transport
-                // failure is a request outcome, not an absence of one.
-                if let Some(p) = pending_stats.take() {
-                    p.finalize_failed();
-                }
+                // Same contract as the buffered arm.
+                capture::finalize_rejected(pending_stats.take());
                 return Err(e.into());
             }
         }
@@ -1225,19 +1201,17 @@ pub(crate) async fn forward_http(
         // Non-SSE response on a recorded LLM path: tee the JSON body
         // into a bounded buffer and parse usage when it completes.
         let shape = match SseStreamKind::for_request_path(&path_for_log) {
-            SseStreamKind::OpenAiChat => crate::observability::capture::ResponseShape::OpenAiChat,
-            SseStreamKind::OpenAiResponses => {
-                crate::observability::capture::ResponseShape::OpenAiResponses
-            }
-            // Anthropic, plus the only other way pending exists with
-            // kind None: /v1/responses with the streaming state
-            // machine disabled — the JSON parse then simply finds no
-            // usage and records compression-side numbers alone.
-            _ => crate::observability::capture::ResponseShape::Anthropic,
+            SseStreamKind::OpenAiChat => capture::ResponseShape::OpenAiChat,
+            SseStreamKind::OpenAiResponses => capture::ResponseShape::OpenAiResponses,
+            // Anthropic (/v1/messages). Note: /v1/responses with the
+            // streaming state machine disabled still matches the
+            // OpenAiResponses arm above — for_request_path classifies
+            // by path, independent of the enable flag. An SSE body
+            // teed here simply fails the JSON parse and records
+            // compression-side numbers alone.
+            _ => capture::ResponseShape::Anthropic,
         };
-        Some(crate::observability::capture::spawn_json_usage_capture(
-            shape, p,
-        ))
+        Some(capture::spawn_json_usage_capture(shape, p))
     } else {
         None
     };
@@ -1302,11 +1276,9 @@ pub(crate) async fn forward_http(
 }
 
 /// Bound on the in-flight queue between the byte-passthrough and the
-/// SSE state-machine task. Picked so that under steady-state streaming
-/// load (~5 events/100ms typical) the parser is never blocked on
-/// queue space, yet a stalled parser can't grow memory unboundedly.
-/// Tunable via `proxy.toml` if a deployment finds this insufficient.
-const SSE_PARSER_QUEUE_DEPTH: usize = 256;
+/// SSE state-machine task — see [`TEE_QUEUE_DEPTH`] for the sizing
+/// rationale it shares with every other telemetry tee.
+use crate::observability::capture::TEE_QUEUE_DEPTH as SSE_PARSER_QUEUE_DEPTH;
 
 /// Which provider's state machine should run on this stream. Picked
 /// from the *request* path because the response content-type
@@ -1470,7 +1442,7 @@ async fn run_sse_state_machine(
     kind: SseStreamKind,
     mut rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
     request_id: String,
-    pending_stats: Option<crate::observability::capture::PendingRecord>,
+    pending_stats: Option<capture::PendingRecord>,
 ) {
     use crate::sse::framing::SseFramer;
 
@@ -1545,9 +1517,15 @@ async fn run_sse_state_machine(
                 if let Some(model) = state.model.as_deref() {
                     p.set_model_if_unknown(model);
                 }
-                p.finalize(crate::observability::capture::usage_from_anthropic_state(
-                    &state,
-                ));
+                // A 200 OK stream can still fail in-band: Anthropic
+                // emits `{"type":"error"}` mid-stream (e.g. overloaded
+                // during generation) and the state machine lands in
+                // `Errored`. That is not a billable success — record
+                // it as failed so retries can't inflate savings.
+                if matches!(state.status, crate::sse::anthropic::StreamStatus::Errored) {
+                    p.mark_failed();
+                }
+                p.finalize(capture::usage_from_anthropic_state(&state));
             }
         }
         SseStreamKind::OpenAiChat => {
@@ -1660,10 +1638,7 @@ async fn run_sse_state_machine(
                     .usage
                     .as_ref()
                     .and_then(|u| {
-                        crate::observability::capture::usage_from_usage_block(
-                            crate::observability::capture::ResponseShape::OpenAiChat,
-                            u,
-                        )
+                        capture::usage_from_usage_block(capture::ResponseShape::OpenAiChat, u)
                     })
                     .unwrap_or_default();
                 p.finalize(usage);
@@ -1813,10 +1788,7 @@ async fn run_sse_state_machine(
                     .usage
                     .as_ref()
                     .and_then(|u| {
-                        crate::observability::capture::usage_from_usage_block(
-                            crate::observability::capture::ResponseShape::OpenAiResponses,
-                            u,
-                        )
+                        capture::usage_from_usage_block(capture::ResponseShape::OpenAiResponses, u)
                     })
                     .unwrap_or_default();
                 p.finalize(usage);
@@ -1826,7 +1798,7 @@ async fn run_sse_state_machine(
             if let Some(p) = pending_stats {
                 // No parser for this stream — record what the
                 // request side knew (compression estimates only).
-                p.finalize(crate::observability::ledger::Usage::default());
+                p.finalize(ledger::Usage::default());
             }
         }
     }

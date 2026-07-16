@@ -13,7 +13,16 @@
 /// vendor segment. Stripped (once) before vendor resolution. Kept to a
 /// closed, known set so an unrelated `something.anthropic.x` id is not
 /// mistaken for an Anthropic inference profile.
-const GEO_PREFIXES: [&str; 4] = ["eu.", "us.", "apac.", "global."];
+///
+/// The set is the prefixes present in the vendored LiteLLM price
+/// table (`data/model_prices_and_context_window.json`) — every one of
+/// these fronts real `<geo>.anthropic.…` ids there. A missing entry
+/// is not cosmetic: an unrecognized geo prefix makes
+/// `is_anthropic_model_id` return false, silently skipping
+/// compression for that region's inference profiles (`au.`/`jp.`/
+/// `us-gov.` were missing until review of the stats work caught it).
+pub(crate) const GEO_PREFIXES: [&str; 7] =
+    ["eu.", "us.", "us-gov.", "apac.", "au.", "jp.", "global."];
 
 /// Strip a cross-region inference-profile geo prefix, if present.
 /// `eu.anthropic.claude-…` → `anthropic.claude-…`; ids without a
@@ -81,6 +90,17 @@ mod tests {
         ));
         assert!(is_anthropic_model_id(
             "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+        ));
+        // au./jp./us-gov. are real AWS geo prefixes (present in the
+        // vendored price table); they must gate as Anthropic too.
+        assert!(is_anthropic_model_id(
+            "au.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        ));
+        assert!(is_anthropic_model_id(
+            "jp.anthropic.claude-haiku-4-5-20251001-v1:0"
+        ));
+        assert!(is_anthropic_model_id(
+            "us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0"
         ));
         // Non-Anthropic vendors, including geo-prefixed, stay false.
         assert!(!is_anthropic_model_id("amazon.titan-text-express-v1"));

@@ -62,11 +62,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    // Savings ledger: background persistence while serving, one
-    // final flush after the server drains so the last few requests
-    // survive shutdown.
+    // Savings observability: with the master compression switch on
+    // but the mode off, the dispatcher passes every body through and
+    // tokens_saved reads 0 on the dashboard with no hint why. Say so
+    // once at startup instead of letting the zero look like a bug.
+    if config.compression
+        && matches!(
+            config.compression_mode,
+            headroom_proxy::config::CompressionMode::Off
+        )
+    {
+        tracing::warn!(
+            event = "compression_mode_off",
+            "--compression is on but --compression-mode is `off`: bodies \
+             pass through unmodified and the dashboard's compression \
+             savings will read 0. Set --compression-mode live_zone to \
+             engage the dispatcher."
+        );
+    }
+
+    // Savings ledger: background persistence while serving, plus a
+    // best-effort final flush after the server drains (capture tasks
+    // are detached, so a request finishing in the same instant as
+    // shutdown may still miss it — see observability::capture docs).
     let stats_ledger = state.stats.clone();
     if config.stats {
+        // Pay the vendored price-table parse now, not on the first
+        // recorded request.
+        headroom_proxy::observability::pricing::warm();
         tracing::info!(
             event = "stats_enabled",
             path = ?stats_ledger.path().map(|p| p.display().to_string()),

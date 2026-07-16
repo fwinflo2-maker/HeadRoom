@@ -114,10 +114,22 @@ streaming output/cache token counts come from the real SSE /
 EventStream usage frames. USD figures come from the vendored LiteLLM
 price table (`data/model_prices_and_context_window.json`); a model
 missing from it records $0 and logs one WARN — refresh via
-`scripts/refresh_model_limits.sh`. Failed upstreams count as
-failures and accrue no savings. Aggregates (lifetime, per-model,
-48 h hourly + ~13 mo daily buckets) persist as one atomic snapshot
-written off the hot path every 10 s and on shutdown.
+`scripts/refresh_model_limits.sh`. Input and output are priced
+separately (`input_cost_usd` / `output_cost_usd`) because they bill
+at different rates — output is typically 4-5x input, so a spend
+figure that counted input alone would understate a short-prompt,
+long-answer turn by most of its cost. `total_cost_usd` is the sum
+and is what `/dashboard` shows as "Spend". Cache savings are NET: the
+cache-read discount minus the cache-write premium (writes bill
+above list price), floored at $0 per request — a warm-up turn that
+only writes is not counted as negative savings, and gross-read
+figures that overstate the benefit are never shown. Failed upstreams count as
+failures and accrue no savings — as do proxy-side rejections
+(missing AWS credentials, SigV4/ADC failures, oversized bodies), so
+an operator-side outage reads as a failure spike rather than as
+zero traffic. Aggregates (lifetime, per-model, 48 h hourly +
+~13 mo daily buckets) persist as one atomic snapshot written off
+the hot path every 10 s and on shutdown.
 
 > **What reads 0 today.** Spend, token counts, and prompt-cache
 > savings are live. `tokens_saved` / `compression_savings_usd` are
@@ -127,6 +139,31 @@ written off the hot path every 10 s and on shutdown.
 > (`live_zone_mode_with_valid_body_returns_no_compression_pr_b2`
 > pins that invariant). Nothing needs changing here when they land;
 > the numbers start flowing on their own.
+
+> **No auth; exposure is split by tier.** These endpoints bind
+> wherever `--listen` points (default `0.0.0.0:8787`) and carry no
+> auth, so the payload is split the same way the Python proxy splits
+> its own `/stats`:
+>
+> - **Aggregates** — spend, tokens, per-model/provider rollups,
+>   history — are served to anyone, like the Prometheus `/metrics`
+>   endpoint next door. Same data class, same stance.
+> - **Per-request rows** — `recent_requests`, all of `/stats/events`
+>   — plus the ledger's filesystem path are served **only to local
+>   callers**: loopback peer *and* a loopback `Host` header (the
+>   second is the DNS-rebinding defence — a rebound request reaches
+>   the proxy *from* loopback, so the peer check alone doesn't hold).
+>   Remote callers get `recent_requests: null` and a 404 from
+>   `/stats/events`; the dashboard says so rather than erroring.
+>
+> A request id + model + timestamp is a different sensitivity tier
+> from a counter, and `/metrics` never exposes it — so "same as
+> /metrics" isn't a licence to hand it to the open internet. Opening
+> the local-only tier to a trusted reverse proxy is tracked in
+> [#1959](https://github.com/headroomlabs-ai/headroom/issues/1959),
+> which is settling that policy for the Python dashboard first; this
+> surface should adopt it rather than grow a second scheme.
+> `--stats=false` removes the routes entirely.
 
 ### Picking the next port: invocation telemetry
 

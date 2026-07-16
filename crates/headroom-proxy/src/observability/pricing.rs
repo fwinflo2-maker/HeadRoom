@@ -1,4 +1,4 @@
-//! Per-token USD pricing, used to value spend and savings.
+//! Per-token USD pricing — Phase H. Used to value spend and savings.
 //!
 //! Reads the LiteLLM price table already vendored for
 //! [`crate::compression::model_limits`] — one embedded copy, two
@@ -20,9 +20,9 @@
 //! `eu.anthropic.claude-3-5-haiku-20241022-v1:0` bills at $0.25/M
 //! against `anthropic.claude-3-5-haiku-20241022-v1:0`'s $0.80/M. Any
 //! region the table tracks therefore gets its true price. The
-//! geo-stripped candidate is only a *fallback* for a region the
-//! table does not list (e.g. `apac.` today), where the base price is
-//! a far better estimate than $0 — approximate, but never silently
+//! geo-stripped candidate is only a *fallback* for a (region, model)
+//! pair the table does not list, where the base price is a far
+//! better estimate than $0 — approximate, but never silently
 //! preferred over an exact regional entry.
 //!
 //! # Coverage
@@ -43,7 +43,7 @@
 //! the vendored table (`scripts/refresh_model_limits.sh`).
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{OnceLock, RwLock};
 
 use crate::bedrock::vendor::strip_geo_prefix;
 use crate::compression::model_limits::VENDORED_JSON;
@@ -66,16 +66,44 @@ impl ModelPrice {
         tokens_saved as f64 * self.input
     }
 
-    /// USD saved by cache reads: the discount delta vs list input
-    /// price. A negative discount (cache reads priced above input —
-    /// wire-format pathology) clamps to $0 rather than accruing
-    /// negative savings.
-    pub fn cache_savings_usd(&self, cache_read_tokens: u64) -> f64 {
-        let discount = self.input - self.cache_read;
-        if discount <= 0.0 {
-            return 0.0;
-        }
-        cache_read_tokens as f64 * discount
+    /// NET USD saved by prompt caching for one request: the read
+    /// discount (`reads × (input − cache_read)`) minus the write
+    /// premium (`writes × (cache_write − input)` — cache writes bill
+    /// ABOVE list price, typically 1.25×). Reporting the gross read
+    /// discount alone overstates the benefit on write-heavy traffic,
+    /// which is exactly the phantom-dollars failure mode this module
+    /// exists to avoid. Floored at $0 per request: a warm-up turn
+    /// that only writes is an investment, not negative savings —
+    /// its real cost is already carried by [`Self::input_cost_usd`].
+    ///
+    /// Known bias, stated because it's the honest thing to state:
+    /// the ledger sums these per-request values, and a floored
+    /// request contributes 0 rather than its true negative, so
+    /// `sum(max(0, net))` ≥ `max(0, sum(net))`. Aggregate cache
+    /// savings therefore skew slightly high. The gap is one write
+    /// premium per floored request, which in practice means the
+    /// first turn of a session: once a prefix is cached, later turns
+    /// read far more than they write and net positive well clear of
+    /// the floor (100k reads + 5k writes on Sonnet nets +$0.266, vs
+    /// a $0.004 premium). Fixing it properly means accumulating a
+    /// signed net and flooring once at the aggregate — worth doing
+    /// if cache-heavy traffic ever makes the skew material, but not
+    /// worth a signed accumulator (and a persisted-negative
+    /// migration) for single-digit thousandths of a cent today.
+    pub fn cache_savings_usd(&self, cache_read_tokens: u64, cache_write_tokens: u64) -> f64 {
+        let read_discount = (self.input - self.cache_read).max(0.0);
+        let write_premium = (self.cache_write - self.input).max(0.0);
+        let net =
+            cache_read_tokens as f64 * read_discount - cache_write_tokens as f64 * write_premium;
+        net.max(0.0)
+    }
+
+    /// USD spent on generated output for a request. Output bills at
+    /// its own rate — typically 4-5x input — so a "spend" figure that
+    /// omits it understates the bill by more than it reports on a
+    /// short-prompt/long-answer turn.
+    pub fn output_cost_usd(&self, output_tokens: u64) -> f64 {
+        output_tokens as f64 * self.output
     }
 
     /// USD actually spent on input for a request, using the cache
@@ -98,9 +126,19 @@ static BOOK: OnceLock<HashMap<String, ModelPrice>> = OnceLock::new();
 /// Bounded once-per-model warn set so an unknown model logs one WARN,
 /// not one per request. Capped so attacker-controlled model ids can't
 /// grow it without bound; once full, further unknown models simply
-/// stop logging (they still price at $0).
-static WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+/// stop logging (they still price at $0). RwLock so the steady-state
+/// path for an already-known-unknown model (every miss after the
+/// first) is a shared read, not serialized writes on the record path.
+static WARNED: OnceLock<RwLock<std::collections::HashSet<String>>> = OnceLock::new();
 const WARNED_CAP: usize = 256;
+
+/// Parse the vendored table now instead of on the first recorded
+/// request. Called once at startup (main.rs) so the ~1.4 MB JSON
+/// parse never stalls tokio workers when a burst of first requests
+/// lands together.
+pub fn warm() {
+    let _ = book();
+}
 
 fn book() -> &'static HashMap<String, ModelPrice> {
     BOOK.get_or_init(parse_vendored)
@@ -162,24 +200,40 @@ fn candidates(model: &str) -> Vec<String> {
         }
     };
     push(lower.clone());
-    // Bedrock cross-region profile: `eu.anthropic.claude…` prices as
-    // `anthropic.claude…`.
+    // Bedrock cross-region profile: `eu.anthropic.claude…` falls back
+    // to `anthropic.claude…` when the region itself isn't in the
+    // table. GEO_PREFIXES (shared with the compression vendor gate)
+    // covers every geo the vendored table fronts, `us-gov.` included.
     let geo = strip_geo_prefix(&lower).to_string();
     push(geo.clone());
-    // Bedrock revision suffix: `…-v1:0` is stored both with and
-    // without `:0` across providers; try the trimmed form.
-    if let Some((head, _)) = geo.split_once(':') {
-        push(head.to_string());
-    }
-    if let Some((head, _)) = lower.split_once(':') {
-        push(head.to_string());
-    }
+    // Bedrock revision suffix: `…-v1:0`. ONLY a numeric suffix is
+    // trimmed. A non-numeric colon suffix is a routing/tier variant
+    // (`:exacto`, `:free`, `:nitro`) that can genuinely bill at its
+    // own rate — the vendored table lists
+    // `openrouter/z-ai/glm-4.6` at $0.40/M and its `:exacto` variant
+    // at $0.45/M. Trimming those would hand an uncatalogued variant
+    // its sibling's price with no warning: a confident wrong number,
+    // which this module exists to avoid. They miss and WARN instead.
+    push_revision_trimmed(&mut push, &geo);
+    push_revision_trimmed(&mut push, &lower);
     // Provider-routed ids (`openai/gpt-4o`, `github-copilot/claude…`):
-    // the bare tail is how LiteLLM stores first-party models.
+    // the bare tail is how LiteLLM stores first-party models. Try the
+    // tail both verbatim and `:rev`-trimmed, so a combined
+    // `vendor/model:rev` id can still reach a fully-stripped entry.
     if let Some((_, tail)) = lower.rsplit_once('/') {
         push(tail.to_string());
+        push_revision_trimmed(&mut push, tail);
     }
     out
+}
+
+/// Push `id` minus a trailing `:<digits>` revision, if it has one.
+fn push_revision_trimmed(push: &mut impl FnMut(String), id: &str) {
+    if let Some((head, rev)) = id.rsplit_once(':') {
+        if !rev.is_empty() && rev.bytes().all(|b| b.is_ascii_digit()) {
+            push(head.to_string());
+        }
+    }
 }
 
 /// Look up per-token pricing for a model id. `None` means "not in
@@ -197,18 +251,27 @@ pub fn lookup(model: &str) -> Option<ModelPrice> {
 }
 
 fn warn_once(model: &str) {
-    let set = WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
-    let mut set = set
-        .lock()
+    let set = WARNED.get_or_init(|| RwLock::new(std::collections::HashSet::new()));
+    {
+        let read = set
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if read.len() >= WARNED_CAP || read.contains(model) {
+            return;
+        }
+    }
+    let mut write = set
+        .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if set.len() >= WARNED_CAP || !set.insert(model.to_string()) {
+    if write.len() >= WARNED_CAP || !write.insert(model.to_string()) {
         return;
     }
+    drop(write);
     tracing::warn!(
-        event = "savings_price_unknown_model",
+        event = "stats_price_unknown_model",
         model = %model,
-        "model id not in the vendored price table; USD savings for it \
-         record as $0 — refresh data/model_prices_and_context_window.json \
+        "model id not in the vendored price table; both spend AND savings \
+         for it record as $0 — refresh data/model_prices_and_context_window.json \
          via scripts/refresh_model_limits.sh to add it"
     );
 }
@@ -249,17 +312,26 @@ mod tests {
 
     /// A region the table does NOT list falls back to the base id —
     /// approximate, but far better than $0.
+    /// Every published geo prefix must fall back to the base entry
+    /// when the table doesn't carry that exact (region, model) pair.
+    /// Table-driven over GEO_PREFIXES itself, so adding a prefix
+    /// without its pricing fallback fails here — the `au.`/`jp.`/
+    /// `us-gov.` gap this PR fixes was exactly that.
     #[test]
-    fn untracked_region_falls_back_to_base_price() {
-        assert!(
-            book()
-                .get("apac.anthropic.claude-3-5-haiku-20241022-v1:0")
-                .is_none(),
-            "fixture guard: this id must be absent for the fallback to be under test"
-        );
-        let base = lookup("anthropic.claude-3-5-haiku-20241022-v1:0").expect("base priced");
-        let apac = lookup("apac.anthropic.claude-3-5-haiku-20241022-v1:0").expect("falls back");
-        assert_eq!(base, apac, "unlisted region falls back to the base entry");
+    fn every_geo_prefix_falls_back_to_base_price() {
+        const BASE: &str = "anthropic.claude-3-5-haiku-20241022-v1:0";
+        let base = lookup(BASE).expect("base priced");
+        for geo in crate::bedrock::vendor::GEO_PREFIXES {
+            let id = format!("{geo}{BASE}");
+            if book().get(&id).is_some() {
+                continue; // table lists this region explicitly — priced on its own terms
+            }
+            assert_eq!(
+                lookup(&id).unwrap_or_else(|| panic!("{id} must fall back")),
+                base,
+                "{geo} must strip to the base entry when unlisted"
+            );
+        }
     }
 
     #[test]
@@ -278,7 +350,37 @@ mod tests {
 
     #[test]
     fn case_insensitive_lookup() {
-        assert_eq!(lookup("GPT-4o"), lookup("gpt-4o"));
+        assert_eq!(
+            lookup("GPT-4o").expect("priced"),
+            lookup("gpt-4o").expect("priced")
+        );
+    }
+
+    /// A combined `vendor/model:rev` id must reach a table entry
+    /// stored fully stripped — the slash-tail is also tried with its
+    /// `:rev` suffix trimmed.
+    #[test]
+    fn provider_path_and_revision_compose() {
+        let bare = lookup("gpt-4o").expect("bare id priced");
+        let combined = lookup("openai/gpt-4o:2").expect("combined form priced");
+        assert_eq!(bare, combined, "provider path + numeric revision compose");
+    }
+
+    /// A non-numeric colon suffix is a pricing-relevant variant, not a
+    /// revision. It must NOT inherit the bare model's rate: the table
+    /// prices `openrouter/z-ai/glm-4.6` at $0.40/M and `:exacto` at
+    /// $0.45/M, so borrowing across that boundary invents dollars.
+    #[test]
+    fn variant_suffix_never_borrows_the_bare_models_price() {
+        let bare = lookup("openrouter/z-ai/glm-4.6").expect("bare variant priced");
+        let exacto = lookup("openrouter/z-ai/glm-4.6:exacto").expect("listed variant priced");
+        assert_ne!(bare.input, exacto.input, "fixture guard: these must differ");
+        // An UNLISTED variant must miss loudly, not silently take the
+        // bare price.
+        assert!(
+            lookup("openrouter/z-ai/glm-4.6:priority").is_none(),
+            "an uncatalogued variant must record $0 + WARN, never a guessed rate"
+        );
     }
 
     #[test]
@@ -290,8 +392,13 @@ mod tests {
             cache_write: 3.75e-6,
         };
         assert!((p.compression_savings_usd(1_000_000) - 3.0).abs() < 1e-9);
-        // Cache savings = discount delta vs list input price.
-        assert!((p.cache_savings_usd(1_000_000) - 2.7).abs() < 1e-9);
+        // Cache savings = read discount, NET of the write premium.
+        assert!((p.cache_savings_usd(1_000_000, 0) - 2.7).abs() < 1e-9);
+        // 1M reads save $2.70; 1M writes cost a $0.75 premium → net $1.95.
+        assert!((p.cache_savings_usd(1_000_000, 1_000_000) - 1.95).abs() < 1e-9);
+        // Write-only warm-up floors at $0, never negative savings
+        // (the premium itself is billed via input_cost_usd).
+        assert_eq!(p.cache_savings_usd(0, 1_000_000), 0.0);
         // Breakdown input cost: uncached + cache_read + cache_write.
         let usd = p.input_cost_usd(1_000_000, 1_000_000, 1_000_000);
         assert!((usd - (3.0 + 0.3 + 3.75)).abs() < 1e-9);
@@ -302,6 +409,6 @@ mod tests {
             cache_read: 2e-6,
             cache_write: 1e-6,
         };
-        assert_eq!(inverted.cache_savings_usd(1000), 0.0);
+        assert_eq!(inverted.cache_savings_usd(1000, 0), 0.0);
     }
 }

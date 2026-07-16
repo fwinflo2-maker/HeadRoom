@@ -690,17 +690,29 @@ impl Config {
 /// resolvable) keeps stats in-memory.
 fn default_stats_path() -> Option<std::path::PathBuf> {
     if let Ok(dir) = std::env::var("HEADROOM_WORKSPACE_DIR") {
-        if !dir.trim().is_empty() {
-            return Some(std::path::PathBuf::from(dir).join("native_stats.json"));
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            // Tilde-expand, matching the Python proxy's
+            // `workspace_dir()` semantics (its tests pin
+            // `HEADROOM_WORKSPACE_DIR=~/custom` → `$HOME/custom`).
+            let expanded = if let Some(rest) = dir.strip_prefix("~/") {
+                match home_dir() {
+                    Some(home) => home.join(rest),
+                    None => return None,
+                }
+            } else {
+                std::path::PathBuf::from(dir)
+            };
+            return Some(expanded.join("native_stats.json"));
         }
     }
-    let home = std::env::var("HOME")
+    Some(home_dir()?.join(".headroom").join("native_stats.json"))
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var("HOME")
         .ok()
         .filter(|h| !h.trim().is_empty())
-        .or_else(|| std::env::var("USERPROFILE").ok())?;
-    Some(
-        std::path::PathBuf::from(home)
-            .join(".headroom")
-            .join("native_stats.json"),
-    )
+        .or_else(|| std::env::var("USERPROFILE").ok())
+        .map(std::path::PathBuf::from)
 }

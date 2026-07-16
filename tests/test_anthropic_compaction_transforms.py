@@ -22,6 +22,24 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _reset_tool_desc_max_chars_cache():
+    """Reset the per-process ``_TOOL_DESC_MAX_CHARS`` cache around each test.
+
+    ``tool_desc_max_chars()`` reads ``HEADROOM_TOOL_DESC_MAX_CHARS`` once and
+    caches it in a module global, never re-reading. So any earlier test (or
+    code) that calls it with the env unset pins the cache to 0, and a later
+    test here that sets the env and expects 20 gets the stale 0 -- green in
+    isolation, red in a full CI shard (``assert 0 == 20``). Clearing the cache
+    before and after each test makes these env-based tests order-independent.
+    """
+    import headroom.proxy.tool_schema_compaction as _mod
+
+    _mod._TOOL_DESC_MAX_CHARS = None
+    yield
+    _mod._TOOL_DESC_MAX_CHARS = None
+
+
 def _make_anthropic_payload_with_tools() -> dict:
     """Minimal Anthropic-style payload with tools that will be compacted."""
     return {

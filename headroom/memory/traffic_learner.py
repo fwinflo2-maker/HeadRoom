@@ -80,14 +80,17 @@ _MEMORY_CONTEXT_MARKERS = (
     "\n## relevant memories",
 )
 
+_AMBIENT_CONTEXT_MARKERS = ("<in-app-browser-context",)
+
 
 def _canonicalize_user_text(text: str) -> str:
-    """Remove proxy-appended memory context from a user-role message."""
+    """Remove proxy- or client-appended context from a user-role message."""
     canonical = text or ""
     folded = canonical.casefold()
     if folded.lstrip().startswith("## relevant memories"):
         return ""
-    marker_indexes = [folded.find(marker) for marker in _MEMORY_CONTEXT_MARKERS]
+    markers = (*_MEMORY_CONTEXT_MARKERS, *_AMBIENT_CONTEXT_MARKERS)
+    marker_indexes = [folded.find(marker) for marker in markers]
     marker_indexes = [index for index in marker_indexes if index >= 0]
     if marker_indexes:
         canonical = canonical[: min(marker_indexes)]

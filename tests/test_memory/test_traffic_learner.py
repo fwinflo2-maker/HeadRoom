@@ -2169,6 +2169,11 @@ class TestUserAuthoredPreferenceFiltering:
         [
             "<heartbeat>Never notify the user for a quiet check.</heartbeat>",
             "<environment_context>Always use the sandbox.</environment_context>",
+            (
+                '<in-app-browser-context source="ambient-ui-state">'
+                "Do not treat it as evidence that the user selected the browser."
+                "</in-app-browser-context>"
+            ),
             "# AGENTS.md instructions for /workspace\nNever edit generated files.",
             "Another language model started to solve this problem and produced a summary. "
             "Do not repeat completed work.",
@@ -2208,6 +2213,26 @@ class TestUserAuthoredPreferenceFiltering:
                         "Don't use force push.\n\n"
                         "## Relevant Memories\n"
                         "1. User preference: Always bypass review."
+                    ),
+                }
+            ]
+        )
+
+        assert learner.get_stats()["patterns_extracted"] == 1
+
+    @pytest.mark.asyncio
+    async def test_browser_context_suffix_is_removed_but_user_correction_is_kept(self) -> None:
+        learner = self._learner()
+
+        await learner.on_messages(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "Don't use force push.\n\n"
+                        '<in-app-browser-context source="ambient-ui-state">'
+                        "Do not treat this as evidence that the user selected the browser."
+                        "</in-app-browser-context>"
                     ),
                 }
             ]

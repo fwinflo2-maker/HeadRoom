@@ -62,7 +62,13 @@ from ..tokenizer import Tokenizer
 from ..tokenizers.estimator import EstimatingTokenCounter
 from . import mixed_content as _mixed_content
 from .base import Transform
-from .content_detector import ContentType, DetectionResult, _try_detect_log, _try_detect_search
+from .content_detector import (
+    ContentType,
+    DetectionResult,
+    _try_detect_log,
+    _try_detect_search,
+    _try_detect_structured_config,
+)
 from .content_detector import detect_content_type as _regex_detect_content_type
 from .error_detection import content_has_strong_error_indicators
 from .mixed_content import ContentSection, mixed_content_indicators
@@ -354,6 +360,36 @@ def _json_shape(content: str) -> dict[str, Any]:
     return {"is_json": True, "kind": type(parsed).__name__}
 
 
+def _content_is_valid_json(content: str) -> bool:
+    """Return True iff ``content`` parses as valid JSON.
+
+    Used by the SMART_CRUSHER → Log fallback guard (#1306): the native
+    magika detector tags content by shape, so truncated/mid-stream JSON
+    tool outputs are misclassified as ``json_array``. SmartCrusher can't
+    parse them and returns no savings; without this guard the LogCompressor
+    would then collapse the broken JSON to a single CCR-retrieval marker
+    (99.9% data loss). Valid JSON arrays still reach the Log fallback —
+    LogCompressor is a no-op on them, so the guard is safe for the
+    intended "repetitive JSONL" case.
+    """
+    try:
+        json.loads(content)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    except RecursionError:
+        # Deeply nested JSON (e.g. ``[[[[...]]]]`` with 10k+ levels) can
+        # exceed Python's recursion limit inside ``json.loads``.  Treat
+        # it as invalid so the Log fallback is skipped — the content
+        # passes through verbatim instead of being collapsed.
+        logger.warning(
+            "json.loads hit recursion limit on deeply nested JSON "
+            "(%d chars); treating as invalid for Log-fallback guard",
+            len(content),
+        )
+        return False
+    return True
+
+
 def _mixed_indicators(content: str) -> dict[str, bool]:
     return mixed_content_indicators(content)
 
@@ -564,6 +600,15 @@ def _detect_content(content: str) -> DetectionResult:
         override = _try_detect_log(content) or _try_detect_search(content)
         if override is not None:
             return override
+
+    # Config misroute guard (native/magika path): magika classifies YAML/TOML/
+    # INI as SourceCode, which routes to the (default-disabled) code path and
+    # degrades to prose compression. When the structural config detector
+    # positively claims the payload, trust it over the SourceCode verdict.
+    if content_type is ContentType.SOURCE_CODE:
+        config_override = _try_detect_structured_config(content)
+        if config_override is not None and config_override.confidence >= 0.7:
+            return config_override
 
     if content_type is ContentType.PLAIN_TEXT:
         regex_result = _regex_detect_content_type(content)
@@ -923,6 +968,7 @@ class CompressionStrategy(Enum):
     DIFF = "diff"
     HTML = "html"
     TABULAR = "tabular"
+    CONFIG = "config"
     MIXED = "mixed"
     PASSTHROUGH = "passthrough"
 
@@ -1032,6 +1078,7 @@ class ContentRouterConfig:
         enable_search_compressor: Enable search result compression.
         enable_log_compressor: Enable build/test log compression.
         enable_tabular_compressor: Enable CSV/TSV/markdown-table compression.
+        enable_config_compressor: Enable YAML/TOML/INI config compression.
         enable_image_optimizer: Enable image token optimization.
         prefer_code_aware_for_code: Use CodeAware over Kompress for code.
         min_section_tokens: Minimum tokens for a section to compress.
@@ -1048,6 +1095,7 @@ class ContentRouterConfig:
     enable_search_compressor: bool = True
     enable_log_compressor: bool = True
     enable_tabular_compressor: bool = True  # CSV/TSV/markdown tables via SmartCrusher
+    enable_config_compressor: bool = True  # YAML/TOML/INI structural compression
     enable_html_extractor: bool = True  # HTML content extraction
     enable_image_optimizer: bool = True  # Image token optimization
 
@@ -1320,6 +1368,7 @@ class ContentRouter(Transform):
         self._diff_compressor: Any = None
         self._html_extractor: Any = None
         self._tabular_compressor: Any = None
+        self._config_compressor: Any = None
         self._kompress: Any = None
         # Stage B relevance split (lazy; None until first use, sentinel-checked
         # via _relevance_scorer_tried so a failed load isn't retried per call).
@@ -1810,6 +1859,19 @@ class ContentRouter(Transform):
         """
         # 1. Check for mixed content
         if is_mixed_content(content):
+            # 2. Verify with the native detector: ``is_mixed_content`` uses
+            # cheap regex heuristics that produce false positives on source
+            # code.  Python files with dict/list literals (``{``, ``[`` at
+            # line start) trigger ``has_json_blocks``, and docstrings/comments
+            # trigger ``has_prose`` — so a pure Python blob is misclassified
+            # as MIXED, routed through ``_compress_mixed`` which splits it
+            # into sections and dispatches each to KOMPRESS (no-op on code),
+            # wasting latency on splitting without any compression.
+            # When the native magika detector confidently says SOURCE_CODE,
+            # trust it over the regex heuristics.
+            detection = _detect_content(content)
+            if detection.content_type == ContentType.SOURCE_CODE and detection.confidence >= 0.8:
+                return self._strategy_from_detection(detection)
             return CompressionStrategy.MIXED
 
         # 2. Detect content type from content itself
@@ -1833,6 +1895,7 @@ class ContentRouter(Transform):
             ContentType.GIT_DIFF: CompressionStrategy.DIFF,
             ContentType.HTML: CompressionStrategy.HTML,
             ContentType.TABULAR: CompressionStrategy.TABULAR,
+            ContentType.STRUCTURED_CONFIG: CompressionStrategy.CONFIG,
             ContentType.PLAIN_TEXT: CompressionStrategy.TEXT,
         }
 
@@ -1843,7 +1906,19 @@ class ContentRouter(Transform):
             strategy == CompressionStrategy.CODE_AWARE
             and not self.config.prefer_code_aware_for_code
         ):
-            strategy = CompressionStrategy.KOMPRESS
+            # When CodeAware is not preferred, the intent is "let code pass
+            # through unmangled" (per the config comment).  Previously this
+            # fell back to KOMPRESS, which is an ML compressor that can
+            # destroy code semantics — on a 45K-token Python blob it
+            # compresses to 912 tokens with 11% fact recall, making the
+            # code useless for an agent.  The MIXED path accidentally
+            # protected code by splitting it into small sections that
+            # KOMPRESS passes through, but that was a side-effect, not
+            # intent.  Now that the MIXED false-positive on source code is
+            # fixed (``_determine_strategy`` trusts the native detector),
+            # code reaches this path directly — so use PASSTHROUGH to
+            # honour the "unmangled" intent explicitly.
+            strategy = CompressionStrategy.PASSTHROUGH
 
         return strategy
 
@@ -1991,6 +2066,7 @@ class ContentRouter(Transform):
             CompressionStrategy.SEARCH: "search",
             CompressionStrategy.LOG: "log",
             CompressionStrategy.DIFF: "diff",
+            CompressionStrategy.CONFIG: "config",
         }.get(strategy)
         order = ([primary] if primary else []) + [
             k for k in ("search", "paths", "log", "diff", "text") if k != primary
@@ -2274,6 +2350,18 @@ class ContentRouter(Transform):
                         )
                         decision_reason = "tabular_compressor"
 
+            elif strategy == CompressionStrategy.CONFIG:
+                if self.config.enable_config_compressor:
+                    compressor = self._get_config_compressor()
+                    if compressor:
+                        compressor_name = type(compressor).__name__
+                        result = compressor.compress(content, context=context, bias=bias)
+                        compressed, compressed_tokens = (
+                            result.compressed,
+                            len(result.compressed.split()),
+                        )
+                        decision_reason = "config_compressor"
+
             elif strategy == CompressionStrategy.DIFF:
                 compressor = self._get_diff_compressor()
                 if compressor:
@@ -2325,6 +2413,7 @@ class ContentRouter(Transform):
                 CompressionStrategy.SMART_CRUSHER,
                 CompressionStrategy.CODE_AWARE,
                 CompressionStrategy.TABULAR,
+                CompressionStrategy.CONFIG,
             }
             fallback_no_savings = compressed == content or compressed_tokens >= original_tokens
             if fallback_eligible_strategy and fallback_no_savings:
@@ -2353,9 +2442,24 @@ class ContentRouter(Transform):
                     # Kompress can't shrink but the log compressor can).
                     # Only attempted when the strategy was SMART_CRUSHER so
                     # we don't reroute genuine code/diff content.
+                    #
+                    # JSON-validity guard (#1306): the native magika detector
+                    # classifies content by shape, not parseability, so a
+                    # truncated/mid-stream JSON tool output is tagged
+                    # ``json_array`` and routed to SMART_CRUSHER. SmartCrusher
+                    # returns it unchanged (it can't parse the broken JSON),
+                    # Kompress passes it through, and then the LogCompressor
+                    # treats the whole thing as a multi-thousand-line "log"
+                    # and collapses it to a single CCR-retrieval marker —
+                    # 99.9% data loss when CCR retrieval isn't configured.
+                    # Skip the Log fallback when the content isn't actually
+                    # valid JSON; the passthrough at the bottom of this
+                    # function preserves it verbatim. Valid JSON arrays still
+                    # get the Log fallback (LogCompressor is a no-op on them).
                     if (
                         strategy == CompressionStrategy.SMART_CRUSHER
                         and self.config.enable_log_compressor
+                        and _content_is_valid_json(content)
                     ):
                         log_compressor = self._get_log_compressor()
                         if log_compressor is not None:
@@ -2655,6 +2759,7 @@ class ContentRouter(Transform):
             ContentType.GIT_DIFF: CompressionStrategy.DIFF,
             ContentType.HTML: CompressionStrategy.HTML,
             ContentType.TABULAR: CompressionStrategy.TABULAR,
+            ContentType.STRUCTURED_CONFIG: CompressionStrategy.CONFIG,
             ContentType.PLAIN_TEXT: CompressionStrategy.TEXT,
         }
         return mapping.get(content_type, self.config.fallback_strategy)
@@ -2669,6 +2774,7 @@ class ContentRouter(Transform):
             CompressionStrategy.DIFF: ContentType.GIT_DIFF,
             CompressionStrategy.HTML: ContentType.HTML,
             CompressionStrategy.TABULAR: ContentType.TABULAR,
+            CompressionStrategy.CONFIG: ContentType.STRUCTURED_CONFIG,
             CompressionStrategy.TEXT: ContentType.PLAIN_TEXT,
             CompressionStrategy.KOMPRESS: ContentType.PLAIN_TEXT,
             CompressionStrategy.PASSTHROUGH: ContentType.PLAIN_TEXT,
@@ -2892,6 +2998,19 @@ class ContentRouter(Transform):
             except ImportError:  # pragma: no cover - defensive; tabular_ingest is pure stdlib
                 logger.debug("TabularCompressor not available")
         return self._tabular_compressor
+
+    def _get_config_compressor(self) -> Any:
+        """Get ConfigCompressor (lazy load)."""
+        if self._config_compressor is None:
+            try:
+                from .config_compressor import ConfigCompressor, ConfigCompressorConfig
+
+                self._config_compressor = ConfigCompressor(
+                    ConfigCompressorConfig(enable_ccr=self.config.ccr_inject_marker)
+                )
+            except ImportError:  # pragma: no cover - defensive; module is pure stdlib
+                logger.debug("ConfigCompressor not available")
+        return self._config_compressor
 
     def _get_diff_compressor(self) -> Any:
         """Get DiffCompressor (lazy load). Rust-only — Python implementation

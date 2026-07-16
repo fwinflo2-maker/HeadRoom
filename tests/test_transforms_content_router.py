@@ -693,11 +693,14 @@ def test_smart_crusher_log_fallback_runs_for_valid_json(
 
     monkeypatch.setattr(router, "_get_smart_crusher", lambda: NoopSmartCrusher())
     monkeypatch.setattr(router, "_get_log_compressor", lambda: ShrinkingLogCompressor())
-    # Kompress no-op → Log fallback fires.
+    # Kompress no-op → returns the content unchanged with its estimated token
+    # count (mirroring the real ``_try_ml_compressor``, which always reports
+    # ``_estimate_tokens``). Because that equals the SmartCrusher result, the
+    # router sees no Kompress savings and the Log fallback fires.
     monkeypatch.setattr(
         router,
         "_try_ml_compressor",
-        lambda content, context, question=None: (content, len(content.split())),
+        lambda content, context, question=None: (content, _estimate_tokens(content)),
     )
 
     compressed, _compressed_tokens, strategy_chain = router._apply_strategy_to_content(

@@ -14,7 +14,8 @@ def _win32_pid_alive(pid: int) -> bool:
     if handle:
         kernel32.CloseHandle(handle)
         return True
-    return False
+    ERROR_ACCESS_DENIED = 5
+    return kernel32.GetLastError() == ERROR_ACCESS_DENIED
 
 
 def pid_alive(pid: int) -> bool:

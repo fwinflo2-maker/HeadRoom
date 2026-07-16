@@ -114,3 +114,29 @@ def test_pid_alive_win32_no_psutil_no_ctypes_returns_conservative(monkeypatch) -
     monkeypatch.setattr("headroom._subprocess.os.kill", boom)
 
     assert pid_alive(4321) is True
+
+
+def test_pid_alive_win32_access_denied_returns_alive(monkeypatch) -> None:
+    """OpenProcess returning NULL with ERROR_ACCESS_DENIED means the process exists but is protected."""
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        types.SimpleNamespace(pid_exists=lambda pid: (_ for _ in ()).throw(RuntimeError())),
+    )
+    monkeypatch.setattr("headroom._subprocess.sys.platform", "win32")
+
+    ERROR_ACCESS_DENIED = 5
+
+    fake_kernel32 = types.SimpleNamespace(
+        OpenProcess=lambda access, inherit, pid: 0,
+        GetLastError=lambda: ERROR_ACCESS_DENIED,
+    )
+    fake_ctypes = types.SimpleNamespace(windll=types.SimpleNamespace(kernel32=fake_kernel32))
+    monkeypatch.setitem(sys.modules, "ctypes", fake_ctypes)
+
+    def boom(pid: int, sig: int) -> None:
+        raise AssertionError("os.kill must not be called on Windows")
+
+    monkeypatch.setattr("headroom._subprocess.os.kill", boom)
+
+    assert pid_alive(4321) is True

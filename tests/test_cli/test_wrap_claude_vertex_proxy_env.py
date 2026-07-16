@@ -38,6 +38,7 @@ def _clear_claude_mode_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "ANTHROPIC_VERTEX_BASE_URL",
         "ANTHROPIC_FOUNDRY_BASE_URL",
         "ANTHROPIC_FOUNDRY_RESOURCE",
+        "HEADROOM_CLAUDE_PROJECT_SETTINGS",
         "CLAUDE_CODE_USE_VERTEX",
         "CLAUDE_CODE_USE_FOUNDRY",
         "VERTEX_TARGET_API_URL",
@@ -192,13 +193,11 @@ def test_wrap_claude_vertex_passes_custom_base_url_to_proxy_before_child_redirec
 
     ensure_kwargs = captured["ensure_kwargs"]
     child_env = captured["child_env"]
-    write_kwargs = captured["write_base_url_kwargs"]
     assert ensure_kwargs["vertex_api_url"] == custom_vertex_url
     assert ensure_kwargs["clear_vertex_api_url"] is False
     assert ensure_kwargs["anthropic_api_url"] is None
     assert child_env["ANTHROPIC_VERTEX_BASE_URL"] == "http://127.0.0.1:8787"
-    assert write_kwargs["vertex_mode"] is True
-    assert write_kwargs["foundry_mode"] is False
+    assert "write_base_url_kwargs" not in captured
 
 
 def test_wrap_claude_vertex_target_env_beats_anthropic_vertex_base_url(
@@ -251,7 +250,7 @@ def test_wrap_claude_vertex_default_or_absent_base_url_does_not_force_vertex_tar
     assert child_env["ANTHROPIC_VERTEX_BASE_URL"] == "http://127.0.0.1:8787"
 
 
-def test_wrap_claude_foundry_proxy_env_behavior_is_unchanged(
+def test_wrap_claude_foundry_proxy_env_uses_process_environment_only_by_default(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     foundry_url = "https://my-resource.services.ai.azure.com/anthropic"
@@ -274,8 +273,7 @@ def test_wrap_claude_foundry_proxy_env_behavior_is_unchanged(
     assert ensure_kwargs["anthropic_api_url"] == foundry_url
     assert ensure_kwargs["vertex_api_url"] is None
     assert child_env["ANTHROPIC_FOUNDRY_BASE_URL"] == "http://127.0.0.1:8787/anthropic"
-    assert captured["write_base_url_kwargs"]["foundry_mode"] is True
-    assert captured["write_base_url_kwargs"]["vertex_mode"] is False
+    assert "write_base_url_kwargs" not in captured
 
 
 def test_write_vertex_mode_sets_vertex_key(tmp_path: Path) -> None:

@@ -680,6 +680,8 @@ class TestPatternsToRecommendations:
         assert len(recs) == 1
         assert recs[0].target == RecommendationTarget.MEMORY_FILE
         assert "User prefers terse output" in recs[0].content
+        assert "<!-- headroom:pattern-id:" in recs[0].content
+        assert recs[0].preserve_prior_items is True
 
     def test_routes_environment_to_context_file(self):
         from headroom.learn.models import RecommendationTarget
@@ -718,6 +720,7 @@ class TestPatternsToRecommendations:
         assert lines[0] == "- B"
         assert lines[1] == "- A"
         assert recs[0].evidence_count == 7
+        assert recs[0].preserve_prior_items is False
 
 
 # =============================================================================

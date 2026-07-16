@@ -163,6 +163,9 @@ class Recommendation:
     # above one-off rules because their waste scales with repetition.
     is_loop_guardrail: bool = False
     loop_occurrences: int = 0  # Repetitions of the loop this rule guards against
+    # Preserve prior markdown-list items in the same section. This is opt-in
+    # because most analyzers treat a re-surfaced section as authoritative.
+    preserve_prior_items: bool = False
 
 
 @dataclass

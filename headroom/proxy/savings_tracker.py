@@ -238,7 +238,12 @@ def _estimate_output_savings_usd(model: str, tokens_saved: int) -> float:
         resolved = _resolve_litellm_model(model)
         info = litellm.model_cost.get(resolved, {})
         output_cost_per_token = info.get("output_cost_per_token")
-        if not output_cost_per_token:
+        # Distinguish "price unknown" (missing key -> fall back to the estimate)
+        # from a model that is legitimately free (output_cost_per_token == 0.0).
+        # `if not ...` treated a real 0.0 as unavailable and billed the fallback
+        # rate -> phantom output savings for a model that costs nothing. Mirrors
+        # the fix already applied to `_estimate_compression_savings_usd`.
+        if output_cost_per_token is None:
             raise RuntimeError("output cost unavailable")
         return float(tokens_saved) * float(output_cost_per_token)
     except Exception:
@@ -581,9 +586,7 @@ class SavingsTracker:
         self._persistence_error: str | None = None
         self._needs_schema_save = False
         self._state = self._load_state()
-        self._persistent_metrics = PersistentMetricsState(
-            self._state.pop("lifetime_metrics", None)
-        )
+        self._persistent_metrics = PersistentMetricsState(self._state.pop("lifetime_metrics", None))
 
     @property
     def storage_path(self) -> str:
@@ -859,7 +862,9 @@ class SavingsTracker:
             "compression_savings_usd",
             _estimate_compression_savings_usd(model, _coerce_int(metrics.get("tokens_saved"))),
         )
-        metrics.setdefault("cache_savings_usd", _estimate_cache_savings_usd(model, cache_read_tokens))
+        metrics.setdefault(
+            "cache_savings_usd", _estimate_cache_savings_usd(model, cache_read_tokens)
+        )
         with self._lock:
             self._persistent_metrics.record_request(**metrics)
             if persist:
@@ -871,7 +876,9 @@ class SavingsTracker:
         with self._lock:
             self._persistent_metrics.record_stack(stack)
 
-    def record_lifetime_failed(self, *, provider: str | None = None, model: str | None = None) -> None:
+    def record_lifetime_failed(
+        self, *, provider: str | None = None, model: str | None = None
+    ) -> None:
         """Record a failed proxy request without changing legacy history."""
 
         with self._lock:
@@ -1004,6 +1011,7 @@ class SavingsTracker:
             )
             result[model] = view
         return result
+
     def lifetime_response(self) -> dict[str, Any]:
         """Return the durable aggregate used only by ``/stats-lifetime``."""
 
@@ -1309,8 +1317,7 @@ class SavingsTracker:
                 "other": {
                     "requests": legacy["requests"],
                     "input_tokens": legacy["total_input_tokens"],
-                    "attempted_input_tokens": legacy["total_input_tokens"]
-                    + legacy["tokens_saved"],
+                    "attempted_input_tokens": legacy["total_input_tokens"] + legacy["tokens_saved"],
                     "tokens_saved": legacy["tokens_saved"],
                     "last_activity_at": last_activity_at,
                 },

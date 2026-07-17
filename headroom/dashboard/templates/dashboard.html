@@ -468,8 +468,8 @@
                     </div>
                 </div>
 
-                <!-- Prefix Cache Impact: current process or persisted lifetime cache reads -->
-                <template x-if="cacheSessionActive || (stats.persistent_savings?.lifetime?.cache_read_tokens || 0) > 0">
+                <!-- Prefix Cache Impact: current process only -->
+                <template x-if="cacheSessionActive">
                     <div class="bg-surface rounded-lg p-4 border border-border mb-6">
                         <div class="flex justify-between items-center mb-3">
                             <div class="text-sm font-medium text-gray-300">Prefix Cache Impact</div>
@@ -1381,14 +1381,6 @@
                         </div>
                     </template>
                 </section>
-
-                <!-- Per-project setup hint: shown in session view when no per-project data exists yet -->
-                <template x-if="Object.keys(lifetimeStats.projects || {}).length === 0">
-                    <div class="text-xs text-gray-500 mt-4">
-                        Use per-project routing to track savings per codebase:
-                        <code class="font-mono text-gray-300" x-text="'ANTHROPIC_BASE_URL: ' + window.location.origin + '/p/&lt;project-name&gt;'"></code>
-                    </div>
-                </template>
             </div>
         </template>
 

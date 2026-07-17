@@ -3226,7 +3226,11 @@ def _same_port_claude_env_keys(port: int) -> list[str]:
             parsed = urllib.parse.urlparse(raw)
         except Exception:
             continue
-        if parsed.port != port:
+        try:
+            parsed_port = parsed.port
+        except ValueError:
+            continue
+        if parsed_port != port:
             continue
         host = (parsed.hostname or "").strip().lower()
         if host not in {"127.0.0.1", "localhost", "::1"}:

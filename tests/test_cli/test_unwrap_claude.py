@@ -334,6 +334,23 @@ def test_unwrap_claude_warns_about_same_port_inherited_env(
     assert "Claude is no longer durably wrapped by Headroom." not in result.output
 
 
+def test_unwrap_claude_ignores_malformed_inherited_env_port(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:notaport")
+
+    with patch("headroom.cli.wrap._stop_local_proxy_for_unwrap", return_value="stopped"):
+        result = runner.invoke(
+            main,
+            ["unwrap", "claude", "--keep-mcp", "--keep-rtk", "--port", "8787"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "current shell still exports ANTHROPIC_BASE_URL" not in result.output
+    assert "Claude is no longer durably wrapped by Headroom." in result.output
+
+
 def test_remove_claude_rtk_hooks_removes_init_hooks_and_env(tmp_path: Path) -> None:
     settings = tmp_path / "settings.json"
     settings.write_text(

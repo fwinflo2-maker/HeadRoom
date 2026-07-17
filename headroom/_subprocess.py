@@ -20,7 +20,7 @@ def pid_alive(pid: int) -> bool:
     try:
         import psutil  # type: ignore[import-untyped]  # optional dep, already used elsewhere
 
-        return bool(psutil.pid_exists(pid))
+        return bool(psutil.pid_exists(pid))  # type: ignore[no-any-return]
     except Exception:
         pass
     try:

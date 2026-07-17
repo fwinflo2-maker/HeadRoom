@@ -359,3 +359,16 @@ class TestFindSystemProxy:
         with caplog.at_level(logging.INFO, logger="headroom.proxy"):
             url = find_system_proxy()
         assert url == "not-a-valid-url"
+
+    def test_malformed_port_does_not_raise(self, monkeypatch, caplog):
+        _clean_proxy_env(monkeypatch)
+        monkeypatch.setattr(
+            "urllib.request.getproxies",
+            lambda: {"https": "http://proxy.example:notaport"},
+        )
+        with caplog.at_level(logging.INFO, logger="headroom.proxy"):
+            url = find_system_proxy()
+        assert url == "http://proxy.example:notaport"
+        logged = "\n".join(caplog.messages)
+        assert "proxy.example" in logged
+        assert "notaport" not in logged

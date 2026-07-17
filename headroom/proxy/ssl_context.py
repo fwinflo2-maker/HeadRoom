@@ -274,6 +274,13 @@ def _log_detected_system_proxy(url: str) -> None:
     if not parsed.hostname:
         logger.info("event=system_proxy_detected scheme=%s", parsed.scheme or "unknown")
         return
-    netloc = parsed.hostname + (f":{parsed.port}" if parsed.port else "")
+    try:
+        port = parsed.port
+    except ValueError:
+        # e.g. "http://proxy.example:notaport" -- ParseResult.port raises
+        # rather than returning None for a non-numeric port.
+        logger.info("event=system_proxy_detected host=%s", parsed.hostname)
+        return
+    netloc = parsed.hostname + (f":{port}" if port else "")
     safe = parsed._replace(netloc=netloc)
     logger.info("event=system_proxy_detected url=%s", safe.geturl())

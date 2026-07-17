@@ -275,7 +275,10 @@ def test_build_manifest_extra_env_overrides_derived_defaults() -> None:
     [
         "ANTHROPIC_TARGET_API_URL",
         "OPENAI_TARGET_API_URL",
+        "GEMINI_TARGET_API_URL",
+        "CLOUDCODE_TARGET_API_URL",
         "VERTEX_TARGET_API_URL",
+        "BEDROCK_TARGET_API_URL",
     ],
 )
 def test_build_manifest_snapshots_target_api_urls(monkeypatch, key: str) -> None:
@@ -287,13 +290,28 @@ def test_build_manifest_snapshots_target_api_urls(monkeypatch, key: str) -> None
 
 
 def test_build_manifest_omits_missing_or_empty_target_api_urls(monkeypatch) -> None:
-    monkeypatch.delenv("ANTHROPIC_TARGET_API_URL", raising=False)
+    for key in (
+        "ANTHROPIC_TARGET_API_URL",
+        "OPENAI_TARGET_API_URL",
+        "GEMINI_TARGET_API_URL",
+        "CLOUDCODE_TARGET_API_URL",
+        "VERTEX_TARGET_API_URL",
+        "BEDROCK_TARGET_API_URL",
+    ):
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("OPENAI_TARGET_API_URL", "")
 
     manifest = build_manifest(**_base_manifest_kwargs())
 
-    assert "ANTHROPIC_TARGET_API_URL" not in manifest.base_env
-    assert "OPENAI_TARGET_API_URL" not in manifest.base_env
+    for key in (
+        "ANTHROPIC_TARGET_API_URL",
+        "OPENAI_TARGET_API_URL",
+        "GEMINI_TARGET_API_URL",
+        "CLOUDCODE_TARGET_API_URL",
+        "VERTEX_TARGET_API_URL",
+        "BEDROCK_TARGET_API_URL",
+    ):
+        assert key not in manifest.base_env
 
 
 def test_build_manifest_extra_env_overrides_target_api_url(monkeypatch) -> None:

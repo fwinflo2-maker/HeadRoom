@@ -168,7 +168,10 @@ def build_manifest(
     for key in (
         "ANTHROPIC_TARGET_API_URL",
         "OPENAI_TARGET_API_URL",
+        "GEMINI_TARGET_API_URL",
+        "CLOUDCODE_TARGET_API_URL",
         "VERTEX_TARGET_API_URL",
+        "BEDROCK_TARGET_API_URL",
     ):
         if value := os.environ.get(key):
             base_env[key] = value

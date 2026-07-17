@@ -191,7 +191,12 @@
     <main class="p-6 max-w-7xl mx-auto">
         <template x-if="viewMode === 'session'">
             <div>
-                <p class="mb-4 text-xs text-gray-500">Current proxy process · runtime counters reset on restart</p>
+                <p class="mb-2 text-xs text-gray-500">Current proxy process · runtime counters reset on restart</p>
+                <div class="mb-4 text-xs text-gray-500 font-mono">
+                    <span>ANTHROPIC_BASE_URL: </span>
+                    <span class="text-accent"
+                          x-text="window.location.origin + '/p/&lt;project-name&gt;'"></span>
+                </div>
 
                 <!-- Runtime Overview -->
                 <div class="grid grid-cols-1 gap-4 mb-6 lg:grid-cols-2">

@@ -72,6 +72,28 @@ Avoid setting process-wide variables such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_P
 | `--no-read-lifecycle` | `false` | Disable stale/superseded Read-output compression. |
 | `--code-aware` / `--no-code-aware` | disabled | Enable or disable AST-based code compression. Requires `headroom-ai[code]`. |
 | `--code-graph` | `false` | Force a tokensave code-graph index of the current project (tokensave is the default coding-task compressor registered by `headroom wrap`). |
+| `--code-graph-backend <backend>` | `tokensave` | Select `tokensave`, `codebase-memory-mcp`, or `codegraph`. |
+
+#### Code-graph backend selection
+
+`--code-graph` enables project indexing. The backend can be selected with
+`--code-graph-backend`, `HEADROOM_CODE_GRAPH_BACKEND`, or a `code_graph_backend`
+key in `headroom.toml` or `headroom.yaml`. The precedence is CLI, environment,
+config file, then the current default (`tokensave`).
+
+CodeGraph is installed through npm and initialized in the current project:
+
+```bash
+npm install --global @colbymchenry/codegraph
+headroom wrap claude --code-graph --code-graph-backend codegraph
+```
+
+Headroom runs `codegraph install` to register the detected agent and
+`codegraph init` to create the project's `.codegraph/` index. CodeGraph keeps
+its own file watcher active; Headroom's watchdog watcher remains for the
+`tokensave` and `codebase-memory-mcp` backends. `headroom unwrap <agent>` and
+`headroom mcp uninstall` remove CodeGraph's agent configuration while keeping
+the CLI installed.
 
 #### tokensave binary trust model
 

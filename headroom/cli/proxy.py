@@ -9,6 +9,7 @@ from typing import Any, Literal, cast
 import click
 
 from headroom import paths as _paths
+from headroom.graph.backend import CODE_GRAPH_BACKEND_CHOICES, resolve_code_graph_backend
 from headroom.providers.registry import (
     resolve_api_overrides,
     resolve_api_targets,
@@ -606,7 +607,7 @@ def dashboard(port: int, no_open: bool) -> None:
         "--disable-kompress. Env: HEADROOM_DISABLE_KOMPRESS_OPENAI=1."
     ),
 )
-# Code graph: indexes project + watches files for live reindex via codebase-memory-mcp.
+# Code graph: indexes project + watches files for live reindex via the selected backend.
 # Only useful when the proxy is launched from a project root — it indexes the
 # current working directory.
 @click.option(
@@ -614,8 +615,18 @@ def dashboard(port: int, no_open: bool) -> None:
     is_flag=True,
     help=(
         "Enable code graph intelligence: indexes the current working directory "
-        "and watches files for live reindex via codebase-memory-mcp. Only useful "
+        "and watches files for live reindex via the selected backend. Only useful "
         "when the proxy is launched from a project root."
+    ),
+)
+@click.option(
+    "--code-graph-backend",
+    type=click.Choice(CODE_GRAPH_BACKEND_CHOICES, case_sensitive=False),
+    default=None,
+    envvar="HEADROOM_CODE_GRAPH_BACKEND",
+    help=(
+        "Code graph backend: tokensave (default), codegraph, or "
+        "codebase-memory-mcp. Also reads headroom.toml/yaml."
     ),
 )
 # Read lifecycle (ON by default: compresses stale/superseded Read outputs)
@@ -965,6 +976,7 @@ def proxy(
     disable_kompress_anthropic: bool | None,
     disable_kompress_openai: bool | None,
     code_graph: bool,
+    code_graph_backend: str | None,
     no_read_lifecycle: bool,
     read_maturation: bool,
     read_maturation_quiesce_turns: int,
@@ -1275,6 +1287,7 @@ def proxy(
         offline=_get_env_bool("HEADROOM_OFFLINE", False),
         # Code graph: live file watcher for incremental reindexing
         code_graph_watcher=code_graph,
+        code_graph_backend=resolve_code_graph_backend(code_graph_backend).value,
         # Read lifecycle: ON by default (use --no-read-lifecycle to disable)
         read_lifecycle=not no_read_lifecycle,
         # Read maturation (Mechanism B): experimental, OFF by default

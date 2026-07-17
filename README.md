@@ -111,6 +111,24 @@ The `headroom` CLI ships **only** via the PyPI package. The npm `headroom-ai` is
 
 Granular extras: `[proxy]`, `[mcp]`, `[ml]`, `[code]`, `[memory]`, `[vector]` (optional HNSW backend — needs a C++ toolchain, not in `[all]`), `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`, `[pytorch-mps]` (Apple-GPU memory-embedder offload — set `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.
 
+### Code graph backends
+
+`--code-graph` uses the current default `tokensave`. Select another backend
+with `--code-graph-backend`, `HEADROOM_CODE_GRAPH_BACKEND`, or
+`code_graph_backend` in `headroom.toml` / `headroom.yaml`:
+
+```bash
+headroom wrap claude --code-graph --code-graph-backend codegraph
+```
+
+The `codegraph` backend is installed with `npm install --global
+@colbymchenry/codegraph`; Headroom then runs `codegraph install` and
+`codegraph init`. `headroom unwrap <agent>` and `headroom mcp uninstall` remove
+its agent configuration without removing the CLI. `codebase-memory-mcp` remains
+available as an explicit backend. This selection controls the code-graph index;
+it does not disable the separate tokensave coding-context MCP. Use
+`--no-tokensave` only when tokensave itself should be disabled.
+
 ### Codex / global install
 
 If Codex or another MCP client cannot inherit a shell `PATH` reliably, install Headroom as a persistent uv tool and point the client at the absolute binary path:

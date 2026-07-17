@@ -37,6 +37,17 @@ from pathlib import Path
 from typing import Any, cast
 
 from headroom._subprocess import pid_alive, run
+from headroom.graph.backend import (
+    CODE_GRAPH_BACKEND_CHOICES,
+    CodeGraphBackend,
+    resolve_code_graph_backend,
+)
+from headroom.graph.codegraph_installer import (
+    ensure_codegraph,
+    initialize_codegraph,
+    install_codegraph,
+    uninstall_codegraph,
+)
 
 # Fix Windows cp1252 encoding — box-drawing characters require UTF-8
 if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
@@ -45,6 +56,22 @@ if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 import click
+
+
+def _code_graph_backend_option(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Add the shared code-graph backend option to a wrap command."""
+
+    return click.option(
+        "--code-graph-backend",
+        type=click.Choice(CODE_GRAPH_BACKEND_CHOICES, case_sensitive=False),
+        default=None,
+        envvar="HEADROOM_CODE_GRAPH_BACKEND",
+        help=(
+            "Code graph backend: tokensave (default), codegraph, or "
+            "codebase-memory-mcp."
+        ),
+    )(func)
+
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -483,6 +510,7 @@ def _start_proxy(
     memory: bool = False,
     agent_type: str = "unknown",
     code_graph: bool = False,
+    code_graph_backend: str | None = None,
     backend: str | None = None,
     anyllm_provider: str | None = None,
     region: str | None = None,
@@ -522,6 +550,12 @@ def _start_proxy(
     # Forward --code-graph flag to proxy subprocess (live file watcher)
     if code_graph:
         cmd.append("--code-graph")
+        cmd.extend(
+            [
+                "--code-graph-backend",
+                resolve_code_graph_backend(code_graph_backend).value,
+            ]
+        )
 
     # Forward backend configuration to proxy subprocess
     _backend = backend or os.environ.get("HEADROOM_BACKEND")
@@ -2157,24 +2191,123 @@ def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: A
 _CBM_MCP_SERVER_NAME = "codebase-memory-mcp"
 
 
-def _setup_code_graph(verbose: bool = False) -> bool:
-    """Ensure the tokensave code graph is set up and the project indexed.
+def _setup_codebase_memory_graph(*, verbose: bool = False) -> bool:
+    """Install, register, and warm the legacy codebase-memory backend."""
+    from headroom.graph.installer import ensure_cbm, get_cbm_path
 
-    tokensave is Headroom's primary code-graph compressor and is normally
-    installed by default (it builds a semantic knowledge graph the LLM can
-    query for call chains, definitions, and impact analysis instead of
-    reading whole files). ``--code-graph`` is kept for backward compatibility
-    and as an explicit "set up the graph and force an index now" switch, even
-    when tokensave registration was otherwise skipped.
+    cbm_path = get_cbm_path() or ensure_cbm()
+    if cbm_path is None:
+        if verbose:
+            click.echo(" Code graph: codebase-memory-mcp unavailable; skipping")
+        return False
 
-    Returns True if the graph is ready, False if tokensave is unavailable.
-    Earlier releases backed this flag with ``codebase-memory-mcp``; that
-    server is no longer installed, and ``headroom unwrap`` still cleans up any
-    legacy ``codebase-memory-mcp`` entry a prior wrap left behind.
+    claude_bin = shutil.which("claude")
+    if claude_bin:
+        registration = run(
+            [claude_bin, "mcp", "get", _CBM_MCP_SERVER_NAME],
+            capture_output=True,
+            text=True,
+        )
+        if registration.returncode != 0:
+            registration = run(
+                [
+                    claude_bin,
+                    "mcp",
+                    "add",
+                    _CBM_MCP_SERVER_NAME,
+                    "-s",
+                    "user",
+                    "--",
+                    str(cbm_path),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if registration.returncode != 0:
+                if verbose:
+                    click.echo(
+                        " Code graph: codebase-memory-mcp registration failed "
+                        f"({registration.stderr[:100]})"
+                    )
+                return False
+
+    try:
+        result = run(
+            [
+                str(cbm_path),
+                "cli",
+                "index_repository",
+                json.dumps({"repo_path": str(Path.cwd()), "mode": "fast"}),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        if verbose:
+            click.echo(f" Code graph: codebase-memory-mcp indexing skipped ({exc})")
+        return False
+
+    if result.returncode != 0:
+        if verbose:
+            click.echo(
+                " Code graph: codebase-memory-mcp indexing failed "
+                f"({result.stderr[:100]})"
+            )
+        return False
+
+    click.echo(" Code graph: indexed (codebase-memory-mcp)")
+    return True
+
+
+def _setup_codegraph_backend(*, verbose: bool = False) -> bool:
+    """Install CodeGraph, wire detected agents, and initialize this project."""
+    codegraph_path = ensure_codegraph()
+    if codegraph_path is None:
+        if verbose:
+            click.echo(" Code graph: CodeGraph unavailable; skipping")
+        return False
+    if not install_codegraph(codegraph_path):
+        if verbose:
+            click.echo(" Code graph: CodeGraph agent registration failed")
+        return False
+    if not initialize_codegraph(codegraph_path, project_dir=Path.cwd()):
+        if verbose:
+            click.echo(" Code graph: CodeGraph project initialization failed")
+        return False
+    click.echo(" Code graph: initialized (CodeGraph)")
+    return True
+
+
+def _setup_code_graph(
+    backend: str | CodeGraphBackend | None = None,
+    *,
+    verbose: bool = False,
+) -> bool:
+    """Install and initialize the selected code-graph backend.
+
+    The default remains ``tokensave``. ``codebase-memory-mcp`` is kept as a
+    legacy explicit backend, while CodeGraph installs its own agent wiring and
+    native file watcher.
     """
+    graph_backend = resolve_code_graph_backend(backend)
+    if graph_backend == CodeGraphBackend.CODEGRAPH:
+        return _setup_codegraph_backend(verbose=verbose)
+    if graph_backend == CodeGraphBackend.CODEBASE_MEMORY:
+        return _setup_codebase_memory_graph(verbose=verbose)
+
     from headroom.mcp_registry import ClaudeRegistrar
 
     return _setup_tokensave_mcp(ClaudeRegistrar(), verbose=verbose, force=True)
+
+
+def _cleanup_codegraph_backend(*, verbose: bool = False) -> bool:
+    """Remove CodeGraph's agent configuration while keeping its CLI installed."""
+
+    removed = uninstall_codegraph()
+    if removed and verbose:
+        click.echo(" Code graph: removed CodeGraph agent configuration")
+    return removed
 
 
 # rtk instructions for tools without hook support (Codex, Cursor, Aider).
@@ -3094,6 +3227,8 @@ def _run_proxy_only_watcher(
     memory: bool,
     agent_type: str,
     print_setup_lines: Callable[[int], None],
+    code_graph: bool = False,
+    code_graph_backend: str | None = None,
     anthropic_api_url: str | None = None,
     openai_api_url: str | None = None,
 ) -> None:
@@ -3123,6 +3258,8 @@ def _run_proxy_only_watcher(
             learn=learn,
             memory=memory,
             agent_type=agent_type,
+            code_graph=code_graph,
+            code_graph_backend=code_graph_backend,
             anthropic_api_url=anthropic_api_url,
             openai_api_url=openai_api_url,
         )
@@ -3987,6 +4124,7 @@ def _ensure_proxy(
     memory: bool = False,
     agent_type: str = "unknown",
     code_graph: bool = False,
+    code_graph_backend: str | None = None,
     backend: str | None = None,
     anyllm_provider: str | None = None,
     region: str | None = None,
@@ -4000,6 +4138,7 @@ def _ensure_proxy(
 ) -> tuple[subprocess.Popen | None, int]:
     """Start or verify proxy. Returns (process_handle, actual_port)."""
     helpers = _live_wrap_module()
+    resolved_code_graph_backend = resolve_code_graph_backend(code_graph_backend).value
     copilot_subscription_seed_requested = (
         bool(copilot_api_token)
         or bool(copilot_refresh_oauth_token)
@@ -4067,6 +4206,18 @@ def _ensure_proxy(
                         missing.append("learn")
                     if code_graph and not running_config.get("code_graph"):
                         missing.append("code_graph")
+                    if code_graph:
+                        running_code_graph_backend = running_config.get("code_graph_backend")
+                        if running_code_graph_backend is None:
+                            running_code_graph_backend = CodeGraphBackend.TOKENSAVE.value
+                        try:
+                            running_code_graph_backend = resolve_code_graph_backend(
+                                running_code_graph_backend
+                            ).value
+                        except ValueError:
+                            running_code_graph_backend = None
+                        if running_code_graph_backend != resolved_code_graph_backend:
+                            missing.append("code-graph-backend")
                     if copilot_subscription_seed_requested:
                         missing.append("copilot-subscription-auth")
                     if openai_api_url:
@@ -4131,6 +4282,18 @@ def _ensure_proxy(
                         missing.append("learn")
                     if code_graph and not running_config.get("code_graph"):
                         missing.append("code-graph")
+                    if code_graph:
+                        running_code_graph_backend = running_config.get("code_graph_backend")
+                        if running_code_graph_backend is None:
+                            running_code_graph_backend = CodeGraphBackend.TOKENSAVE.value
+                        try:
+                            running_code_graph_backend = resolve_code_graph_backend(
+                                running_code_graph_backend
+                            ).value
+                        except ValueError:
+                            running_code_graph_backend = None
+                        if running_code_graph_backend != resolved_code_graph_backend:
+                            missing.append("code-graph-backend")
                     if copilot_subscription_seed_requested:
                         missing.append("copilot-subscription-auth")
                     if openai_api_url:
@@ -4220,6 +4383,18 @@ def _ensure_proxy(
                     missing.append("learn")
                 if code_graph and not running_config.get("code_graph"):
                     missing.append("code_graph")
+                if code_graph:
+                    running_code_graph_backend = running_config.get("code_graph_backend")
+                    if running_code_graph_backend is None:
+                        running_code_graph_backend = CodeGraphBackend.TOKENSAVE.value
+                    try:
+                        running_code_graph_backend = resolve_code_graph_backend(
+                            running_code_graph_backend
+                        ).value
+                    except ValueError:
+                        running_code_graph_backend = None
+                    if running_code_graph_backend != resolved_code_graph_backend:
+                        missing.append("code-graph-backend")
                 if copilot_subscription_seed_requested:
                     missing.append("copilot-subscription-auth")
                 expected_savings_profile = helpers._wrap_agent_savings_profile(agent_type)
@@ -4324,6 +4499,7 @@ def _ensure_proxy(
                     memory=memory,
                     agent_type=agent_type,
                     code_graph=code_graph,
+                    code_graph_backend=resolved_code_graph_backend,
                     backend=backend,
                     anyllm_provider=anyllm_provider,
                     region=region,
@@ -4541,6 +4717,7 @@ def _launch_tool(
     memory: bool = False,
     agent_type: str = "unknown",
     code_graph: bool = False,
+    code_graph_backend: str | None = None,
     backend: str | None = None,
     anyllm_provider: str | None = None,
     region: str | None = None,
@@ -4577,6 +4754,7 @@ def _launch_tool(
             memory=memory,
             agent_type=agent_type,
             code_graph=code_graph,
+            code_graph_backend=code_graph_backend,
             backend=backend,
             anyllm_provider=anyllm_provider,
             region=region,
@@ -4600,7 +4778,7 @@ def _launch_tool(
             args, env, env_vars_display = configure_launch(actual_port, args, env, env_vars_display)
 
         if code_graph:
-            _setup_code_graph(verbose=False)
+            _setup_code_graph(code_graph_backend, verbose=False)
 
         click.echo()
         click.echo(f"  Launching {tool_label} (API routed through Headroom)...")
@@ -4914,10 +5092,11 @@ def wrap_selfheal(marker: str | None) -> None:
     hidden=True,
     help="Deprecated: use --code-memory tokensave/none. Never register Serena.",
 )
+@_code_graph_backend_option
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Force a tokensave code-graph index now (tokensave is the default compressor)",
+    help="Enable code graph indexing via the selected backend (optional)",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
@@ -4972,6 +5151,7 @@ def claude(
     serena: bool,
     no_serena: bool,
     code_graph: bool,
+    code_graph_backend: str | None,
     no_proxy: bool,
     learn: bool,
     memory: bool,
@@ -5127,6 +5307,7 @@ def claude(
             memory=memory,
             agent_type="claude",
             code_graph=code_graph,
+            code_graph_backend=code_graph_backend,
             backend=backend,
             region=region,
             anthropic_api_url=foundry_upstream,
@@ -5169,7 +5350,7 @@ def claude(
         )
 
         if code_graph:
-            _setup_code_graph(verbose=verbose)
+            _setup_code_graph(code_graph_backend, verbose=verbose)
 
         proxy_url = _claude_proxy_base_url(actual_port)
         click.echo()
@@ -5350,6 +5531,7 @@ def unwrap_claude(
         from headroom.mcp_registry import ClaudeRegistrar
 
         registrar = ClaudeRegistrar()
+        removed_codegraph = _cleanup_codegraph_backend(verbose=False)
         if registrar.detect():
             removed_headroom = registrar.unregister_server("headroom")
             removed_code_graph = registrar.unregister_server(_CBM_MCP_SERVER_NAME)
@@ -5361,6 +5543,8 @@ def unwrap_claude(
                 click.echo("  Headroom MCP retrieve tool was not registered in Claude.")
             if removed_code_graph:
                 click.echo("  Removed legacy codebase-memory-mcp code graph server from Claude.")
+            if removed_codegraph:
+                click.echo("  Removed CodeGraph agent configuration.")
             if tokensave_status == "removed":
                 click.echo("  Removed Headroom-installed tokensave MCP server from Claude.")
             elif tokensave_status == "failed":
@@ -5884,6 +6068,7 @@ def _run_codex_wrap(
     verbose: bool,
     prepare_only: bool,
     codex_args: tuple,
+    code_graph_backend: str | None = None,
 ) -> None:
     """Execute the Codex wrap flow against the durable Codex home."""
     if prepare_only:
@@ -5948,6 +6133,7 @@ def _run_codex_wrap(
         memory=memory,
         agent_type="codex",
         code_graph=code_graph,
+        code_graph_backend=code_graph_backend,
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
@@ -5992,10 +6178,11 @@ def _run_codex_wrap(
     hidden=True,
     help="Deprecated: use --code-memory tokensave/none. Never register Serena.",
 )
+@_code_graph_backend_option
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Force a tokensave code-graph index now (tokensave is the default compressor)",
+    help="Enable code graph indexing via the selected backend (optional)",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
@@ -6026,6 +6213,7 @@ def codex(
     serena: bool,
     no_serena: bool,
     code_graph: bool,
+    code_graph_backend: str | None,
     no_proxy: bool,
     learn: bool,
     memory: bool,
@@ -6065,6 +6253,7 @@ def codex(
         serena=serena,
         no_serena=no_serena,
         code_graph=code_graph,
+        code_graph_backend=code_graph_backend,
         no_proxy=no_proxy,
         learn=learn,
         memory=memory,
@@ -6094,10 +6283,11 @@ def codex(
     is_flag=True,
     help="Skip CLI context-tool setup",
 )
+@_code_graph_backend_option
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Enable code graph indexing via codebase-memory-mcp (optional)",
+    help="Enable code graph indexing via the selected backend (optional)",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
@@ -6114,6 +6304,7 @@ def aider(
     port: int,
     no_rtk: bool,
     code_graph: bool,
+    code_graph_backend: str | None,
     no_proxy: bool,
     learn: bool,
     memory: bool,
@@ -6176,6 +6367,7 @@ def aider(
         memory=memory,
         agent_type="aider",
         code_graph=code_graph,
+        code_graph_backend=code_graph_backend,
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
@@ -6197,10 +6389,11 @@ def aider(
     is_flag=True,
     help="Skip CLI context-tool setup",
 )
+@_code_graph_backend_option
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Enable code graph indexing via codebase-memory-mcp (optional)",
+    help="Enable code graph indexing via the selected backend (optional)",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
@@ -6217,6 +6410,7 @@ def openclaude(
     port: int,
     no_rtk: bool,
     code_graph: bool,
+    code_graph_backend: str | None,
     no_proxy: bool,
     learn: bool,
     memory: bool,
@@ -6279,6 +6473,7 @@ def openclaude(
         memory=memory,
         agent_type="openclaude",
         code_graph=code_graph,
+        code_graph_backend=code_graph_backend,
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
@@ -6305,8 +6500,9 @@ def openclaude(
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Enable code graph indexing via codebase-memory-mcp (optional)",
+    help="Enable code graph indexing via the selected backend (optional)",
 )
+@_code_graph_backend_option
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
@@ -6317,6 +6513,7 @@ def vibe(
     port: int,
     no_rtk: bool,
     code_graph: bool,
+    code_graph_backend: str | None,
     no_proxy: bool,
     learn: bool,
     memory: bool,
@@ -6361,6 +6558,7 @@ def vibe(
         memory=memory,
         agent_type="vibe",
         code_graph=code_graph,
+        code_graph_backend=code_graph_backend,
         openai_api_url="https://api.mistral.ai",
     )
 
@@ -6385,8 +6583,9 @@ def vibe(
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Enable code graph indexing via codebase-memory-mcp (optional)",
+    help="Enable code graph indexing via the selected backend (optional)",
 )
+@_code_graph_backend_option
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
@@ -6402,6 +6601,7 @@ def kimi(
     port: int,
     no_rtk: bool,
     code_graph: bool,
+    code_graph_backend: str | None,
     no_proxy: bool,
     learn: bool,
     memory: bool,
@@ -6449,6 +6649,7 @@ def kimi(
         memory=memory,
         agent_type="kimi",
         code_graph=code_graph,
+        code_graph_backend=code_graph_backend,
         openai_api_url=kimi_api_url,
     )
 
@@ -6491,10 +6692,11 @@ def kimi(
     hidden=True,
     help="Deprecated: use --code-memory tokensave/none. Never register Serena.",
 )
+@_code_graph_backend_option
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Force a tokensave code-graph index now (tokensave is the default compressor)",
+    help="Enable code graph indexing via the selected backend (optional)",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
@@ -6517,6 +6719,7 @@ def grok(
     serena: bool,
     no_serena: bool,
     code_graph: bool,
+    code_graph_backend: str | None,
     no_proxy: bool,
     learn: bool,
     memory: bool,
@@ -6598,6 +6801,7 @@ def grok(
         memory=memory,
         agent_type="grok",
         code_graph=code_graph,
+        code_graph_backend=code_graph_backend,
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
@@ -6826,6 +7030,12 @@ def grok_build(
     is_flag=True,
     help="Skip CLI context-tool setup",
 )
+@_code_graph_backend_option
+@click.option(
+    "--code-graph",
+    is_flag=True,
+    help="Enable code graph indexing via the selected backend (optional)",
+)
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
@@ -6834,6 +7044,8 @@ def grok_build(
 def cline(
     port: int,
     no_rtk: bool,
+    code_graph: bool,
+    code_graph_backend: str | None,
     no_proxy: bool,
     learn: bool,
     memory: bool,
@@ -6909,6 +7121,8 @@ def cline(
         memory=memory,
         agent_type="cline",
         print_setup_lines=_print_cline_setup,
+        code_graph=code_graph,
+        code_graph_backend=code_graph_backend,
     )
 
 
@@ -6929,6 +7143,12 @@ def cline(
     is_flag=True,
     help="Skip CLI context-tool setup",
 )
+@_code_graph_backend_option
+@click.option(
+    "--code-graph",
+    is_flag=True,
+    help="Enable code graph indexing via the selected backend (optional)",
+)
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
@@ -6937,6 +7157,8 @@ def cline(
 def zcode(
     port: int,
     no_rtk: bool,
+    code_graph: bool,
+    code_graph_backend: str | None,
     no_proxy: bool,
     learn: bool,
     memory: bool,
@@ -7003,6 +7225,8 @@ def zcode(
         memory=memory,
         agent_type="zcode",
         print_setup_lines=_print_zcode_setup,
+        code_graph=code_graph,
+        code_graph_backend=code_graph_backend,
         anthropic_api_url=anthropic_url,
         openai_api_url=openai_url,
     )
@@ -7025,6 +7249,12 @@ def zcode(
     is_flag=True,
     help="Skip CLI context-tool setup",
 )
+@_code_graph_backend_option
+@click.option(
+    "--code-graph",
+    is_flag=True,
+    help="Enable code graph indexing via the selected backend (optional)",
+)
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
@@ -7040,6 +7270,8 @@ def zcode(
 def continue_dev(
     port: int,
     no_rtk: bool,
+    code_graph: bool,
+    code_graph_backend: str | None,
     no_proxy: bool,
     learn: bool,
     memory: bool,
@@ -7130,6 +7362,8 @@ def continue_dev(
         memory=memory,
         agent_type="continue",
         print_setup_lines=_print_continue_setup,
+        code_graph=code_graph,
+        code_graph_backend=code_graph_backend,
     )
 
 
@@ -7153,8 +7387,9 @@ def continue_dev(
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Enable code graph indexing via codebase-memory-mcp (optional)",
+    help="Enable code graph indexing via the selected backend (optional)",
 )
+@_code_graph_backend_option
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
@@ -7170,6 +7405,7 @@ def goose(
     port: int,
     no_rtk: bool,
     code_graph: bool,
+    code_graph_backend: str | None,
     no_proxy: bool,
     learn: bool,
     memory: bool,
@@ -7253,6 +7489,7 @@ def goose(
         memory=memory,
         agent_type="goose",
         code_graph=code_graph,
+        code_graph_backend=code_graph_backend,
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
@@ -7279,8 +7516,9 @@ def goose(
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Enable code graph indexing via codebase-memory-mcp (optional)",
+    help="Enable code graph indexing via the selected backend (optional)",
 )
+@_code_graph_backend_option
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
@@ -7296,6 +7534,7 @@ def openhands(
     port: int,
     no_rtk: bool,
     code_graph: bool,
+    code_graph_backend: str | None,
     no_proxy: bool,
     learn: bool,
     memory: bool,
@@ -7397,6 +7636,7 @@ def openhands(
         memory=memory,
         agent_type="openhands",
         code_graph=code_graph,
+        code_graph_backend=code_graph_backend,
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
@@ -7670,10 +7910,11 @@ def openclaw(
 )
 @click.option("--no-mcp", is_flag=True, help="Skip headroom MCP server registration")
 @click.option("--no-serena", is_flag=True, help="Skip Serena MCP server registration")
+@_code_graph_backend_option
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Enable code graph indexing via codebase-memory-mcp (optional)",
+    help="Enable code graph indexing via the selected backend (optional)",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
@@ -7698,6 +7939,7 @@ def opencode(
     no_mcp: bool,
     no_serena: bool,
     code_graph: bool,
+    code_graph_backend: str | None,
     no_proxy: bool,
     copilot_subscription: bool,
     learn: bool,
@@ -7824,6 +8066,7 @@ def opencode(
         memory=memory,
         agent_type="opencode",
         code_graph=code_graph,
+        code_graph_backend=code_graph_backend,
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
@@ -7877,6 +8120,7 @@ def opencode(
             memory=memory,
             agent_type="opencode",
             code_graph=code_graph,
+            code_graph_backend=code_graph_backend,
             backend=backend,
             anyllm_provider=anyllm_provider,
             region=region,
@@ -7930,6 +8174,9 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
     click.echo("  ║         HEADROOM UNWRAP: OPENCODE             ║")
     click.echo("  ╚═══════════════════════════════════════════════╝")
     click.echo()
+    codegraph_removed = _cleanup_codegraph_backend(verbose=False)
+    if codegraph_removed:
+        click.echo("  Removed CodeGraph agent configuration.")
 
     config_file, backup_file = opencode_config_paths()
 
@@ -8144,6 +8391,9 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
     click.echo("  ║           HEADROOM UNWRAP: CODEX              ║")
     click.echo("  ╚═══════════════════════════════════════════════╝")
     click.echo()
+    codegraph_removed = _cleanup_codegraph_backend(verbose=False)
+    if codegraph_removed:
+        click.echo("  Removed CodeGraph agent configuration.")
 
     try:
         status, config_file = _restore_codex_provider_config()
@@ -8226,10 +8476,11 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
     is_flag=True,
     help="Skip CLI context-tool setup",
 )
+@_code_graph_backend_option
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Enable code graph indexing via codebase-memory-mcp (optional)",
+    help="Enable code graph indexing via the selected backend (optional)",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
@@ -8241,6 +8492,7 @@ def omp(
     port: int,
     no_rtk: bool,
     code_graph: bool,
+    code_graph_backend: str | None,
     no_proxy: bool,
     learn: bool,
     memory: bool,
@@ -8312,6 +8564,7 @@ def omp(
         memory=memory,
         agent_type="omp",
         code_graph=code_graph,
+        code_graph_backend=code_graph_backend,
     )
 
 
@@ -8328,6 +8581,10 @@ def unwrap_omp(port: int, no_stop_proxy: bool) -> None:
     models.yml the wrap does not manage is never touched. Also removes the
     marker-fenced rtk guidance from the current project's AGENTS.md.
     """
+    codegraph_removed = _cleanup_codegraph_backend(verbose=False)
+    if codegraph_removed:
+        click.echo("  Removed CodeGraph agent configuration.")
+
     status = _restore_omp_models_override()
     if status == "restored":
         click.echo(f"  Restored pre-wrap models.yml from backup: {_omp_models_yml_path()}")
@@ -8374,6 +8631,9 @@ def unwrap_grok(port: int, no_stop_proxy: bool) -> None:
 
     grok_registrar = GrokRegistrar()
     removed_any = False
+    if _cleanup_codegraph_backend(verbose=False):
+        click.echo("  Removed CodeGraph agent configuration.")
+        removed_any = True
     if grok_registrar.detect():
         tokensave_status = _remove_headroom_installed_tokensave_mcp(grok_registrar)
         if tokensave_status == "removed":

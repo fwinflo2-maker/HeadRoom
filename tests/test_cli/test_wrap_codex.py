@@ -40,6 +40,15 @@ def runner() -> CliRunner:
     return CliRunner()
 
 
+def test_codex_help_describes_selected_code_graph_backend(runner: CliRunner) -> None:
+    result = runner.invoke(main, ["wrap", "codex", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--code-graph-backend" in result.output
+    assert "codegraph" in result.output
+    assert "Force a tokensave code-graph index" not in result.output
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: helpers operating on ~/.codex/config.toml
 # ---------------------------------------------------------------------------

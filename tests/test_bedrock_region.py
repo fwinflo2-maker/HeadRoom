@@ -401,9 +401,18 @@ class TestBedrockModelMapping:
             backend = LiteLLMBackend(provider="bedrock", region="us-east-1")
             cases = [
                 ("au.anthropic.claude-opus-4-8", "bedrock/au.anthropic.claude-opus-4-8"),
-                ("us.anthropic.claude-sonnet-4-20250514-v1:0", "bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0"),
-                ("eu.anthropic.claude-3-5-sonnet-20241022-v2:0", "bedrock/eu.anthropic.claude-3-5-sonnet-20241022-v2:0"),
-                ("apac.anthropic.claude-3-5-haiku-20241022-v1:0", "bedrock/apac.anthropic.claude-3-5-haiku-20241022-v1:0"),
+                (
+                    "us.anthropic.claude-sonnet-4-20250514-v1:0",
+                    "bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0",
+                ),
+                (
+                    "eu.anthropic.claude-3-5-sonnet-20241022-v2:0",
+                    "bedrock/eu.anthropic.claude-3-5-sonnet-20241022-v2:0",
+                ),
+                (
+                    "apac.anthropic.claude-3-5-haiku-20241022-v1:0",
+                    "bedrock/apac.anthropic.claude-3-5-haiku-20241022-v1:0",
+                ),
                 ("global.anthropic.claude-opus-4-8", "bedrock/global.anthropic.claude-opus-4-8"),
             ]
             for model_in, expected in cases:

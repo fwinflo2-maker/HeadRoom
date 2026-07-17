@@ -47,7 +47,7 @@ def _load_config(path: Path) -> dict[str, Any] | None:
         if path.suffix == ".toml":
             payload = tomllib.loads(path.read_text(encoding="utf-8"))
         else:
-            import yaml
+            import yaml  # type: ignore[import-untyped]
 
             payload = yaml.safe_load(path.read_text(encoding="utf-8"))
     except ImportError:

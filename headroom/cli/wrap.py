@@ -57,22 +57,6 @@ if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
 
 import click
 
-
-def _code_graph_backend_option(func: Callable[..., Any]) -> Callable[..., Any]:
-    """Add the shared code-graph backend option to a wrap command."""
-
-    return click.option(
-        "--code-graph-backend",
-        type=click.Choice(CODE_GRAPH_BACKEND_CHOICES, case_sensitive=False),
-        default=None,
-        envvar="HEADROOM_CODE_GRAPH_BACKEND",
-        help=(
-            "Code graph backend: tokensave (default), codegraph, or "
-            "codebase-memory-mcp."
-        ),
-    )(func)
-
-
 if sys.version_info >= (3, 11):
     import tomllib
 else:  # pragma: no cover - exercised only on Python 3.10
@@ -197,6 +181,22 @@ from headroom.providers.zcode import (
 from headroom.proxy.project_context import with_project_prefix as _with_project_prefix
 
 from .main import main
+
+
+def _code_graph_backend_option(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Add the shared code-graph backend option to a wrap command."""
+
+    return cast(
+        Callable[..., Any],
+        click.option(
+            "--code-graph-backend",
+            type=click.Choice(CODE_GRAPH_BACKEND_CHOICES, case_sensitive=False),
+            default=None,
+            envvar="HEADROOM_CODE_GRAPH_BACKEND",
+            help=("Code graph backend: tokensave (default), codegraph, or codebase-memory-mcp."),
+        )(func),
+    )
+
 
 _COPILOT_PROXY_SEED_ENV_VARS = (
     "GITHUB_COPILOT_API_TOKEN",
@@ -2250,10 +2250,7 @@ def _setup_codebase_memory_graph(*, verbose: bool = False) -> bool:
 
     if result.returncode != 0:
         if verbose:
-            click.echo(
-                " Code graph: codebase-memory-mcp indexing failed "
-                f"({result.stderr[:100]})"
-            )
+            click.echo(f" Code graph: codebase-memory-mcp indexing failed ({result.stderr[:100]})")
         return False
 
     click.echo(" Code graph: indexed (codebase-memory-mcp)")

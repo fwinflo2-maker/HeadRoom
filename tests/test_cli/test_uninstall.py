@@ -40,10 +40,9 @@ def isolate_edges(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(uninstall_mod, "_openclaw_wrapped", lambda: False)
     monkeypatch.setattr(uninstall_mod, "_deployment_profiles", lambda: [])
     # Keep `mcp uninstall` a real no-op instead of reaching the live machine.
-    from headroom.cli import mcp as mcp_mod
+    import headroom.mcp_registry as mcp_registry
 
-    monkeypatch.setattr(mcp_mod.shutil, "which", lambda _name: None)
-    monkeypatch.setattr(mcp_mod, "MCP_CONFIG_PATH", tmp_path / ".claude" / "mcp.json")
+    monkeypatch.setattr(mcp_registry, "get_all_registrars", lambda: [])
 
     stopped: list[int] = []
     monkeypatch.setattr(

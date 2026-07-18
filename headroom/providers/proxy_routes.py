@@ -87,7 +87,7 @@ def _resolve_copilot_or_custom_base(request: Request) -> str | None:
     arbitrary external hosts).
     """
     custom_base = request.headers.get("x-headroom-base-url")
-    if custom_base:
+    if isinstance(custom_base, str) and custom_base:
         return custom_base
     original_host = request.headers.get("x-original-host", "")
     if original_host in _COPILOT_ALLOWED_HOSTS:
@@ -288,12 +288,12 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         publisher: str,
         model: str,
     ):
-        del api_version, project, location
+        del api_version, project
         if is_vertex_google_publisher(publisher):
             return await proxy.handle_gemini_generate_content(
                 request,
                 model,
-                _api_target(proxy, "vertex"),
+                _vertex_target_for_location(proxy, location),
                 VERTEX_GOOGLE_PROVIDER_NAME,
             )
         return await vertex_publisher_passthrough(request, publisher, VERTEX_GENERATE_CONTENT.name)
@@ -309,12 +309,12 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         publisher: str,
         model: str,
     ):
-        del api_version, project, location
+        del api_version, project
         if is_vertex_google_publisher(publisher):
             return await proxy.handle_gemini_generate_content(
                 request,
                 model,
-                _api_target(proxy, "vertex"),
+                _vertex_target_for_location(proxy, location),
                 VERTEX_GOOGLE_PROVIDER_NAME,
             )
         return await vertex_publisher_passthrough(
@@ -334,12 +334,12 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         publisher: str,
         model: str,
     ):
-        del api_version, project, location
+        del api_version, project
         if is_vertex_google_publisher(publisher):
             return await proxy.handle_gemini_count_tokens(
                 request,
                 model,
-                _api_target(proxy, "vertex"),
+                _vertex_target_for_location(proxy, location),
                 VERTEX_GOOGLE_PROVIDER_NAME,
             )
         return await vertex_publisher_passthrough(request, publisher, VERTEX_COUNT_TOKENS.name)

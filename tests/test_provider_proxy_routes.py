@@ -1447,6 +1447,55 @@ def test_factory_openai_chat_route_compresses_and_forwards_to_factory(monkeypatc
     ]
 
 
+def test_factory_openai_chat_route_ignores_spoofed_routing_headers(monkeypatch) -> None:
+    # Regression: a client must not be able to override Factory routing by
+    # sending its own x-headroom-* headers. The route now replaces (not
+    # appends) them, and handle_openai_chat resolves the upstream via
+    # `request.headers.get(...)`, which returns the FIRST duplicate — so a
+    # leftover spoofed value would win. Assert the injected Factory base/path
+    # are authoritative and the spoofed values are gone entirely.
+    seen: list[tuple[str, str | None, str | None]] = []
+
+    async def fake_openai_chat(self, request):  # type: ignore[no-untyped-def]
+        seen.append(
+            (
+                request.url.path,
+                request.headers.get("x-headroom-base-url"),
+                request.headers.get("x-headroom-original-path"),
+            )
+        )
+        # There must be exactly one of each internal routing header left.
+        assert [k for k, _ in request.scope["headers"] if k == b"x-headroom-base-url"] == [
+            b"x-headroom-base-url"
+        ]
+        assert [k for k, _ in request.scope["headers"] if k == b"x-headroom-original-path"] == [
+            b"x-headroom-original-path"
+        ]
+        return JSONResponse({"handler": "handle_openai_chat"})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_openai_chat", fake_openai_chat)
+
+    with TestClient(_factory_app()) as client:
+        payload = client.post(
+            "/api/llm/o/v1/chat/completions",
+            headers={
+                "authorization": "Bearer fk-test",
+                "x-headroom-base-url": "https://evil.example",
+                "x-headroom-original-path": "/evil/chat/completions",
+            },
+            json={"model": "kimi-k2", "messages": []},
+        ).json()
+
+    assert payload == {"handler": "handle_openai_chat"}
+    assert seen == [
+        (
+            "/api/llm/o/v1/chat/completions",
+            "https://api.factory.ai",
+            "/api/llm/o/v1/chat/completions",
+        )
+    ]
+
+
 def test_factory_openai_chat_route_absent_without_factory_upstream(monkeypatch) -> None:
     async def fake_openai_chat(self, request):  # type: ignore[no-untyped-def]
         return JSONResponse({"handler": "handle_openai_chat"})

@@ -66,7 +66,7 @@ from headroom.providers.vertex import (
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
-from headroom.proxy.request_scope import add_scope_header, normalize_request_path
+from headroom.proxy.request_scope import normalize_request_path, set_scope_header
 from headroom.proxy.upstream_guard import is_safe_upstream_url, is_safe_upstream_url_async
 
 logger = logging.getLogger("headroom.proxy.routes")
@@ -332,8 +332,13 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         # without touching the handler.
         @app.post("/api/llm/o/v1/chat/completions")
         async def factory_llm_chat(request: Request):
-            add_scope_header(request, _HEADROOM_BASE_URL_HEADER, _factory_base)
-            add_scope_header(request, _HEADROOM_ORIGINAL_PATH_HEADER, request.url.path)
+            # `set_scope_header` replaces (not appends) so an inbound client
+            # cannot shadow the Factory routing controls: `handle_openai_chat`
+            # resolves the upstream via `request.headers.get(...)`, which returns
+            # the FIRST duplicate. A spoofed `x-headroom-base-url` would
+            # otherwise steer the request to a client-controlled upstream.
+            set_scope_header(request, _HEADROOM_BASE_URL_HEADER, _factory_base)
+            set_scope_header(request, _HEADROOM_ORIGINAL_PATH_HEADER, request.url.path)
             return await proxy.handle_openai_chat(request)
 
     _register_openai_responses_routes(app, proxy)

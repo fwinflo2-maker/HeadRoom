@@ -362,6 +362,10 @@ def test_ensure_proxy_droid_restarts_idle_non_factory_proxy(monkeypatch) -> None
     monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
     monkeypatch.setattr(wrap_cli, "_proxy_needs_version_restart", lambda payload: False)
     monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda *a, **kw: [])
+    # Patch the port probe so the restart reuses the requested port
+    # deterministically; a real 8787 listener on the dev machine would
+    # otherwise push `_find_available_port` to 8788 and fail the assertion.
+    monkeypatch.setattr(wrap_cli, "_find_available_port", lambda port, **kw: port)
     monkeypatch.setattr(
         wrap_cli,
         "_kill_proxy_by_pid",

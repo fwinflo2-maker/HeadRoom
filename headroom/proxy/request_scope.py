@@ -34,3 +34,23 @@ def add_scope_header(request: Request, name: str, value: str) -> None:
     request.scope["headers"].append((name.lower().encode("latin-1"), value.encode("latin-1")))
     if hasattr(request, "_headers"):
         delattr(request, "_headers")
+
+
+def set_scope_header(request: Request, name: str, value: str) -> None:
+    """Replace every existing occurrence of ``name`` in the ASGI scope with one
+    ``value``.
+
+    Unlike :func:`add_scope_header`, this first drops all pairs whose
+    (lower-cased) name matches, then appends the single injected value. That
+    matters for internal routing headers: Starlette's ``Headers.get`` returns
+    the *first* duplicate, so a client could otherwise send its own
+    ``x-headroom-base-url`` and shadow an internally injected one, steering the
+    request to a client-controlled upstream. Sanitizing first makes the injected
+    value authoritative.
+    """
+    lowered = name.lower().encode("latin-1")
+    headers = request.scope["headers"]
+    headers[:] = [(key, val) for (key, val) in headers if key.lower() != lowered]
+    headers.append((lowered, value.encode("latin-1")))
+    if hasattr(request, "_headers"):
+        delattr(request, "_headers")

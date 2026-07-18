@@ -117,6 +117,13 @@ class PrometheusMetrics:
         self.compressions_by_strategy: dict[str, int] = defaultdict(int)
         self.tokens_saved_by_strategy: dict[str, int] = defaultdict(int)
 
+        # Per-extension token savings, keyed by the extension-supplied
+        # ``key``. Populated lazily by ``record_extension_savings`` — no
+        # hardcoded list of extensions. Proxy extensions report the tokens
+        # they saved so per-extension contribution is observable via /stats,
+        # mirroring the per-strategy compression breakdown above.
+        self.extension_savings: dict[str, int] = defaultdict(int)
+
         # Fail-open compression failures, keyed by reason ("timeout",
         # "error"). The proxy fails open on any optimization error so the
         # request still succeeds; without this counter the failure is only
@@ -130,14 +137,18 @@ class PrometheusMetrics:
         # counter proves whether the gate ever fires on live traffic.
         self.kompress_size_gate_by_outcome: dict[str, int] = defaultdict(int)
 
-        # These two counters are mutated from the compression thread-pool
-        # worker (record_kompress_size_gate runs inside ContentRouter, which
-        # the proxy runs in an executor), while export()/reset_runtime() read
-        # and clear them from the event-loop thread. asyncio.Lock can't be
-        # taken off-loop, so guard them with a plain threading.Lock, mirroring
-        # _stage_timing_lock below. Without it a first-time key insert can race
-        # an export iteration ("dictionary changed size during iteration") and
-        # concurrent increments can be lost.
+        # Timeout-debt quarantine events. ``activated`` means a request timed
+        # out while its worker kept running; ``skipped`` means later work was
+        # rejected before executor admission behind that worker.
+        self.compression_quarantine_by_event: dict[str, int] = defaultdict(int)
+
+        # These counters are mutated from compression worker threads and the
+        # event-loop thread, while export()/reset_runtime() read and clear them.
+        # asyncio.Lock can't be taken off-loop, so guard them with a plain
+        # threading.Lock, mirroring _stage_timing_lock below. Without it a
+        # first-time key insert can race an export iteration ("dictionary
+        # changed size during iteration") and concurrent increments can be
+        # lost.
         self._obs_counter_lock = threading.Lock()
 
         # Codex WebSocket compression observability. These are intentionally
@@ -317,9 +328,11 @@ class PrometheusMetrics:
 
             self.compressions_by_strategy.clear()
             self.tokens_saved_by_strategy.clear()
+            self.extension_savings.clear()
             with self._obs_counter_lock:
                 self.compression_failed_by_reason.clear()
                 self.kompress_size_gate_by_outcome.clear()
+                self.compression_quarantine_by_event.clear()
 
             self.codex_ws_units_total = 0
             self.codex_ws_units_modified_total = 0
@@ -478,6 +491,24 @@ class PrometheusMetrics:
         if saved > 0:
             self.tokens_saved_by_strategy[strategy] += saved
 
+    def record_extension_savings(self, key: str, saved: int) -> None:
+        """Accumulate tokens saved by a proxy extension, keyed by ``key``.
+
+        Called by proxy extensions that perform their own token
+        reduction and want that contribution surfaced alongside the
+        built-in compression metrics. The per-extension totals are
+        exposed via /stats (``extension_savings``), mirroring how
+        ``record_compression`` accumulates ``tokens_saved_by_strategy``.
+
+        Synchronous + lock-free: ``defaultdict(int)`` writes are atomic
+        under the GIL for these key types, matching ``record_compression``.
+
+        Non-positive ``saved`` values are ignored — the metric never
+        records "negative savings".
+        """
+        if saved > 0:
+            self.extension_savings[key] += saved
+
     def record_compression_failed(self, reason: str) -> None:
         """Record one fail-open compression failure, bucketed by ``reason``.
 
@@ -501,6 +532,18 @@ class PrometheusMetrics:
         """
         with self._obs_counter_lock:
             self.kompress_size_gate_by_outcome[outcome or "within"] += 1
+
+    def record_compression_quarantine(self, event: str) -> None:
+        """Record one timeout-debt quarantine event.
+
+        ``event`` is ``"activated"`` when a timed-out worker is confirmed to
+        still be running, or ``"skipped"`` when new compression is rejected
+        before executor admission while that worker remains. Both worker and
+        event-loop threads call this method, so updates share the
+        observer-counter lock.
+        """
+        with self._obs_counter_lock:
+            self.compression_quarantine_by_event[event or "skipped"] += 1
 
     def record_router_route_counts(self, counts: dict[str, int]) -> None:
         """Accumulate ContentRouter routing-category counts for a single
@@ -1167,6 +1210,7 @@ class PrometheusMetrics:
             with self._obs_counter_lock:
                 compression_failed = dict(self.compression_failed_by_reason)
                 kompress_size_gate = dict(self.kompress_size_gate_by_outcome)
+                compression_quarantine = dict(self.compression_quarantine_by_event)
 
             if compression_failed:
                 lines.extend(
@@ -1191,6 +1235,19 @@ class PrometheusMetrics:
                 for outcome, count in kompress_size_gate.items():
                     lines.append(
                         f'headroom_kompress_size_gate_total{{outcome="{_escape_label_value(outcome)}"}} {count}'
+                    )
+                lines.append("")
+
+            if compression_quarantine:
+                lines.extend(
+                    [
+                        "# HELP headroom_compression_quarantine_total Timeout-debt quarantine events by type",
+                        "# TYPE headroom_compression_quarantine_total counter",
+                    ]
+                )
+                for event, count in compression_quarantine.items():
+                    lines.append(
+                        f'headroom_compression_quarantine_total{{event="{_escape_label_value(event)}"}} {count}'
                     )
                 lines.append("")
 

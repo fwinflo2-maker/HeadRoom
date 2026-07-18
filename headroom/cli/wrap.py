@@ -5611,8 +5611,14 @@ def copilot(
                 "automatic model selection."
             )
 
-        effective_wire_api = wire_api or (
-            _copilot_default_wire_api_for_model(selected_model) if subscription else "completions"
+        env_wire_api = env.get("COPILOT_PROVIDER_WIRE_API")
+        effective_wire_api = (
+            wire_api
+            or (
+                env_wire_api
+                if env_wire_api in {"completions", "responses"}
+                else _copilot_default_wire_api_for_model(selected_model)
+            )
         )
         env["COPILOT_PROVIDER_TYPE"] = "openai"
         # Per-project savings: the Copilot CLI cannot send custom headers, so

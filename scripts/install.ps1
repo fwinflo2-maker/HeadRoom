@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 
-$ImageDefault = 'ghcr.io/chopratejas/headroom:latest'
+$ImageDefault = 'ghcr.io/headroomlabs-ai/headroom:latest'
 $InstallImage = if ($env:HEADROOM_DOCKER_IMAGE) { $env:HEADROOM_DOCKER_IMAGE } else { $ImageDefault }
 $InstallDir = Join-Path $HOME '.local\bin'
 if (-not (Test-Path (Join-Path $HOME '.local'))) {
@@ -616,7 +616,7 @@ function Show-InstallApplyHelp {
         '  --mode TEXT                   Proxy optimization mode.  [default: token]',
         '  --memory                      Enable persistent memory in the runtime.',
         '  --no-telemetry                Disable anonymous telemetry in the runtime.',
-        '  --image TEXT                  Docker image to use.  [default: HEADROOM_DOCKER_IMAGE or ghcr.io/chopratejas/headroom:latest]',
+        '  --image TEXT                  Docker image to use.  [default: HEADROOM_DOCKER_IMAGE or ghcr.io/headroomlabs-ai/headroom:latest]',
         '  -?, --help                    Show this message and exit.'
     )
     Write-Host ($lines -join [Environment]::NewLine)
@@ -1611,7 +1611,7 @@ switch ($args[0]) {
         }
 
         if ($args.Count -lt 2) {
-            Fail 'Usage: headroom wrap <claude|codex|aider|cursor|openclaw> [...]'
+            Fail 'Usage: headroom wrap <claude|codex|aider|cursor|openclaw|opencode> [...]'
         }
 
         $tool = $args[1]
@@ -1623,8 +1623,9 @@ switch ($args[0]) {
             'aider' { }
             'cursor' { }
             'openclaw' { }
+            'opencode' { }
             default {
-                Fail "Docker-native wrapper does not support 'wrap $tool'. Supported targets: claude, codex, aider, cursor, openclaw"
+                Fail "Docker-native wrapper does not support 'wrap $tool'. Supported targets: claude, codex, aider, cursor, openclaw, opencode"
             }
         }
 

@@ -16,6 +16,11 @@ def runner() -> CliRunner:
     return CliRunner()
 
 
+@pytest.fixture(autouse=True)
+def _no_persistent_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda _port: None)
+
+
 def test_remove_claude_rtk_hooks_preserves_unrelated_hooks(tmp_path: Path) -> None:
     settings = tmp_path / "settings.json"
     settings.write_text(
@@ -208,3 +213,252 @@ def test_unwrap_claude_keep_flags_skip_cleanup(
     registrar.assert_not_called()
     remove_rtk.assert_not_called()
     stop_proxy.assert_not_called()
+
+
+def test_unwrap_claude_restores_all_base_url_modes(runner: CliRunner) -> None:
+    restore_calls: list[dict[str, object]] = []
+
+    def restore_base_url(previous: str | None, **kwargs: object) -> None:
+        restore_calls.append({"previous": previous, **kwargs})
+
+    with patch("headroom.cli.wrap._restore_claude_wrap_base_url", side_effect=restore_base_url):
+        result = runner.invoke(
+            main,
+            ["unwrap", "claude", "--keep-mcp", "--keep-rtk", "--no-stop-proxy"],
+        )
+
+    assert result.exit_code == 0, result.output
+    settings_path = Path.cwd() / ".claude" / "settings.local.json"
+    assert restore_calls == [
+        {
+            "previous": None,
+            "foundry_mode": False,
+            "vertex_mode": False,
+            "settings_path": settings_path,
+        },
+        {
+            "previous": None,
+            "foundry_mode": True,
+            "vertex_mode": False,
+            "settings_path": settings_path,
+        },
+        {
+            "previous": None,
+            "foundry_mode": False,
+            "vertex_mode": True,
+            "settings_path": settings_path,
+        },
+    ]
+
+
+def test_unwrap_claude_stops_claude_owned_persistent_deployment(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Manifest:
+        profile = "unwrap-2340"
+        targets = ["claude"]
+        tool_envs = {"claude": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}}
+        mutations: list[object] = []
+        supervisor_kind = "service"
+
+    stopped: list[str] = []
+    deactivated: list[str] = []
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: Manifest())
+    monkeypatch.setattr(
+        "headroom.cli.install._deactivate_deployment_mutations",
+        lambda manifest: deactivated.append(manifest.profile),
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install._stop_deployment",
+        lambda manifest: stopped.append(manifest.profile),
+    )
+
+    with (
+        patch("headroom.cli.wrap._stop_local_proxy_for_unwrap") as stop_local,
+    ):
+        result = runner.invoke(
+            main,
+            ["unwrap", "claude", "--keep-mcp", "--keep-rtk", "--port", "8787"],
+        )
+
+    assert result.exit_code == 0, result.output
+    stop_local.assert_not_called()
+    assert deactivated == ["unwrap-2340"]
+    assert stopped == ["unwrap-2340"]
+    assert "Stopped Claude-owned persistent deployment 'unwrap-2340' on port 8787." in result.output
+    assert "Claude is no longer durably wrapped by Headroom." in result.output
+
+
+def test_unwrap_claude_reports_ambiguous_same_port_persistent_deployment(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Manifest:
+        profile = "shared-proxy"
+        targets = ["codex"]
+        tool_envs = {"codex": {"OPENAI_BASE_URL": "http://127.0.0.1:8787"}}
+        mutations: list[object] = []
+        supervisor_kind = "service"
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: Manifest())
+
+    with patch("headroom.cli.wrap._stop_local_proxy_for_unwrap") as stop_local:
+        result = runner.invoke(
+            main,
+            ["unwrap", "claude", "--keep-mcp", "--keep-rtk", "--port", "8787"],
+        )
+
+    assert result.exit_code == 0, result.output
+    stop_local.assert_not_called()
+    assert "same-port persistent deployment 'shared-proxy' still owns port 8787" in result.output
+    assert "headroom install stop --profile shared-proxy" in result.output
+    assert "Claude is no longer durably wrapped by Headroom." not in result.output
+
+
+def test_unwrap_claude_warns_about_same_port_inherited_env(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:8787")
+
+    with patch("headroom.cli.wrap._stop_local_proxy_for_unwrap", return_value="stopped"):
+        result = runner.invoke(
+            main,
+            ["unwrap", "claude", "--keep-mcp", "--keep-rtk", "--port", "8787"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "current shell still exports ANTHROPIC_BASE_URL for port 8787" in result.output
+    assert "Claude is no longer durably wrapped by Headroom." not in result.output
+
+
+def test_unwrap_claude_ignores_malformed_inherited_env_port(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:notaport")
+
+    with patch("headroom.cli.wrap._stop_local_proxy_for_unwrap", return_value="stopped"):
+        result = runner.invoke(
+            main,
+            ["unwrap", "claude", "--keep-mcp", "--keep-rtk", "--port", "8787"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "current shell still exports ANTHROPIC_BASE_URL" not in result.output
+    assert "Claude is no longer durably wrapped by Headroom." in result.output
+
+
+def test_remove_claude_rtk_hooks_removes_init_hooks_and_env(tmp_path: Path) -> None:
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "model": "opus",
+                "env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787", "FOO": "bar"},
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "matcher": "startup|resume",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": (
+                                        "/home/u/.local/bin/headroom init hook ensure "
+                                        "--profile init-user --marker headroom-init-claude"
+                                    ),
+                                    "timeout": 15,
+                                }
+                            ],
+                        }
+                    ],
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "headroom init hook ensure --marker headroom-init-claude",
+                                },
+                                {"type": "command", "command": "echo keep-me"},
+                            ],
+                        }
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert wrap_cli._remove_claude_rtk_hooks(settings) is True
+
+    payload = json.loads(settings.read_text(encoding="utf-8"))
+    # ANTHROPIC_BASE_URL stripped; unrelated env var preserved
+    assert payload.get("env") == {"FOO": "bar"}
+    # SessionStart removed entirely (its only hook was the init marker)
+    assert "SessionStart" not in payload.get("hooks", {})
+    # PreToolUse: init-marker hook gone, unrelated hook kept
+    assert payload["hooks"]["PreToolUse"][0]["hooks"] == [
+        {"type": "command", "command": "echo keep-me"}
+    ]
+    assert payload["model"] == "opus"
+
+
+def test_remove_claude_rtk_hooks_strips_env_without_hooks(tmp_path: Path) -> None:
+    # Regression: unwrap previously returned early when no hooks existed,
+    # leaving init's ANTHROPIC_BASE_URL behind in settings.json.
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert wrap_cli._remove_claude_rtk_hooks(settings) is True
+
+    payload = json.loads(settings.read_text(encoding="utf-8"))
+    assert "env" not in payload  # emptied env dict is dropped
+
+
+def test_remove_claude_rtk_hooks_noop_when_nothing_managed(tmp_path: Path) -> None:
+    settings = tmp_path / "settings.json"
+    original = {
+        "model": "opus",
+        "env": {"FOO": "bar"},
+        "hooks": {
+            "PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": "echo hi"}]}
+            ]
+        },
+    }
+    settings.write_text(json.dumps(original) + "\n", encoding="utf-8")
+
+    assert wrap_cli._remove_claude_rtk_hooks(settings) is False
+    # nothing managed -> file untouched
+    assert json.loads(settings.read_text(encoding="utf-8")) == original
+
+
+def test_remove_claude_rtk_hooks_strips_enable_tool_search(tmp_path: Path) -> None:
+    # unwrap must remove BOTH env vars init writes (ANTHROPIC_BASE_URL +
+    # ENABLE_TOOL_SEARCH, GH #746), leaving user-set vars intact.
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
+                    "ENABLE_TOOL_SEARCH": "true",
+                    "KEEP": "1",
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert wrap_cli._remove_claude_rtk_hooks(settings) is True
+
+    payload = json.loads(settings.read_text(encoding="utf-8"))
+    assert payload["env"] == {"KEEP": "1"}

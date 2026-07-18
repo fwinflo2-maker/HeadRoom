@@ -401,7 +401,9 @@ class TestDeepseekBackendApiKeyResolution:
 
     def test_resolve_api_key_from_authorization_bearer_lowercase(self):
         backend = DeepseekBackend()
-        assert backend._resolve_api_key({"authorization": "Bearer bearer-key-lc"}) == "bearer-key-lc"
+        assert (
+            backend._resolve_api_key({"authorization": "Bearer bearer-key-lc"}) == "bearer-key-lc"
+        )
 
     def test_resolve_api_key_from_env(self):
         backend = DeepseekBackend()

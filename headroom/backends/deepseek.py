@@ -124,7 +124,13 @@ class DeepseekBackend(Backend):
         api_key = self._resolve_api_key(headers)
         if not api_key:
             return BackendResponse(
-                body={"type": "error", "error": {"type": "authentication_error", "message": "No API key provided. Set DEEPSEEK_API_KEY or pass via x-api-key / Authorization header."}},
+                body={
+                    "type": "error",
+                    "error": {
+                        "type": "authentication_error",
+                        "message": "No API key provided. Set DEEPSEEK_API_KEY or pass via x-api-key / Authorization header.",
+                    },
+                },
                 status_code=401,
                 error="No API key provided",
             )
@@ -300,7 +306,12 @@ class DeepseekBackend(Backend):
         api_key = self._resolve_api_key(headers)
         if not api_key:
             return BackendResponse(
-                body={"error": {"message": "No API key provided. Set DEEPSEEK_API_KEY or pass via x-api-key / Authorization header.", "type": "authentication_error"}},
+                body={
+                    "error": {
+                        "message": "No API key provided. Set DEEPSEEK_API_KEY or pass via x-api-key / Authorization header.",
+                        "type": "authentication_error",
+                    }
+                },
                 status_code=401,
                 error="No API key provided",
             )

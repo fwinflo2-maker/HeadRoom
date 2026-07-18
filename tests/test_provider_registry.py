@@ -12,6 +12,7 @@ from headroom.providers.registry import (
     format_backend_status,
     resolve_api_overrides,
     resolve_api_targets,
+    resolve_extra_headers,
 )
 from headroom.proxy.models import ProxyConfig
 
@@ -122,13 +123,33 @@ def test_create_proxy_backend_handles_missing_litellm_backend(caplog) -> None:
             anyllm_provider="ignored",
             bedrock_region="us-east-1",
             logger=logger,
-            litellm_backend_cls=lambda provider, region: (_ for _ in ()).throw(
+            litellm_backend_cls=lambda provider, region, profile_name=None: (_ for _ in ()).throw(
                 ImportError("missing")
             ),
         )
 
     assert missing is None
     assert "LiteLLM backend not available" in caplog.text
+
+
+def test_create_proxy_backend_logs_structured_failure_details(caplog) -> None:
+    logger = logging.getLogger("test")
+
+    with caplog.at_level(logging.ERROR):
+        missing = create_proxy_backend(
+            backend="bedrock",
+            anyllm_provider="ignored",
+            bedrock_region="us-east-1",
+            logger=logger,
+            litellm_backend_cls=lambda provider, region, profile_name=None: (_ for _ in ()).throw(
+                RuntimeError("boom")
+            ),
+        )
+
+    assert missing is None
+    assert "backend initialization failed: backend=litellm-bedrock provider=bedrock error=boom" in (
+        caplog.text
+    )
 
 
 def test_proxy_provider_runtime_loaders_cache_backend_types(monkeypatch) -> None:
@@ -147,6 +168,8 @@ def test_proxy_provider_runtime_loaders_cache_backend_types(monkeypatch) -> None
     class FakeDeepseekBackend:
         pass
 
+    original_import = __import__
+
     def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
         nonlocal anyllm_loads, litellm_loads, deepseek_loads
         if name == "headroom.backends.anyllm":
@@ -155,10 +178,12 @@ def test_proxy_provider_runtime_loaders_cache_backend_types(monkeypatch) -> None
         if name == "headroom.backends.litellm":
             litellm_loads += 1
             return type("Module", (), {"LiteLLMBackend": FakeLiteLLMBackend})()
+        if name in {"anthropic", "openai"}:
+            return type("Module", (), {})()
         if name == "headroom.backends.deepseek":
             deepseek_loads += 1
             return type("Module", (), {"DeepseekBackend": FakeDeepseekBackend})()
-        raise AssertionError(name)
+        return original_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(registry, "AnyLLMBackendType", None)
     monkeypatch.setattr(registry, "LiteLLMBackendType", None)
@@ -463,7 +488,7 @@ def test_create_proxy_backend_deepseek_falls_back_to_litellm(caplog) -> None:
     logger = logging.getLogger("test")
 
     class FakeLiteLLMBackend:
-        def __init__(self, provider, region=None):
+        def __init__(self, provider, region=None, profile_name=None):
             self.provider = provider
 
     original_loader = registry._load_deepseek_backend
@@ -498,11 +523,12 @@ def test_load_deepseek_backend_raises_when_no_sdks() -> None:
 
     # Reset the cached type so it re-checks
     registry.DeepseekBackendType = None
+    original_import = __import__
 
     def _mock_import(name, *args, **kwargs):
         if name in ("anthropic", "openai"):
             raise ImportError(f"No module named '{name}'")
-        return __import__(name, *args, **kwargs)
+        return original_import(name, *args, **kwargs)
 
     try:
         with patch("builtins.__import__", side_effect=_mock_import):
@@ -511,3 +537,35 @@ def test_load_deepseek_backend_raises_when_no_sdks() -> None:
     finally:
         registry.DeepseekBackendType = original_type
         registry._load_deepseek_backend = original_loader
+
+
+def test_resolve_extra_headers_cli_wins_over_env(monkeypatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_TARGET_API_HEADERS", '{"Env-Header": "env-value"}')
+    result = resolve_extra_headers('{"Cli-Header": "cli-value"}', "ANTHROPIC_TARGET_API_HEADERS")
+    assert result == {"Cli-Header": "cli-value"}
+
+
+def test_resolve_extra_headers_falls_back_to_env(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_TARGET_API_HEADERS", '{"Env-Header": "env-value"}')
+    result = resolve_extra_headers(None, "OPENAI_TARGET_API_HEADERS")
+    assert result == {"Env-Header": "env-value"}
+
+
+def test_resolve_extra_headers_unset_returns_none(monkeypatch) -> None:
+    monkeypatch.delenv("ANTHROPIC_TARGET_API_HEADERS", raising=False)
+    assert resolve_extra_headers(None, "ANTHROPIC_TARGET_API_HEADERS") is None
+
+
+def test_resolve_extra_headers_invalid_json_raises(monkeypatch) -> None:
+    with pytest.raises(ValueError):
+        resolve_extra_headers("not json", "ANTHROPIC_TARGET_API_HEADERS")
+
+
+def test_resolve_extra_headers_non_object_raises(monkeypatch) -> None:
+    with pytest.raises(ValueError):
+        resolve_extra_headers('["a", "b"]', "ANTHROPIC_TARGET_API_HEADERS")
+
+
+def test_resolve_extra_headers_non_string_value_raises(monkeypatch) -> None:
+    with pytest.raises(ValueError):
+        resolve_extra_headers('{"Key": 123}', "ANTHROPIC_TARGET_API_HEADERS")

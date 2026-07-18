@@ -6905,7 +6905,8 @@ class OpenAIHandlerMixin:
                             # as HTTP turns.
                             await self._record_request_outcome(
                                 RequestOutcome(
-                                    request_id=request_id,
+                                    # Per-emission ids keep dashboard request-log keys unique.
+                                    request_id=await self._next_request_id(),
                                     provider="openai",
                                     model=model_for_metrics,
                                     original_tokens=max(0, input_delta) + max(0, saved_delta),
@@ -7497,7 +7498,8 @@ class OpenAIHandlerMixin:
                     ws_messages_for_log.append({"role": "user", "content": ws_input_for_log})
                 await self._record_request_outcome(
                     RequestOutcome(
-                        request_id=request_id,
+                        # Per-emission ids keep dashboard request-log keys unique.
+                        request_id=await self._next_request_id(),
                         provider="openai",
                         model=model_name,
                         original_tokens=residual_input_tokens + residual_tokens_saved,

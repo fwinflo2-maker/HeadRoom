@@ -120,6 +120,7 @@ from headroom.providers.grok_build.config import (
     inject_grok_provider_config,
     restore_grok_provider_config,
 )
+from headroom.providers.kimi import build_launch_env as _build_kimi_launch_env
 from headroom.providers.mistral_vibe import build_launch_env as _build_mistral_vibe_launch_env
 from headroom.providers.omp import build_launch_env as _build_omp_launch_env
 from headroom.providers.omp import inject_models_override as _inject_omp_models_override
@@ -646,8 +647,42 @@ def _start_proxy(
         stdio_log_file.close()
 
 
+def _rtk_opt_in() -> bool:
+    """Whether RTK CLI-command filtering was explicitly enabled.
+
+    RTK is opt-in (off by default): turn it on with ``--rtk`` (which sets
+    ``HEADROOM_RTK=1``) or by exporting ``HEADROOM_RTK=1``. ``--no-rtk`` remains
+    accepted as a deprecated no-op.
+    """
+    return os.environ.get("HEADROOM_RTK", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _rtk_flag_callback(ctx: Any, param: Any, value: bool) -> bool:
+    """Click eager callback: ``--rtk`` sets HEADROOM_RTK so the central RTK gate
+    (:func:`_rtk_opt_in`) sees the opt-in without threading a param through every
+    wrap subcommand."""
+    if value:
+        os.environ["HEADROOM_RTK"] = "1"
+    return value
+
+
+# Shared opt-in flag applied to every ``wrap`` subcommand. ``expose_value=False``
+# so no subcommand signature changes; it works purely through HEADROOM_RTK.
+_rtk_option = click.option(
+    "--rtk",
+    is_flag=True,
+    default=False,
+    expose_value=False,
+    is_eager=True,
+    callback=_rtk_flag_callback,
+    help="Enable RTK CLI-command filtering (opt-in; off by default). Also enabled by HEADROOM_RTK=1.",
+)
+
+
 def _setup_rtk(verbose: bool = False) -> Path | None:
     """Ensure rtk is installed and hooks are registered."""
+    if not _rtk_opt_in():
+        return None
     from headroom.rtk import get_rtk_path
     from headroom.rtk.installer import ensure_rtk, register_claude_hooks
 
@@ -1832,7 +1867,7 @@ def _codex_toml_value(value: Any) -> str:
         return json.dumps(value)
     if isinstance(value, bool):
         return "true" if value else "false"
-    if isinstance(value, (int, float)):
+    if isinstance(value, int | float):
         return str(value)
     raise TypeError(f"unsupported Codex config override: {type(value).__name__}")
 
@@ -2122,6 +2157,8 @@ def _snapshot_codex_config_if_unwrapped(config_file: Path, backup_file: Path) ->
 
 def _ensure_rtk_binary(verbose: bool = False) -> Path | None:
     """Ensure rtk binary is installed (download if needed). No hook registration."""
+    if not _rtk_opt_in():
+        return None
     from headroom.rtk import get_rtk_path
     from headroom.rtk.installer import ensure_rtk
 
@@ -2692,6 +2729,8 @@ def _inject_rtk_instructions(file_path: Path, verbose: bool = False) -> bool:
     Idempotent — skips if marker already present. Appends to existing content.
     Returns True if instructions were written.
     """
+    if not _rtk_opt_in():
+        return False
     if file_path.exists():
         existing = _read_text(file_path)
         if _RTK_MARKER in existing:
@@ -3127,11 +3166,11 @@ def _kill_proxy_by_pid(pid: int, port: int) -> bool:
     """
     try:
         os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass  # Already gone
     except PermissionError:
         click.echo(f"  Warning: No permission to kill proxy PID {pid}")
         return False
+    except (ProcessLookupError, OSError, SystemError):
+        pass
 
     # Wait for port to free (up to 5 seconds)
     for _ in range(50):
@@ -3143,7 +3182,7 @@ def _kill_proxy_by_pid(pid: int, port: int) -> bool:
     try:
         _kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
         os.kill(pid, _kill_signal)
-    except (ProcessLookupError, PermissionError):
+    except (ProcessLookupError, PermissionError, OSError, SystemError):
         pass
 
     for _ in range(20):
@@ -3183,6 +3222,143 @@ def _stop_local_proxy_for_unwrap(port: int) -> str:
         return "no_pid"
 
     return "stopped" if _kill_proxy_by_pid(pid, port) else "failed"
+
+
+def _manifest_targets_claude(manifest: Any) -> bool:
+    targets = getattr(manifest, "targets", None)
+    if isinstance(targets, list) and any(
+        str(target).strip().lower() == "claude" for target in targets
+    ):
+        return True
+    tool_envs = getattr(manifest, "tool_envs", None)
+    if isinstance(tool_envs, dict) and any(
+        str(name).strip().lower() == "claude" for name in tool_envs
+    ):
+        return True
+    mutations = getattr(manifest, "mutations", None)
+    if isinstance(mutations, list):
+        for mutation in mutations:
+            if str(getattr(mutation, "target", "")).strip().lower() == "claude":
+                return True
+    return False
+
+
+def _can_unwrap_stop_persistent_manifest(manifest: Any) -> bool:
+    if not _manifest_targets_claude(manifest):
+        return False
+    supervisor_kind = str(getattr(manifest, "supervisor_kind", "")).strip().lower()
+    return supervisor_kind in {"", "none", "service"}
+
+
+def _same_port_claude_env_keys(port: int) -> list[str]:
+    matches: list[str] = []
+    for key in (
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_FOUNDRY_BASE_URL",
+        "ANTHROPIC_VERTEX_BASE_URL",
+    ):
+        raw = os.environ.get(key, "").strip()
+        if not raw:
+            continue
+        try:
+            parsed = urllib.parse.urlparse(raw)
+        except Exception:
+            continue
+        try:
+            parsed_port = parsed.port
+        except ValueError:
+            continue
+        if parsed_port != port:
+            continue
+        host = (parsed.hostname or "").strip().lower()
+        if host not in {"127.0.0.1", "localhost", "::1"}:
+            continue
+        matches.append(key)
+    return matches
+
+
+def _stop_persistent_manifest_for_claude_unwrap(manifest: Any) -> str | None:
+    from headroom.cli.install import _deactivate_deployment_mutations, _stop_deployment
+
+    try:
+        _deactivate_deployment_mutations(manifest)
+        _stop_deployment(manifest)
+        return None
+    except Exception as exc:
+        return str(exc)
+
+
+def _unwrap_claude_route_cleanup(port: int) -> dict[str, Any]:
+    manifest = _find_persistent_manifest(port)
+    env_keys = _same_port_claude_env_keys(port)
+    if manifest is not None:
+        if _can_unwrap_stop_persistent_manifest(manifest):
+            error = _stop_persistent_manifest_for_claude_unwrap(manifest)
+            if error is None:
+                return {
+                    "kind": "persistent_stopped",
+                    "manifest": manifest,
+                    "env_keys": env_keys,
+                }
+            return {
+                "kind": "persistent_failed",
+                "manifest": manifest,
+                "env_keys": env_keys,
+                "error": error,
+            }
+        return {
+            "kind": "persistent_residue",
+            "manifest": manifest,
+            "env_keys": env_keys,
+        }
+    return {
+        "kind": "local",
+        "status": _stop_local_proxy_for_unwrap(port),
+        "env_keys": env_keys,
+    }
+
+
+def _echo_claude_unwrap_route_cleanup(result: dict[str, Any], port: int) -> bool:
+    kind = str(result.get("kind") or "")
+    env_keys = [str(key) for key in result.get("env_keys", []) if isinstance(key, str)]
+    clean = True
+    if kind == "local":
+        status = str(result.get("status") or "failed")
+        _echo_unwrap_proxy_stop_status(status, port)
+        clean = status in {"stopped", "not_running"}
+    elif kind == "persistent_stopped":
+        manifest = result["manifest"]
+        click.echo(
+            f"  Stopped Claude-owned persistent deployment '{manifest.profile}' on port {port}."
+        )
+    elif kind == "persistent_residue":
+        manifest = result["manifest"]
+        click.echo(
+            "  Warning: same-port persistent deployment "
+            f"'{manifest.profile}' still owns port {port}; left it running because it is not "
+            "clearly Claude-targeted."
+        )
+        click.echo(f"  To stop it, run `headroom install stop --profile {manifest.profile}`.")
+        click.echo(
+            f"  To remove it completely, run `headroom install remove --profile {manifest.profile}`."
+        )
+        clean = False
+    elif kind == "persistent_failed":
+        manifest = result["manifest"]
+        click.echo(
+            "  Warning: failed to stop Claude-owned persistent deployment "
+            f"'{manifest.profile}' on port {port}: {result.get('error')}"
+        )
+        click.echo(f"  Retry with `headroom install stop --profile {manifest.profile}`.")
+        clean = False
+    if env_keys:
+        click.echo(
+            "  Warning: current shell still exports "
+            + ", ".join(env_keys)
+            + f" for port {port}; restart Claude and your shell or unset those variables."
+        )
+        clean = False
+    return clean
 
 
 def _echo_unwrap_proxy_stop_status(status: str, port: int) -> None:
@@ -4258,6 +4434,7 @@ def wrap_selfheal(marker: str | None) -> None:
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     # no "-p" short alias here: claude's own -p/--print must fall through to CLAUDE_ARGS
     "--port",
@@ -4385,7 +4562,12 @@ def claude(
         headroom wrap claude --no-serena        # Never register the Serena backup
         headroom wrap claude --1m               # Preserve the 1M context window
     """
-    setup_context_tool = context_tool and not no_rtk
+    # RTK/context-tool is opt-in (off by default): --context-tool (legacy) and
+    # --rtk both enable it. Mirror --context-tool into HEADROOM_RTK so the central
+    # RTK gate (_rtk_opt_in) fires for the legacy flag too.
+    if context_tool:
+        os.environ["HEADROOM_RTK"] = "1"
+    setup_context_tool = (context_tool or _rtk_opt_in()) and not no_rtk
     if prepare_only:
         if setup_context_tool:
             if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
@@ -4777,9 +4959,18 @@ def unwrap_claude(
         )
 
     click.echo()
-    click.echo("✓ Claude is no longer durably wrapped by Headroom.")
-    if not no_stop_proxy:
-        _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
+    clean_unwrap = True
+    if no_stop_proxy:
+        click.echo("  Kept proxy stop disabled (--no-stop-proxy).")
+        clean_unwrap = False
+    else:
+        clean_unwrap = _echo_claude_unwrap_route_cleanup(_unwrap_claude_route_cleanup(port), port)
+    if clean_unwrap:
+        click.echo("✓ Claude is no longer durably wrapped by Headroom.")
+    else:
+        click.echo(
+            "  Claude local wrap settings were removed, but effective routing residue remains."
+        )
     click.echo()
 
 
@@ -4789,6 +4980,7 @@ def unwrap_claude(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -5312,6 +5504,7 @@ def _run_codex_wrap(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -5430,6 +5623,7 @@ def codex(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -5534,6 +5728,7 @@ def aider(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
 @click.option(
     "--no-context-tool",
@@ -5636,6 +5831,7 @@ def openclaude(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -5710,11 +5906,100 @@ def vibe(
 
 
 # =============================================================================
+# Kimi CLI
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup (no effect for kimi)",
+)
+@click.option(
+    "--code-graph",
+    is_flag=True,
+    help="Enable code graph indexing via codebase-memory-mcp (optional)",
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option(
+    "--kimi-api-url",
+    default="https://api.kimi.com/coding/v1",
+    help="Upstream Kimi coding endpoint (default: https://api.kimi.com/coding/v1)",
+)
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("kimi_args", nargs=-1, type=click.UNPROCESSED)
+def kimi(
+    port: int,
+    no_rtk: bool,
+    code_graph: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    verbose: bool,
+    kimi_api_url: str,
+    prepare_only: bool,
+    kimi_args: tuple,
+) -> None:
+    """Launch Kimi CLI through Headroom proxy.
+
+    \b
+    Sets KIMI_BASE_URL to route Kimi's OpenAI-compatible /chat/completions
+    traffic through Headroom. Kimi's own OAuth bearer is forwarded upstream,
+    so no extra login is required — run `kimi` once to authenticate first.
+
+    \b
+    Examples:
+        headroom wrap kimi                         # Start proxy + kimi
+        headroom wrap kimi -- -m kimi-for-coding   # Pass args to kimi
+        headroom wrap kimi --port 9999             # Custom proxy port
+        headroom wrap kimi --kimi-api-url https://api.moonshot.ai/v1
+    """
+    if prepare_only:
+        return
+
+    kimi_bin = shutil.which("kimi") or shutil.which("kimi-cli")
+    if not kimi_bin:
+        click.echo("Error: 'kimi' (or 'kimi-cli') not found in PATH.")
+        click.echo("Install Kimi CLI: https://github.com/MoonshotAI/kimi-cli")
+        raise SystemExit(1)
+
+    env, env_vars_display = _build_kimi_launch_env(
+        port, os.environ, project=_project_name_from_cwd()
+    )
+
+    _launch_tool(
+        binary=kimi_bin,
+        args=kimi_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="KIMI",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="kimi",
+        code_graph=code_graph,
+        openai_api_url=kimi_api_url,
+    )
+
+
+# =============================================================================
 # Grok CLI
 # =============================================================================
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -5858,6 +6143,7 @@ def grok(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -5964,6 +6250,7 @@ def cursor(
 
 
 @wrap.command("grok-build", context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -6060,6 +6347,7 @@ def grok_build(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -6162,6 +6450,7 @@ def cline(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -6257,6 +6546,7 @@ def zcode(
 
 
 @wrap.command("continue", context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -6381,6 +6671,7 @@ def continue_dev(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -6506,6 +6797,7 @@ def goose(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -6649,6 +6941,7 @@ def openhands(
 
 
 @wrap.command("openclaw")
+@_rtk_option
 @click.option(
     "--plugin-path",
     type=click.Path(path_type=Path, file_okay=False, dir_okay=True),
@@ -6890,6 +7183,7 @@ def openclaw(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -7414,6 +7708,7 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )

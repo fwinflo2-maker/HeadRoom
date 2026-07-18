@@ -1609,10 +1609,28 @@ class OpenAIHandlerMixin:
                     # Protected from lossy compression — but grep/log/json output
                     # can still be losslessly compacted. Reuse the router helper
                     # so the Responses path matches the chat/Anthropic behavior.
-                    excl_out = _responses_part_text(item.get("output"))
-                    fold = router._lossless_compact_excluded(excl_out) if excl_out else None
-                    if fold is not None:
-                        lossless_excluded.append((idx, ("output", None), fold[0], excl_out))
+                    # Note: when output is a content-part array, fold each text part
+                    # individually using ("output_part", index) slots to preserve the
+                    # array structure (non-text parts like images are left untouched).
+                    raw_output = item.get("output")
+                    if isinstance(raw_output, list):
+                        for pidx, part in enumerate(raw_output):
+                            if (
+                                isinstance(part, dict)
+                                and part.get("type") in {"input_text", "output_text"}
+                                and isinstance(part.get("text"), str)
+                            ):
+                                part_text = part["text"]
+                                pf = router._lossless_compact_excluded(part_text)
+                                if pf is not None:
+                                    lossless_excluded.append(
+                                        (idx, ("output_part", pidx), pf[0], part_text)
+                                    )
+                    else:
+                        excl_out = _responses_part_text(raw_output)
+                        fold = router._lossless_compact_excluded(excl_out) if excl_out else None
+                        if fold is not None:
+                            lossless_excluded.append((idx, ("output", None), fold[0], excl_out))
                     if debug_enabled:
                         extraction_debug.append(
                             {
@@ -3342,6 +3360,63 @@ class OpenAIHandlerMixin:
         # those requests work unchanged. No-op when the caller already set
         # `max_completion_tokens`.
         _normalize_openai_max_tokens(body)
+
+        # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER): verbosity steering
+        # on the chat system message. Runs after every other body mutation so the
+        # turn classifier sees the final messages, and respects the same bypass
+        # as compression. OpenAI-compatible clients that route through
+        # /v1/chat/completions (GitHub Copilot CLI, opencode, older SDKs) never
+        # reached the shaper before, so they saw zero output savings (#2302).
+        # Mutating `body` in place is sufficient here — the outbound request
+        # serializes `body` fresh, so no body-mutation tracker is needed.
+        if not _bypass:
+            from headroom.proxy import runtime_env
+            from headroom.proxy.output_savings import (
+                assign_arm,
+                conversation_key_from_body,
+                stratum_key,
+                stratum_label,
+            )
+            from headroom.proxy.output_shaper import (
+                OutputShaperSettings,
+                classify_turn,
+                resolve_verbosity_level,
+                shape_openai_chat_request,
+            )
+
+            _shaper_settings = OutputShaperSettings.from_env()
+            if _shaper_settings.enabled:
+                # Conversation-stable holdout: a whole conversation is treatment
+                # or control, which keeps the A/B comparison clean and the
+                # provider prefix cache stable (the steering block never flips
+                # mid-conversation).
+                _holdout = 0.0
+                try:
+                    _holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
+                except ValueError:
+                    _holdout = 0.0
+                _arm = assign_arm(conversation_key_from_body(body), _holdout)
+                _turn_kind = classify_turn(body.get("messages", [])).value
+                _stratum = stratum_key(
+                    turn_kind=_turn_kind,
+                    input_tokens=original_tokens,
+                    model=model,
+                    has_tools=bool(body.get("tools")),
+                )
+                # Carry (arm, stratum) on the transforms channel so the outcome
+                # funnel feeds the output-savings ledger from the chat path too.
+                transforms_applied.append(stratum_label(_arm, _stratum))
+                if _arm == "treatment":
+                    _level, _src = resolve_verbosity_level(_shaper_settings)
+                    _shape_result = shape_openai_chat_request(
+                        body, _shaper_settings, level_override=_level
+                    )
+                    if _shape_result.changed:
+                        transforms_applied.extend(_shape_result.labels or [])
+                        logger.info(
+                            f"[{request_id}] OutputShaper(chat, L{_level}/{_src}): "
+                            f"{_shape_result.labels}"
+                        )
 
         # Route through LiteLLM/any-llm backend if configured
         if self.anthropic_backend is not None:

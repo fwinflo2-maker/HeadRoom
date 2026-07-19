@@ -142,6 +142,8 @@ class RequestOutcome:
     tags: dict[str, str] = field(default_factory=dict)
     client: str | None = None
     project: str | None = None
+    # Upstream cost explicitly supplied by provider response (USD), if any.
+    provider_cost_usd: float | None = None
 
     # ── Derived (computed once, no caching needed — properties are cheap) ─
 
@@ -425,6 +427,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             cache_write_1h_tokens=outcome.cache_write_1h_tokens,
             uncached_tokens=outcome.uncached_input_tokens,
             output_tokens=outcome.output_tokens,
+            provider_cost_usd=outcome.provider_cost_usd,
         )
 
     # 3. Per-request log (optional). The ``client`` outcome field is

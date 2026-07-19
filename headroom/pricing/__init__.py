@@ -34,6 +34,7 @@ from .openai_prices import (
     OPENAI_PRICES,
     get_openai_registry,
 )
+from .calculator import CostCalculator
 from .registry import CostEstimate, ModelPricing, PricingRegistry
 
 __all__ = [
@@ -44,6 +45,7 @@ __all__ = [
     "get_model_pricing",
     "list_available_models",
     # Core classes
+    "CostCalculator",
     "CostEstimate",
     "ModelPricing",
     "PricingRegistry",

@@ -651,9 +651,27 @@ class CostTracker:
     # get_period_cost() undercounts and check_budget() silently under-enforces.
     COST_RETENTION_HOURS = 744  # 31 days
 
-    def __init__(self, budget_limit_usd: float | None = None, budget_period: str = "daily"):
+    def __init__(
+        self,
+        budget_limit_usd: float | None = None,
+        budget_period: str = "daily",
+        custom_pricing: dict | PricingRegistry | None = None,
+        cost_fallback_enabled: bool = True,
+    ):
         self.budget_limit_usd = budget_limit_usd
         self.budget_period = budget_period
+        self.cost_fallback_enabled = cost_fallback_enabled
+
+        from headroom.pricing.calculator import CostCalculator
+        from headroom.pricing.registry import PricingRegistry
+
+        custom_registry = None
+        if isinstance(custom_pricing, PricingRegistry):
+            custom_registry = custom_pricing
+        elif isinstance(custom_pricing, dict):
+            custom_registry = PricingRegistry.from_dict(custom_pricing)
+
+        self.calculator = CostCalculator(custom_registry=custom_registry)
 
         # Cost tracking - using deque for efficient left-side removal
         self._costs: deque[tuple[datetime, float]] = deque(maxlen=self.MAX_COST_ENTRIES)
@@ -670,6 +688,17 @@ class CostTracker:
         self._api_cache_write_5m_by_model: dict[str, int] = {}
         self._api_cache_write_1h_by_model: dict[str, int] = {}
         self._api_uncached_by_model: dict[str, int] = {}
+
+    def set_custom_pricing(self, custom_pricing: dict | PricingRegistry | None) -> None:
+        """Update the custom model pricing registry used by CostTracker."""
+        from headroom.pricing.registry import PricingRegistry
+
+        if isinstance(custom_pricing, PricingRegistry):
+            self.calculator.set_custom_registry(custom_pricing)
+        elif isinstance(custom_pricing, dict):
+            self.calculator.set_custom_registry(PricingRegistry.from_dict(custom_pricing))
+        else:
+            self.calculator.set_custom_registry(None)
 
     def reset_runtime(self) -> None:
         """Reset in-memory cost/token counters for local test/debug use."""
@@ -691,11 +720,9 @@ class CostTracker:
         output_tokens: int,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
+        provider_cost_usd: float | None = None,
     ) -> float | None:
-        """Estimate cost in USD using LiteLLM's pricing database.
-
-        LiteLLM natively handles cache_read and cache_creation pricing
-        for all providers (Anthropic, OpenAI, Google, etc.) in a single call.
+        """Estimate cost in USD using CostCalculator (Provider -> Custom Pricing -> LiteLLM).
 
         Args:
             model: Model name for pricing lookup
@@ -703,33 +730,16 @@ class CostTracker:
             output_tokens: Output tokens
             cache_read_tokens: Tokens served from cache (~10% of input rate)
             cache_write_tokens: Tokens written to cache (~125% of input rate)
+            provider_cost_usd: Explicit cost returned by provider response, if any
         """
-        litellm = _get_litellm_module()
-        if litellm is None:
-            logger.warning("LiteLLM not available - cannot calculate costs")
-            return None
-
-        try:
-            from headroom.pricing.litellm_pricing import resolve_litellm_model
-
-            resolved_model = resolve_litellm_model(model)
-
-            # litellm.cost_per_token handles all token types natively:
-            # prompt_tokens at input rate, cache_read at ~10%, cache_creation at ~125%
-            input_cost, output_cost = litellm.cost_per_token(
-                model=resolved_model,
-                prompt_tokens=input_tokens,
-                completion_tokens=output_tokens,
-                cache_read_input_tokens=cache_read_tokens,
-                cache_creation_input_tokens=cache_write_tokens,
-            )
-
-            total_cost = input_cost + output_cost
-            return float(total_cost) if total_cost > 0 else None
-
-        except Exception as e:
-            logger.warning(f"Failed to get pricing for model {model}: {e}")
-            return None
+        return self.calculator.calculate_request_cost(
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            provider_cost_usd=provider_cost_usd,
+        )
 
     def _prune_old_costs(self):
         """Remove cost entries older than retention period.
@@ -761,6 +771,7 @@ class CostTracker:
         cache_write_1h_tokens: int = 0,
         uncached_tokens: int = 0,
         output_tokens: int = 0,
+        provider_cost_usd: float | None = None,
     ):
         """Record token counts per model and accumulate request cost for budget enforcement.
 
@@ -772,6 +783,7 @@ class CostTracker:
             cache_write_tokens: Cache write tokens from API response usage.
             uncached_tokens: Non-cached input tokens from API response usage.
             output_tokens: Output tokens from API response usage.
+            provider_cost_usd: Upstream cost supplied by provider response, if any.
         """
         # Post-guard invariant (all providers): Headroom never forwards a request
         # larger than the original (handlers revert any inflation before sending),
@@ -820,6 +832,7 @@ class CostTracker:
             output_tokens=output_tokens,
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens,
+            provider_cost_usd=provider_cost_usd,
         )
         if cost is not None:
             self._costs.append((datetime.now(), cost))
@@ -849,6 +862,11 @@ class CostTracker:
 
     def _get_list_price(self, model: str) -> float | None:
         """Get list input price per 1M tokens for a model."""
+        if self.calculator.custom_registry is not None:
+            pricing = self.calculator.custom_registry.get_price(model)
+            if pricing is not None:
+                return pricing.input_per_1m
+
         litellm = _get_litellm_module()
         if litellm is None:
             return None
@@ -866,8 +884,20 @@ class CostTracker:
         """Get per-token prices for cache read, cache write, and uncached input.
 
         Returns (cache_read, cache_write, uncached) per-token costs, or None
-        if pricing is unavailable. Uses LiteLLM's native cache pricing data.
+        if pricing is unavailable.
         """
+        if self.calculator.custom_registry is not None:
+            pricing = self.calculator.custom_registry.get_price(model)
+            if pricing is not None:
+                uncached = pricing.input_per_1m / 1_000_000
+                cache_read = (
+                    (pricing.cached_input_per_1m / 1_000_000)
+                    if pricing.cached_input_per_1m is not None
+                    else uncached
+                )
+                cache_write = uncached
+                return (cache_read, cache_write, uncached)
+
         litellm = _get_litellm_module()
         if litellm is None:
             return None

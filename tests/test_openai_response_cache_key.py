@@ -1,11 +1,14 @@
-"""Response-cache key drift on the OpenAI chat path (parity with #2124 / #327).
+"""OpenAI chat response cache must key on the looked-up messages, not the
+``pre_compress``-mutated ones (parity with #2124 / #327).
 
-`handle_openai_chat` looks the response cache up with `messages` at `cache.get`,
-then the `pre_compress` hook reassigns `messages` before `cache.set`. Caching the
-response under the live (hooked) `messages` stores it under a key no future
-lookup can produce, so the response cache never hits and fills with unreachable
-entries. This is the OpenAI twin of the anthropic fix pinned by
-``tests/test_anthropic_pre_upstream_backpressure.py`` (#2124).
+Companion to ``test_proxy_openai_cache_key_integration.py``: same real-cache +
+upstream-call-counting idiom, applied to the ``pre_compress`` mutation hazard
+instead of a missing ``cache_key_fields`` entry. ``cache.get`` runs before the
+``pre_compress`` hook reassigns ``messages``; caching the response under the live
+(mutated) ``messages`` would store it under a key the next lookup can't produce,
+so an identical repeat would never hit. Driving the real ``SemanticCache`` and
+counting upstream calls proves the actual cache hit — a get/set-argument check
+cannot, because it never runs ``_compute_key``.
 
 The drift only fires when a message-rewriting ``pre_compress`` hook is configured
 (a non-default deployment extension point); OSS default hooks are no-ops.
@@ -13,93 +16,87 @@ The drift only fires when a message-rewriting ``pre_compress`` hook is configure
 
 from __future__ import annotations
 
-import copy
-import json
-from typing import Any
-
+import httpx
 import pytest
 
-fastapi = pytest.importorskip("fastapi")
+pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
 from headroom.hooks import CompressionHooks  # noqa: E402
-from headroom.proxy import semantic_cache as semantic_cache_mod  # noqa: E402
-from headroom.proxy import server as server_mod  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
 
 class _MutatingHooks(CompressionHooks):
     """A deployment-provided ``pre_compress`` hook that rewrites history (the
-    kind of cross-turn dedup / memory injection / redaction the hook exists for).
-
-    It returns a NEW list — the documented contract (``hooks.py`` "Modify and
-    return") and what the handler relies on (``messages = pre_compress(...)``) —
-    reproducing the get -> mutate -> set key drift.
+    cross-turn dedup / memory injection / redaction the hook exists for). It
+    returns a NEW list — the documented contract (``hooks.py`` "Modify and
+    return") and what the handler relies on — reproducing the
+    get -> mutate -> set key drift.
     """
 
     def pre_compress(self, messages, ctx):
         return [dict(m, content="MUTATED") for m in messages]
 
 
-class _ResponseStub:
-    """Minimal stand-in for the upstream httpx response on the direct
-    (non-backend) non-streaming OpenAI chat path."""
-
-    status_code = 200
-    headers = {"content-type": "application/json"}
-    content = (
-        b'{"id":"chatcmpl-1","object":"chat.completion",'
-        b'"choices":[{"index":0,"message":{"role":"assistant","content":"hi"},'
-        b'"finish_reason":"stop"}],'
-        b'"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}'
-    )
-
-    def json(self) -> dict[str, Any]:
-        return json.loads(self.content)
+def _content(response: httpx.Response) -> str:
+    return response.json()["choices"][0]["message"]["content"]
 
 
-def test_openai_chat_response_cache_keys_on_lookup_messages_not_mutated(monkeypatch):
-    """The OpenAI response must be cached under the same messages it was looked
-    up by. ``messages`` is reassigned by the ``pre_compress`` hook after the
-    ``cache.get``; caching under the live value stores the entry under a
-    different key than it was read by, so the cache never hits.
+def test_openai_chat_cache_hits_repeat_request_despite_pre_compress_mutation() -> None:
+    """An identical repeat request must be served from cache, not re-sent
+    upstream, even when a ``pre_compress`` hook rewrites ``messages`` between the
+    cache lookup and the cache store.
     """
-    captured: dict[str, Any] = {"get": None, "set": None}
-
-    async def _recording_get(self, messages, model, *args, **kwargs):
-        captured["get"] = copy.deepcopy(messages)
-        return None  # force a miss so the upstream response gets cached
-
-    async def _recording_set(self, messages, model, *args, **kwargs):
-        captured["set"] = copy.deepcopy(messages)
-
-    async def _fake_retry_request(self, method, url, headers, body, *args, **kwargs):
-        return _ResponseStub()
-
-    monkeypatch.setattr(semantic_cache_mod.SemanticCache, "get", _recording_get)
-    monkeypatch.setattr(semantic_cache_mod.SemanticCache, "set", _recording_set)
-    monkeypatch.setattr(server_mod.HeadroomProxy, "_retry_request", _fake_retry_request)
+    calls = {"n": 0}
 
     config = ProxyConfig(
         optimize=False,
         cache_enabled=True,
         rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
         hooks=_MutatingHooks(),
     )
+    with TestClient(create_app(config)) as client:
+        proxy = client.app.state.proxy
 
-    app = create_app(config)
-    with TestClient(app) as client:
-        resp = client.post(
-            "/v1/chat/completions",
-            json={"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]},
-            headers={"Authorization": "Bearer sk-test"},
-        )
-        assert resp.status_code == 200, resp.text[:300]
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            calls["n"] += 1
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl_1",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": f"resp-{calls['n']}"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+                },
+            )
 
-    assert captured["get"] is not None, "cache.get was not called"
-    assert captured["set"] is not None, "cache.set was not called"
-    # Same messages at get and set -> same key -> the cache can actually hit.
-    assert captured["set"] == captured["get"]
-    # And specifically the raw lookup messages, not the hook's rewrite.
-    assert captured["set"][0]["content"] == "hello"
+        proxy._retry_request = _fake_retry
+        headers = {"authorization": "Bearer sk-test"}
+        body = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}
+
+        # First request: cache miss -> upstream call 1, response cached.
+        r1 = client.post("/v1/chat/completions", headers=headers, json=body)
+        assert r1.status_code == 200
+        assert _content(r1) == "resp-1"
+        assert calls["n"] == 1
+
+        # Identical repeat: must be served from cache under the looked-up key,
+        # NOT re-sent upstream. Pre-fix the response was stored under the
+        # hook-mutated key, so this lookup missed and calls climbed to 2.
+        r2 = client.post("/v1/chat/completions", headers=headers, json=body)
+        assert r2.status_code == 200
+        assert _content(r2) == "resp-1"
+        assert calls["n"] == 1

@@ -13,6 +13,7 @@ from .anthropic_prices import (
 from .anthropic_prices import (
     LAST_UPDATED as ANTHROPIC_LAST_UPDATED,
 )
+from .calculator import CostCalculator
 from .deepseek_prices import (
     DEEPSEEK_PRICES,
     get_deepseek_registry,
@@ -44,6 +45,7 @@ __all__ = [
     "get_model_pricing",
     "list_available_models",
     # Core classes
+    "CostCalculator",
     "CostEstimate",
     "ModelPricing",
     "PricingRegistry",

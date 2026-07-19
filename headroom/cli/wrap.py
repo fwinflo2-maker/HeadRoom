@@ -647,8 +647,105 @@ def _start_proxy(
         stdio_log_file.close()
 
 
+def _rtk_opt_in() -> bool:
+    """Whether RTK CLI-command filtering was explicitly enabled.
+
+    RTK is opt-in (off by default): turn it on with ``--rtk`` (which sets
+    ``HEADROOM_RTK=1``) or by exporting ``HEADROOM_RTK=1``. ``--no-rtk`` remains
+    accepted as a deprecated no-op.
+    """
+    return os.environ.get("HEADROOM_RTK", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _rtk_flag_callback(ctx: Any, param: Any, value: bool) -> bool:
+    """Click eager callback: ``--rtk`` sets HEADROOM_RTK so the central RTK gate
+    (:func:`_rtk_opt_in`) sees the opt-in without threading a param through every
+    wrap subcommand."""
+    if value:
+        os.environ["HEADROOM_RTK"] = "1"
+    return value
+
+
+# Shared opt-in flag applied to every ``wrap`` subcommand. ``expose_value=False``
+# so no subcommand signature changes; it works purely through HEADROOM_RTK.
+_rtk_option = click.option(
+    "--rtk",
+    is_flag=True,
+    default=False,
+    expose_value=False,
+    is_eager=True,
+    callback=_rtk_flag_callback,
+    help="Enable RTK CLI-command filtering (opt-in; off by default). Also enabled by HEADROOM_RTK=1.",
+)
+
+
+# --- Code-memory MCP selection ------------------------------------------------
+# The code-memory MCP is on by default (tokensave). Swap it with --code-memory
+# serena, or turn it off with --code-memory none. Selection flows through
+# HEADROOM_CODE_MEMORY (set by the eager --code-memory callback) so it works the
+# same on every agent without threading a param through each subcommand — the
+# same approach as _rtk_option above.
+_CODE_MEMORY_ENV = "HEADROOM_CODE_MEMORY"
+_CODE_MEMORY_TOKENSAVE = "tokensave"
+_CODE_MEMORY_SERENA = "serena"
+_CODE_MEMORY_NONE = "none"
+_VALID_CODE_MEMORY = {_CODE_MEMORY_TOKENSAVE, _CODE_MEMORY_SERENA, _CODE_MEMORY_NONE}
+
+
+def _resolve_code_memory(kwargs: dict[str, Any]) -> str:
+    """Resolve which code-memory MCP to register.
+
+    Precedence: the explicit selector (``--code-memory`` / ``HEADROOM_CODE_MEMORY``)
+    wins; otherwise the deprecated ``--serena`` / ``--no-tokensave`` / ``--no-serena``
+    flags map into it; otherwise the default is ``serena`` — mature, offline,
+    symbol-level code navigation (tokensave is a lighter opt-in).
+    """
+    env = os.environ.get(_CODE_MEMORY_ENV, "").strip().lower()
+    if env:
+        if env not in _VALID_CODE_MEMORY:
+            raise click.ClickException(
+                f"{_CODE_MEMORY_ENV} must be one of: {', '.join(sorted(_VALID_CODE_MEMORY))}"
+            )
+        return env
+    if kwargs.get("serena"):
+        return _CODE_MEMORY_SERENA
+    if kwargs.get("no_tokensave"):
+        return _CODE_MEMORY_NONE if kwargs.get("no_serena") else _CODE_MEMORY_SERENA
+    if kwargs.get("no_serena"):
+        return _CODE_MEMORY_TOKENSAVE
+    return _CODE_MEMORY_SERENA
+
+
+def _code_memory_flag_callback(ctx: Any, param: Any, value: str | None) -> str | None:
+    """Click eager callback: ``--code-memory X`` sets HEADROOM_CODE_MEMORY so the
+    central resolver (:func:`_resolve_code_memory`) sees the choice without
+    threading a param through every wrap subcommand."""
+    if value:
+        os.environ[_CODE_MEMORY_ENV] = value
+    return value
+
+
+# Shared selector applied to code-memory-capable subcommands (claude/codex/grok).
+# ``expose_value=False`` so no subcommand signature changes; it flows purely
+# through HEADROOM_CODE_MEMORY.
+_code_memory_option = click.option(
+    "--code-memory",
+    type=click.Choice([_CODE_MEMORY_TOKENSAVE, _CODE_MEMORY_SERENA, _CODE_MEMORY_NONE]),
+    default=None,
+    expose_value=False,
+    is_eager=True,
+    callback=_code_memory_flag_callback,
+    help=(
+        "Code-memory MCP to register: 'serena' (default), 'tokensave', or 'none'. "
+        "Also set by HEADROOM_CODE_MEMORY. Replaces --serena/--no-serena/--no-tokensave."
+    ),
+)
+
+
 def _setup_rtk(verbose: bool = False) -> Path | None:
     """Ensure rtk is installed and hooks are registered."""
+    if not _rtk_opt_in():
+        return None
     from headroom.rtk import get_rtk_path
     from headroom.rtk.installer import ensure_rtk, register_claude_hooks
 
@@ -1398,6 +1495,44 @@ def _setup_headroom_mcp(
         click.echo(line)
 
 
+def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
+    """Disable Serena's browser dashboard auto-open in ``~/.serena/serena_config.yml``.
+
+    Serena opens its web dashboard in a browser tab on launch by default
+    (``web_dashboard_open_on_launch: true``). Since Headroom now registers Serena
+    as the default code-memory MCP, flip that setting off so wrapped sessions
+    don't spawn a browser tab. The dashboard backend still runs and stays
+    reachable at http://localhost:24282/dashboard/. The setting lives in Serena's
+    own config (authoritative, unlike a startup flag); other keys and comments are
+    preserved via a targeted line edit rather than a YAML rewrite.
+    """
+    import re
+
+    cfg = Path.home() / ".serena" / "serena_config.yml"
+    key = "web_dashboard_open_on_launch"
+    try:
+        if cfg.exists():
+            text = cfg.read_text(encoding="utf-8")
+            pattern = re.compile(rf"^(\s*){re.escape(key)}:\s*\S+\s*$", re.MULTILINE)
+            if pattern.search(text):
+                new = pattern.sub(rf"\g<1>{key}: false", text)
+            else:
+                new = text.rstrip("\n") + f"\n{key}: false\n"
+            if new != text:
+                cfg.write_text(new, encoding="utf-8")
+                if verbose:
+                    click.echo("  Serena: disabled dashboard browser auto-open (serena_config.yml)")
+        else:
+            cfg.parent.mkdir(parents=True, exist_ok=True)
+            # Serena fills defaults for any keys we omit, so a single-key file is valid.
+            cfg.write_text(f"{key}: false\n", encoding="utf-8")
+            if verbose:
+                click.echo("  Serena: created serena_config.yml with dashboard auto-open off")
+    except OSError as e:
+        if verbose:
+            click.echo(f"  Serena: could not update serena_config.yml ({e})")
+
+
 def _setup_serena_mcp(
     registrar: Any, *, context: str, verbose: bool = False, force: bool = False
 ) -> None:
@@ -1425,6 +1560,9 @@ def _setup_serena_mcp(
     if shutil.which("uvx") is None:
         click.echo("  Serena MCP: uvx not found — install uv/uvx to enable Serena; skipping")
         return
+
+    # Serena is a real launch now — make sure it won't pop a browser tab.
+    _ensure_serena_dashboard_disabled(verbose=verbose)
 
     spec = build_serena_spec(context)
     result = registrar.register_server(spec, force=force)
@@ -1665,38 +1803,45 @@ def _disable_tokensave_mcp(registrar: Any, *, verbose: bool = False) -> None:
 
 
 def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: Any) -> None:
-    """Set up the coding-task compressor: tokensave primary, Serena backup.
+    """Set up the code-memory MCP, selected via ``--code-memory`` (default serena).
 
-    Policy (decided per the integration):
+    Selection (see :func:`_resolve_code_memory`):
 
-    * ``no_tokensave`` — skip/disable tokensave entirely.
-    * tokensave is set up by default; on success it becomes the primary
-      compressor and any Headroom-installed Serena entry is removed.
-    * Serena is the backup: registered automatically when tokensave is
-      unavailable (unless ``no_serena``), or forced on with ``serena=True``.
+    * ``serena`` (default) — register Serena and remove any Headroom-installed
+      tokensave. Serena is mature, offline, and symbol-level.
+    * ``tokensave`` — register tokensave (lighter/faster); Serena is registered
+      automatically only as a backup when tokensave is unavailable (unless the
+      deprecated ``--no-serena`` suppressed the fallback).
+    * ``none`` — remove both Headroom-installed entries.
 
-    ``kwargs`` carries the boolean flags ``serena``, ``no_serena``,
-    ``no_tokensave`` and the per-agent registrar ``force`` semantics.
+    Deprecated ``--serena`` / ``--no-serena`` / ``--no-tokensave`` flags map into
+    the selector. User-managed MCP entries are always left untouched (ledger).
     """
-    serena = bool(kwargs.get("serena"))
-    no_serena = bool(kwargs.get("no_serena"))
-    no_tokensave = bool(kwargs.get("no_tokensave"))
     force = bool(kwargs.get("force"))
     verbose = bool(kwargs.get("verbose"))
+    selection = _resolve_code_memory(kwargs)
+    # Deprecated --no-serena: in tokensave mode, don't auto-fall back to Serena.
+    suppress_serena_fallback = bool(kwargs.get("no_serena"))
 
-    tokensave_ok = False
-    if no_tokensave:
+    if selection == _CODE_MEMORY_NONE:
         _disable_tokensave_mcp(registrar, verbose=verbose)
-    else:
-        tokensave_ok = _setup_tokensave_mcp(registrar, verbose=verbose, force=force)
+        _disable_serena_mcp(registrar, verbose=verbose, reason="--code-memory none")
+        return
 
-    if serena or (not tokensave_ok and not no_serena):
+    if selection == _CODE_MEMORY_SERENA:
+        _disable_tokensave_mcp(registrar, verbose=verbose)
+        _setup_serena_mcp(registrar, context=serena_context, verbose=verbose, force=force)
+        return
+
+    # tokensave (explicit opt-in): register it; Serena is the automatic backup.
+    tokensave_ok = _setup_tokensave_mcp(registrar, verbose=verbose, force=force)
+    if not tokensave_ok and not suppress_serena_fallback:
         _setup_serena_mcp(registrar, context=serena_context, verbose=verbose, force=force)
     else:
-        # tokensave is primary (or Serena was explicitly disabled): drop any
-        # Serena entry a prior wrap installed; user-managed entries are kept.
         reason = (
-            "--no-serena" if no_serena else "tokensave is now the primary code-graph compressor"
+            "--no-serena"
+            if suppress_serena_fallback
+            else "tokensave is the primary code-graph compressor"
         )
         _disable_serena_mcp(registrar, verbose=verbose, reason=reason)
 
@@ -1838,8 +1983,21 @@ def _codex_toml_value(value: Any) -> str:
     raise TypeError(f"unsupported Codex config override: {type(value).__name__}")
 
 
+_CODEX_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
 def _codex_dotted_key(*parts: str) -> str:
-    return ".".join(json.dumps(part) for part in parts)
+    """Dotted ``--config`` key with segments bare wherever possible.
+
+    Codex's override parser (observed on 0.144.x) matches dotted segments
+    literally and silently ignores quoted ones, so quoting every segment made
+    the whole override a no-op and traffic bypassed the proxy (#2358). Quote
+    only segments that are not valid TOML bare keys (e.g. a provider name
+    containing a dot), where bare emission would corrupt the path.
+    """
+    return ".".join(
+        part if _CODEX_BARE_KEY_RE.fullmatch(part) else json.dumps(part) for part in parts
+    )
 
 
 def _codex_session_launch_settings(
@@ -2123,6 +2281,8 @@ def _snapshot_codex_config_if_unwrapped(config_file: Path, backup_file: Path) ->
 
 def _ensure_rtk_binary(verbose: bool = False) -> Path | None:
     """Ensure rtk binary is installed (download if needed). No hook registration."""
+    if not _rtk_opt_in():
+        return None
     from headroom.rtk import get_rtk_path
     from headroom.rtk.installer import ensure_rtk
 
@@ -2693,6 +2853,8 @@ def _inject_rtk_instructions(file_path: Path, verbose: bool = False) -> bool:
     Idempotent — skips if marker already present. Appends to existing content.
     Returns True if instructions were written.
     """
+    if not _rtk_opt_in():
+        return False
     if file_path.exists():
         existing = _read_text(file_path)
         if _RTK_MARKER in existing:
@@ -3184,6 +3346,143 @@ def _stop_local_proxy_for_unwrap(port: int) -> str:
         return "no_pid"
 
     return "stopped" if _kill_proxy_by_pid(pid, port) else "failed"
+
+
+def _manifest_targets_claude(manifest: Any) -> bool:
+    targets = getattr(manifest, "targets", None)
+    if isinstance(targets, list) and any(
+        str(target).strip().lower() == "claude" for target in targets
+    ):
+        return True
+    tool_envs = getattr(manifest, "tool_envs", None)
+    if isinstance(tool_envs, dict) and any(
+        str(name).strip().lower() == "claude" for name in tool_envs
+    ):
+        return True
+    mutations = getattr(manifest, "mutations", None)
+    if isinstance(mutations, list):
+        for mutation in mutations:
+            if str(getattr(mutation, "target", "")).strip().lower() == "claude":
+                return True
+    return False
+
+
+def _can_unwrap_stop_persistent_manifest(manifest: Any) -> bool:
+    if not _manifest_targets_claude(manifest):
+        return False
+    supervisor_kind = str(getattr(manifest, "supervisor_kind", "")).strip().lower()
+    return supervisor_kind in {"", "none", "service"}
+
+
+def _same_port_claude_env_keys(port: int) -> list[str]:
+    matches: list[str] = []
+    for key in (
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_FOUNDRY_BASE_URL",
+        "ANTHROPIC_VERTEX_BASE_URL",
+    ):
+        raw = os.environ.get(key, "").strip()
+        if not raw:
+            continue
+        try:
+            parsed = urllib.parse.urlparse(raw)
+        except Exception:
+            continue
+        try:
+            parsed_port = parsed.port
+        except ValueError:
+            continue
+        if parsed_port != port:
+            continue
+        host = (parsed.hostname or "").strip().lower()
+        if host not in {"127.0.0.1", "localhost", "::1"}:
+            continue
+        matches.append(key)
+    return matches
+
+
+def _stop_persistent_manifest_for_claude_unwrap(manifest: Any) -> str | None:
+    from headroom.cli.install import _deactivate_deployment_mutations, _stop_deployment
+
+    try:
+        _deactivate_deployment_mutations(manifest)
+        _stop_deployment(manifest)
+        return None
+    except Exception as exc:
+        return str(exc)
+
+
+def _unwrap_claude_route_cleanup(port: int) -> dict[str, Any]:
+    manifest = _find_persistent_manifest(port)
+    env_keys = _same_port_claude_env_keys(port)
+    if manifest is not None:
+        if _can_unwrap_stop_persistent_manifest(manifest):
+            error = _stop_persistent_manifest_for_claude_unwrap(manifest)
+            if error is None:
+                return {
+                    "kind": "persistent_stopped",
+                    "manifest": manifest,
+                    "env_keys": env_keys,
+                }
+            return {
+                "kind": "persistent_failed",
+                "manifest": manifest,
+                "env_keys": env_keys,
+                "error": error,
+            }
+        return {
+            "kind": "persistent_residue",
+            "manifest": manifest,
+            "env_keys": env_keys,
+        }
+    return {
+        "kind": "local",
+        "status": _stop_local_proxy_for_unwrap(port),
+        "env_keys": env_keys,
+    }
+
+
+def _echo_claude_unwrap_route_cleanup(result: dict[str, Any], port: int) -> bool:
+    kind = str(result.get("kind") or "")
+    env_keys = [str(key) for key in result.get("env_keys", []) if isinstance(key, str)]
+    clean = True
+    if kind == "local":
+        status = str(result.get("status") or "failed")
+        _echo_unwrap_proxy_stop_status(status, port)
+        clean = status in {"stopped", "not_running"}
+    elif kind == "persistent_stopped":
+        manifest = result["manifest"]
+        click.echo(
+            f"  Stopped Claude-owned persistent deployment '{manifest.profile}' on port {port}."
+        )
+    elif kind == "persistent_residue":
+        manifest = result["manifest"]
+        click.echo(
+            "  Warning: same-port persistent deployment "
+            f"'{manifest.profile}' still owns port {port}; left it running because it is not "
+            "clearly Claude-targeted."
+        )
+        click.echo(f"  To stop it, run `headroom install stop --profile {manifest.profile}`.")
+        click.echo(
+            f"  To remove it completely, run `headroom install remove --profile {manifest.profile}`."
+        )
+        clean = False
+    elif kind == "persistent_failed":
+        manifest = result["manifest"]
+        click.echo(
+            "  Warning: failed to stop Claude-owned persistent deployment "
+            f"'{manifest.profile}' on port {port}: {result.get('error')}"
+        )
+        click.echo(f"  Retry with `headroom install stop --profile {manifest.profile}`.")
+        clean = False
+    if env_keys:
+        click.echo(
+            "  Warning: current shell still exports "
+            + ", ".join(env_keys)
+            + f" for port {port}; restart Claude and your shell or unset those variables."
+        )
+        clean = False
+    return clean
 
 
 def _echo_unwrap_proxy_stop_status(status: str, port: int) -> None:
@@ -4259,6 +4558,7 @@ def wrap_selfheal(marker: str | None) -> None:
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     # no "-p" short alias here: claude's own -p/--print must fall through to CLAUDE_ARGS
     "--port",
@@ -4284,18 +4584,25 @@ def wrap_selfheal(marker: str | None) -> None:
     is_flag=True,
     help="Skip headroom MCP server registration (compression markers will be unactionable)",
 )
+@_code_memory_option
 @click.option(
     "--no-tokensave",
     is_flag=True,
-    help="Skip the tokensave code-graph MCP server (primary coding-task compressor)",
+    hidden=True,
+    help="Deprecated: use --code-memory none/serena. Skip the tokensave code-graph MCP.",
 )
 @click.option(
     "--serena",
     is_flag=True,
-    help="Force the Serena MCP backup compressor on (registered automatically when "
-    "tokensave is unavailable)",
+    hidden=True,
+    help="Deprecated: use --code-memory serena. Force the Serena MCP compressor on.",
 )
-@click.option("--no-serena", is_flag=True, help="Never register the Serena backup compressor")
+@click.option(
+    "--no-serena",
+    is_flag=True,
+    hidden=True,
+    help="Deprecated: use --code-memory tokensave/none. Never register Serena.",
+)
 @click.option(
     "--code-graph",
     is_flag=True,
@@ -4386,7 +4693,12 @@ def claude(
         headroom wrap claude --no-serena        # Never register the Serena backup
         headroom wrap claude --1m               # Preserve the 1M context window
     """
-    setup_context_tool = context_tool and not no_rtk
+    # RTK/context-tool is opt-in (off by default): --context-tool (legacy) and
+    # --rtk both enable it. Mirror --context-tool into HEADROOM_RTK so the central
+    # RTK gate (_rtk_opt_in) fires for the legacy flag too.
+    if context_tool:
+        os.environ["HEADROOM_RTK"] = "1"
+    setup_context_tool = (context_tool or _rtk_opt_in()) and not no_rtk
     if prepare_only:
         if setup_context_tool:
             if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
@@ -4778,9 +5090,18 @@ def unwrap_claude(
         )
 
     click.echo()
-    click.echo("✓ Claude is no longer durably wrapped by Headroom.")
-    if not no_stop_proxy:
-        _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
+    clean_unwrap = True
+    if no_stop_proxy:
+        click.echo("  Kept proxy stop disabled (--no-stop-proxy).")
+        clean_unwrap = False
+    else:
+        clean_unwrap = _echo_claude_unwrap_route_cleanup(_unwrap_claude_route_cleanup(port), port)
+    if clean_unwrap:
+        click.echo("✓ Claude is no longer durably wrapped by Headroom.")
+    else:
+        click.echo(
+            "  Claude local wrap settings were removed, but effective routing residue remains."
+        )
     click.echo()
 
 
@@ -4790,6 +5111,7 @@ def unwrap_claude(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -5313,6 +5635,7 @@ def _run_codex_wrap(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -5328,18 +5651,25 @@ def _run_codex_wrap(
     is_flag=True,
     help="Skip headroom MCP server registration (compression markers will be unactionable)",
 )
+@_code_memory_option
 @click.option(
     "--no-tokensave",
     is_flag=True,
-    help="Skip the tokensave code-graph MCP server (primary coding-task compressor)",
+    hidden=True,
+    help="Deprecated: use --code-memory none/serena. Skip the tokensave code-graph MCP.",
 )
 @click.option(
     "--serena",
     is_flag=True,
-    help="Force the Serena MCP backup compressor on (registered automatically when "
-    "tokensave is unavailable)",
+    hidden=True,
+    help="Deprecated: use --code-memory serena. Force the Serena MCP compressor on.",
 )
-@click.option("--no-serena", is_flag=True, help="Never register the Serena backup compressor")
+@click.option(
+    "--no-serena",
+    is_flag=True,
+    hidden=True,
+    help="Deprecated: use --code-memory tokensave/none. Never register Serena.",
+)
 @click.option(
     "--code-graph",
     is_flag=True,
@@ -5431,6 +5761,7 @@ def codex(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -5535,6 +5866,7 @@ def aider(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
 @click.option(
     "--no-context-tool",
@@ -5637,6 +5969,7 @@ def openclaude(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -5716,6 +6049,7 @@ def vibe(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -5803,6 +6137,7 @@ def kimi(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -5814,18 +6149,25 @@ def kimi(
     help="Skip CLI context-tool setup",
 )
 @click.option("--no-mcp", is_flag=True, help="Skip headroom MCP server registration")
+@_code_memory_option
 @click.option(
     "--no-tokensave",
     is_flag=True,
-    help="Skip the tokensave code-graph MCP server (primary coding-task compressor)",
+    hidden=True,
+    help="Deprecated: use --code-memory none/serena. Skip the tokensave code-graph MCP.",
 )
 @click.option(
     "--serena",
     is_flag=True,
-    help="Force the Serena MCP backup compressor on (registered automatically when "
-    "tokensave is unavailable)",
+    hidden=True,
+    help="Deprecated: use --code-memory serena. Force the Serena MCP compressor on.",
 )
-@click.option("--no-serena", is_flag=True, help="Never register the Serena backup compressor")
+@click.option(
+    "--no-serena",
+    is_flag=True,
+    hidden=True,
+    help="Deprecated: use --code-memory tokensave/none. Never register Serena.",
+)
 @click.option(
     "--code-graph",
     is_flag=True,
@@ -5946,6 +6288,7 @@ def grok(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -6052,6 +6395,7 @@ def cursor(
 
 
 @wrap.command("grok-build", context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -6148,6 +6492,7 @@ def grok_build(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -6250,6 +6595,7 @@ def cline(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -6345,6 +6691,7 @@ def zcode(
 
 
 @wrap.command("continue", context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -6469,6 +6816,7 @@ def continue_dev(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -6594,6 +6942,7 @@ def goose(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -6737,6 +7086,7 @@ def openhands(
 
 
 @wrap.command("openclaw")
+@_rtk_option
 @click.option(
     "--plugin-path",
     type=click.Path(path_type=Path, file_okay=False, dir_okay=True),
@@ -6978,6 +7328,7 @@ def openclaw(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -7502,6 +7853,7 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_rtk_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )

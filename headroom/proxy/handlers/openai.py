@@ -130,8 +130,13 @@ _OPENAI_BASE_URL_HEADER = "x-headroom-base-url"
 _decode_openai_bearer_payload = decode_openai_bearer_payload
 
 
-def _normalize_openai_max_tokens(body: dict[str, Any]) -> None:
+def _normalize_openai_max_tokens(
+    body: dict[str, Any], *, backend_owns_translation: bool = False
+) -> None:
     """Rename the legacy ``max_tokens`` to ``max_completion_tokens`` in-place.
+
+    This direct-OpenAI compatibility shim leaves provider-specific translation
+    to backend-routed requests.
 
     GPT-5 / o-series chat models reject ``max_tokens`` and require
     ``max_completion_tokens``; gpt-4o/4.1 accept the latter too. So translating
@@ -140,7 +145,7 @@ def _normalize_openai_max_tokens(body: dict[str, Any]) -> None:
     No-op when there is no ``max_tokens``; keeps an already-set
     ``max_completion_tokens`` and just drops the rejected legacy key.
     """
-    if not isinstance(body, dict) or "max_tokens" not in body:
+    if backend_owns_translation or not isinstance(body, dict) or "max_tokens" not in body:
         return
     legacy = body.get("max_tokens")
     if legacy is not None and body.get("max_completion_tokens") is None:
@@ -1318,6 +1323,47 @@ class OpenAIHandlerMixin:
             await traffic_learner.on_messages(learner_messages)
         except Exception as exc:
             logger.debug("[%s] Traffic learner (responses): %s", request_id, exc)
+
+    async def _observe_openai_chat_traffic(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        request_id: str,
+    ) -> None:
+        """Feed one chat/completions request into the live traffic learner.
+
+        The chat counterpart of :meth:`_observe_openai_responses_traffic`.
+        Chat/completions clients (GitHub Copilot CLI, opencode, OpenAI SDKs)
+        route here rather than through ``/v1/responses``, so without this call
+        their tool results and user preferences never reached the learner even
+        with Learn enabled (part of #2060). Chat messages are already
+        ``role``/``content`` shaped, so ``on_messages`` consumes them directly;
+        tool results use the OpenAI-format extractor.
+        """
+        traffic_learner = getattr(self, "traffic_learner", None)
+        if traffic_learner is None:
+            return
+        try:
+            memory_handler = getattr(self, "memory_handler", None)
+            if (
+                traffic_learner._backend is None
+                and memory_handler
+                and memory_handler.initialized
+                and memory_handler.backend
+            ):
+                traffic_learner.set_backend(memory_handler.backend)
+
+            tool_results = traffic_learner.extract_tool_results_from_openai_messages(messages)
+            for tool_result in tool_results[-5:]:
+                await traffic_learner.on_tool_result(
+                    tool_name=tool_result["tool_name"],
+                    tool_input=tool_result["input"],
+                    tool_output=tool_result["output"],
+                    is_error=tool_result["is_error"],
+                )
+            await traffic_learner.on_messages(messages)
+        except Exception as exc:
+            logger.debug("[%s] Traffic learner (chat): %s", request_id, exc)
 
     @staticmethod
     def _headroom_bypass_enabled(headers: Any) -> bool:
@@ -2558,6 +2604,12 @@ class OpenAIHandlerMixin:
 
         stream = body.get("stream", False)
 
+        # Learn from the original client payload before memory context or
+        # compression mutates it, mirroring the Responses and Anthropic
+        # ingestion paths. Without this, chat/completions traffic (Copilot CLI,
+        # opencode, OpenAI SDKs) fed nothing to the learner (part of #2060).
+        await self._observe_openai_chat_traffic(original_client_messages, request_id=request_id)
+
         # Bypass: skip ALL compression for explicit opt-out
         _bypass = self._headroom_bypass_enabled(request.headers)
         if _bypass:
@@ -3359,7 +3411,66 @@ class OpenAIHandlerMixin:
         # translate it here — the proxy already owns the outbound body — and
         # those requests work unchanged. No-op when the caller already set
         # `max_completion_tokens`.
-        _normalize_openai_max_tokens(body)
+        _normalize_openai_max_tokens(
+            body, backend_owns_translation=self.anthropic_backend is not None
+        )
+
+        # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER): verbosity steering
+        # on the chat system message. Runs after every other body mutation so the
+        # turn classifier sees the final messages, and respects the same bypass
+        # as compression. OpenAI-compatible clients that route through
+        # /v1/chat/completions (GitHub Copilot CLI, opencode, older SDKs) never
+        # reached the shaper before, so they saw zero output savings (#2302).
+        # Mutating `body` in place is sufficient here — the outbound request
+        # serializes `body` fresh, so no body-mutation tracker is needed.
+        if not _bypass:
+            from headroom.proxy import runtime_env
+            from headroom.proxy.output_savings import (
+                assign_arm,
+                conversation_key_from_body,
+                stratum_key,
+                stratum_label,
+            )
+            from headroom.proxy.output_shaper import (
+                OutputShaperSettings,
+                classify_turn,
+                resolve_verbosity_level,
+                shape_openai_chat_request,
+            )
+
+            _shaper_settings = OutputShaperSettings.from_env()
+            if _shaper_settings.enabled:
+                # Conversation-stable holdout: a whole conversation is treatment
+                # or control, which keeps the A/B comparison clean and the
+                # provider prefix cache stable (the steering block never flips
+                # mid-conversation).
+                _holdout = 0.0
+                try:
+                    _holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
+                except ValueError:
+                    _holdout = 0.0
+                _arm = assign_arm(conversation_key_from_body(body), _holdout)
+                _turn_kind = classify_turn(body.get("messages", [])).value
+                _stratum = stratum_key(
+                    turn_kind=_turn_kind,
+                    input_tokens=original_tokens,
+                    model=model,
+                    has_tools=bool(body.get("tools")),
+                )
+                # Carry (arm, stratum) on the transforms channel so the outcome
+                # funnel feeds the output-savings ledger from the chat path too.
+                transforms_applied.append(stratum_label(_arm, _stratum))
+                if _arm == "treatment":
+                    _level, _src = resolve_verbosity_level(_shaper_settings)
+                    _shape_result = shape_openai_chat_request(
+                        body, _shaper_settings, level_override=_level
+                    )
+                    if _shape_result.changed:
+                        transforms_applied.extend(_shape_result.labels or [])
+                        logger.info(
+                            f"[{request_id}] OutputShaper(chat, L{_level}/{_src}): "
+                            f"{_shape_result.labels}"
+                        )
 
         # Route through LiteLLM/any-llm backend if configured
         if self.anthropic_backend is not None:

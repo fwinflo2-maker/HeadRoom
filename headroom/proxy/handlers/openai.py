@@ -2799,7 +2799,10 @@ class OpenAIHandlerMixin:
         # different key than it was looked up by — the cache would never hit
         # and would fill with unreachable entries. Reuse this raw snapshot
         # verbatim at cache.set (the same reason cache_key_fields is
-        # snapshotted here, #327).
+        # snapshotted here, #327). Image compression above also rebinds
+        # `messages`, but it runs before this snapshot, so its output is already
+        # captured — keep this snapshot after image compression, or a reorder
+        # silently reintroduces the drift.
         cache_lookup_messages = messages
         # Check cache
         if self.cache and not stream:

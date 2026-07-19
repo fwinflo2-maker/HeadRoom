@@ -204,6 +204,16 @@ SETTINGS: tuple[SettingField, ...] = (
         help="Period the budget applies to.",
         tier="basic",
     ),
+    SettingField(
+        "HEADROOM_COST_FALLBACK_ENABLED",
+        "cost_fallback_enabled",
+        "Cost Fallback Estimation",
+        "Budget",
+        "bool",
+        default=True,
+        help="Estimate request cost using user/LiteLLM model pricing when provider cost is missing.",
+        tier="advanced",
+    ),
     # --- Networking (baked into the install manifest on supervised deploys) ---
     SettingField(
         "HEADROOM_HOST",

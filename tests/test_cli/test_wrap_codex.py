@@ -1176,9 +1176,10 @@ def test_codex_session_launch_settings_preserve_custom_provider_identity(
     assert 'model_providers.company.base_url="http://127.0.0.1:9898/v1"' in args
     assert "model_providers.company.supports_websockets=true" in args
     assert (
-        "model_providers.company.env_http_headers.X-Headroom-Base-Url"
-        '="HEADROOM_CODEX_UPSTREAM_BASE_URL"'
+        "model_providers.company.env_http_headers.X-Headroom-Base-Url="
+        '"HEADROOM_CODEX_UPSTREAM_BASE_URL"'
     ) in args
+    assert not any('"model_providers"' in arg for arg in args)
     assert env[wrap_mod._UPSTREAM_BASE_URL_ENV_VAR] == "https://api.example.test/v1"
     assert config_file.read_text(encoding="utf-8") == original_config
 
@@ -1203,6 +1204,35 @@ def test_codex_dotted_key_quotes_only_unsafe_segments() -> None:
         wrap_mod._codex_dotted_key("model_providers", "my.provider", "base_url")
         == 'model_providers."my.provider".base_url'
     )
+
+
+def test_codex_session_launch_settings_quotes_only_unsafe_provider_segments(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(wrap_mod, "_project_name_from_cwd", lambda: None)
+    config_file = codex_home / "config.toml"
+    config_file.write_text(
+        '[profiles.work]\nmodel_provider = "company.prod"\n\n'
+        '[model_providers."company.prod"]\nbase_url = "https://api.example.test/v1"\n',
+        encoding="utf-8",
+    )
+
+    args, _, _ = wrap_mod._codex_session_launch_settings(
+        port=9898,
+        codex_args=("--profile", "work"),
+        environ={"CODEX_HOME": str(codex_home)},
+    )
+
+    assert 'model_providers."company.prod".base_url="http://127.0.0.1:9898/v1"' in args
+    assert 'model_providers."company.prod".supports_websockets=true' in args
+    assert (
+        'model_providers."company.prod".env_http_headers.X-Headroom-Base-Url='
+        '"HEADROOM_CODEX_UPSTREAM_BASE_URL"'
+    ) in args
 
 
 def test_wrap_codex_rejects_custom_provider_without_upstream_base_url(

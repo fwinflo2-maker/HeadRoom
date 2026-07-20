@@ -1211,10 +1211,11 @@ class PrometheusMetrics:
                     ]
                 )
                 for _provider, _reasons in self.cache_miss_attribution_by_provider.items():
+                    _safe_provider = _escape_label_value(_provider)
                     for _reason, _count in _reasons.items():
                         lines.append(
-                            f'headroom_cache_miss_attribution_total{{provider="{_provider}",'
-                            f'reason="{_reason}"}} {_count}'
+                            f'headroom_cache_miss_attribution_total{{provider="{_safe_provider}",'
+                            f'reason="{_escape_label_value(_reason)}"}} {_count}'
                         )
                 lines.append("")
 
@@ -1271,7 +1272,9 @@ class PrometheusMetrics:
                 ]
             )
             for provider, count in self.requests_by_provider.items():
-                lines.append(f'headroom_requests_by_provider{{provider="{provider}"}} {count}')
+                lines.append(
+                    f'headroom_requests_by_provider{{provider="{_escape_label_value(provider)}"}} {count}'
+                )
             lines.append("")
 
             lines.extend(
@@ -1281,7 +1284,9 @@ class PrometheusMetrics:
                 ]
             )
             for model, count in self.requests_by_model.items():
-                lines.append(f'headroom_requests_by_model{{model="{model}"}} {count}')
+                lines.append(
+                    f'headroom_requests_by_model{{model="{_escape_label_value(model)}"}} {count}'
+                )
             lines.append("")
 
             if self.transform_timing_sum:
@@ -1416,13 +1421,20 @@ class PrometheusMetrics:
                 lines.append("")
 
             if self.cache_by_provider:
+                # The exposition format wants each family's samples grouped, so the
+                # blocks below re-walk this dict once per family. Escape the provider
+                # keys once here instead of at all eleven emission sites.
+                cache_by_provider = {
+                    _escape_label_value(name): stats
+                    for name, stats in self.cache_by_provider.items()
+                }
                 lines.extend(
                     [
                         "# HELP headroom_cache_read_tokens_total Provider cache read tokens",
                         "# TYPE headroom_cache_read_tokens_total counter",
                     ]
                 )
-                for provider, stats in self.cache_by_provider.items():
+                for provider, stats in cache_by_provider.items():
                     lines.append(
                         f'headroom_cache_read_tokens_total{{provider="{provider}"}} {stats["cache_read_tokens"]}'
                     )
@@ -1433,7 +1445,7 @@ class PrometheusMetrics:
                         "# TYPE headroom_cache_write_tokens_total counter",
                     ]
                 )
-                for provider, stats in self.cache_by_provider.items():
+                for provider, stats in cache_by_provider.items():
                     lines.append(
                         f'headroom_cache_write_tokens_total{{provider="{provider}"}} {stats["cache_write_tokens"]}'
                     )
@@ -1444,7 +1456,7 @@ class PrometheusMetrics:
                         "# TYPE headroom_cache_write_ttl_tokens_total counter",
                     ]
                 )
-                for provider, stats in self.cache_by_provider.items():
+                for provider, stats in cache_by_provider.items():
                     lines.append(
                         f'headroom_cache_write_ttl_tokens_total{{provider="{provider}",ttl="5m"}} {stats["cache_write_5m_tokens"]}'
                     )
@@ -1458,7 +1470,7 @@ class PrometheusMetrics:
                         "# TYPE headroom_cache_write_ttl_requests_total counter",
                     ]
                 )
-                for provider, stats in self.cache_by_provider.items():
+                for provider, stats in cache_by_provider.items():
                     lines.append(
                         f'headroom_cache_write_ttl_requests_total{{provider="{provider}",ttl="5m"}} {stats["cache_write_5m_requests"]}'
                     )
@@ -1472,7 +1484,7 @@ class PrometheusMetrics:
                         "# TYPE headroom_uncached_input_tokens_total counter",
                     ]
                 )
-                for provider, stats in self.cache_by_provider.items():
+                for provider, stats in cache_by_provider.items():
                     lines.append(
                         f'headroom_uncached_input_tokens_total{{provider="{provider}"}} {stats["uncached_input_tokens"]}'
                     )
@@ -1483,7 +1495,7 @@ class PrometheusMetrics:
                         "# TYPE headroom_provider_cache_requests_total counter",
                     ]
                 )
-                for provider, stats in self.cache_by_provider.items():
+                for provider, stats in cache_by_provider.items():
                     lines.append(
                         f'headroom_provider_cache_requests_total{{provider="{provider}"}} {stats["requests"]}'
                     )
@@ -1494,7 +1506,7 @@ class PrometheusMetrics:
                         "# TYPE headroom_provider_cache_hit_requests_total counter",
                     ]
                 )
-                for provider, stats in self.cache_by_provider.items():
+                for provider, stats in cache_by_provider.items():
                     lines.append(
                         f'headroom_provider_cache_hit_requests_total{{provider="{provider}"}} {stats["hit_requests"]}'
                     )
@@ -1505,7 +1517,7 @@ class PrometheusMetrics:
                         "# TYPE headroom_provider_cache_bust_total counter",
                     ]
                 )
-                for provider, stats in self.cache_by_provider.items():
+                for provider, stats in cache_by_provider.items():
                     lines.append(
                         f'headroom_provider_cache_bust_total{{provider="{provider}"}} {stats["bust_count"]}'
                     )
@@ -1516,7 +1528,7 @@ class PrometheusMetrics:
                         "# TYPE headroom_provider_cache_bust_write_tokens_total counter",
                     ]
                 )
-                for provider, stats in self.cache_by_provider.items():
+                for provider, stats in cache_by_provider.items():
                     lines.append(
                         f'headroom_provider_cache_bust_write_tokens_total{{provider="{provider}"}} {stats["bust_write_tokens"]}'
                     )

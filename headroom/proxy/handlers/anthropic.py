@@ -2503,8 +2503,11 @@ class AnthropicHandlerMixin:
             # frozen-prefix policy deferred the earlier injection.
             final_injector = CCRToolInjector(provider="anthropic")
             final_injector.scan_for_markers(body.get("messages", []))
-            if final_injector.has_anthropic_ccr_tool_use_history and not self._has_headroom_retrieve_tool(
-                body.get("tools")
+            if (
+                self.config.ccr_inject_tool
+                and not _bypass
+                and final_injector.has_anthropic_ccr_tool_use_history
+                and not self._has_headroom_retrieve_tool(body.get("tools"))
             ):
                 from headroom.proxy.helpers import apply_session_sticky_ccr_tool
 

@@ -56,24 +56,34 @@ def _reset_tracker():
 
 @pytest.mark.parametrize("session_id", [None, "anthropic-session-without-tracker"])
 def test_sessionless_history_redeclares_ccr_tool(session_id: str | None) -> None:
-    body = _issue_body([{"type": "tool_use", "name": CCR_TOOL_NAME}])
-
-    with pytest.raises(RuntimeError, match="400 Tool reference") as error:
-        _strict_upstream(body)
-    assert str(error.value) == ISSUE_2440_ERROR
+    base_body = _issue_body([{"type": "tool_use", "name": CCR_TOOL_NAME}])
+    head_body = _issue_body([{"type": "tool_use", "name": CCR_TOOL_NAME}])
 
     injector = CCRToolInjector(provider="anthropic")
-    injector.scan_for_markers(body["messages"])
-    body["tools"], was_injected = apply_session_sticky_ccr_tool(
+    injector.scan_for_markers(head_body["messages"])
+    base_body["tools"], base_injected = apply_session_sticky_ccr_tool(
+        provider="anthropic",
+        session_id=session_id,
+        request_id="issue-2440-base-shape",
+        existing_tools=base_body["tools"],
+        has_compressed_content_this_turn=False,
+        has_ccr_tool_use_history=False,
+    )
+    with pytest.raises(RuntimeError, match="400 Tool reference") as error:
+        _strict_upstream(base_body)
+    assert base_injected is False
+    assert str(error.value) == ISSUE_2440_ERROR
+
+    head_body["tools"], was_injected = apply_session_sticky_ccr_tool(
         provider="anthropic",
         session_id=session_id,
         request_id="issue-2440",
-        existing_tools=body["tools"],
+        existing_tools=head_body["tools"],
         has_compressed_content_this_turn=False,
         has_ccr_tool_use_history=injector.has_anthropic_ccr_tool_use_history,
     )
 
-    response = _strict_upstream(body)
+    response = _strict_upstream(head_body)
 
     assert was_injected is True
     assert response["status"] == 200
@@ -129,6 +139,66 @@ def test_anthropic_handler_redeclares_history_added_by_pre_send() -> None:
     anyio.run(handler.handle_anthropic_messages, request)
 
     assert get_session_ccr_tracker().has_done_ccr("anthropic", "handler-session-empty")
+
+
+@pytest.mark.parametrize(
+    ("ccr_enabled", "bypass_header"),
+    [
+        (False, None),
+        (True, "true"),
+    ],
+)
+def test_anthropic_handler_final_rescan_respects_disabled_and_bypass(
+    ccr_enabled: bool,
+    bypass_header: str | None,
+) -> None:
+    handler = _DummyAnthropicHandler()
+    handler.config.ccr_inject_tool = ccr_enabled
+    handler.session_tracker_store.compute_session_id = lambda *args, **kwargs: (
+        "handler-session-disabled"
+    )
+    handler.session_tracker_store.resolve_tracker = lambda *args, **kwargs: type(
+        "FrozenTracker",
+        (),
+        {
+            "get_frozen_message_count": lambda self: 3,
+            "get_last_original_messages": lambda self: [],
+            "get_last_forwarded_messages": lambda self: [],
+            "record_request": lambda self, *args, **kwargs: None,
+        },
+    )()
+
+    def emit(stage, **kwargs):
+        if stage is PipelineStage.PRE_SEND:
+            kwargs["messages"] = [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "name": CCR_TOOL_NAME}],
+                }
+            ]
+        return SimpleNamespace(**kwargs)
+
+    handler.pipeline_extensions = SimpleNamespace(emit=emit)
+
+    async def strict_retry(method, url, headers, body, **kwargs):
+        assert body.get("tools", []) == []
+        return _ResponseStub()
+
+    handler._retry_request = strict_retry
+    headers = {"authorization": "Bearer sk-ant-api-test"}
+    if bypass_header is not None:
+        headers["x-headroom-bypass"] = bypass_header
+    request = _build_anthropic_request(
+        {
+            "model": "claude-3-5-sonnet-latest",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        headers,
+    )
+
+    import anyio
+
+    anyio.run(handler.handle_anthropic_messages, request)
 
 
 @pytest.mark.parametrize(

@@ -171,6 +171,11 @@ from headroom.proxy.project_context import with_project_prefix as _with_project_
 from .main import main
 
 _COPILOT_PROXY_SEED_ENV_VARS = (
+    "GITHUB_COPILOT_API_TOKEN",
+    _REFRESH_OAUTH_TOKEN_ENV_VAR,
+    _API_TOKEN_EXPIRES_AT_ENV_VAR,
+)
+_COPILOT_SUBSCRIPTION_LAUNCH_SECRET_ENV_VARS = (
     *_API_TOKEN_ENV_VARS,
     _REFRESH_OAUTH_TOKEN_ENV_VAR,
     _API_TOKEN_EXPIRES_AT_ENV_VAR,
@@ -181,6 +186,11 @@ _COPILOT_PROXY_SEED_ENV_VARS = (
 
 def _scrub_copilot_proxy_seed_env(env: dict[str, str]) -> None:
     for key in _COPILOT_PROXY_SEED_ENV_VARS:
+        env.pop(key, None)
+
+
+def _scrub_copilot_subscription_launch_env(env: dict[str, str]) -> None:
+    for key in _COPILOT_SUBSCRIPTION_LAUNCH_SECRET_ENV_VARS:
         env.pop(key, None)
 
 
@@ -7838,7 +7848,7 @@ def opencode(
 
         launch_environ = os.environ.copy()
         if subscription_resolution is not None:
-            _scrub_copilot_proxy_seed_env(launch_environ)
+            _scrub_copilot_subscription_launch_env(launch_environ)
         env, env_vars_display = _build_opencode_launch_env(
             actual_port, launch_environ, project=_project_name_from_cwd(), include_mcp=not no_mcp
         )

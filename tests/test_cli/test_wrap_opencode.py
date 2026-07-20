@@ -106,7 +106,9 @@ def test_wrap_opencode_copilot_subscription_handoffs_seed_after_actual_port(
     launch = captured["launch"]
     assert launch["port"] == 9010
     assert "copilot-api-secret" not in result.output
+    assert "copilot-api-secret" not in str(launch["env"])
     assert "copilot-refresh-secret" not in str(launch["env"])
+    assert "copilot-api-secret" not in launch["env"]["OPENCODE_CONFIG_CONTENT"]
     assert "GITHUB_COPILOT_API_TOKEN" not in launch["env"]
     assert "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN" not in launch["env"]
     assert "GITHUB_COPILOT_API_TOKEN_EXPIRES_AT" not in launch["env"]

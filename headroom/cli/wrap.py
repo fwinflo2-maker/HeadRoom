@@ -63,6 +63,7 @@ from headroom.copilot_auth import (
     _COPILOT_OAUTH_TOKEN_ENV_VARS,
     _GENERIC_GITHUB_TOKEN_ENV_VARS,
     _REFRESH_OAUTH_TOKEN_ENV_VAR,
+    CopilotSubscriptionTokenResolution,
     has_oauth_auth,
     resolve_client_bearer_token,
     resolve_copilot_api_url,
@@ -5420,7 +5421,7 @@ def unwrap_claude(
 # =============================================================================
 
 
-def _require_copilot_subscription_resolution():
+def _require_copilot_subscription_resolution() -> CopilotSubscriptionTokenResolution:
     resolution = resolve_subscription_bearer_token_details()
     if resolution is None:
         raise click.ClickException(
@@ -5573,7 +5574,8 @@ def copilot(
     copilot_proxy_token: str | None = None
     copilot_refresh_oauth_token: str | None = None
     copilot_api_token_expires_at: float | None = None
-    subscription_resolution = None
+    client_bearer: str | None = None
+    subscription_resolution: CopilotSubscriptionTokenResolution | None = None
     if _should_use_copilot_oauth(
         backend=effective_backend,
         provider_type=provider_type,

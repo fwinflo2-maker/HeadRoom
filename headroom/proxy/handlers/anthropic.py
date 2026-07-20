@@ -1863,11 +1863,17 @@ class AnthropicHandlerMixin:
                     provider="anthropic",
                 )
 
+                injector_has_ccr_tool_use_history = getattr(
+                    injector,
+                    "has_anthropic_ccr_tool_use_history",
+                    False,
+                )
+
                 should_inject, is_marker_override = should_inject_ccr_tool(
                     configured_inject_tool=configured_inject_tool,
                     frozen_message_count=frozen_message_count,
                     has_compressed_content=has_new_compressed_content,
-                    has_ccr_tool_use_history=injector.has_anthropic_ccr_tool_use_history,
+                    has_ccr_tool_use_history=injector_has_ccr_tool_use_history,
                 )
                 if should_inject:
                     if is_marker_override:
@@ -1885,7 +1891,7 @@ class AnthropicHandlerMixin:
                         request_id=request_id,
                         existing_tools=tools,
                         has_compressed_content_this_turn=has_new_compressed_content,
-                        has_ccr_tool_use_history=injector.has_anthropic_ccr_tool_use_history,
+                        has_ccr_tool_use_history=injector_has_ccr_tool_use_history,
                     )
                     if ccr_tool_injected:
                         logger.debug(
@@ -2501,12 +2507,21 @@ class AnthropicHandlerMixin:
             # Re-scan the exact outbound messages after every message mutator.
             # A late-added CCR tool_use requires its declaration even when the
             # frozen-prefix policy deferred the earlier injection.
-            final_injector = CCRToolInjector(provider="anthropic")
+            final_injector = CCRToolInjector(
+                provider="anthropic",
+                inject_tool=False,
+                inject_system_instructions=False,
+            )
             final_injector.scan_for_markers(body.get("messages", []))
+            final_has_ccr_tool_use_history = getattr(
+                final_injector,
+                "has_anthropic_ccr_tool_use_history",
+                False,
+            )
             if (
                 self.config.ccr_inject_tool
                 and not _bypass
-                and final_injector.has_anthropic_ccr_tool_use_history
+                and final_has_ccr_tool_use_history
                 and not self._has_headroom_retrieve_tool(body.get("tools"))
             ):
                 from headroom.proxy.helpers import apply_session_sticky_ccr_tool

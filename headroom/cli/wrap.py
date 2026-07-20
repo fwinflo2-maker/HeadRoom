@@ -7709,11 +7709,6 @@ def opencode(
         headroom wrap opencode --backend anyllm --anyllm-provider groq
         headroom wrap opencode --copilot-subscription # Use a GitHub Copilot subscription
     """
-    # Snapshot OpenCode config.json BEFORE any wrap-time mutation so
-    # `headroom unwrap opencode` can restore the user's pre-wrap state.
-    _opencode_config_file, _opencode_backup_file = opencode_config_paths()
-    snapshot_opencode_config_if_unwrapped(_opencode_config_file, _opencode_backup_file)
-
     subscription_resolution = None
     if copilot_subscription:
         effective_backend = backend or os.environ.get("HEADROOM_BACKEND")
@@ -7733,6 +7728,11 @@ def opencode(
                 "it requires a running private seeded proxy."
             )
         subscription_resolution = _require_copilot_subscription_resolution()
+
+    # Snapshot OpenCode config.json BEFORE any wrap-time mutation so
+    # `headroom unwrap opencode` can restore the user's pre-wrap state.
+    _opencode_config_file, _opencode_backup_file = opencode_config_paths()
+    snapshot_opencode_config_if_unwrapped(_opencode_config_file, _opencode_backup_file)
 
     # Setup CLI context tool for OpenCode.
     if not no_rtk:
@@ -7828,8 +7828,11 @@ def opencode(
 
             _setup_headroom_mcp(OpencodeRegistrar(), actual_port, verbose=verbose, force=True)
 
+    launch_environ = os.environ.copy()
+    if subscription_resolution is not None:
+        _scrub_copilot_proxy_seed_env(launch_environ)
     env, env_vars_display = _build_opencode_launch_env(
-        actual_port, os.environ, project=_project_name_from_cwd(), include_mcp=not no_mcp
+        actual_port, launch_environ, project=_project_name_from_cwd(), include_mcp=not no_mcp
     )
 
     # Inject Headroom provider into OpenCode config so traffic routes through proxy.

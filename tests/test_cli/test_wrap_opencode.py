@@ -57,6 +57,9 @@ def test_wrap_opencode_copilot_subscription_handoffs_seed_after_actual_port(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     _set_test_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("GITHUB_COPILOT_API_TOKEN", "inherited-api-secret")
+    monkeypatch.setenv("GITHUB_COPILOT_REFRESH_OAUTH_TOKEN", "inherited-refresh-secret")
+    monkeypatch.setenv("GITHUB_COPILOT_API_TOKEN_EXPIRES_AT", "999.0")
     captured: dict[str, object] = {}
 
     def fake_ensure_proxy(*args, **kwargs):  # noqa: ANN002, ANN003
@@ -98,6 +101,9 @@ def test_wrap_opencode_copilot_subscription_handoffs_seed_after_actual_port(
     assert launch["port"] == 9010
     assert "copilot-api-secret" not in result.output
     assert "copilot-refresh-secret" not in str(launch["env"])
+    assert "GITHUB_COPILOT_API_TOKEN" not in launch["env"]
+    assert "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN" not in launch["env"]
+    assert "GITHUB_COPILOT_API_TOKEN_EXPIRES_AT" not in launch["env"]
 
 
 @pytest.mark.parametrize(
@@ -117,6 +123,9 @@ def test_wrap_opencode_copilot_subscription_rejects_incompatible_modes(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text("{}", encoding="utf-8")
     with patch.object(wrap_mod, "_ensure_proxy", side_effect=AssertionError("proxy launched")):
         result = runner.invoke(
             main,
@@ -124,6 +133,24 @@ def test_wrap_opencode_copilot_subscription_rejects_incompatible_modes(
         )
     assert result.exit_code == 1
     assert message in result.output
+    assert not config_file.with_name("opencode.json.headroom-backup").exists()
+
+
+def test_wrap_opencode_copilot_subscription_rejects_headroom_backend_env(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("HEADROOM_BACKEND", "anyllm")
+    with patch.object(wrap_mod, "_ensure_proxy", side_effect=AssertionError("proxy launched")):
+        result = runner.invoke(
+            main,
+            ["wrap", "opencode", "--copilot-subscription", "--no-rtk", "--no-mcp"],
+        )
+    assert result.exit_code == 1
+    assert "translated backends" in result.output
 
 
 def test_wrap_opencode_copilot_subscription_requires_login_before_launch(

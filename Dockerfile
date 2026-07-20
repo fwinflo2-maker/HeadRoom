@@ -195,11 +195,17 @@ VOLUME ${RUNTIME_HOME}/.headroom
 
 EXPOSE 8787
 
+# Shell form so ${HEADROOM_PORT} expands at probe time: `headroom deploy
+# --port N` sets it in the container env, and an exec-form CMD would keep
+# probing 8787 and report a working deployment as unhealthy (issue #2432).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD ["curl", "--fail", "--silent", "http://127.0.0.1:8787/readyz"]
+    CMD curl --fail --silent "http://127.0.0.1:${HEADROOM_PORT:-8787}/readyz"
 
 ENTRYPOINT ["headroom", "proxy"]
-CMD ["--host", "0.0.0.0", "--port", "8787"]
+# No baked `--port`: an explicit CLI argument beats click's HEADROOM_PORT
+# envvar, so hardcoding it here silently pinned the listener to 8787 even
+# when the operator set HEADROOM_PORT. Matches docker-compose.yml's command.
+CMD ["--host", "0.0.0.0"]
 
 FROM ${DISTROLESS_IMAGE} AS runtime-slim
 
@@ -220,11 +226,14 @@ ENV HEADROOM_HOST=0.0.0.0 \
 
 EXPOSE 8787
 
+# This stage is distroless, so there is no shell to expand ${HEADROOM_PORT}.
+# Resolve the port inside Python instead, keeping exec form (issue #2432).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD ["python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/readyz', timeout=5)"]
+    CMD ["python3", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('HEADROOM_PORT', '8787') + '/readyz', timeout=5)"]
 
 ENTRYPOINT ["python3", "-m", "headroom.cli", "proxy"]
-CMD ["--host", "0.0.0.0", "--port", "8787"]
+# See the runtime stage: no baked `--port`, so HEADROOM_PORT stays authoritative.
+CMD ["--host", "0.0.0.0"]
 
 # Default published image remains python-slim runtime
 FROM runtime-slim-base AS runtime

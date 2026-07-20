@@ -2498,6 +2498,30 @@ class AnthropicHandlerMixin:
                                 f"{shape_result.labels}"
                             )
 
+            # Re-scan the exact outbound messages after every message mutator.
+            # A late-added CCR tool_use requires its declaration even when the
+            # frozen-prefix policy deferred the earlier injection.
+            final_injector = CCRToolInjector(provider="anthropic")
+            final_injector.scan_for_markers(body.get("messages", []))
+            if final_injector.has_anthropic_ccr_tool_use_history and not self._has_headroom_retrieve_tool(
+                body.get("tools")
+            ):
+                from headroom.proxy.helpers import apply_session_sticky_ccr_tool
+
+                tools, ccr_tool_injected = apply_session_sticky_ccr_tool(
+                    provider="anthropic",
+                    session_id=session_id,
+                    request_id=request_id,
+                    existing_tools=body.get("tools"),
+                    has_compressed_content_this_turn=False,
+                    has_ccr_tool_use_history=True,
+                )
+                if ccr_tool_injected:
+                    body["tools"] = tools
+                    logger.info(
+                        f"[{request_id}] CCR: redeclared retrieval tool for final outbound history"
+                    )
+
             # Unit 2: mark end of pre-upstream phase. Everything after this
             # point is upstream I/O or post-response bookkeeping.
             stage_timer.record(

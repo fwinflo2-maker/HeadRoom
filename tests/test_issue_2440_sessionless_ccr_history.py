@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from headroom.ccr.tool_injection import CCR_TOOL_NAME, CCRToolInjector
+from headroom.pipeline import PipelineStage
 from headroom.proxy.helpers import (
     _reset_session_ccr_tracker_for_test,
     apply_session_sticky_ccr_tool,
@@ -77,7 +80,7 @@ def test_sessionless_history_redeclares_ccr_tool(session_id: str | None) -> None
     assert response["declared_tools"] == {CCR_TOOL_NAME}
 
 
-def test_anthropic_handler_redeclares_frozen_tracked_history() -> None:
+def test_anthropic_handler_redeclares_history_added_by_pre_send() -> None:
     handler = _DummyAnthropicHandler()
     handler.config.ccr_inject_tool = True
     handler.session_tracker_store.compute_session_id = lambda *args, **kwargs: (
@@ -94,6 +97,18 @@ def test_anthropic_handler_redeclares_frozen_tracked_history() -> None:
         },
     )()
 
+    def emit(stage, **kwargs):
+        if stage is PipelineStage.PRE_SEND:
+            kwargs["messages"] = [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "name": CCR_TOOL_NAME}],
+                }
+            ]
+        return SimpleNamespace(**kwargs)
+
+    handler.pipeline_extensions = SimpleNamespace(emit=emit)
+
     async def strict_retry(method, url, headers, body, **kwargs):
         assert body.get("tools", [])
         assert [tool["name"] for tool in body["tools"]] == [CCR_TOOL_NAME]
@@ -104,12 +119,7 @@ def test_anthropic_handler_redeclares_frozen_tracked_history() -> None:
     request = _build_anthropic_request(
         {
             "model": "claude-3-5-sonnet-latest",
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": [{"type": "tool_use", "name": CCR_TOOL_NAME}],
-                }
-            ],
+            "messages": [{"role": "user", "content": "hello"}],
         },
         {"authorization": "Bearer sk-ant-api-test"},
     )

@@ -6,6 +6,14 @@ from headroom.ccr.tool_injection import CCR_TOOL_NAME, CCRToolInjector
 from headroom.proxy.helpers import (
     _reset_session_ccr_tracker_for_test,
     apply_session_sticky_ccr_tool,
+    get_session_ccr_tracker,
+)
+from tests.test_anthropic_stage_timings import (
+    _build_request as _build_anthropic_request,
+)
+from tests.test_anthropic_stage_timings import (
+    _DummyAnthropicHandler,
+    _ResponseStub,
 )
 
 ISSUE_2440_ERROR = "API Error: 400 Tool reference 'headroom_retrieve' not found in available tools"
@@ -67,6 +75,50 @@ def test_sessionless_history_redeclares_ccr_tool(session_id: str | None) -> None
     assert was_injected is True
     assert response["status"] == 200
     assert response["declared_tools"] == {CCR_TOOL_NAME}
+
+
+def test_anthropic_handler_redeclares_frozen_tracked_history() -> None:
+    handler = _DummyAnthropicHandler()
+    handler.config.ccr_inject_tool = True
+    handler.session_tracker_store.compute_session_id = lambda *args, **kwargs: (
+        "handler-session-empty"
+    )
+    handler.session_tracker_store.resolve_tracker = lambda *args, **kwargs: type(
+        "FrozenTracker",
+        (),
+        {
+            "get_frozen_message_count": lambda self: 3,
+            "get_last_original_messages": lambda self: [],
+            "get_last_forwarded_messages": lambda self: [],
+            "record_request": lambda self, *args, **kwargs: None,
+        },
+    )()
+
+    async def strict_retry(method, url, headers, body, **kwargs):
+        assert body.get("tools", [])
+        assert [tool["name"] for tool in body["tools"]] == [CCR_TOOL_NAME]
+        handler.captured = (method, url, headers, body)
+        return _ResponseStub()
+
+    handler._retry_request = strict_retry
+    request = _build_anthropic_request(
+        {
+            "model": "claude-3-5-sonnet-latest",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "name": CCR_TOOL_NAME}],
+                }
+            ],
+        },
+        {"authorization": "Bearer sk-ant-api-test"},
+    )
+
+    import anyio
+
+    anyio.run(handler.handle_anthropic_messages, request)
+
+    assert get_session_ccr_tracker().has_done_ccr("anthropic", "handler-session-empty")
 
 
 @pytest.mark.parametrize(

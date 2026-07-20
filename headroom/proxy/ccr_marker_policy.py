@@ -35,6 +35,7 @@ def should_inject_ccr_tool(
     configured_inject_tool: bool,
     frozen_message_count: int,
     has_compressed_content: bool,
+    has_ccr_tool_use_history: bool = False,
 ) -> tuple[bool, bool]:
     """Decide whether the CCR retrieval tool must be injected this turn."""
 
@@ -42,4 +43,5 @@ def should_inject_ccr_tool(
     if inject_tool and frozen_message_count > 0:
         inject_tool = False
     is_marker_override = not inject_tool and has_compressed_content
-    return (inject_tool or is_marker_override), is_marker_override
+    is_history_override = configured_inject_tool and not inject_tool and has_ccr_tool_use_history
+    return (inject_tool or is_marker_override or is_history_override), is_marker_override

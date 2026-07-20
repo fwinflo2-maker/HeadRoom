@@ -2263,6 +2263,7 @@ def should_inject_ccr_tool(
     configured_inject_tool: bool,
     frozen_message_count: int,
     has_compressed_content: bool,
+    has_ccr_tool_use_history: bool = False,
 ) -> tuple[bool, bool]:
     """Decide whether the ``headroom_retrieve`` tool must be injected this turn.
 
@@ -2284,6 +2285,7 @@ def should_inject_ccr_tool(
         configured_inject_tool=configured_inject_tool,
         frozen_message_count=frozen_message_count,
         has_compressed_content=has_compressed_content,
+        has_ccr_tool_use_history=has_ccr_tool_use_history,
     )
 
 
@@ -2294,6 +2296,7 @@ def apply_session_sticky_ccr_tool(
     request_id: str | None,
     existing_tools: list[dict[str, Any]] | None,
     has_compressed_content_this_turn: bool,
+    has_ccr_tool_use_history: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Apply sticky-on CCR retrieval-tool injection per :class:`SessionCcrTracker`.
 
@@ -2344,7 +2347,7 @@ def apply_session_sticky_ccr_tool(
 
     # No session_id (e.g. WS path): per-turn decision drives directly.
     if not session_id:
-        if not has_compressed_content_this_turn:
+        if not (has_compressed_content_this_turn or has_ccr_tool_use_history):
             log_tool_injection_decision(
                 provider=provider,
                 session_id=None,

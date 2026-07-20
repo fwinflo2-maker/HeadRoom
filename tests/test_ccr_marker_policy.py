@@ -87,3 +87,21 @@ def test_should_inject_ccr_tool_injects_configured_tool_without_frozen_prefix() 
         frozen_message_count=0,
         has_compressed_content=False,
     ) == (True, False)
+
+
+def test_should_inject_ccr_tool_sessionless_history_overrides_frozen_deferral() -> None:
+    assert should_inject_ccr_tool(
+        configured_inject_tool=True,
+        frozen_message_count=3,
+        has_compressed_content=False,
+        has_ccr_tool_use_history=True,
+    ) == (True, False)
+
+
+def test_should_inject_ccr_tool_history_does_not_override_disabled_injection() -> None:
+    assert should_inject_ccr_tool(
+        configured_inject_tool=False,
+        frozen_message_count=3,
+        has_compressed_content=False,
+        has_ccr_tool_use_history=True,
+    ) == (False, False)

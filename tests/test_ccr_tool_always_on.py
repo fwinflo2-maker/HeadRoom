@@ -228,6 +228,20 @@ def test_no_session_id_falls_back_to_per_turn_decision():
     assert _has_ccr_tool(tools)
 
 
+def test_sessionless_history_redeclares_tool():
+    tools, injected = apply_session_sticky_ccr_tool(
+        provider="anthropic",
+        session_id=None,
+        request_id="history",
+        existing_tools=None,
+        has_compressed_content_this_turn=False,
+        has_ccr_tool_use_history=True,
+    )
+
+    assert injected is True
+    assert [tool["name"] for tool in tools] == [CCR_TOOL_NAME]
+
+
 # ─── Byte-stable tool definition ───────────────────────────────────────
 
 

@@ -173,6 +173,7 @@ class CCRToolInjector:
 
     # Detected compression markers
     _detected_hashes: list[str] = field(default_factory=list)
+    _has_anthropic_ccr_tool_use_history: bool = False
     # Multiple marker patterns to match different compressors:
     # - SmartCrusher: [100 items compressed to 10. Retrieve more: hash=abc123]
     # - Kompress: [100 lines compressed to 10. Retrieve more: hash=abc123]
@@ -213,6 +214,7 @@ class CCRToolInjector:
     def __post_init__(self) -> None:
         # Reset detected hashes
         self._detected_hashes = []
+        self._has_anthropic_ccr_tool_use_history = False
 
     @property
     def has_compressed_content(self) -> bool:
@@ -224,6 +226,11 @@ class CCRToolInjector:
         """Get list of detected compression hashes."""
         return self._detected_hashes.copy()
 
+    @property
+    def has_anthropic_ccr_tool_use_history(self) -> bool:
+        """Whether the scan found an assistant CCR ``tool_use`` block."""
+        return self._has_anthropic_ccr_tool_use_history
+
     def scan_for_markers(self, messages: list[dict[str, Any]]) -> list[str]:
         """Scan messages for compression markers and extract hashes.
 
@@ -234,6 +241,7 @@ class CCRToolInjector:
             List of detected hash keys.
         """
         self._detected_hashes = []
+        self._has_anthropic_ccr_tool_use_history = False
 
         for message in messages:
             content = message.get("content", "")
@@ -246,6 +254,13 @@ class CCRToolInjector:
             elif isinstance(content, list):
                 for block in content:
                     if isinstance(block, dict):
+                        if (
+                            self.provider == "anthropic"
+                            and message.get("role") == "assistant"
+                            and block.get("type") == "tool_use"
+                            and block.get("name") == CCR_TOOL_NAME
+                        ):
+                            self._has_anthropic_ccr_tool_use_history = True
                         # Text blocks
                         if block.get("type") == "text":
                             self._scan_text(block.get("text", ""))

@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from headroom.ccr import (
     CCR_TOOL_NAME,
     CCRToolInjector,
@@ -506,6 +508,57 @@ class TestSmartCrusherCcrMarkers:
         hash_key = parse_tool_call(tool_call, "anthropic")
 
         assert hash_key == "abc123def456abc123def456"
+
+
+class TestAnthropicToolUseHistory:
+    def test_history_tool_use_sets_signal_only_for_assistant_ccr_block(self):
+        injector = CCRToolInjector(provider="anthropic")
+
+        injector.scan_for_markers(
+            [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "name": CCR_TOOL_NAME}],
+                }
+            ]
+        )
+
+        assert injector.has_anthropic_ccr_tool_use_history is True
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            {
+                "role": "user",
+                "content": [{"type": "tool_use", "name": CCR_TOOL_NAME}],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "name": "other_tool"}],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": CCR_TOOL_NAME}],
+            },
+            {"role": "assistant", "content": [{"name": CCR_TOOL_NAME}]},
+        ],
+    )
+    def test_history_tool_use_requires_structured_assistant_ccr_block(self, message):
+        injector = CCRToolInjector(provider="anthropic")
+
+        injector.scan_for_markers([message])
+
+        assert injector.has_anthropic_ccr_tool_use_history is False
+
+    def test_history_tool_use_signal_resets_between_scans(self):
+        injector = CCRToolInjector(provider="anthropic")
+        injector.scan_for_markers(
+            [{"role": "assistant", "content": [{"type": "tool_use", "name": CCR_TOOL_NAME}]}]
+        )
+
+        injector.scan_for_markers([])
+
+        assert injector.has_anthropic_ccr_tool_use_history is False
 
 
 class TestSystemInstructions:

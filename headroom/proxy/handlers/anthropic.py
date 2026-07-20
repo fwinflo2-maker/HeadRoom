@@ -1867,6 +1867,7 @@ class AnthropicHandlerMixin:
                     configured_inject_tool=configured_inject_tool,
                     frozen_message_count=frozen_message_count,
                     has_compressed_content=has_new_compressed_content,
+                    has_ccr_tool_use_history=injector.has_anthropic_ccr_tool_use_history,
                 )
                 if should_inject:
                     if is_marker_override:
@@ -1884,6 +1885,7 @@ class AnthropicHandlerMixin:
                         request_id=request_id,
                         existing_tools=tools,
                         has_compressed_content_this_turn=has_new_compressed_content,
+                        has_ccr_tool_use_history=injector.has_anthropic_ccr_tool_use_history,
                     )
                     if ccr_tool_injected:
                         logger.debug(

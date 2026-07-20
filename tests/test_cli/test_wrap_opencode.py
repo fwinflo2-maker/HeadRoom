@@ -11,6 +11,7 @@ from click.testing import CliRunner
 
 from headroom.cli import wrap as wrap_mod
 from headroom.cli.main import main
+from headroom.copilot_auth import CopilotSubscriptionTokenResolution
 
 
 @pytest.fixture(autouse=True)
@@ -32,9 +33,120 @@ def _set_test_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
 
 
+def _subscription_resolution() -> CopilotSubscriptionTokenResolution:
+    return CopilotSubscriptionTokenResolution(
+        token="copilot-api-secret",
+        source="test",
+        confidence="test",
+        api_url="https://api.githubcopilot.com",
+        token_fingerprint="sha256:test",
+        refresh_oauth_token="copilot-refresh-secret",
+        api_token_expires_at=123.5,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Wrap opencode
 # ---------------------------------------------------------------------------
+
+
+def test_wrap_opencode_copilot_subscription_handoffs_seed_after_actual_port(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+    captured: dict[str, object] = {}
+
+    def fake_ensure_proxy(*args, **kwargs):  # noqa: ANN002, ANN003
+        captured["ensure"] = kwargs
+        return None, 9010
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured["launch"] = kwargs
+
+    with (
+        patch.object(wrap_mod.shutil, "which", return_value="opencode"),
+        patch.object(
+            wrap_mod,
+            "_require_copilot_subscription_resolution",
+            return_value=_subscription_resolution(),
+        ),
+        patch.object(wrap_mod, "_ensure_proxy", side_effect=fake_ensure_proxy),
+        patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "opencode",
+                "--copilot-subscription",
+                "--no-rtk",
+                "--no-mcp",
+                "--no-serena",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    ensure = captured["ensure"]
+    assert ensure["openai_api_url"] == "https://api.githubcopilot.com"
+    assert ensure["copilot_api_token"] == "copilot-api-secret"
+    assert ensure["copilot_refresh_oauth_token"] == "copilot-refresh-secret"
+    assert ensure["copilot_api_token_expires_at"] == 123.5
+    launch = captured["launch"]
+    assert launch["port"] == 9010
+    assert "copilot-api-secret" not in result.output
+    assert "copilot-refresh-secret" not in str(launch["env"])
+
+
+@pytest.mark.parametrize(
+    "extra_args, message",
+    [
+        (["--no-proxy"], "--no-proxy"),
+        (["--prepare-only"], "--prepare-only"),
+        (["--backend", "anyllm"], "translated backends"),
+    ],
+)
+def test_wrap_opencode_copilot_subscription_rejects_incompatible_modes(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra_args: list[str],
+    message: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+    with patch.object(wrap_mod, "_ensure_proxy", side_effect=AssertionError("proxy launched")):
+        result = runner.invoke(
+            main,
+            ["wrap", "opencode", "--copilot-subscription", "--no-rtk", "--no-mcp", *extra_args],
+        )
+    assert result.exit_code == 1
+    assert message in result.output
+
+
+def test_wrap_opencode_copilot_subscription_requires_login_before_launch(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+    with (
+        patch.object(
+            wrap_mod,
+            "resolve_subscription_bearer_token_details",
+            return_value=None,
+        ),
+        patch.object(wrap_mod, "_ensure_proxy", side_effect=AssertionError("proxy launched")),
+    ):
+        result = runner.invoke(
+            main,
+            ["wrap", "opencode", "--copilot-subscription", "--no-rtk", "--no-mcp"],
+        )
+    assert result.exit_code == 1
+    assert "headroom copilot-auth login" in result.output
 
 
 def test_wrap_opencode_sets_config_content_env(

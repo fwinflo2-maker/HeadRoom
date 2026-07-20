@@ -3982,8 +3982,10 @@ def _ensure_proxy(
 ) -> tuple[subprocess.Popen | None, int]:
     """Start or verify proxy. Returns (process_handle, actual_port)."""
     helpers = _live_wrap_module()
-    copilot_subscription_seed_requested = bool(copilot_refresh_oauth_token) or (
-        copilot_api_token_expires_at is not None
+    copilot_subscription_seed_requested = (
+        bool(copilot_api_token)
+        or bool(copilot_refresh_oauth_token)
+        or copilot_api_token_expires_at is not None
     )
     # --no-proxy reuses an already-running proxy, so backend/region/provider
     # flags (which only apply when we start one) would be silently dropped.
@@ -3999,7 +4001,7 @@ def _ensure_proxy(
         )
         if isolated_copilot_subscription_proxy:
             click.echo(
-                "  Copilot subscription refresh seeds are session-specific; "
+                "  Copilot subscription seeds are session-specific; "
                 "starting a dedicated local proxy instance for this wrap session."
             )
         if not isolated_copilot_subscription_proxy and manifest is not None:
@@ -5401,6 +5403,17 @@ def unwrap_claude(
 # =============================================================================
 
 
+def _require_copilot_subscription_resolution():
+    resolution = resolve_subscription_bearer_token_details()
+    if resolution is None:
+        raise click.ClickException(
+            "GitHub Copilot subscription mode requires a reusable GitHub/Copilot bearer "
+            "token, but none could be resolved. Run `headroom copilot-auth login` first, or set "
+            "GITHUB_COPILOT_TOKEN / GITHUB_COPILOT_GITHUB_TOKEN."
+        )
+    return resolution
+
+
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_rtk_option
 @click.option(
@@ -5551,10 +5564,8 @@ def copilot(
         force_subscription=subscription,
     ):
         if subscription:
-            subscription_resolution = resolve_subscription_bearer_token_details()
-            client_bearer = (
-                subscription_resolution.token if subscription_resolution is not None else None
-            )
+            subscription_resolution = _require_copilot_subscription_resolution()
+            client_bearer = subscription_resolution.token
         else:
             client_bearer = resolve_client_bearer_token()
         if not client_bearer:
@@ -7646,6 +7657,11 @@ def openclaw(
     help="Enable code graph indexing via codebase-memory-mcp (optional)",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option(
+    "--copilot-subscription",
+    is_flag=True,
+    help="Route headroom/* models through the authenticated GitHub Copilot subscription",
+)
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
 @click.option(
@@ -7664,6 +7680,7 @@ def opencode(
     no_serena: bool,
     code_graph: bool,
     no_proxy: bool,
+    copilot_subscription: bool,
     learn: bool,
     memory: bool,
     backend: str | None,
@@ -7690,11 +7707,32 @@ def opencode(
         headroom wrap opencode --no-serena             # Skip Serena MCP registration
         headroom wrap opencode --port 9999             # Custom proxy port
         headroom wrap opencode --backend anyllm --anyllm-provider groq
+        headroom wrap opencode --copilot-subscription # Use a GitHub Copilot subscription
     """
     # Snapshot OpenCode config.json BEFORE any wrap-time mutation so
     # `headroom unwrap opencode` can restore the user's pre-wrap state.
     _opencode_config_file, _opencode_backup_file = opencode_config_paths()
     snapshot_opencode_config_if_unwrapped(_opencode_config_file, _opencode_backup_file)
+
+    subscription_resolution = None
+    if copilot_subscription:
+        effective_backend = backend or os.environ.get("HEADROOM_BACKEND")
+        if effective_backend not in (None, "", "anthropic"):
+            raise click.ClickException(
+                "--copilot-subscription cannot be combined with translated backends "
+                "such as anyllm or litellm-*; use the anthropic backend."
+            )
+        if no_proxy:
+            raise click.ClickException(
+                "--copilot-subscription cannot be combined with --no-proxy because "
+                "it requires a private seeded proxy."
+            )
+        if prepare_only:
+            raise click.ClickException(
+                "--copilot-subscription cannot be combined with --prepare-only because "
+                "it requires a running private seeded proxy."
+            )
+        subscription_resolution = _require_copilot_subscription_resolution()
 
     # Setup CLI context tool for OpenCode.
     if not no_rtk:
@@ -7770,6 +7808,14 @@ def opencode(
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
+        openai_api_url=(subscription_resolution.api_url if subscription_resolution else None),
+        copilot_api_token=(subscription_resolution.token if subscription_resolution else None),
+        copilot_refresh_oauth_token=(
+            subscription_resolution.refresh_oauth_token if subscription_resolution else None
+        ),
+        copilot_api_token_expires_at=(
+            subscription_resolution.api_token_expires_at if subscription_resolution else None
+        ),
     )
 
     # If the proxy fell back to a different port, move our marker so

@@ -58,6 +58,11 @@ from headroom.agent_savings import (
     apply_agent_savings_env_defaults,
 )
 from headroom.copilot_auth import (
+    _API_TOKEN_ENV_VARS,
+    _API_TOKEN_EXPIRES_AT_ENV_VAR,
+    _COPILOT_OAUTH_TOKEN_ENV_VARS,
+    _GENERIC_GITHUB_TOKEN_ENV_VARS,
+    _REFRESH_OAUTH_TOKEN_ENV_VAR,
     has_oauth_auth,
     resolve_client_bearer_token,
     resolve_copilot_api_url,
@@ -166,9 +171,11 @@ from headroom.proxy.project_context import with_project_prefix as _with_project_
 from .main import main
 
 _COPILOT_PROXY_SEED_ENV_VARS = (
-    "GITHUB_COPILOT_API_TOKEN",
-    "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN",
-    "GITHUB_COPILOT_API_TOKEN_EXPIRES_AT",
+    *_API_TOKEN_ENV_VARS,
+    _REFRESH_OAUTH_TOKEN_ENV_VAR,
+    _API_TOKEN_EXPIRES_AT_ENV_VAR,
+    *_COPILOT_OAUTH_TOKEN_ENV_VARS,
+    *_GENERIC_GITHUB_TOKEN_ENV_VARS,
 )
 
 
@@ -7818,34 +7825,34 @@ def opencode(
         ),
     )
 
-    # If the proxy fell back to a different port, move our marker so
-    # cleanup tracking stays accurate and update MCP config.
-    if actual_port != port:
-        _unregister_proxy_client(port)
-        _register_proxy_client(actual_port)
-        if not no_mcp:
-            from headroom.mcp_registry import OpencodeRegistrar
+    try:
+        # If the proxy fell back to a different port, move our marker so
+        # cleanup tracking stays accurate and update MCP config.
+        if actual_port != port:
+            _unregister_proxy_client(port)
+            _register_proxy_client(actual_port)
+            if not no_mcp:
+                from headroom.mcp_registry import OpencodeRegistrar
 
-            _setup_headroom_mcp(OpencodeRegistrar(), actual_port, verbose=verbose, force=True)
+                _setup_headroom_mcp(OpencodeRegistrar(), actual_port, verbose=verbose, force=True)
 
-    launch_environ = os.environ.copy()
-    if subscription_resolution is not None:
-        _scrub_copilot_proxy_seed_env(launch_environ)
-    env, env_vars_display = _build_opencode_launch_env(
-        actual_port, launch_environ, project=_project_name_from_cwd(), include_mcp=not no_mcp
-    )
-
-    # Inject Headroom provider into OpenCode config so traffic routes through proxy.
-    inject_opencode_provider_config(actual_port)
-    if memory:
-        mem_dir = Path.cwd() / ".headroom"
-        _inject_memory_mcp_config(
-            os.environ.get("USER", os.environ.get("USERNAME", "default")),
+        launch_environ = os.environ.copy()
+        if subscription_resolution is not None:
+            _scrub_copilot_proxy_seed_env(launch_environ)
+        env, env_vars_display = _build_opencode_launch_env(
+            actual_port, launch_environ, project=_project_name_from_cwd(), include_mcp=not no_mcp
         )
 
-    # Proxy already started by _ensure_proxy above; tell _launch_tool to
-    # skip duplicate startup.
-    try:
+        # Inject Headroom provider into OpenCode config so traffic routes through proxy.
+        inject_opencode_provider_config(actual_port)
+        if memory:
+            mem_dir = Path.cwd() / ".headroom"
+            _inject_memory_mcp_config(
+                os.environ.get("USER", os.environ.get("USERNAME", "default")),
+            )
+
+        # Proxy already started by _ensure_proxy above; tell _launch_tool to
+        # skip duplicate startup.
         _launch_tool(
             binary=opencode_bin,
             args=opencode_args,

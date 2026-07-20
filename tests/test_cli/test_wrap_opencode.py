@@ -60,6 +60,12 @@ def test_wrap_opencode_copilot_subscription_handoffs_seed_after_actual_port(
     monkeypatch.setenv("GITHUB_COPILOT_API_TOKEN", "inherited-api-secret")
     monkeypatch.setenv("GITHUB_COPILOT_REFRESH_OAUTH_TOKEN", "inherited-refresh-secret")
     monkeypatch.setenv("GITHUB_COPILOT_API_TOKEN_EXPIRES_AT", "999.0")
+    monkeypatch.setenv("GITHUB_COPILOT_TOKEN", "inherited-seat-token")
+    monkeypatch.setenv("GITHUB_COPILOT_GITHUB_TOKEN", "inherited-github-token")
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "inherited-alt-github-token")
+    monkeypatch.setenv("COPILOT_PROVIDER_BEARER_TOKEN", "inherited-provider-bearer")
+    monkeypatch.setenv("GH_TOKEN", "inherited-gh-token")
+    monkeypatch.setenv("GITHUB_TOKEN", "inherited-github-pat")
     captured: dict[str, object] = {}
 
     def fake_ensure_proxy(*args, **kwargs):  # noqa: ANN002, ANN003
@@ -104,6 +110,12 @@ def test_wrap_opencode_copilot_subscription_handoffs_seed_after_actual_port(
     assert "GITHUB_COPILOT_API_TOKEN" not in launch["env"]
     assert "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN" not in launch["env"]
     assert "GITHUB_COPILOT_API_TOKEN_EXPIRES_AT" not in launch["env"]
+    assert "GITHUB_COPILOT_TOKEN" not in launch["env"]
+    assert "GITHUB_COPILOT_GITHUB_TOKEN" not in launch["env"]
+    assert "COPILOT_GITHUB_TOKEN" not in launch["env"]
+    assert "COPILOT_PROVIDER_BEARER_TOKEN" not in launch["env"]
+    assert "GH_TOKEN" not in launch["env"]
+    assert "GITHUB_TOKEN" not in launch["env"]
 
 
 @pytest.mark.parametrize(
@@ -174,6 +186,68 @@ def test_wrap_opencode_copilot_subscription_requires_login_before_launch(
         )
     assert result.exit_code == 1
     assert "headroom copilot-auth login" in result.output
+
+
+def test_wrap_opencode_copilot_subscription_cleans_up_proxy_on_config_failure(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+
+    class _FakeProxy:
+        def __init__(self) -> None:
+            self.terminated = False
+            self.wait_timeout: float | None = None
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_timeout = timeout
+            return 0
+
+    proxy = _FakeProxy()
+
+    with (
+        patch.object(wrap_mod.shutil, "which", return_value="opencode"),
+        patch.object(
+            wrap_mod,
+            "_require_copilot_subscription_resolution",
+            return_value=_subscription_resolution(),
+        ),
+        patch.object(wrap_mod, "_ensure_proxy", return_value=(proxy, 9010)),
+        patch.object(wrap_mod, "_register_proxy_client"),
+        patch.object(wrap_mod, "_unregister_proxy_client"),
+        patch.object(wrap_mod, "_live_proxy_clients", return_value=[]),
+        patch.object(
+            wrap_mod,
+            "inject_opencode_provider_config",
+            side_effect=RuntimeError("config write failed"),
+        ),
+        patch.object(wrap_mod, "_launch_tool", side_effect=AssertionError("launch should not run")),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "opencode",
+                "--copilot-subscription",
+                "--no-rtk",
+                "--no-mcp",
+                "--no-serena",
+            ],
+        )
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, RuntimeError)
+    assert str(result.exception) == "config write failed"
+    assert proxy.terminated is True
+    assert proxy.wait_timeout == 5
 
 
 def test_wrap_opencode_sets_config_content_env(

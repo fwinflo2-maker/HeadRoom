@@ -27,7 +27,11 @@ from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
-from headroom.proxy.auth_mode import classify_auth_mode, classify_client
+from headroom.proxy.auth_mode import (
+    classify_auth_mode,
+    classify_client,
+    supports_mid_turn_coalescing,
+)
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
@@ -2799,11 +2803,9 @@ class AnthropicHandlerMixin:
                     # this to opt-in (header-bearing) callers with an active
                     # stream, so the coarse md5 fallback can't 202 a streaming
                     # caller.
-                    if classify_client(
-                        request.headers
-                    ) == "claude-code" and self._should_queue_mid_turn(
-                        session_key, explicit_session_header
-                    ):
+                    if supports_mid_turn_coalescing(
+                        classify_client(request.headers)
+                    ) and self._should_queue_mid_turn(session_key, explicit_session_header):
                         from fastapi.responses import JSONResponse
 
                         queued = self._queue_mid_turn_message(session_key, body)

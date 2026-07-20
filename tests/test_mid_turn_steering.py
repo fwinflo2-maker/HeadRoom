@@ -298,3 +298,18 @@ class TestMidTurnSteering:
         finally:
             proxy._active_streams.discard(session_key)
             proxy._mid_turn_queues.pop(session_key, None)
+
+
+class TestCoalescingCapability:
+    """The capability predicate that gates the mid-turn coalescing protocol."""
+
+    def test_claude_code_supports_coalescing(self):
+        from headroom.proxy.auth_mode import supports_mid_turn_coalescing
+
+        assert supports_mid_turn_coalescing("claude-code") is True
+
+    def test_other_clients_do_not_support_coalescing(self):
+        from headroom.proxy.auth_mode import supports_mid_turn_coalescing
+
+        for client in ("opencode", "codex", "cursor", "aider", "", None):
+            assert supports_mid_turn_coalescing(client) is False

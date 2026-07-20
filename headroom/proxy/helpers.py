@@ -2412,7 +2412,7 @@ def apply_session_sticky_ccr_tool(
         return tools_out, True
 
     # Fresh session — only inject when this turn produced compressed content.
-    if not has_compressed_content_this_turn:
+    if not (has_compressed_content_this_turn or has_ccr_tool_use_history):
         log_tool_injection_decision(
             provider=provider,
             session_id=session_id,

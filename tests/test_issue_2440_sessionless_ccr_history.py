@@ -3,7 +3,10 @@ from __future__ import annotations
 import pytest
 
 from headroom.ccr.tool_injection import CCR_TOOL_NAME, CCRToolInjector
-from headroom.proxy.helpers import apply_session_sticky_ccr_tool
+from headroom.proxy.helpers import (
+    _reset_session_ccr_tracker_for_test,
+    apply_session_sticky_ccr_tool,
+)
 
 ISSUE_2440_ERROR = "API Error: 400 Tool reference 'headroom_retrieve' not found in available tools"
 
@@ -33,7 +36,15 @@ def _issue_body(content: list[dict], tools: list[dict] | None = None) -> dict:
     }
 
 
-def test_sessionless_history_redeclares_ccr_tool() -> None:
+@pytest.fixture(autouse=True)
+def _reset_tracker():
+    _reset_session_ccr_tracker_for_test()
+    yield
+    _reset_session_ccr_tracker_for_test()
+
+
+@pytest.mark.parametrize("session_id", [None, "anthropic-session-without-tracker"])
+def test_sessionless_history_redeclares_ccr_tool(session_id: str | None) -> None:
     body = _issue_body([{"type": "tool_use", "name": CCR_TOOL_NAME}])
 
     with pytest.raises(RuntimeError, match="400 Tool reference") as error:
@@ -44,7 +55,7 @@ def test_sessionless_history_redeclares_ccr_tool() -> None:
     injector.scan_for_markers(body["messages"])
     body["tools"], was_injected = apply_session_sticky_ccr_tool(
         provider="anthropic",
-        session_id=None,
+        session_id=session_id,
         request_id="issue-2440",
         existing_tools=body["tools"],
         has_compressed_content_this_turn=False,

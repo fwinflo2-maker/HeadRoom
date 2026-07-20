@@ -242,6 +242,21 @@ def test_sessionless_history_redeclares_tool():
     assert [tool["name"] for tool in tools] == [CCR_TOOL_NAME]
 
 
+def test_tracked_session_history_redeclares_when_tracker_is_empty():
+    tools, injected = apply_session_sticky_ccr_tool(
+        provider="anthropic",
+        session_id="session-with-history-only",
+        request_id="history-tracked",
+        existing_tools=None,
+        has_compressed_content_this_turn=False,
+        has_ccr_tool_use_history=True,
+    )
+
+    assert injected is True
+    assert [tool["name"] for tool in tools] == [CCR_TOOL_NAME]
+    assert get_session_ccr_tracker().has_done_ccr("anthropic", "session-with-history-only")
+
+
 # ─── Byte-stable tool definition ───────────────────────────────────────
 
 

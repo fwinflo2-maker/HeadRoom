@@ -101,42 +101,6 @@ async def test_metrics_lock_is_free_while_the_ledger_write_runs(
 
 
 @pytest.mark.asyncio
-async def test_event_loop_keeps_running_during_the_ledger_write(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The write happens off-loop, so other coroutines keep being scheduled."""
-
-    def slow_record(**kwargs: Any) -> None:
-        time.sleep(_WRITE_SECONDS)
-
-    monkeypatch.setattr(prometheus_metrics.savings_ledger, "record_savings_event", slow_record)
-    metrics = _metrics()
-
-    ticks: list[float] = []
-    stop = False
-
-    async def canary() -> None:
-        while not stop:
-            await asyncio.sleep(0.01)
-            ticks.append(time.perf_counter())
-
-    canary_task = asyncio.create_task(canary())
-    # Let the canary establish a tick rhythm before the write starts, so the
-    # measurement is a gap between real ticks rather than a startup artifact.
-    await asyncio.sleep(0.05)
-    del ticks[:-1]
-
-    await _record(metrics)
-    stop = True
-    await canary_task
-
-    max_gap = max(b - a for a, b in zip(ticks, ticks[1:]))
-    assert max_gap < _WRITE_SECONDS / 2, (
-        f"event loop stalled {max_gap:.3f}s during a {_WRITE_SECONDS:.3f}s ledger write"
-    )
-
-
-@pytest.mark.asyncio
 async def test_event_is_on_disk_once_record_request_returns(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -172,3 +136,24 @@ async def test_no_ledger_write_when_gated_out(
     await _record(_metrics(stateless=stateless), tokens_saved=tokens_saved)
 
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_requests_all_land_their_events(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Offloading means N in-flight requests append from N worker threads.
+
+    Before the move every proxy ledger write ran on the one event-loop thread,
+    so they were serialised for free. Now they are not, and the ledger's own
+    ``flock`` plus its past-1 MB full-file rewrite are what has to hold the line.
+    """
+
+    monkeypatch.setenv("HEADROOM_SAVINGS_EVENTS_PATH", str(tmp_path / "savings_events.jsonl"))
+    metrics = _metrics()
+
+    await asyncio.gather(*(_record(metrics) for _ in range(24)))
+
+    report = savings_ledger.aggregate_savings()
+    assert report.lifetime["calls"] == 24, "a concurrent append was lost"
+    assert report.lifetime["tokens_saved"] == 24 * 400

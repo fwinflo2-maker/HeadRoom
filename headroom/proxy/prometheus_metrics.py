@@ -28,6 +28,13 @@ logger = logging.getLogger("headroom.proxy")
 
 
 def _escape_label_value(value: str) -> str:
+    # The /metrics body is emitted whole with .encode("utf-8") (server.py). A
+    # client-supplied value can be a valid str that is not UTF-8-encodable — a
+    # lone surrogate decoded from a JSON model id — which raises in the response
+    # encoder and 500s every scrape, not just its own line. Drop un-encodable
+    # code points before escaping so one malformed request can't down the
+    # endpoint. Byte-identical for encodable values, including non-ASCII.
+    value = value.encode("utf-8", "replace").decode("utf-8")
     return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
 

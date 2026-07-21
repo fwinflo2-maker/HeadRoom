@@ -130,8 +130,13 @@ _OPENAI_BASE_URL_HEADER = "x-headroom-base-url"
 _decode_openai_bearer_payload = decode_openai_bearer_payload
 
 
-def _normalize_openai_max_tokens(body: dict[str, Any]) -> None:
+def _normalize_openai_max_tokens(
+    body: dict[str, Any], *, backend_owns_translation: bool = False
+) -> None:
     """Rename the legacy ``max_tokens`` to ``max_completion_tokens`` in-place.
+
+    This direct-OpenAI compatibility shim leaves provider-specific translation
+    to backend-routed requests.
 
     GPT-5 / o-series chat models reject ``max_tokens`` and require
     ``max_completion_tokens``; gpt-4o/4.1 accept the latter too. So translating
@@ -140,7 +145,7 @@ def _normalize_openai_max_tokens(body: dict[str, Any]) -> None:
     No-op when there is no ``max_tokens``; keeps an already-set
     ``max_completion_tokens`` and just drops the rejected legacy key.
     """
-    if not isinstance(body, dict) or "max_tokens" not in body:
+    if backend_owns_translation or not isinstance(body, dict) or "max_tokens" not in body:
         return
     legacy = body.get("max_tokens")
     if legacy is not None and body.get("max_completion_tokens") is None:
@@ -952,31 +957,71 @@ def _dedup_responses_output_items(
 
 
 def _openai_responses_to_sse(response: dict[str, Any]) -> list[bytes]:
-    """Convert a complete Responses API JSON body into a minimal SSE stream.
+    """Convert a complete Responses API JSON body into an SSE stream.
 
-    Used only for the buffered-CCR path: the client asked for
-    ``stream: true`` but we forced a non-streaming upstream call so CCR
-    retrieval could be resolved server-side. This reconstructs just enough
-    of the real event sequence (``response.created`` + ``response.completed``)
-    for Responses API clients that key off the terminal event's full
-    response object — it does not replay incremental output-item/text
-    deltas. Mirrors the equivalent simplification in
-    ``StreamingMixin._response_to_sse`` for the Anthropic buffered path.
+    Used only for the buffered-CCR path: the client asked for ``stream: true``
+    but we forced a non-streaming upstream call so CCR retrieval could be
+    resolved server-side. We then have to replay the response as SSE.
+
+    Some Responses clients read the whole answer off the terminal
+    ``response.completed`` event, but others (OpenCode / the Vercel AI SDK)
+    render output only from the *incremental* item/text events and show nothing
+    when they are absent (#2410). So reconstruct the real event sequence:
+    ``response.created`` -> ``response.in_progress`` -> per output item
+    (``response.output_item.added``, and for message items the
+    ``response.content_part.added`` / ``response.output_text.delta`` /
+    ``response.output_text.done`` / ``response.content_part.done`` sequence) ->
+    ``response.output_item.done`` -> ``response.completed`` -> ``[DONE]``.
     """
-    created_response = {**response, "status": "in_progress", "output": []}
     events: list[bytes] = []
-    for seq, (event_type, event_response) in enumerate(
-        (
-            ("response.created", created_response),
-            ("response.completed", response),
-        )
-    ):
-        payload = {
-            "type": event_type,
-            "sequence_number": seq,
-            "response": event_response,
-        }
+    seq = 0
+
+    def _emit(event_type: str, extra: dict[str, Any]) -> None:
+        nonlocal seq
+        payload = {"type": event_type, "sequence_number": seq, **extra}
         events.append(f"event: {event_type}\ndata: {json.dumps(payload)}\n\n".encode())
+        seq += 1
+
+    output_items = response.get("output") or []
+    created_response = {**response, "status": "in_progress", "output": []}
+    _emit("response.created", {"response": created_response})
+    _emit("response.in_progress", {"response": created_response})
+
+    for out_idx, item in enumerate(output_items):
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id", f"item_{out_idx}")
+
+        # ``output_item.added`` carries the item shell; message content streams
+        # via the content-part events below, so start it empty there.
+        if item.get("type") == "message":
+            added_item = {k: v for k, v in item.items() if k != "content"}
+            added_item["content"] = []
+        else:
+            added_item = item
+        _emit("response.output_item.added", {"output_index": out_idx, "item": added_item})
+
+        content = item.get("content")
+        if item.get("type") == "message" and isinstance(content, list):
+            for c_idx, part in enumerate(content):
+                if not isinstance(part, dict):
+                    continue
+                loc = {"item_id": item_id, "output_index": out_idx, "content_index": c_idx}
+                if part.get("type") in ("output_text", "text"):
+                    text = part.get("text", "") or ""
+                    _emit("response.content_part.added", {**loc, "part": {**part, "text": ""}})
+                    if text:
+                        _emit("response.output_text.delta", {**loc, "delta": text})
+                    _emit("response.output_text.done", {**loc, "text": text})
+                    _emit("response.content_part.done", {**loc, "part": part})
+                else:
+                    # Non-text part (e.g. refusal): add + done with the full part.
+                    _emit("response.content_part.added", {**loc, "part": part})
+                    _emit("response.content_part.done", {**loc, "part": part})
+
+        _emit("response.output_item.done", {"output_index": out_idx, "item": item})
+
+    _emit("response.completed", {"response": response})
     events.append(b"data: [DONE]\n\n")
     return events
 
@@ -1318,6 +1363,47 @@ class OpenAIHandlerMixin:
             await traffic_learner.on_messages(learner_messages)
         except Exception as exc:
             logger.debug("[%s] Traffic learner (responses): %s", request_id, exc)
+
+    async def _observe_openai_chat_traffic(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        request_id: str,
+    ) -> None:
+        """Feed one chat/completions request into the live traffic learner.
+
+        The chat counterpart of :meth:`_observe_openai_responses_traffic`.
+        Chat/completions clients (GitHub Copilot CLI, opencode, OpenAI SDKs)
+        route here rather than through ``/v1/responses``, so without this call
+        their tool results and user preferences never reached the learner even
+        with Learn enabled (part of #2060). Chat messages are already
+        ``role``/``content`` shaped, so ``on_messages`` consumes them directly;
+        tool results use the OpenAI-format extractor.
+        """
+        traffic_learner = getattr(self, "traffic_learner", None)
+        if traffic_learner is None:
+            return
+        try:
+            memory_handler = getattr(self, "memory_handler", None)
+            if (
+                traffic_learner._backend is None
+                and memory_handler
+                and memory_handler.initialized
+                and memory_handler.backend
+            ):
+                traffic_learner.set_backend(memory_handler.backend)
+
+            tool_results = traffic_learner.extract_tool_results_from_openai_messages(messages)
+            for tool_result in tool_results[-5:]:
+                await traffic_learner.on_tool_result(
+                    tool_name=tool_result["tool_name"],
+                    tool_input=tool_result["input"],
+                    tool_output=tool_result["output"],
+                    is_error=tool_result["is_error"],
+                )
+            await traffic_learner.on_messages(messages)
+        except Exception as exc:
+            logger.debug("[%s] Traffic learner (chat): %s", request_id, exc)
 
     @staticmethod
     def _headroom_bypass_enabled(headers: Any) -> bool:
@@ -2558,6 +2644,12 @@ class OpenAIHandlerMixin:
 
         stream = body.get("stream", False)
 
+        # Learn from the original client payload before memory context or
+        # compression mutates it, mirroring the Responses and Anthropic
+        # ingestion paths. Without this, chat/completions traffic (Copilot CLI,
+        # opencode, OpenAI SDKs) fed nothing to the learner (part of #2060).
+        await self._observe_openai_chat_traffic(original_client_messages, request_id=request_id)
+
         # Bypass: skip ALL compression for explicit opt-out
         _bypass = self._headroom_bypass_enabled(request.headers)
         if _bypass:
@@ -2741,6 +2833,17 @@ class OpenAIHandlerMixin:
             "verbosity": body.get("verbosity"),
             "modalities": body.get("modalities"),
         }
+        # Snapshot the lookup messages too. `messages` is the primary cache
+        # key component, but the pre_compress hook below reassigns it, so
+        # caching the response under the live `messages` would store it under a
+        # different key than it was looked up by — the cache would never hit
+        # and would fill with unreachable entries. Reuse this raw snapshot
+        # verbatim at cache.set (the same reason cache_key_fields is
+        # snapshotted here, #327). Image compression above also rebinds
+        # `messages`, but it runs before this snapshot, so its output is already
+        # captured — keep this snapshot after image compression, or a reorder
+        # silently reintroduces the drift.
+        cache_lookup_messages = messages
         # Check cache
         if self.cache and not stream:
             cached = await self.cache.get(messages, model, **cache_key_fields)
@@ -3359,7 +3462,9 @@ class OpenAIHandlerMixin:
         # translate it here — the proxy already owns the outbound body — and
         # those requests work unchanged. No-op when the caller already set
         # `max_completion_tokens`.
-        _normalize_openai_max_tokens(body)
+        _normalize_openai_max_tokens(
+            body, backend_owns_translation=self.anthropic_backend is not None
+        )
 
         # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER): verbosity steering
         # on the chat system message. Runs after every other body mutation so the
@@ -3600,8 +3705,15 @@ class OpenAIHandlerMixin:
                     # cache stats from the LAST upstream call.
                     total_latency = (time.time() - start_time) * 1000
                     usage = backend_response.body.get("usage", {})
-                    output_tokens = usage.get("completion_tokens", 0)
-                    total_input_tokens = usage.get("prompt_tokens", optimized_tokens)
+                    # `.get(key, default)` only falls back when the key is
+                    # absent; a present-but-null count (some OpenAI-compatible
+                    # backends emit these on a stopped/empty turn) would return
+                    # None and crash the downstream `max(...)` arithmetic and the
+                    # int-typed outcome/metrics. `_usage_int` coerces both cases,
+                    # matching the streaming path and the guarded cache keys below
+                    # (same class as the gemini fix in #2347).
+                    output_tokens = _usage_int(usage.get("completion_tokens"))
+                    total_input_tokens = _usage_int(usage.get("prompt_tokens")) or optimized_tokens
 
                     # Cache stats: prefer the Anthropic/Bedrock top-level
                     # keys when present (authoritative). Fall back to
@@ -3911,12 +4023,17 @@ class OpenAIHandlerMixin:
                 try:
                     resp_json = response.json()
                     usage = resp_json.get("usage", {})
-                    total_input_tokens = usage.get("prompt_tokens", optimized_tokens)
-                    output_tokens = usage.get("completion_tokens", 0)
+                    # Coerce present-but-null counts: the arithmetic below
+                    # (`_infer_openai_cache_write_tokens`, `max(...)`) runs
+                    # outside this try, so a null `prompt_tokens`/`cached_tokens`
+                    # would otherwise raise an uncaught TypeError and 500 the
+                    # request (same class as the gemini fix in #2347).
+                    total_input_tokens = _usage_int(usage.get("prompt_tokens")) or optimized_tokens
+                    output_tokens = _usage_int(usage.get("completion_tokens"))
                     # OpenAI returns cached_tokens in prompt_tokens_details
                     # These are charged at 50% of the input price
                     prompt_details = usage.get("prompt_tokens_details") or {}
-                    cache_read_tokens = prompt_details.get("cached_tokens", 0)
+                    cache_read_tokens = _usage_int(prompt_details.get("cached_tokens"))
                 except (KeyError, TypeError, AttributeError) as e:
                     logger.debug(
                         f"[{request_id}] Failed to extract cached tokens from OpenAI response: {e}"
@@ -3991,10 +4108,12 @@ class OpenAIHandlerMixin:
                     except Exception as e:
                         logger.warning(f"[{request_id}] Memory tool handling failed: {e}")
 
-                # Cache
+                # Cache response under the SAME key it was looked up by:
+                # cache_lookup_messages is the raw pre-mutation snapshot, not
+                # the live (hooked) `messages` (#327).
                 if self.cache and response.status_code == 200:
                     await self.cache.set(
-                        messages,
+                        cache_lookup_messages,
                         model,
                         response.content,
                         dict(response.headers),
@@ -7820,11 +7939,54 @@ class OpenAIHandlerMixin:
             with contextlib.suppress(Exception):
                 await websocket.close()
 
+    def _lossy_inline_pipeline(self) -> Any:
+        """Cached pipeline for ``/v1/compress`` ``config.mode="lossy_inline"``.
+
+        Runs the lossless byte/data fold first, then Kompresses the folded
+        remainder (``lossless_then_lossy``). ``ccr_inject_marker=False`` makes
+        every compressor (Kompress, SmartCrusher, search/log/config) emit inline
+        lossy output with NO ``<<ccr:…>>`` / ``Retrieve more: hash=`` marker and
+        NO CCR store write, so the result is safe to forward straight to a
+        provider with no retrieval round-trip. Derived once from the live OpenAI
+        router's config and reused read-only across requests.
+
+        ponytail: a first-request race just builds it twice — both are
+        equivalent and Kompress weights are cached at module level, so no lock.
+        """
+        cached = getattr(self, "_lossy_inline_pipeline_cache", None)
+        if cached is not None:
+            return cached
+
+        from headroom.transforms.compression_units import find_content_router
+        from headroom.transforms.content_router import ContentRouter
+        from headroom.transforms.pipeline import TransformPipeline
+
+        base = find_content_router(self.openai_pipeline)
+        if base is None:  # ponytail: nothing to derive from — use default pipeline
+            return self.openai_pipeline
+        cfg = replace(
+            base.config,
+            lossless=False,  # lossy mode (not lossless-only)
+            lossless_then_lossy=True,  # fold first, then Kompress the remainder
+            ccr_inject_marker=False,  # inline, marker-free everywhere
+            ccr_enabled=False,  # no CCR store writes
+            smart_crusher_lossless_only=False,  # keep SmartCrusher lossy
+        )  # enable_kompress inherited: on by default, off if operator disabled it
+        pipeline = TransformPipeline(
+            transforms=[ContentRouter(cfg, observer=self.metrics)],
+            provider=self.openai_provider,
+        )
+        self._lossy_inline_pipeline_cache = pipeline
+        return pipeline
+
     async def handle_compress(self, request: Request) -> JSONResponse:
         """Compress messages without calling an LLM.
 
         POST /v1/compress
         Body: {"messages": [...], "model": "...", "config": {}}
+        ``config.mode="lossy_inline"`` (alias ``"lossless_then_lossy"``) selects
+        the marker-free lossless-then-lossy pipeline whose output needs no CCR
+        retrieval round-trip — the mode to use behind a gateway/sidecar.
         Returns compressed messages + metrics.
         """
         from fastapi.responses import JSONResponse
@@ -7921,10 +8083,20 @@ class OpenAIHandlerMixin:
             )
             # Extract CompressConfig options from request body
             compress_config = body.get("config", {})
+            if not isinstance(compress_config, dict):
+                compress_config = {}
             compress_user_messages = compress_config.get("compress_user_messages", False)
             target_ratio = compress_config.get("target_ratio")
             protect_recent = compress_config.get("protect_recent")
             protect_analysis_context = compress_config.get("protect_analysis_context")
+            # Marker-free lossless-then-lossy mode: safe to forward downstream
+            # with no CCR retrieval round-trip (see _lossy_inline_pipeline).
+            mode = compress_config.get("mode")
+            pipeline = (
+                self._lossy_inline_pipeline()
+                if mode in ("lossy_inline", "lossless_then_lossy")
+                else self.openai_pipeline
+            )
 
             pipeline_kwargs: dict = {
                 "model_limit": context_limit,
@@ -7945,7 +8117,7 @@ class OpenAIHandlerMixin:
             # until it finished (#718). The executor also enforces a timeout so a
             # too-large body fails fast instead of hanging forever.
             result = await self._run_compression_in_executor(
-                lambda: self.openai_pipeline.apply(
+                lambda: pipeline.apply(
                     messages=messages,
                     model=model,
                     **pipeline_kwargs,
@@ -7975,6 +8147,12 @@ class OpenAIHandlerMixin:
                     overhead_ms=latency_ms,
                     num_messages=len(messages) if isinstance(messages, list) else 0,
                     transforms_applied=tuple(result.transforms_applied or ()),
+                    waste_signals=(
+                        result.waste_signals.to_dict()
+                        if getattr(result, "waste_signals", None) is not None
+                        else None
+                    ),
+                    pipeline_timing=getattr(result, "timing", None) or None,
                     tags=tags,
                     client=client,
                 )

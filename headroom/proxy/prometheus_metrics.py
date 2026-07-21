@@ -1211,11 +1211,11 @@ class PrometheusMetrics:
                     ]
                 )
                 for _provider, _reasons in self.cache_miss_attribution_by_provider.items():
-                    _safe_provider = _escape_label_value(_provider)
+                    _safe_provider = _escape_label_value(str(_provider))
                     for _reason, _count in _reasons.items():
                         lines.append(
                             f'headroom_cache_miss_attribution_total{{provider="{_safe_provider}",'
-                            f'reason="{_escape_label_value(_reason)}"}} {_count}'
+                            f'reason="{_escape_label_value(str(_reason))}"}} {_count}'
                         )
                 lines.append("")
 
@@ -1273,7 +1273,7 @@ class PrometheusMetrics:
             )
             for provider, count in self.requests_by_provider.items():
                 lines.append(
-                    f'headroom_requests_by_provider{{provider="{_escape_label_value(provider)}"}} {count}'
+                    f'headroom_requests_by_provider{{provider="{_escape_label_value(str(provider))}"}} {count}'
                 )
             lines.append("")
 
@@ -1285,7 +1285,7 @@ class PrometheusMetrics:
             )
             for model, count in self.requests_by_model.items():
                 lines.append(
-                    f'headroom_requests_by_model{{model="{_escape_label_value(model)}"}} {count}'
+                    f'headroom_requests_by_model{{model="{_escape_label_value(str(model))}"}} {count}'
                 )
             lines.append("")
 
@@ -1425,7 +1425,7 @@ class PrometheusMetrics:
                 # blocks below re-walk this dict once per family. Escape the provider
                 # keys once here instead of at all eleven emission sites.
                 cache_by_provider = {
-                    _escape_label_value(name): stats
+                    _escape_label_value(str(name)): stats
                     for name, stats in self.cache_by_provider.items()
                 }
                 lines.extend(

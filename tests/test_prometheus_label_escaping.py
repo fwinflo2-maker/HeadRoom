@@ -242,3 +242,30 @@ async def test_well_formed_values_are_emitted_unchanged() -> None:
 
     assert 'headroom_requests_by_provider{provider="anthropic"} 1' in text
     assert 'headroom_requests_by_model{model="claude-sonnet-4-5"} 1' in text
+
+
+@pytest.mark.asyncio
+async def test_export_is_utf8_encodable_with_surrogate_model() -> None:
+    # `/metrics` renders the whole body with `.encode("utf-8")` (server.py). A
+    # client can decode a lone surrogate from JSON (`{"model": "x-\ud83d-y"}`) —
+    # a valid str that is NOT UTF-8-encodable and passes escaping untouched. It
+    # would raise in the response encoder and, because the poisoned key persists
+    # in requests_by_model, 500 every later scrape until restart. Escaping must
+    # leave the whole export encodable.
+    metrics = PrometheusMetrics()
+
+    await _record(metrics, model="x-\ud83d-y")
+    await _record(metrics, model="clean-model")  # a healthy series alongside
+
+    text = await metrics.export()
+
+    # The load-bearing assertion: the body a scraper receives must encode.
+    text.encode("utf-8")
+    # And the healthy series is still readable, i.e. the poison did not corrupt
+    # the surrounding output.
+    assert 'headroom_requests_by_model{model="clean-model"} 1' in text
+    # Legitimate astral characters (a real emoji is one code point, encodable)
+    # are preserved, not scrubbed — only un-encodable lone surrogates change.
+    metrics2 = PrometheusMetrics()
+    await _record(metrics2, model="gpt-\U0001f600")
+    assert 'headroom_requests_by_model{model="gpt-\U0001f600"} 1' in await metrics2.export()

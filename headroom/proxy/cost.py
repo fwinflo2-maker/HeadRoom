@@ -672,7 +672,10 @@ class CostTracker:
         elif isinstance(custom_pricing, dict):
             custom_registry = PricingRegistry.from_dict(custom_pricing)
 
-        self.calculator = CostCalculator(custom_registry=custom_registry)
+        self.calculator = CostCalculator(
+            custom_registry=custom_registry,
+            cost_fallback_enabled=cost_fallback_enabled,
+        )
 
         # Cost tracking - using deque for efficient left-side removal
         self._costs: deque[tuple[datetime, float]] = deque(maxlen=self.MAX_COST_ENTRIES)

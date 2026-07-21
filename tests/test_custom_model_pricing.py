@@ -168,6 +168,37 @@ def test_existing_behavior_unchanged_when_unconfigured() -> None:
     assert tracker.cost_fallback_enabled is True
 
 
+def test_cost_tracker_respects_disabled_fallback_with_custom_pricing() -> None:
+    """Proxy CostTracker must pass HEADROOM_COST_FALLBACK_ENABLED through."""
+    tracker = CostTracker(
+        custom_pricing={
+            "custom-internal-model": {
+                "input_per_1m": 5.0,
+                "output_per_1m": 15.0,
+            }
+        },
+        cost_fallback_enabled=False,
+    )
+
+    tracker.record_tokens(
+        model="custom-internal-model",
+        tokens_saved=0,
+        tokens_sent=100_000,
+        uncached_tokens=100_000,
+        output_tokens=20_000,
+    )
+
+    assert tracker.get_period_cost() == 0.0
+    assert (
+        tracker.estimate_cost(
+            model="custom-internal-model",
+            input_tokens=100_000,
+            output_tokens=20_000,
+        )
+        is None
+    )
+
+
 def test_extract_provider_cost_headers_and_payload() -> None:
     """Test helper for extracting provider-supplied cost from headers or JSON payload."""
     # 1. From standard header

@@ -41,6 +41,25 @@ def runner() -> CliRunner:
     return CliRunner()
 
 
+_PROXY_DEP_TESTS = frozenset(
+    {
+        "test_wrap_codex_aborts_before_mutating_config_when_proxy_deps_missing",
+        "test_wrap_codex_skips_proxy_dependency_check_with_no_proxy",
+        "test_ensure_proxy_dependencies_exits_when_server_import_fails",
+    }
+)
+
+
+@pytest.fixture(autouse=True)
+def _skip_proxy_dependency_gate_unless_exercised(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wrap-codex integration tests run in the base CI env without [proxy] extras."""
+    if request.node.name in _PROXY_DEP_TESTS:
+        return
+    monkeypatch.setattr("headroom.cli.wrap.ensure_proxy_dependencies", lambda: None)
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: helpers operating on ~/.codex/config.toml
 # ---------------------------------------------------------------------------

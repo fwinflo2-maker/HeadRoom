@@ -3,7 +3,7 @@
 ``PrometheusMetrics.export()`` builds the exposition text by hand, so every label
 value has to pass through ``_escape_label_value`` before it is interpolated. The
 format reserves ``"``, ``\\`` and the line feed, and a standard scraper does not
-degrade gracefully on a malformed line -- it aborts the parse, losing every
+degrade gracefully on a malformed line — it aborts the parse, losing every
 family emitted at or after the bad sample.
 
 ``model`` reaches ``requests_by_model`` straight from the parsed client request
@@ -67,7 +67,7 @@ def _parse_label_block(block: str) -> dict[str, str]:
 def _labelled_samples(text: str) -> list[tuple[str, dict[str, str]]]:
     """Every labelled sample in a scrape, as (metric name, decoded labels).
 
-    Raises on any line a scraper would reject -- including the fragments an
+    Raises on any line a scraper would reject — including the fragments an
     unescaped line feed splits a sample into.
     """
     samples: list[tuple[str, dict[str, str]]] = []
@@ -189,10 +189,13 @@ async def test_no_emitted_label_value_is_malformed() -> None:
     # escape fails here even when no assertion above names it.
     metrics = PrometheusMetrics()
 
+    # The comma matters: a raw value like `x",evil="1` re-parses as two
+    # well-formed labels rather than raising, so a poison set without one would
+    # miss that shape of injection entirely.
     await _record(
         metrics,
         provider='pro"vider\\one',
-        model='mo"del\\two',
+        model='mo"del,evil="1',
         cache_read_tokens=40,
         cache_write_tokens=60,
         cache_write_5m_tokens=10,
@@ -205,7 +208,28 @@ async def test_no_emitted_label_value_is_malformed() -> None:
 
     values = {value for _, labels in samples for value in labels.values()}
     assert 'pro"vider\\one' in values, "provider did not round-trip through the escape"
-    assert 'mo"del\\two' in values, "model did not round-trip through the escape"
+    assert 'mo"del,evil="1' in values, "model did not round-trip through the escape"
+
+
+@pytest.mark.asyncio
+async def test_non_string_label_values_are_coerced() -> None:
+    # A JSON body can carry `"model": 123`, and the handlers pass the decoded
+    # value through untouched (handlers/openai.py reads body.get("model")). The
+    # hand-rolled f-strings used to call str() implicitly, so escaping has to
+    # keep tolerating a non-str. /metrics has no error handling around export(),
+    # and the key survives in the dict, so a raise here would take out every
+    # later scrape too.
+    metrics = PrometheusMetrics()
+
+    await _record(metrics, provider=456, model=123, cache_read_tokens=5, cache_write_tokens=5)
+    await metrics.record_cache_miss_attribution(456, 789)
+
+    text = await metrics.export()
+
+    assert 'headroom_requests_by_model{model="123"} 1' in text
+    assert 'headroom_requests_by_provider{provider="456"} 1' in text
+    assert 'headroom_cache_read_tokens_total{provider="456"}' in text
+    assert 'headroom_cache_miss_attribution_total{provider="456",reason="789"} 1' in text
 
 
 @pytest.mark.asyncio

@@ -82,6 +82,9 @@ class PrometheusMetrics:
         self.requests_total = 0
         self.requests_by_provider: dict[str, int] = defaultdict(int)
         self.requests_by_model: dict[str, int] = defaultdict(int)
+        # Set once when requests_by_model first reaches MAX_DISTINCT_MODELS, so the
+        # cardinality-cap warning fires exactly once instead of per request.
+        self._model_cardinality_warned = False
         # Populated via X-Headroom-Stack header (TS SDK adapters, etc.)
         self.requests_by_stack: dict[str, int] = defaultdict(int)
         self.requests_cached = 0
@@ -310,6 +313,7 @@ class PrometheusMetrics:
             self.requests_total = 0
             self.requests_by_provider.clear()
             self.requests_by_model.clear()
+            self._model_cardinality_warned = False
             self.requests_by_stack.clear()
             self.requests_cached = 0
             self.requests_rate_limited = 0
@@ -685,6 +689,10 @@ class PrometheusMetrics:
         client: str | None = None,
     ):
         """Record metrics for a request."""
+        # Local import mirrors record_stack: defers to call-time (the telemetry
+        # package is fully loaded by then), avoiding an import cycle at module load.
+        from headroom.telemetry.context import MAX_DISTINCT_MODELS
+
         # Post-guard invariant (all providers): Headroom never forwards a request
         # larger than the original — handlers revert any inflation before sending
         # (verified clean on the wire). So compression savings are >= 0; a negative
@@ -701,7 +709,25 @@ class PrometheusMetrics:
         async with self._lock:
             self.requests_total += 1
             self.requests_by_provider[provider] += 1
-            self.requests_by_model[model] += 1
+            # Cap client-supplied model cardinality. `model` is client-controlled
+            # (body.get("model") in the openai/gemini/bedrock handlers), so an
+            # arbitrary-model client would otherwise grow requests_by_model and the
+            # exported series without bound. Bucket over-cap models into "other"
+            # (the sentinel docs/observability.md documents for `tier`), mirroring
+            # the requests_by_stack cap. Membership test, never a defaultdict index:
+            # indexing would materialize the key and defeat the cap.
+            if model in self.requests_by_model or len(self.requests_by_model) < MAX_DISTINCT_MODELS:
+                bounded_model = model
+            else:
+                bounded_model = "other"
+                if not self._model_cardinality_warned:
+                    self._model_cardinality_warned = True
+                    logger.warning(
+                        "metrics.record: model cardinality cap (%d) reached; "
+                        'bucketing further models into "other"',
+                        MAX_DISTINCT_MODELS,
+                    )
+            self.requests_by_model[bounded_model] += 1
 
             if cached:
                 self.requests_cached += 1
@@ -732,8 +758,12 @@ class PrometheusMetrics:
                 # is always a cold start (100% write, 0% read) — not a bust.
                 # Only flag as bust when a previously-warm model suddenly has
                 # high write ratio, indicating prefix invalidation.
-                model_req_num = self._cache_requests_by_model[model]
-                self._cache_requests_by_model[model] += 1
+                # ponytail: bounded_model may be "other" under a cardinality attack,
+                # mixing models in this bust heuristic. Acceptable — only bites
+                # >MAX_DISTINCT_MODELS distinct models on cached anthropic traffic,
+                # worst case a mis-attributed bust stat; keeps the dict bounded.
+                model_req_num = self._cache_requests_by_model[bounded_model]
+                self._cache_requests_by_model[bounded_model] += 1
                 if provider == "anthropic" and model_req_num > 0:
                     total_cached = cache_read_tokens + cache_write_tokens
                     if total_cached > 0 and cache_write_tokens > total_cached * 0.5:

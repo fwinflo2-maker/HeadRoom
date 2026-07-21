@@ -262,6 +262,15 @@ Every label vocabulary is bounded by code, not customer input:
 - `tool` (Python-side `wrap_rtk_invocations_total`): bounded by the
   set of tools the wrap CLI rewrites, captured by
   `headroom.cli.wrap_rtk_metrics`.
+- `model` (Python-side `requests_by_model` /
+  `_cache_requests_by_model`): unlike the Rust path above, the Python
+  proxy reads `model` from the request body, so it is client-supplied.
+  It is bounded at record time by `MAX_DISTINCT_MODELS`
+  (`headroom.telemetry.context`): once the cap is reached, further
+  distinct models bucket into the `"other"` sentinel and a one-time
+  warning is logged, mirroring the `tier` discipline above. The
+  in-memory dicts and the exported `headroom_requests_by_model` series
+  can never exceed the cap plus `"other"`.
 
 There is no code path where a malicious client can drive label
 cardinality unbounded.

@@ -189,9 +189,11 @@ async def test_no_emitted_label_value_is_malformed() -> None:
     # escape fails here even when no assertion above names it.
     metrics = PrometheusMetrics()
 
-    # The comma matters: a raw value like `x",evil="1` re-parses as two
-    # well-formed labels rather than raising, so a poison set without one would
-    # miss that shape of injection entirely.
+    # The model poison carries a comma and an inner quote. The parse alone
+    # can't catch comma-injection (this value raises on the quote first), so the
+    # round-trip assertion below is the real guard: after escaping, the value
+    # must decode back to the exact raw string, comma and all, rather than
+    # splitting into extra labels.
     await _record(
         metrics,
         provider='pro"vider\\one',

@@ -614,11 +614,12 @@ def build_session_summary(
 
     # ---- CCR retrieval drawback -> net savings ----
     # Retrievals re-inject original content plus tool wrappers: real billed
-    # tokens that offset gross compression savings. Sum both retrieval channels
-    # -- the MCP shared log (out-of-process `headroom mcp serve`) and the
-    # in-process proxy CCR handler -- which handle disjoint retrievals, so this
-    # does not double-count. Imported lazily to avoid an import cycle (matches
-    # _aggregate_mcp_events' deferred import above).
+    # tokens that offset gross compression savings. Sum the three retrieval
+    # channels -- the MCP shared log (out-of-process `headroom mcp serve`), the
+    # in-process proxy CCR reactive handler, and proxy proactive expansion
+    # (folded into the same handler counters) -- which handle disjoint
+    # retrievals, so this does not double-count. Imported lazily to avoid an
+    # import cycle (matches _aggregate_mcp_events' deferred import above).
     from headroom.ccr import CCR_RETRIEVAL_OVERHEAD_TOKENS
     from headroom.savings_ledger import estimate_cost_usd
 

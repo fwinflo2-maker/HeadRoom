@@ -585,6 +585,18 @@ class CCRResponseHandler:
         except Exception:
             logger.debug("durable proxy retrieval recording failed", exc_info=True)
 
+    def record_proactive_retrievals(self, count: int, tokens: int) -> None:
+        """Fold proxy proactive-expansion re-injections into live retrieval stats.
+
+        Payload tokens only (overhead is added once by cost.py from the count),
+        mirroring the reactive path so cost.py aggregation stays consistent.
+        """
+        if count <= 0 and tokens <= 0:
+            return
+        with self._retrieval_count_lock:
+            self._retrieval_count += max(count, 0)
+            self._retrieved_tokens += max(tokens, 0)
+
     @staticmethod
     def _extract_usage_tokens(resp: Any) -> tuple[int, int]:
         """Return (input_tokens, output_tokens) from a provider response.

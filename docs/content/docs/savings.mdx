@@ -66,7 +66,7 @@ Cost avoided is the dollar value of the saved **input** tokens. Headroom uses [l
 Compression savings are a *gross* figure. CCR retrievals re-inject original content back into context (plus a small tool-call wrapper overhead, ~50 tokens per retrieval) — real, billed tokens that offset what compression saved. `headroom savings` also reports **net** savings per window:
 
 - **gross** — tokens removed by compression
-- **retrieved-back** — tokens re-injected by `headroom_retrieve`
+- **retrieved-back** — tokens re-injected by CCR retrieval: model-invoked `headroom_retrieve` calls *and* proxy proactive expansion (relevant compressed content the proxy re-injects before the model asks)
 - **net** = gross − retrieved-back − per-retrieval overhead
 
 Net is never clamped to zero: if retrievals outweigh compression, it renders **negative**, an honest signal that compression is dropping data the model keeps asking for.

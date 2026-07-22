@@ -26,11 +26,34 @@ actually reports.
 from __future__ import annotations
 
 import logging
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
 logger = logging.getLogger("headroom.proxy")
+
+
+# CCR proxy proactive-expansion drawback, bound per-request via a ContextVar so
+# the outcome funnel can debit it WITHOUT threading a parameter through every
+# streaming/non-streaming handler (mirrors project_context). Set at re-injection
+# time; consumed only in emit's success section, so a failed forward books nothing.
+_pending_proactive_retrieval: ContextVar[tuple[int, int] | None] = ContextVar(
+    "headroom_ccr_proactive_pending", default=None
+)
+
+
+def set_pending_proactive_retrieval(value: tuple[int, int] | None) -> None:
+    """Bind a proxy proactive-expansion retrieval drawback to this request."""
+    _pending_proactive_retrieval.set(value)
+
+
+def consume_pending_proactive_retrieval() -> tuple[int, int] | None:
+    """Read and clear the pending proactive drawback for this request."""
+    value = _pending_proactive_retrieval.get()
+    if value is not None:
+        _pending_proactive_retrieval.set(None)
+    return value
 
 
 @dataclass(frozen=True)
@@ -357,6 +380,11 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
 
         outcome = dataclasses.replace(outcome, provider="copilot")
 
+    # Consume (read + clear) any pending CCR proactive-expansion drawback for
+    # this request now, but only RECORD it in the success section below -- a
+    # >=500 short-circuit must never book a retrieval that was never billed.
+    _pending_proactive = consume_pending_proactive_retrieval()
+
     # Upstream failure (>= 500, e.g. a 529 Overloaded surfaced after retry
     # exhaustion) must not feed the savings/cost/log success stats; that would
     # let a failed request inflate the save-rate. Record it as failed and stop,
@@ -366,6 +394,14 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     if outcome.status_code >= 500:
         await handler.metrics.record_failed(provider=outcome.provider)
         return
+
+    # Success section (status < 500, no exception): book the CCR proactive-
+    # expansion drawback now, gated exactly like the gross tokens_saved below,
+    # mirroring the reactive account-after-the-continuation-succeeds rule.
+    if _pending_proactive is not None:
+        _proactive_rec = getattr(handler, "_record_proactive_retrieval_drawback", None)
+        if _proactive_rec is not None:
+            _proactive_rec(*_pending_proactive)
 
     # Output-shaping savings ledger (counterfactual estimator). The shaper
     # tags each request's (arm, stratum) onto ``transforms_applied``; feed the

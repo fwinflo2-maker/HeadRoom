@@ -710,8 +710,6 @@ _RESPONSES_OUTPUT_ITEM_TYPES = frozenset(
 _RESPONSES_EXACT_TOOL_OUTPUT_NAMES = frozenset(
     {
         "edit",
-        "glob",
-        "grep",
         "read",
         "write",
     }

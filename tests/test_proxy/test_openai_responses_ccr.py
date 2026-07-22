@@ -450,7 +450,10 @@ async def test_buffered_responses_ccr_late_failure_emits_sanitized_error_event()
     assert b"An error occurred while processing the request." in bodies[-1]
     assert b"boom" not in bodies[-1]
     assert events[-1]["more_body"] is False
-    assert any(record.levelno == logging.ERROR and "RuntimeError: boom" in record.getMessage() for record in error_records)
+    assert any(
+        record.levelno == logging.ERROR and "RuntimeError: boom" in record.getMessage()
+        for record in error_records
+    )
 
 
 @pytest.mark.asyncio

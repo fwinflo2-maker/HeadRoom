@@ -525,7 +525,9 @@ async def test_buffered_ccr_late_failure_emits_sanitized_error_event() -> None:
                 await release.wait()
                 raise RuntimeError("boom")
 
-            with patch.object(proxy.metrics, "record_failed", new_callable=AsyncMock) as record_failed:
+            with patch.object(
+                proxy.metrics, "record_failed", new_callable=AsyncMock
+            ) as record_failed:
                 proxy._retry_request = delayed_failure
                 task = asyncio.create_task(proxy.handle_anthropic_messages(Request(scope, receive)))
                 await started.wait()
@@ -550,7 +552,10 @@ async def test_buffered_ccr_late_failure_emits_sanitized_error_event() -> None:
     assert b"An error occurred while processing the request." in bodies[-1]
     assert b"boom" not in bodies[-1]
     assert events[-1]["more_body"] is False
-    assert any(record.levelno == logging.ERROR and "RuntimeError: boom" in record.getMessage() for record in error_records)
+    assert any(
+        record.levelno == logging.ERROR and "RuntimeError: boom" in record.getMessage()
+        for record in error_records
+    )
 
 
 @pytest.mark.asyncio

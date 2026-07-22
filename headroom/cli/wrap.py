@@ -83,6 +83,7 @@ from headroom.providers.claude import (
 from headroom.providers.claude import (
     proxy_base_url as _claude_proxy_base_url,
 )
+from headroom.providers.claude.runtime import TOOL_SEARCH_FOUNDRY_DEFAULT
 from headroom.providers.codex import build_launch_env as _build_codex_launch_env
 from headroom.providers.codex.install import codex_uses_chatgpt_auth
 from headroom.providers.codex.threads import retag_to_headroom, retag_to_native
@@ -222,13 +223,14 @@ _WRAP_PROXY_TIMEOUT_ML_MODULES = ("torch", "sentence_transformers", "spacy")
 # Issue #746: Claude Code disables on-demand tool loading (deferral) when
 # ANTHROPIC_BASE_URL is a custom host and ENABLE_TOOL_SEARCH is unset, which
 # inflates the local context window by tens of K tokens. Setting the env var
-# when we launch Claude Code keeps deferral on. Default to "true" — defer the
-# MCP/system tools for maximum context savings, matching native first-party
-# behaviour (core built-ins like Read/Edit/Bash are never deferred by Claude
-# Code, so the agent loop is unaffected). The key/default are shared with
-# `init` and `install` via the Claude provider package to prevent drift.
+# when we launch Claude Code keeps deferral on. The generic default stays
+# "true" for non-Foundry sessions, while Foundry uses a dedicated compatibility
+# default of "false" because its upstream does not support the deferred-tool
+# shape. The key/defaults are shared with `init` and `install` via the Claude
+# provider package to prevent drift.
 _TOOL_SEARCH_ENV = TOOL_SEARCH_ENV
 _TOOL_SEARCH_DEFAULT = TOOL_SEARCH_DEFAULT
+_TOOL_SEARCH_FOUNDRY_DEFAULT = TOOL_SEARCH_FOUNDRY_DEFAULT
 _AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor", "grok", "grok_build"}
 
 # 1M context window for `wrap claude` (#1158). Claude Code only sends the
@@ -284,7 +286,8 @@ def _configure_tool_search_env(env: dict[str, str], flag_value: str | None) -> s
     1. explicit ``--tool-search`` flag — wins (the user asked for it on the CLI),
     2. a pre-existing ``ENABLE_TOOL_SEARCH`` in the environment — respected and
        left untouched (the user's own Claude Code knob),
-    3. the built-in default (``true``).
+    3. the built-in mode-specific default (``true`` normally, ``false`` on
+       Foundry).
 
     Returns the value written, or ``None`` when an existing environment value
     was deliberately left in place.
@@ -299,8 +302,11 @@ def _configure_tool_search_env(env: dict[str, str], flag_value: str | None) -> s
     existing = env.get(_TOOL_SEARCH_ENV)
     if existing is not None and existing.strip():
         return None
-    env[_TOOL_SEARCH_ENV] = _TOOL_SEARCH_DEFAULT
-    return _TOOL_SEARCH_DEFAULT
+    default = (
+        _TOOL_SEARCH_FOUNDRY_DEFAULT if env.get("CLAUDE_CODE_USE_FOUNDRY") else _TOOL_SEARCH_DEFAULT
+    )
+    env[_TOOL_SEARCH_ENV] = default
+    return default
 
 
 # ENABLE_TOOL_SEARCH modes that turn deferral OFF. Everything else Claude Code

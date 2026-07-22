@@ -51,13 +51,13 @@ if sys.version_info >= (3, 11):
 else:  # pragma: no cover - exercised only on Python 3.10
     import tomli as tomllib  # type: ignore[no-redef]
 
-from headroom.cli.proxy import ensure_proxy_dependencies
 from headroom import fsutil
 from headroom._version import __version__ as _HEADROOM_VERSION
 from headroom._version import normalize_release_version as _normalize_release_version
 from headroom.agent_savings import (
     apply_agent_savings_env_defaults,
 )
+from headroom.cli.proxy import ensure_proxy_dependencies
 from headroom.copilot_auth import (
     _API_TOKEN_ENV_VARS,
     _API_TOKEN_EXPIRES_AT_ENV_VAR,

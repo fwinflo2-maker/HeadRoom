@@ -272,8 +272,8 @@ Every label vocabulary is bounded by code, not customer input:
   in-memory dicts and the exported `headroom_requests_by_model` series
   can never exceed the cap plus `"other"`.
 
-There is no code path where a malicious client can drive label
-cardinality unbounded.
+Every label vocabulary listed above is bounded by code, so no
+client-supplied value can drive label cardinality unbounded.
 
 ## See also
 

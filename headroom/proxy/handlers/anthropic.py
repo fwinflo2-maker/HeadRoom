@@ -68,8 +68,79 @@ def _strip_index_from_content_blocks(content: Any) -> None:
             _strip_index_from_content_blocks(block.get("content"))
 
 
+def _append_ccr_instructions_to_system(body: dict[str, Any]) -> bool:
+    """Append stable CCR retrieval instructions to an Anthropic body."""
+    from headroom.ccr.tool_injection import create_stable_system_instructions
+
+    marker = "Compressed Context Available"
+    instructions = create_stable_system_instructions().strip()
+    system = body.get("system")
+
+    if isinstance(system, str):
+        if marker in system:
+            return False
+        body["system"] = f"{system}\n\n{instructions}" if system else instructions
+        return True
+
+    if isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and marker in str(block.get("text", "")):
+                return False
+            if isinstance(block, str) and marker in block:
+                return False
+        system.append({"type": "text", "text": instructions})
+        return True
+
+    body["system"] = instructions
+    return True
+
+
 class AnthropicHandlerMixin:
     """Mixin providing Anthropic API handler methods for HeadroomProxy."""
+
+    def _start_waste_signal_task(
+        self,
+        result,  # noqa: ANN001
+        *,
+        model: str,
+        provider_name: str,
+    ):  # noqa: ANN201
+        provider = getattr(result, "waste_signals_provider", None)
+        if provider is None:
+            return None
+
+        def _job() -> dict[str, int] | None:
+            try:
+                from headroom.observability import get_otel_metrics
+
+                waste_signals = provider()
+                if waste_signals is None:
+                    return None
+                signals_dict = waste_signals.to_dict()
+                get_otel_metrics().record_waste_signals(
+                    model=model,
+                    provider=provider_name,
+                    waste_signals=signals_dict,
+                )
+                return signals_dict
+            except Exception:
+                logger.debug("Background waste-signal detection failed", exc_info=True)
+                return None
+
+        task = asyncio.create_task(self._run_compression_background(_job))
+        tasks = getattr(self, "_waste_signal_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._waste_signal_tasks = tasks
+
+        def _on_done(t) -> None:  # noqa: ANN001
+            tasks.discard(t)
+            if not t.cancelled():
+                t.exception()
+
+        tasks.add(task)
+        task.add_done_callback(_on_done)
+        return task
 
     async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
         """Resolve a tokenizer and count messages off the event loop.

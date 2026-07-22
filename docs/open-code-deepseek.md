@@ -127,7 +127,8 @@ Edit `~/.config/opencode/opencode.json`:
 
 **Important:** Only include model IDs that appear in the proxy's `/v1/models`
 response. OpenCode validates config models against the proxy's model list.
-If you need DeepSeek R1 (reasoner), see the note at the end of the guide.
+The current DeepSeek model names are `deepseek-v4-pro` and `deepseek-v4-flash`.
+`deepseek-chat` and `deepseek-reasoner` are deprecated compatibility aliases.
 
 ### Model comparison
 
@@ -135,6 +136,8 @@ If you need DeepSeek R1 (reasoner), see the note at the end of the guide.
 |---|---|---|---|
 | `deepseek-v4-pro` | Paid ($0.435/$0.87) | 200K | Complex coding, architecture, debugging |
 | `deepseek-v4-flash` | Free | 200K | Daily tasks, quick edits, exploration |
+
+Both models support **thinking mode** for step-by-step reasoning (see below).
 
 Switch models at any time with `/model` in OpenCode.
 
@@ -146,7 +149,7 @@ Switch models at any time with `/model` in OpenCode.
 opencode
 ```
 
-Run `/models` to confirm the DeepSeek models appear under "Headroom Proxy".
+Run `/models` to confirm both DeepSeek models appear under "Headroom Proxy".
 Select one with `/model deepseek-v4-flash` or `/model deepseek-v4-pro`.
 
 ---
@@ -158,6 +161,35 @@ curl http://127.0.0.1:8787/stats | python3 -m json.tool | grep -A5 compression
 ```
 
 Or open the dashboard at [http://127.0.0.1:8787/dashboard](http://127.0.0.1:8787/dashboard).
+
+---
+
+## Thinking mode (reasoning)
+
+Both `deepseek-v4-pro` and `deepseek-v4-flash` support **thinking mode** — the
+model works through problems step-by-step before answering. This replaces the
+deprecated `deepseek-reasoner` (R1) model.
+
+To enable thinking mode, pass `thinking` in the request body:
+
+```json
+{
+  "model": "deepseek-v4-pro",
+  "messages": [{"role": "user", "content": "Your question"}],
+  "thinking": {"type": "enabled"},
+  "reasoning_effort": "high"
+}
+```
+
+OpenCode sends requests through the headroom proxy, which forwards them to
+DeepSeek. If you need thinking mode for specific tasks, you can:
+
+- **Set it in your provider options** — add `headers` or request body defaults
+  via the AI SDK's provider configuration if supported
+- **Use `/model deepseek-v4-flash`** for free-tier reasoning (thinking mode on
+  flash gives similar behavior to the old R1 model)
+- **Check DeepSeek's API docs** for the latest thinking mode parameters:
+  [api-docs.deepseek.com](https://api-docs.deepseek.com)
 
 ---
 
@@ -175,7 +207,6 @@ API key to the proxy, and the proxy forwards it to DeepSeek. Make sure
 2. Check which models the proxy exposes: `curl -s http://127.0.0.1:8787/v1/models -H "Authorization: Bearer sk-your-key"`
 3. Make sure your config model IDs match **exactly** what the proxy returns
 4. Don't use both `opencode.json` and `opencode.jsonc` in the same config directory — use one file
-5. Models like `deepseek-reasoner` and `deepseek-chat` are not exposed by the proxy; use `deepseek-v4-pro` or `deepseek-v4-flash` instead
 
 ### Models appear but requests fail
 
@@ -206,27 +237,13 @@ shaper is active immediately — the numbers just need calibration.
 
 ---
 
-## Using DeepSeek R1 (reasoner)
-
-The proxy's `/v1/models` endpoint currently only exposes `deepseek-v4-pro` and
-`deepseek-v4-flash`. However, the proxy can still route requests to R1 — you
-just can't select it from OpenCode's `/models` picker.
-
-If you need R1 for math/logic tasks, switch your default model:
-
-```bash
-/model deepseek-reasoner
-```
-
-Or set it directly in an OpenCode session config. R1 has 128K context and
-excels at reasoning-heavy workloads.
-
----
-
 ## What's NOT in this guide
 
 - **Claude or GPT models** — this setup uses DeepSeek exclusively
 - **`headroom wrap`** — do not use it; it overrides the config
+- **Deprecated model names** — `deepseek-chat` and `deepseek-reasoner` are
+  compatibility aliases that will be deprecated on 2026-07-24; use
+  `deepseek-v4-pro` and `deepseek-v4-flash` instead
 - **Kompress (ML compression)** — requires extra dependencies; SmartCrusher
   handles the majority of use cases
 - **Any code changes** — headroom ships full DeepSeek support natively

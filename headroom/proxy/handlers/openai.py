@@ -2576,7 +2576,6 @@ class OpenAIHandlerMixin:
             _read_request_json,
         )
         from headroom.proxy.modes import is_cache_mode, is_token_mode
-        from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -2905,9 +2904,8 @@ class OpenAIHandlerMixin:
 
                 return Response(content=cached.response_body, headers=response_headers)
 
-        # Token counting
-        tokenizer = get_tokenizer(model)
-        original_tokens = tokenizer.count_messages(messages)
+        # Token counting (offloaded off the event loop — GH #1701)
+        tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
 
         # Hook: pre_compress
         _hook_biases = None
@@ -4257,7 +4255,6 @@ class OpenAIHandlerMixin:
             MAX_REQUEST_BODY_SIZE,
             read_request_json_with_bytes,
         )
-        from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -4474,9 +4471,8 @@ class OpenAIHandlerMixin:
                     detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
                 )
 
-        # Token counting on converted messages
-        tokenizer = get_tokenizer(model)
-        original_tokens = tokenizer.count_messages(messages)
+        # Token counting on converted messages (offloaded off the event loop — GH #1701)
+        tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
 
         # Defaults below feed downstream telemetry and memory injection.
         # If optimization remains enabled, the Responses payload is compressed

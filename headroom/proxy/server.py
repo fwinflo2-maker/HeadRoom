@@ -1333,6 +1333,53 @@ class HeadroomProxy(
             },
         )
 
+    async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
+        """Resolve a tokenizer and count messages off the event loop.
+
+        Tokenizer resolution can be expensive on first use (HuggingFace
+        backends may download vocab files) and counting a full Claude Code
+        conversation is CPU-bound, so both run on the compression executor
+        bounded by ``COMPRESSION_TIMEOUT_SECONDS`` (GH #1701: an unbounded
+        on-loop load froze the whole server). On timeout or error this
+        fails open to character-based estimation.
+
+        Shared by every provider handler mixin (Anthropic, OpenAI, Gemini):
+        the OpenAI ``/v1/chat/completions`` and ``/v1/responses`` endpoints
+        are multi-provider passthroughs, so an HF-routed model (qwen,
+        deepseek, llama, ...) can reach them and trigger the same cold load.
+
+        Returns:
+            Tuple of ``(tokenizer, token_count)``. The tokenizer is fully
+            initialized, so later ``count_messages`` calls on it are pure
+            CPU work.
+        """
+        from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
+        from headroom.tokenizers import EstimatingTokenCounter, get_tokenizer
+
+        def _resolve_and_count():  # noqa: ANN202
+            tokenizer = get_tokenizer(model)
+            return tokenizer, tokenizer.count_messages(messages)
+
+        try:
+            return await self._run_compression_in_executor(
+                _resolve_and_count,
+                timeout=float(COMPRESSION_TIMEOUT_SECONDS),
+            )
+        except Exception as e:  # fail open — includes asyncio.TimeoutError
+            # Log the downgrade once per model, not per request.
+            fallback_models = getattr(self, "_token_count_fallback_models", None)
+            if fallback_models is None:
+                fallback_models = set()
+                self._token_count_fallback_models = fallback_models
+            if model not in fallback_models:
+                fallback_models.add(model)
+                logger.warning(
+                    f"Token counting for model {model} failed or timed out "
+                    f"({e.__class__.__name__}); falling back to estimation"
+                )
+            estimator = EstimatingTokenCounter()
+            return estimator, estimator.count_messages(messages)
+
     async def _run_compression_in_executor(
         self,
         fn,  # noqa: ANN001 — caller-supplied no-arg sync callable

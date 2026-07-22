@@ -259,7 +259,6 @@ class GeminiHandlerMixin:
         from fastapi.responses import JSONResponse, Response
 
         from headroom.proxy.helpers import MAX_REQUEST_BODY_SIZE, _read_request_json
-        from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -491,9 +490,8 @@ class GeminiHandlerMixin:
                     headers=response_headers,
                 )
 
-        # Token counting
-        tokenizer = get_tokenizer(model)
-        original_tokens = tokenizer.count_messages(messages)
+        # Token counting (offloaded off the event loop — GH #1701)
+        tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
 
         # Optimization
         transforms_applied: list[str] = []
@@ -816,7 +814,6 @@ class GeminiHandlerMixin:
         from fastapi.responses import JSONResponse
 
         from headroom.proxy.helpers import _read_request_json
-        from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -880,8 +877,10 @@ class GeminiHandlerMixin:
             if isinstance(contents, list) and idx < len(contents)
         }
 
-        tokenizer = get_tokenizer(model)
-        original_tokens = tokenizer.count_messages(messages) if messages else 0
+        # Token counting (offloaded off the event loop — GH #1701)
+        tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
+        if not messages:
+            original_tokens = 0
         optimized_messages = messages
         optimized_tokens = original_tokens
         transforms_applied: list[str] = []
@@ -981,7 +980,6 @@ class GeminiHandlerMixin:
         from fastapi.responses import JSONResponse
 
         from headroom.proxy.helpers import _read_request_json
-        from headroom.tokenizers import get_tokenizer
 
         start_time = time.time()
         request_id = await self._next_request_id()
@@ -1019,8 +1017,10 @@ class GeminiHandlerMixin:
             request_id=request_id,
         )
 
-        # Token counting
-        tokenizer = get_tokenizer(model)
+        # Token counting — resolve the tokenizer off the event loop (GH #1701),
+        # then sum text parts on the warm result. The empty-messages call only
+        # forces the fail-open resolve; the count_text loop below is the count.
+        tokenizer, _ = await self._count_tokens_offloaded(model, [])
         original_tokens = 0
         for content in contents:
             parts = content.get("parts", [])
@@ -1069,7 +1069,6 @@ class GeminiHandlerMixin:
         from fastapi.responses import JSONResponse, Response
 
         from headroom.proxy.helpers import _read_request_json
-        from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -1140,9 +1139,8 @@ class GeminiHandlerMixin:
                 headers=response_headers,
             )
 
-        # Token counting (original)
-        tokenizer = get_tokenizer(model)
-        original_tokens = tokenizer.count_messages(messages)
+        # Token counting (original, offloaded off the event loop — GH #1701)
+        tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
 
         # Apply compression using the same pipeline as generateContent
         transforms_applied: list[str] = []

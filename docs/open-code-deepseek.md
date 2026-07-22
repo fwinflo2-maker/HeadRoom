@@ -106,11 +106,11 @@ Edit `~/.config/opencode/opencode.json`:
       "models": {
         "deepseek-v4-pro": {
           "name": "DeepSeek V4 Pro",
-          "limit": { "context": 200000, "output": 16384 }
+          "limit": { "context": 1000000, "output": 384000 }
         },
         "deepseek-v4-flash": {
-          "name": "DeepSeek V4 Flash (Free)",
-          "limit": { "context": 200000, "output": 16384 }
+          "name": "DeepSeek V4 Flash",
+          "limit": { "context": 1000000, "output": 384000 }
         }
       }
     }
@@ -132,10 +132,10 @@ The current DeepSeek model names are `deepseek-v4-pro` and `deepseek-v4-flash`.
 
 ### Model comparison
 
-| Model | Cost | Context | Best for |
+| Model | Input / Output (per 1M) | Context | Max Output |
 |---|---|---|---|
-| `deepseek-v4-pro` | Paid ($0.435/$0.87) | 200K | Complex coding, architecture, debugging |
-| `deepseek-v4-flash` | Free | 200K | Daily tasks, quick edits, exploration |
+| `deepseek-v4-pro` | $0.435 / $0.87 | 1M | 384K |
+| `deepseek-v4-flash` | $0.14 / $0.28 | 1M | 384K |
 
 Both models support **thinking mode** for step-by-step reasoning (see below).
 
@@ -166,30 +166,10 @@ Or open the dashboard at [http://127.0.0.1:8787/dashboard](http://127.0.0.1:8787
 
 ## Thinking mode (reasoning)
 
-Both `deepseek-v4-pro` and `deepseek-v4-flash` support **thinking mode** — the
-model works through problems step-by-step before answering. This replaces the
-deprecated `deepseek-reasoner` (R1) model.
-
-To enable thinking mode, pass `thinking` in the request body:
-
-```json
-{
-  "model": "deepseek-v4-pro",
-  "messages": [{"role": "user", "content": "Your question"}],
-  "thinking": {"type": "enabled"},
-  "reasoning_effort": "high"
-}
-```
-
-OpenCode sends requests through the headroom proxy, which forwards them to
-DeepSeek. If you need thinking mode for specific tasks, you can:
-
-- **Set it in your provider options** — add `headers` or request body defaults
-  via the AI SDK's provider configuration if supported
-- **Use `/model deepseek-v4-flash`** for free-tier reasoning (thinking mode on
-  flash gives similar behavior to the old R1 model)
-- **Check DeepSeek's API docs** for the latest thinking mode parameters:
-  [api-docs.deepseek.com](https://api-docs.deepseek.com)
+Both models support thinking mode natively — no extra config needed.
+This replaces the deprecated `deepseek-reasoner` (R1) model.
+See [DeepSeek's thinking mode docs](https://api-docs.deepseek.com/guides/thinking_mode)
+for details on switching between thinking and non-thinking modes.
 
 ---
 

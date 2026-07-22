@@ -26,6 +26,10 @@ from headroom.proxy.savings_tracker import SavingsTracker
 
 logger = logging.getLogger("headroom.proxy")
 
+# Sentinel label value that models past MAX_DISTINCT_MODELS collapse into, so
+# client-supplied model cardinality stays bounded (see record_request).
+_OTHER_MODEL = "other"
+
 
 def _escape_label_value(value: str) -> str:
     return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
@@ -719,7 +723,7 @@ class PrometheusMetrics:
             if model in self.requests_by_model or len(self.requests_by_model) < MAX_DISTINCT_MODELS:
                 bounded_model = model
             else:
-                bounded_model = "other"
+                bounded_model = _OTHER_MODEL
                 if not self._model_cardinality_warned:
                     self._model_cardinality_warned = True
                     logger.warning(

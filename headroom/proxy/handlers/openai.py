@@ -1316,6 +1316,11 @@ def _prefers_http1_passthrough(base_url: str) -> bool:
 class OpenAIHandlerMixin:
     """Mixin providing OpenAI API handler methods for HeadroomProxy."""
 
+    async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
+        from headroom.proxy.token_counting import count_tokens_offloaded
+
+        return await count_tokens_offloaded(self, model, messages)
+
     OPENAI_RESPONSES_ROUTER_MIN_BYTES = 512
     OPENAI_RESPONSES_OUTPUT_TYPES = _RESPONSES_OUTPUT_ITEM_TYPES
 

@@ -71,6 +71,11 @@ def _strip_index_from_content_blocks(content: Any) -> None:
 class AnthropicHandlerMixin:
     """Mixin providing Anthropic API handler methods for HeadroomProxy."""
 
+    async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
+        from headroom.proxy.token_counting import count_tokens_offloaded
+
+        return await count_tokens_offloaded(self, model, messages)
+
     @staticmethod
     def _resolve_ccr_workspace(
         request: Any,

@@ -38,6 +38,16 @@ def _usage_int(value: Any, default: int = 0) -> int:
 class GeminiHandlerMixin:
     """Mixin providing Gemini API handler methods for HeadroomProxy."""
 
+    async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
+        from headroom.proxy.token_counting import count_tokens_offloaded
+
+        return await count_tokens_offloaded(self, model, messages)
+
+    async def _count_texts_offloaded(self, model, texts):  # noqa: ANN001, ANN201
+        from headroom.proxy.token_counting import count_texts_offloaded
+
+        return await count_texts_offloaded(self, model, texts)
+
     def _is_cloudcode_antigravity_request(
         self, body: dict[str, Any], headers: dict[str, str]
     ) -> bool:

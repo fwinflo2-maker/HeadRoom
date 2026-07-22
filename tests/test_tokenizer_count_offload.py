@@ -23,10 +23,10 @@ from headroom.proxy.handlers.gemini import GeminiHandlerMixin
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
 from headroom.proxy.server import (
     CompressionQuarantinedError,
-    HeadroomProxy,
     ProxyConfig,
     create_app,
 )
+from headroom.proxy.token_counting import count_tokens_offloaded
 from headroom.tokenizers import EstimatingTokenCounter
 
 
@@ -84,7 +84,7 @@ def test_handlers_offload_token_counting_and_batch_apply() -> None:
             assert "_run_compression_in_executor(" in src, f"{method}: apply() not offloaded"
             assert "COMPRESSION_TIMEOUT_SECONDS" in src, f"{method}: offload missing timeout"
 
-    helper_src = inspect.getsource(HeadroomProxy._count_tokens_offloaded)
+    helper_src = inspect.getsource(count_tokens_offloaded)
     assert "COMPRESSION_TIMEOUT_SECONDS" in helper_src
     assert "EstimatingTokenCounter" in helper_src, "helper must fail open to estimation"
 

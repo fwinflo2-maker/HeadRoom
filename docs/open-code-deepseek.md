@@ -57,6 +57,12 @@ curl http://127.0.0.1:8787/health
 # → "status": "healthy"
 ```
 
+To see which models the proxy exposes:
+```bash
+curl -s http://127.0.0.1:8787/v1/models \
+  -H "Authorization: Bearer sk-your-key" | jq '.data[].id'
+```
+
 ### With output shaping (optional)
 
 Output shaping makes the model's responses shorter — fewer tokens, lower cost:
@@ -79,7 +85,11 @@ Verbosity levels:
 
 ## 4. Configure OpenCode
 
-Edit `~/.config/opencode/opencode.jsonc`:
+**Note:** If you have an existing `~/.config/opencode/opencode.json` (for MCP
+servers, etc.), merge the provider section into that file. Having both `.json`
+and `.jsonc` in the same directory can cause conflicts.
+
+Edit `~/.config/opencode/opencode.json`:
 
 ```jsonc
 {
@@ -101,10 +111,6 @@ Edit `~/.config/opencode/opencode.jsonc`:
         "deepseek-v4-flash": {
           "name": "DeepSeek V4 Flash (Free)",
           "limit": { "context": 200000, "output": 16384 }
-        },
-        "deepseek-reasoner": {
-          "name": "DeepSeek R1",
-          "limit": { "context": 128000, "output": 8192 }
         }
       }
     }
@@ -119,13 +125,16 @@ Edit `~/.config/opencode/opencode.jsonc`:
 }
 ```
 
+**Important:** Only include model IDs that appear in the proxy's `/v1/models`
+response. OpenCode validates config models against the proxy's model list.
+If you need DeepSeek R1 (reasoner), see the note at the end of the guide.
+
 ### Model comparison
 
 | Model | Cost | Context | Best for |
 |---|---|---|---|
 | `deepseek-v4-pro` | Paid ($0.435/$0.87) | 200K | Complex coding, architecture, debugging |
 | `deepseek-v4-flash` | Free | 200K | Daily tasks, quick edits, exploration |
-| `deepseek-reasoner` (R1) | Paid | 128K | Math, logic, multi-step reasoning |
 
 Switch models at any time with `/model` in OpenCode.
 
@@ -137,8 +146,8 @@ Switch models at any time with `/model` in OpenCode.
 opencode
 ```
 
-Run `/models` to confirm all three DeepSeek models appear. Select one with
-`/model deepseek-v4-pro`.
+Run `/models` to confirm the DeepSeek models appear under "Headroom Proxy".
+Select one with `/model deepseek-v4-flash` or `/model deepseek-v4-pro`.
 
 ---
 
@@ -158,7 +167,15 @@ Or open the dashboard at [http://127.0.0.1:8787/dashboard](http://127.0.0.1:8787
 
 The `apiKey` in OpenCode's config is missing or wrong. OpenCode must send the
 API key to the proxy, and the proxy forwards it to DeepSeek. Make sure
-`"apiKey": "sk-..."` is set under `options` in `opencode.jsonc`.
+`"apiKey": "sk-..."` is set under `options`.
+
+### Models don't appear under "Headroom Proxy"
+
+1. Verify the proxy is running: `curl http://127.0.0.1:8787/health`
+2. Check which models the proxy exposes: `curl -s http://127.0.0.1:8787/v1/models -H "Authorization: Bearer sk-your-key"`
+3. Make sure your config model IDs match **exactly** what the proxy returns
+4. Don't use both `opencode.json` and `opencode.jsonc` in the same config directory — use one file
+5. Models like `deepseek-reasoner` and `deepseek-chat` are not exposed by the proxy; use `deepseek-v4-pro` or `deepseek-v4-flash` instead
 
 ### Models appear but requests fail
 
@@ -186,6 +203,23 @@ headroom learn --verbosity --apply
 
 This builds the baseline, and `/stats` will show output savings numbers. The
 shaper is active immediately — the numbers just need calibration.
+
+---
+
+## Using DeepSeek R1 (reasoner)
+
+The proxy's `/v1/models` endpoint currently only exposes `deepseek-v4-pro` and
+`deepseek-v4-flash`. However, the proxy can still route requests to R1 — you
+just can't select it from OpenCode's `/models` picker.
+
+If you need R1 for math/logic tasks, switch your default model:
+
+```bash
+/model deepseek-reasoner
+```
+
+Or set it directly in an OpenCode session config. R1 has 128K context and
+excels at reasoning-heavy workloads.
 
 ---
 

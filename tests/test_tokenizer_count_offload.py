@@ -4,8 +4,10 @@ handler. For HF-backed models (e.g. deepseek-*) first use triggers an unbounded
 network download, freezing the whole server (610s request, then /livez, /readyz
 and /health hang until kill). The fix routes resolution + counting through
 HeadroomProxy._count_tokens_offloaded (compression executor, bounded by
-COMPRESSION_TIMEOUT_SECONDS, fail-open to estimation), and offloads the inline
-batch pipeline.apply() calls the same way.
+COMPRESSION_TIMEOUT_SECONDS, fail-open to estimation) — shared by every provider
+handler (Anthropic, OpenAI, Gemini), since the OpenAI passthrough endpoints
+receive the same HF-backed models — and offloads the inline batch
+pipeline.apply() calls the same way.
 """
 
 from __future__ import annotations
@@ -17,7 +19,14 @@ import time
 
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.handlers.batch import BatchHandlerMixin
-from headroom.proxy.server import ProxyConfig, create_app
+from headroom.proxy.handlers.gemini import GeminiHandlerMixin
+from headroom.proxy.handlers.openai import OpenAIHandlerMixin
+from headroom.proxy.server import (
+    CompressionQuarantinedError,
+    HeadroomProxy,
+    ProxyConfig,
+    create_app,
+)
 from headroom.tokenizers import EstimatingTokenCounter
 
 
@@ -36,11 +45,26 @@ def _make_proxy():  # noqa: ANN202 — returns the internal HeadroomProxy
 def test_handlers_offload_token_counting_and_batch_apply() -> None:
     """Wiring guard: the request paths must use the offloaded helpers, not inline
     get_tokenizer/count_messages or pipeline.apply on the event loop."""
-    fn = AnthropicHandlerMixin.handle_anthropic_messages
-    assert inspect.iscoroutinefunction(fn)
-    src = inspect.getsource(fn)
-    assert "_count_tokens_offloaded(" in src, "token counting not offloaded"
-    assert "tokenizer = get_tokenizer(" not in src, "tokenizer resolved inline on the loop"
+    # Every provider handler that counts the original conversation must route
+    # resolution + counting through the shared fail-open helper, never inline on
+    # the loop. OpenAI /chat + /responses are multi-provider passthroughs, so an
+    # HF-routed model (qwen, deepseek, llama, ...) can reach them and cold-load.
+    for mixin, method in (
+        (AnthropicHandlerMixin, "handle_anthropic_messages"),
+        (OpenAIHandlerMixin, "handle_openai_chat"),
+        (OpenAIHandlerMixin, "handle_openai_responses"),
+        (GeminiHandlerMixin, "handle_gemini_generate_content"),
+        (GeminiHandlerMixin, "handle_google_cloudcode_stream"),
+        (GeminiHandlerMixin, "handle_gemini_stream_generate_content"),
+        (GeminiHandlerMixin, "handle_gemini_count_tokens"),
+    ):
+        fn = getattr(mixin, method)
+        assert inspect.iscoroutinefunction(fn), f"{method} must be async"
+        src = inspect.getsource(fn)
+        assert "_count_tokens_offloaded(" in src, f"{method}: token counting not offloaded"
+        assert "tokenizer = get_tokenizer(" not in src, (
+            f"{method}: tokenizer resolved inline on the loop"
+        )
 
     for mixin, method in (
         (AnthropicHandlerMixin, "handle_anthropic_batch_create"),
@@ -54,7 +78,7 @@ def test_handlers_offload_token_counting_and_batch_apply() -> None:
             assert "_run_compression_in_executor(" in src, f"{method}: apply() not offloaded"
             assert "COMPRESSION_TIMEOUT_SECONDS" in src, f"{method}: offload missing timeout"
 
-    helper_src = inspect.getsource(AnthropicHandlerMixin._count_tokens_offloaded)
+    helper_src = inspect.getsource(HeadroomProxy._count_tokens_offloaded)
     assert "COMPRESSION_TIMEOUT_SECONDS" in helper_src
     assert "EstimatingTokenCounter" in helper_src, "helper must fail open to estimation"
 
@@ -124,3 +148,46 @@ async def test_count_tokens_offloaded_fails_open(monkeypatch) -> None:  # noqa: 
     assert tokens > 0
     # Logged-once bookkeeping records the downgraded model.
     assert "deepseek-chat" in proxy._token_count_fallback_models
+
+
+async def test_count_tokens_offloaded_fails_open_on_executor_quarantine() -> None:
+    """Now that OpenAI/Gemini counting shares the compression executor, an
+    unrelated request's compression timeout can quarantine it — the next
+    ``_run_compression_in_executor`` call raises ``CompressionQuarantinedError``
+    immediately (process-wide state). A request that is only counting tokens
+    must not 500 on that; it fails open to estimation like any other error."""
+    # The executor's ``except Exception`` fail-open only catches the quarantine
+    # error because it subclasses Exception — pin that contract.
+    assert issubclass(CompressionQuarantinedError, Exception)
+
+    proxy = _make_proxy()
+    # Record a concurrent compression as timed out so the real executor guard
+    # quarantines the next call — no mock of the helper itself.
+    proxy._compression_timed_out_in_flight = 1
+
+    tokenizer, tokens = await proxy._count_tokens_offloaded(
+        "qwen2.5-coder", [{"role": "user", "content": "hello world"}]
+    )
+
+    assert isinstance(tokenizer, EstimatingTokenCounter)
+    assert tokens > 0
+    assert "qwen2.5-coder" in proxy._token_count_fallback_models
+
+
+async def test_count_tokens_offloaded_returns_count_text_capable_tokenizer() -> None:
+    """handle_gemini_stream_generate_content resolves the tokenizer via
+    ``_count_tokens_offloaded(model, [])`` (empty-messages call), then sums text
+    parts with ``tokenizer.count_text(...)``. The returned tokenizer must support
+    count_text on the fail-open path too, or that streaming handler 500s on
+    exactly the cold/quarantined tokenizer this offload exists to survive."""
+    proxy = _make_proxy()
+    # Quarantine forces the fail-open branch (an EstimatingTokenCounter).
+    proxy._compression_timed_out_in_flight = 1
+
+    # The empty-messages count is intentionally discarded by that handler
+    # (it sums text parts itself), so only the tokenizer matters here.
+    tokenizer, _ = await proxy._count_tokens_offloaded("qwen2.5-coder", [])
+
+    assert isinstance(tokenizer, EstimatingTokenCounter)
+    # The streaming handler's per-part loop must not raise on the fallback.
+    assert tokenizer.count_text("hello world") > 0

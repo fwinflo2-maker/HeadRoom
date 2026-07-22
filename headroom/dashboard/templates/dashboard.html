@@ -192,6 +192,8 @@
         <template x-if="viewMode === 'session'">
             <div>
                 <p class="mb-4 text-xs text-gray-500">Current proxy process · runtime counters reset on restart</p>
+                <p class="mb-4 text-xs text-gray-600 font-mono"
+                   x-text="'ANTHROPIC_BASE_URL: ' + window.location.origin + '/p/<project-name>'"></p>
 
                 <!-- Runtime Overview -->
                 <div class="grid grid-cols-1 gap-4 mb-6 lg:grid-cols-2">
@@ -468,8 +470,8 @@
                     </div>
                 </div>
 
-                <!-- Prefix Cache Impact: current process only -->
-                <template x-if="cacheSessionActive">
+                <!-- Prefix Cache Impact: current process plus persisted lifetime cache reads -->
+                <template x-if="cacheCardActive">
                     <div class="bg-surface rounded-lg p-4 border border-border mb-6">
                         <div class="flex justify-between items-center mb-3">
                             <div class="text-sm font-medium text-gray-300">Prefix Cache Impact</div>
@@ -482,15 +484,19 @@
                         <!-- Totals row -->
                         <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
                             <div>
-                                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Cache Writes</div>
+                                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1" x-text="cacheSessionActive ? 'Cache Writes' : 'Cache Reads (lifetime)'"></div>
                                 <div class="text-2xl font-light tabular-nums text-amber-400"
                                      x-show="cacheSessionActive"
                                      x-text="formatNumber(stats.prefix_cache?.totals?.cache_write_tokens || 0)"></div>
-                                <div class="text-2xl font-light tabular-nums text-gray-600"
-                                     x-show="!cacheSessionActive">&mdash;</div>
+                                <div class="text-2xl font-light tabular-nums text-cyan-400"
+                                     x-show="!cacheSessionActive"
+                                     x-text="formatNumber(cacheLifetimeReads)"></div>
                                 <div class="text-xs text-amber-400/70"
                                      x-show="cacheSessionActive"
                                      x-text="'$' + formatCurrency(stats.prefix_cache?.totals?.write_premium_usd || 0) + ' write premium'"></div>
+                                <div class="text-xs text-cyan-400/70"
+                                     x-show="!cacheSessionActive"
+                                     x-text="'$' + formatCurrency(cacheLifetimeSavingsUsd) + ' saved'"></div>
                                 <div class="text-xs text-gray-500"
                                      x-show="!cacheSessionActive">no activity since restart</div>
                             </div>
@@ -1330,8 +1336,7 @@
                         <div class="px-4 py-8 text-center">
                             <div class="text-xs text-gray-500 mb-3">No per-project data yet.</div>
                             <div class="text-xs text-gray-600 font-mono leading-relaxed">
-                                Route project traffic through
-                                <span class="text-accent" x-text="window.location.origin + '/p/&lt;project-name&gt;'"></span>
+                                <span class="text-accent" x-text="'ANTHROPIC_BASE_URL: ' + window.location.origin + '/p/<project-name>'"></span>
                             </div>
                         </div>
                     </template>
@@ -2491,6 +2496,18 @@
 
                 get cacheSessionActive() {
                     return (this.stats.prefix_cache?.totals?.requests || 0) > 0;
+                },
+
+                get cacheLifetimeReads() {
+                    return this.stats.persistent_savings?.lifetime?.cache_read_tokens || 0;
+                },
+
+                get cacheLifetimeSavingsUsd() {
+                    return this.stats.persistent_savings?.lifetime?.cache_savings_usd || 0;
+                },
+
+                get cacheCardActive() {
+                    return this.cacheSessionActive || this.cacheLifetimeReads > 0 || this.cacheLifetimeSavingsUsd > 0;
                 },
 
                 get cacheSavingsPercent() {

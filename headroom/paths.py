@@ -50,6 +50,7 @@ HEADROOM_SAVINGS_PATH_ENV = "HEADROOM_SAVINGS_PATH"
 HEADROOM_SAVINGS_EVENTS_PATH_ENV = "HEADROOM_SAVINGS_EVENTS_PATH"
 HEADROOM_TOIN_PATH_ENV = "HEADROOM_TOIN_PATH"
 HEADROOM_SUBSCRIPTION_STATE_PATH_ENV = "HEADROOM_SUBSCRIPTION_STATE_PATH"
+HEADROOM_SETTINGS_PATH_ENV = "HEADROOM_SETTINGS_PATH"
 
 # ---------------------------------------------------------------------------
 # Default sub-path fragments
@@ -60,6 +61,7 @@ _CONFIG_DIR_DEFAULT_SUFFIX = "config"
 
 # Resource file/sub-dir names (kept here so nothing else has to hardcode them)
 _SAVINGS_FILE = "proxy_savings.json"
+_SETTINGS_FILE = "settings.json"
 _TOIN_FILE = "toin.json"
 _MODELS_FILE = "models.json"
 _SUBSCRIPTION_FILE = "subscription_state.json"
@@ -93,6 +95,35 @@ def _env(name: str) -> str:
     """Return a trimmed environment value, or ``""`` when unset/blank."""
 
     return os.environ.get(name, "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Process-wide stateless flag
+# ---------------------------------------------------------------------------
+# Stateless mode forbids writes to the workspace. Many persisters are
+# module-level singletons reached without a config object, so the proxy records
+# the mode here once at startup and writers consult ``process_is_stateless()``.
+
+_PROCESS_STATELESS: bool = False
+
+
+def set_process_stateless(value: bool) -> None:
+    """Record process-wide stateless mode (set once at proxy startup)."""
+
+    global _PROCESS_STATELESS
+    _PROCESS_STATELESS = bool(value)
+
+
+def process_is_stateless() -> bool:
+    """True when the process must not write to the workspace.
+
+    True if ``set_process_stateless(True)`` was called OR the ``HEADROOM_STATELESS``
+    environment variable is set, so non-proxy entrypoints honor it too.
+    """
+
+    if _PROCESS_STATELESS:
+        return True
+    return _env("HEADROOM_STATELESS").lower() in ("1", "true", "yes", "on")
 
 
 def _resolve(explicit: str | os.PathLike[str] | None, env_var: str, derived: Path) -> Path:
@@ -178,6 +209,16 @@ def savings_path(explicit: str | os.PathLike[str] | None = None) -> Path:
         explicit,
         HEADROOM_SAVINGS_PATH_ENV,
         workspace_dir() / _SAVINGS_FILE,
+    )
+
+
+def settings_path(explicit: str | os.PathLike[str] | None = None) -> Path:
+    """Return the path for the dashboard-managed settings JSON file."""
+
+    return _resolve(
+        explicit,
+        HEADROOM_SETTINGS_PATH_ENV,
+        workspace_dir() / _SETTINGS_FILE,
     )
 
 
@@ -341,19 +382,38 @@ def models_config_path() -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _validate_plugin_name(plugin_name: str) -> None:
+    """Reject plugin names that would escape the ``plugins/`` sandbox.
+
+    Path separators (``/``, ``\\``) are rejected so a name cannot address a
+    subdirectory. ``.`` and ``..`` are rejected because ``plugins / ".."``
+    resolves to the plugins-parent (i.e. the whole config/workspace root),
+    handing a plugin read/write access to every other plugin's state and the
+    workspace's savings ledger, memory DB, license cache, and logs. NUL is
+    rejected because it terminates paths on POSIX APIs.
+    """
+
+    if (
+        not plugin_name
+        or plugin_name in {".", ".."}
+        or "/" in plugin_name
+        or "\\" in plugin_name
+        or "\x00" in plugin_name
+    ):
+        raise ValueError(f"invalid plugin name: {plugin_name!r}")
+
+
 def plugin_config_dir(plugin_name: str) -> Path:
     """Return the config directory for a named plugin."""
 
-    if not plugin_name or "/" in plugin_name or "\\" in plugin_name:
-        raise ValueError(f"invalid plugin name: {plugin_name!r}")
+    _validate_plugin_name(plugin_name)
     return config_dir() / _PLUGINS_DIR / plugin_name
 
 
 def plugin_workspace_dir(plugin_name: str) -> Path:
     """Return the workspace directory for a named plugin."""
 
-    if not plugin_name or "/" in plugin_name or "\\" in plugin_name:
-        raise ValueError(f"invalid plugin name: {plugin_name!r}")
+    _validate_plugin_name(plugin_name)
     return workspace_dir() / _PLUGINS_DIR / plugin_name
 
 
@@ -364,6 +424,9 @@ __all__ = [
     "HEADROOM_SAVINGS_EVENTS_PATH_ENV",
     "HEADROOM_TOIN_PATH_ENV",
     "HEADROOM_SUBSCRIPTION_STATE_PATH_ENV",
+    "HEADROOM_SETTINGS_PATH_ENV",
+    "set_process_stateless",
+    "process_is_stateless",
     "config_dir",
     "workspace_dir",
     "ensure_config_dir",
@@ -376,6 +439,7 @@ __all__ = [
     "license_cache_path",
     "session_stats_path",
     "savings_events_path",
+    "settings_path",
     "sync_state_path",
     "bridge_state_path",
     "log_dir",

@@ -54,6 +54,8 @@ use crate::relevance::RelevanceScorer;
 use crate::transforms::adaptive_sizer::compute_optimal_k;
 use crate::transforms::anchor_selector::AnchorSelector;
 
+type ProseHook<'a> = dyn Fn(&str, &str) -> Option<(String, String)> + 'a;
+
 /// Return type for `crush_array`.
 ///
 /// Two operating paths feed the same result type:
@@ -138,6 +140,43 @@ pub struct SmartCrusher {
 }
 
 impl SmartCrusher {
+    /// Opt-in variant used by structured pipeline owners that want to
+    /// transform plain string leaves while preserving default callers.
+    pub fn crush_with_prose_hook(
+        &self,
+        content: &str,
+        query: &str,
+        bias: f64,
+        hook: &ProseHook<'_>,
+    ) -> CrushResult {
+        let start = std::time::Instant::now();
+        let (compressed, was_modified, info) =
+            self.smart_crush_content_with_hook(content, query, bias, Some(hook));
+        let strategy = if info.is_empty() {
+            "passthrough".to_string()
+        } else {
+            info
+        };
+        if !self.observers.is_empty() {
+            let event = CrushEvent {
+                strategy: strategy.clone(),
+                input_bytes: content.len(),
+                output_bytes: compressed.len(),
+                elapsed_ns: start.elapsed().as_nanos() as u64,
+                was_modified,
+            };
+            for observer in &self.observers {
+                observer.on_event(&event);
+            }
+        }
+        CrushResult {
+            compressed,
+            original: content.to_string(),
+            was_modified,
+            strategy,
+        }
+    }
+
     /// Construct with the OSS default composition: scorer + constraints +
     /// observer + **lossless-first compaction stage**. Calling
     /// `crush_array` runs the dispatch:
@@ -167,7 +206,7 @@ impl SmartCrusher {
             // the row-drop path), so `enable_ccr_marker=false` yields
             // marker-free, lossless output. Fixes #1091.
             classify: ClassifyConfig {
-                emit_opaque_markers: config.enable_ccr_marker,
+                emit_opaque_markers: config.opaque_markers_enabled(),
                 ..ClassifyConfig::default()
             },
             ..CompactConfig::default()
@@ -202,7 +241,8 @@ impl SmartCrusher {
     /// `"markdown-kv"`). `None` for unknown names — callers own the
     /// fallback/error policy. `"csv-schema"` is equivalent to `new`.
     pub fn with_compaction_format(config: SmartCrusherConfig, format_name: &str) -> Option<Self> {
-        let stage = CompactionStage::from_format_name(format_name)?;
+        let mut stage = CompactionStage::from_format_name(format_name)?;
+        stage.config.classify.emit_opaque_markers = config.opaque_markers_enabled();
         Some(
             SmartCrusherBuilder::new(config)
                 .with_default_oss_setup()
@@ -389,12 +429,22 @@ impl SmartCrusher {
         query_context: &str,
         bias: f64,
     ) -> (String, bool, String) {
-        // Parse — non-JSON content passes through unchanged.
+        self.smart_crush_content_with_hook(content, query_context, bias, None)
+    }
+
+    fn smart_crush_content_with_hook(
+        &self,
+        content: &str,
+        query_context: &str,
+        bias: f64,
+        prose_hook: Option<&ProseHook<'_>>,
+    ) -> (String, bool, String) {
         let Ok(parsed) = serde_json::from_str::<Value>(content) else {
             return (content.to_string(), false, String::new());
         };
 
-        let (crushed, info) = self.process_value(&parsed, 0, query_context, bias);
+        let (crushed, info) =
+            self.process_value_with_hook(&parsed, 0, query_context, bias, prose_hook);
 
         // Re-serialize with Python `safe_json_dumps` formatting:
         // compact `(",", ":")` separators + `ensure_ascii=False`,
@@ -422,6 +472,17 @@ impl SmartCrusher {
         query_context: &str,
         bias: f64,
     ) -> (Value, String) {
+        self.process_value_with_hook(value, depth, query_context, bias, None)
+    }
+
+    fn process_value_with_hook(
+        &self,
+        value: &Value,
+        depth: usize,
+        query_context: &str,
+        bias: f64,
+        prose_hook: Option<&ProseHook<'_>>,
+    ) -> (Value, String) {
         if depth >= Self::MAX_PROCESS_DEPTH {
             return (value.clone(), String::new());
         }
@@ -435,7 +496,34 @@ impl SmartCrusher {
                     let arr_type = classify_array(arr);
                     match arr_type {
                         ArrayType::DictArray => {
-                            let result = self.crush_array(arr, query_context, bias);
+                            let mut rows: Vec<Value> = Vec::with_capacity(n);
+                            if let Some(hook) = prose_hook {
+                                for item in arr {
+                                    if let Value::Object(map) = item {
+                                        let mut processed = serde_json::Map::new();
+                                        for (k, v) in map {
+                                            let (p_val, p_info) = self.process_value_with_hook(
+                                                v,
+                                                depth + 1,
+                                                query_context,
+                                                bias,
+                                                Some(hook),
+                                            );
+                                            processed.insert(k.clone(), p_val);
+                                            if !p_info.is_empty() {
+                                                info_parts.push(p_info);
+                                            }
+                                        }
+                                        rows.push(Value::Object(processed));
+                                    } else {
+                                        rows.push(item.clone());
+                                    }
+                                }
+                            } else {
+                                rows.extend(arr.iter().cloned());
+                            }
+
+                            let result = self.crush_array(&rows, query_context, bias);
                             // Lossless path won → substitute the array
                             // with the compacted string in place. This
                             // makes the lossless win visible to the
@@ -511,7 +599,13 @@ impl SmartCrusher {
                 // Below threshold or not crushable → recurse into items.
                 let mut processed: Vec<Value> = Vec::with_capacity(n);
                 for item in arr {
-                    let (p_item, p_info) = self.process_value(item, depth + 1, query_context, bias);
+                    let (p_item, p_info) = self.process_value_with_hook(
+                        item,
+                        depth + 1,
+                        query_context,
+                        bias,
+                        prose_hook,
+                    );
                     processed.push(p_item);
                     if !p_info.is_empty() {
                         info_parts.push(p_info);
@@ -523,7 +617,8 @@ impl SmartCrusher {
                 // First pass: recurse into values to compress nested arrays.
                 let mut processed = serde_json::Map::new();
                 for (k, v) in map {
-                    let (p_val, p_info) = self.process_value(v, depth + 1, query_context, bias);
+                    let (p_val, p_info) =
+                        self.process_value_with_hook(v, depth + 1, query_context, bias, prose_hook);
                     processed.insert(k.clone(), p_val);
                     if !p_info.is_empty() {
                         info_parts.push(p_info);
@@ -546,7 +641,9 @@ impl SmartCrusher {
             // `process_string` which parses stringified-JSON containers
             // (recursing through `process_value`) and CCR-substitutes
             // opaque blobs (with store-write so retrieval works).
-            Value::String(s) => self.process_string(s, depth, query_context, bias),
+            Value::String(s) => {
+                self.process_string_with_hook(s, depth, query_context, bias, prose_hook)
+            }
             // Other scalars — passthrough.
             _ => (value.clone(), String::new()),
         }
@@ -568,16 +665,19 @@ impl SmartCrusher {
     ///    format as `compaction::walker::format_ccr_marker` so
     ///    downstream consumers can pattern-match markers regardless
     ///    of which path emitted them.
-    fn process_string(
+    fn process_string_with_hook(
         &self,
         s: &str,
         depth: usize,
         query_context: &str,
         bias: f64,
+        prose_hook: Option<&ProseHook<'_>>,
     ) -> (Value, String) {
+        let mut parsed_container_unchanged = false;
         // 1. Stringified-JSON: parse, recurse, re-render.
         if let Some(parsed) = try_parse_json_container(s) {
-            let (processed, sub_info) = self.process_value(&parsed, depth + 1, query_context, bias);
+            let (processed, sub_info) =
+                self.process_value_with_hook(&parsed, depth + 1, query_context, bias, prose_hook);
             // If recursion produced something different, re-emit.
             // Special case: if the recursion returned a `Value::String`
             // (lossless compaction substituted the array with a
@@ -597,6 +697,7 @@ impl SmartCrusher {
                 };
                 return (Value::String(rendered), info);
             }
+            parsed_container_unchanged = true;
         }
 
         // 2. Opaque blob: substitute with CCR marker AND stash the
@@ -605,16 +706,36 @@ impl SmartCrusher {
         // Gated by `enable_ccr_marker` so disabling markers stays lossless
         // here too (#1091).
         let cfg = ClassifyConfig {
-            emit_opaque_markers: self.config.enable_ccr_marker,
+            emit_opaque_markers: self.config.opaque_markers_enabled(),
             ..ClassifyConfig::default()
         };
+        if let CellClass::Opaque(kind) = classify_cell(&Value::String(s.to_string()), &cfg) {
+            match kind {
+                super::compaction::OpaqueKind::Base64Blob
+                | super::compaction::OpaqueKind::HtmlChunk => {
+                    let marker = emit_opaque_ccr_marker(s, &kind, self.ccr_store.as_ref());
+                    let kind_label = opaque_kind_label(&kind);
+                    return (Value::String(marker), format!("string_ccr:{kind_label}"));
+                }
+                super::compaction::OpaqueKind::LongString
+                | super::compaction::OpaqueKind::Other(_) => {}
+            }
+        }
+        if !parsed_container_unchanged {
+            if let Some(hook) = prose_hook {
+                if let Some((compressed, key)) = hook(s, query_context) {
+                    return (Value::String(compressed), format!("string_prose:{key}"));
+                }
+            }
+        }
+
         if let CellClass::Opaque(kind) = classify_cell(&Value::String(s.to_string()), &cfg) {
             let marker = emit_opaque_ccr_marker(s, &kind, self.ccr_store.as_ref());
             let kind_label = opaque_kind_label(&kind);
             return (Value::String(marker), format!("string_ccr:{kind_label}"));
         }
 
-        // 3. Plain string — passthrough.
+        // 4. Plain string — passthrough.
         (Value::String(s.to_string()), String::new())
     }
 
@@ -698,6 +819,24 @@ impl SmartCrusher {
             }
         }
 
+        // ── Strict lossless-only mode ──
+        //
+        // The lossless attempt above either shipped or didn't. Either way
+        // `lossless_only` forbids the lossy row-drop fallback: dropping
+        // rows needs a CCR marker to stay recoverable, and the whole
+        // point of this mode is a marker-free, byte-recoverable result.
+        // Leave the array uncompacted instead.
+        if self.config.lossless_only {
+            return CrushArrayResult {
+                items: items.to_vec(),
+                strategy_info: "lossless_only:uncompacted".to_string(),
+                ccr_hash: None,
+                dropped_summary: String::new(),
+                compacted: None,
+                compaction_kind: None,
+            };
+        }
+
         // ── Lossy path: compress inline + cache full original via CCR ──
         //
         // The runtime caller (PyO3 bridge / proxy server) is expected
@@ -705,6 +844,21 @@ impl SmartCrusher {
         // tool can serve dropped rows back to the LLM on demand.
         // **No data is lost** — "lossy" here means "compressed view
         // inline; full payload retrievable via CCR cache."
+        //
+        // Load-bearing invariant: a `lossless_only` crusher MUST NOT
+        // reach this point — the early return above guarantees it. The
+        // Python per-call override (`crush(..., lossless_only=True)`)
+        // relies on this: it swaps in a separate Rust crusher whose CCR
+        // store stays empty precisely because no lossless_only run ever
+        // executes the store write below. If that early return is ever
+        // removed, the alternate crusher's store would diverge and
+        // retrieval could resolve markers the prompt can't reference.
+        debug_assert!(
+            !self.config.lossless_only,
+            "lossy path reached under lossless_only — the early return \
+             above must keep this codepath (and its CCR store write) \
+             unreachable in strict lossless mode",
+        );
 
         let effective_max_items = adaptive_k;
         let analysis = self.analyzer.analyze_array(items);
@@ -1039,6 +1193,20 @@ fn opaque_kind_label(kind: &super::compaction::OpaqueKind) -> &str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn default_crush_ignores_opt_in_prose_hook() {
+        let crusher = SmartCrusher::new(SmartCrusherConfig::default());
+        let input = serde_json::json!({
+            "summary": (0..8)
+                .map(|i| format!("Segment {i} keeps the default route stable."))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .to_string();
+        let result = crusher.crush(&input, "default route", 0.0);
+        assert!(!result.strategy.contains("string_prose:"));
+    }
 
     fn crusher() -> SmartCrusher {
         SmartCrusher::new(SmartCrusherConfig::default())
@@ -1568,6 +1736,63 @@ mod tests {
     }
 
     #[test]
+    fn prose_hook_preserves_html_opaque_routing() {
+        let c = SmartCrusher::new(SmartCrusherConfig::default());
+        let html = "<html><body><p>".to_string() + &"x".repeat(300) + "</p></body></html>";
+        let hook = |_leaf: &str, _query: &str| -> Option<(String, String)> {
+            Some(("compressed prose".to_string(), "prose-key".to_string()))
+        };
+        let (out, info) = c.process_string_with_hook(&html, 0, "recovery", 1.0, Some(&hook));
+        let routed = out.as_str().expect("html stays string");
+        assert!(routed.contains(",html,"));
+        assert_eq!(info, "string_ccr:html");
+    }
+
+    #[test]
+    fn prose_hook_runs_for_dict_array_rows() {
+        let c = SmartCrusher::new(SmartCrusherConfig::default());
+        let prose = (0..12)
+            .map(|i| format!("Segment {i} documents recovery safeguards for this field."))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let rows = (0..5)
+            .map(|i| serde_json::json!({"id": i, "summary": prose}))
+            .collect::<Vec<_>>();
+        let input = Value::Array(rows);
+        let hook = |leaf: &str, _query: &str| -> Option<(String, String)> {
+            if leaf.contains("recovery safeguards") {
+                Some(("<<ccr:prose-key>>".to_string(), "prose-key".to_string()))
+            } else {
+                None
+            }
+        };
+
+        let (out, info) = c.process_value_with_hook(&input, 0, "recovery", 1.0, Some(&hook));
+        let rendered = out.to_string();
+        assert!(rendered.contains("<<ccr:prose-key>>"));
+        assert!(info.contains("string_prose:prose-key"));
+    }
+
+    #[test]
+    fn unchanged_stringified_json_container_skips_prose_hook() {
+        let c = SmartCrusher::new(SmartCrusherConfig::default());
+        let payload = serde_json::json!({
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": "short",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": "still short",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc": "tiny",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd": "small"
+        })
+        .to_string();
+        let hook = |leaf: &str, _query: &str| -> Option<(String, String)> {
+            (leaf.len() > 256).then_some(("<<ccr:prose-key>>".to_string(), "prose-key".to_string()))
+        };
+        let (out, info) = c.process_string_with_hook(&payload, 0, "recovery", 1.0, Some(&hook));
+        let routed = out.as_str().expect("stringified JSON stays string");
+        assert_eq!(routed, payload);
+        assert!(info.is_empty());
+    }
+
+    #[test]
     fn process_string_top_level_string_processed() {
         // crush() takes a string; if it doesn't parse as JSON, today's
         // behavior returns it unchanged. But if it's a stringified
@@ -1676,6 +1901,149 @@ mod tests {
         assert!(
             store_len_after > store_len_before,
             "default should write to ccr_store"
+        );
+    }
+
+    #[test]
+    fn enable_ccr_marker_false_suppresses_opaque_markers() {
+        // Opaque-blob path symmetry. A long string cell normally renders
+        // as a `<<ccr:HASH,kind,size>>` marker in the lossless table.
+        // With `enable_ccr_marker = false` it must render inline instead,
+        // so no configuration leaks markers into a "lossless-only" prompt.
+        let rows: Vec<Value> = (0..10)
+            .map(|i| json!({"path": "a.py", "line": i, "content": "x".repeat(300)}))
+            .collect();
+
+        // ratio 0.0 forces the lossless table to ship, exercising the
+        // compactor's opaque arm directly (not the lossy row-drop path).
+        let off = SmartCrusher::new(SmartCrusherConfig {
+            lossless_min_savings_ratio: 0.0,
+            enable_ccr_marker: false,
+            ..SmartCrusherConfig::default()
+        });
+        let rendered_off = off
+            .crush_array(&rows, "", 1.0)
+            .compacted
+            .expect("lossless table should ship at ratio 0.0");
+        assert!(
+            !rendered_off.contains("<<ccr:"),
+            "opaque marker leaked despite enable_ccr_marker=false: {rendered_off}"
+        );
+        assert!(
+            rendered_off.contains(&"x".repeat(300)),
+            "blob should be inline when markers are off: {rendered_off}"
+        );
+
+        // Default (markers on) still emits the opaque marker — the gate
+        // is opt-out, not opt-in.
+        let on = SmartCrusher::new(SmartCrusherConfig {
+            lossless_min_savings_ratio: 0.0,
+            ..SmartCrusherConfig::default()
+        });
+        let rendered_on = on
+            .crush_array(&rows, "", 1.0)
+            .compacted
+            .expect("lossless table should ship at ratio 0.0");
+        assert!(
+            rendered_on.contains("<<ccr:"),
+            "default should still emit the opaque marker: {rendered_on}"
+        );
+    }
+
+    // ---------- lossless_only mode (PR part 2) ----------
+
+    #[test]
+    fn lossless_only_leaves_array_uncompacted_instead_of_dropping() {
+        // When the lossless table can't win (forced via ratio 0.99),
+        // lossless_only must NOT fall through to the lossy row-drop path.
+        // The array passes through untouched, so it is marker-free and
+        // byte-recoverable (every original row is preserved verbatim).
+        let rows: Vec<Value> = (0..50)
+            .map(|i| json!({"path": "a.py", "line": i, "content": "x".repeat(300)}))
+            .collect();
+
+        let crusher = SmartCrusher::new(SmartCrusherConfig {
+            lossless_min_savings_ratio: 0.99, // force the would-be-lossy path
+            lossless_only: true,
+            ..SmartCrusherConfig::default()
+        });
+        let result = crusher.crush_array(&rows, "", 1.0);
+
+        assert_eq!(result.items, rows, "lossless_only must not drop rows");
+        assert!(result.ccr_hash.is_none(), "no hash under lossless_only");
+        assert!(
+            result.dropped_summary.is_empty(),
+            "no drop sentinel under lossless_only: {:?}",
+            result.dropped_summary
+        );
+        assert!(
+            result.compacted.is_none(),
+            "nothing shipped, nothing dropped"
+        );
+    }
+
+    #[test]
+    fn lossless_only_inlines_opaque_blobs_when_table_ships() {
+        // When the lossless table DOES win, opaque cells render inline
+        // (no marker) because lossless_only suppresses opaque offload.
+        let rows: Vec<Value> = (0..10)
+            .map(|i| json!({"path": "a.py", "line": i, "content": "x".repeat(300)}))
+            .collect();
+        let crusher = SmartCrusher::new(SmartCrusherConfig {
+            lossless_min_savings_ratio: 0.0, // table ships
+            lossless_only: true,
+            ..SmartCrusherConfig::default()
+        });
+        let rendered = crusher
+            .crush_array(&rows, "", 1.0)
+            .compacted
+            .expect("table should ship at ratio 0.0");
+        assert!(
+            !rendered.contains("<<ccr:"),
+            "opaque marker leaked under lossless_only: {rendered}"
+        );
+        assert!(
+            rendered.contains(&"x".repeat(300)),
+            "blob should be inline under lossless_only: {rendered}"
+        );
+    }
+
+    #[test]
+    fn lossless_only_never_writes_to_ccr_store() {
+        // Load-bearing invariant for the Python per-call override: a
+        // lossless_only crusher MUST NOT write to the CCR store. Force
+        // the would-be-lossy row-drop path (ratio 0.99) and assert the
+        // store does not grow. This pins the early-return guard that the
+        // `debug_assert` in `crush_array` documents — if that return is
+        // ever removed, this test (and the alternate-crusher design)
+        // breaks loudly.
+        use crate::ccr::InMemoryCcrStore;
+        use crate::transforms::smart_crusher::SmartCrusherBuilder;
+        use std::sync::Arc;
+
+        let store: Arc<dyn CcrStore> = Arc::new(InMemoryCcrStore::new());
+        let cfg = SmartCrusherConfig {
+            lossless_min_savings_ratio: 0.99, // force the would-be-lossy path
+            lossless_only: true,
+            ..SmartCrusherConfig::default()
+        };
+        let c = SmartCrusherBuilder::new(cfg)
+            .with_ccr_store(Arc::clone(&store))
+            .build();
+        let items: Vec<Value> = (0..50).map(|_| json!({"status": "ok"})).collect();
+
+        let store_len_before = store.len();
+        let result = c.crush_array(&items, "", 1.0);
+
+        assert_eq!(
+            result.items, items,
+            "lossless_only must keep every row (no drop)"
+        );
+        assert!(result.ccr_hash.is_none(), "no hash under lossless_only");
+        assert_eq!(
+            store.len(),
+            store_len_before,
+            "ccr_store grew under lossless_only — invariant violated"
         );
     }
 }

@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ._shared import claude_config_dir
 from .models import (
     ProjectInfo,
     Recommendation,
@@ -274,10 +275,11 @@ class ClaudeCodeWriter(ContextWriter):
         if self._context_target is not None:
             target = Path(self._context_target).expanduser()
             return target if target.is_absolute() else project.project_path / target
-        # The home directory's CLAUDE.md (~/.claude/CLAUDE.md) is the user's
-        # personal global memory, not a team-shared file, so keep writing there.
+        # The home directory's CLAUDE.md (~/.claude/CLAUDE.md, or
+        # $CLAUDE_CONFIG_DIR/CLAUDE.md) is the user's personal global memory,
+        # not a team-shared file, so keep writing there.
         if project.project_path == Path.home():
-            return Path.home() / ".claude" / "CLAUDE.md"
+            return claude_config_dir() / "CLAUDE.md"
         # Project level: default to the gitignored, personal CLAUDE.local.md so
         # we never pollute the team-shared CLAUDE.md (issue #1072).
         return project.project_path / "CLAUDE.local.md"
@@ -302,12 +304,12 @@ class ClaudeCodeWriter(ContextWriter):
             return []
         if target_path == legacy_path or not legacy_path.exists():
             return []
-        legacy_text = legacy_path.read_text(encoding="utf-8")
+        legacy_text = _read_text_tolerant(legacy_path)
         if _MARKER_START not in legacy_text:
             return []
         # If the target already owns a block, it is the source of truth -- don't
         # double-migrate or clobber accumulated learnings.
-        if target_path.exists() and _MARKER_START in target_path.read_text(encoding="utf-8"):
+        if target_path.exists() and _MARKER_START in _read_text_tolerant(target_path):
             return []
 
         migrated = _parse_prior_recommendations(legacy_text)
@@ -404,5 +406,35 @@ class GeminiWriter(ContextWriter):
         if not dry_run:
             gemini_md.parent.mkdir(parents=True, exist_ok=True)
             gemini_md.write_text(full_content, encoding="utf-8")
+
+        return result
+
+
+# =============================================================================
+# Grok Writer (Grok CLI)
+# =============================================================================
+
+
+class GrokWriter(ContextWriter):
+    """Writes learned patterns to GROK.md for Grok CLI."""
+
+    def write(
+        self,
+        recommendations: list[Recommendation],
+        project: ProjectInfo,
+        dry_run: bool = True,
+    ) -> WriteResult:
+        result = WriteResult()
+        result.dry_run = dry_run
+
+        if not recommendations:
+            return result
+
+        grok_md = project.context_file or (project.project_path / "GROK.md")
+        full_content = _merge_into_file(grok_md, recommendations)
+        result.add(grok_md, full_content)
+        if not dry_run:
+            grok_md.parent.mkdir(parents=True, exist_ok=True)
+            grok_md.write_text(full_content, encoding="utf-8")
 
         return result

@@ -50,6 +50,7 @@ def ensure_proxy_dependencies() -> None:
         click.secho(f"Details: {e}", fg="red", err=True)
         raise SystemExit(1) from None
 
+
 # ---------------------------------------------------------------------------
 # Startup log suppression.
 #

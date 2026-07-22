@@ -64,7 +64,11 @@ def test_responses_compression_skips_exact_file_tool_outputs(monkeypatch) -> Non
             min_bytes=unit.min_bytes,
         )
 
-    monkeypatch.setattr(compression_units, "find_content_router", lambda _pipeline: object())
+    monkeypatch.setattr(
+        compression_units,
+        "find_content_router",
+        lambda _pipeline: SimpleNamespace(config=SimpleNamespace(exclude_tools=None)),
+    )
     monkeypatch.setattr(
         compression_units,
         "compress_unit_with_router",

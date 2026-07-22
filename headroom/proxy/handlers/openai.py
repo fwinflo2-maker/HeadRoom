@@ -5289,9 +5289,12 @@ class OpenAIHandlerMixin:
                                 if done:
                                     try:
                                         result = operation.result()
-                                    except Exception:
+                                    except Exception as e:
+                                        await record_failed(provider="openai")
+                                        logger.error(
+                                            f"[{request_id}] OpenAI responses request failed: {type(e).__name__}: {e}"
+                                        )
                                         if not started:
-                                            await record_failed(provider="openai")
                                             await send(
                                                 {
                                                     "type": "http.response.start",

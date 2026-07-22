@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -512,34 +513,44 @@ async def test_buffered_ccr_late_failure_emits_sanitized_error_event() -> None:
         app = create_app(config)
         with TestClient(app):
             proxy = app.state.proxy
+            proxy_logger = logging.getLogger("headroom.proxy")
+            error_records: list[logging.LogRecord] = []
+            log_handler = logging.Handler()
+            log_handler.setLevel(logging.ERROR)
+            log_handler.emit = error_records.append
+            proxy_logger.addHandler(log_handler)
 
             async def delayed_failure(*args, **kwargs):  # noqa: ANN002, ANN003
                 started.set()
                 await release.wait()
                 raise RuntimeError("boom")
 
-            proxy._retry_request = delayed_failure
-            task = asyncio.create_task(proxy.handle_anthropic_messages(Request(scope, receive)))
-            await started.wait()
-            response = await asyncio.wait_for(asyncio.shield(task), 1)
-            events: list[dict] = []
-            first_body = asyncio.Event()
+            with patch.object(proxy.metrics, "record_failed", new_callable=AsyncMock) as record_failed:
+                proxy._retry_request = delayed_failure
+                task = asyncio.create_task(proxy.handle_anthropic_messages(Request(scope, receive)))
+                await started.wait()
+                response = await asyncio.wait_for(asyncio.shield(task), 1)
+                events: list[dict] = []
+                first_body = asyncio.Event()
 
-            async def send(message):  # noqa: ANN001
-                events.append(message)
-                if message["type"] == "http.response.body" and message["body"]:
-                    first_body.set()
+                async def send(message):  # noqa: ANN001
+                    events.append(message)
+                    if message["type"] == "http.response.body" and message["body"]:
+                        first_body.set()
 
-            response_task = asyncio.create_task(response(scope, receive, send))
-            await asyncio.wait_for(first_body.wait(), 2)
-            release.set()
-            await response_task
+                response_task = asyncio.create_task(response(scope, receive, send))
+                await asyncio.wait_for(first_body.wait(), 2)
+                release.set()
+                await response_task
+                record_failed.assert_awaited_once_with(provider="anthropic")
+            proxy_logger.removeHandler(log_handler)
 
     bodies = [event["body"] for event in events if event["type"] == "http.response.body"]
     assert bodies[0] == b'event: ping\ndata: {"type":"ping"}\n\n'
     assert b"An error occurred while processing the request." in bodies[-1]
     assert b"boom" not in bodies[-1]
     assert events[-1]["more_body"] is False
+    assert any(record.levelno == logging.ERROR and "RuntimeError: boom" in record.getMessage() for record in error_records)
 
 
 @pytest.mark.asyncio

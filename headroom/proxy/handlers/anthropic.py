@@ -3575,9 +3575,12 @@ class AnthropicHandlerMixin:
                                     if done:
                                         try:
                                             result = operation.result()
-                                        except Exception:
+                                        except Exception as e:
+                                            await record_failed(provider=provider_name)
+                                            logger.error(
+                                                f"[{request_id}] Request failed: {type(e).__name__}: {e}"
+                                            )
                                             if not started:
-                                                await record_failed(provider=provider_name)
                                                 await send(
                                                     {
                                                         "type": "http.response.start",

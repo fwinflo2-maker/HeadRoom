@@ -280,3 +280,45 @@ async def test_prometheus_metrics_model_cardinality_warns_once(
             )
     cap_warnings = [r for r in caplog.records if "cardinality cap" in r.getMessage()]
     assert len(cap_warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_prometheus_metrics_reset_rearms_cardinality_warning() -> None:
+    """reset_runtime clears the model dicts and re-arms the one-shot cap warning."""
+    metrics = PrometheusMetrics(stateless=True)
+    for i in range(MAX_DISTINCT_MODELS + 5):
+        await metrics.record_request(
+            provider="openai",
+            model=f"model_{i}",
+            input_tokens=1,
+            output_tokens=1,
+            tokens_saved=1,
+            latency_ms=1.0,
+            cache_read_tokens=1,
+        )
+    assert metrics._model_cardinality_warned is True
+
+    await metrics.reset_runtime()
+
+    assert metrics._model_cardinality_warned is False
+    assert len(metrics.requests_by_model) == 0
+    assert len(metrics._cache_requests_by_model) == 0
+
+
+@pytest.mark.asyncio
+async def test_prometheus_metrics_export_bounds_model_series() -> None:
+    """export() emits at most MAX_DISTINCT_MODELS model series plus the 'other' bucket."""
+    metrics = PrometheusMetrics(stateless=True)
+    for i in range(MAX_DISTINCT_MODELS + 20):
+        await metrics.record_request(
+            provider="openai",
+            model=f"model_{i}",
+            input_tokens=1,
+            output_tokens=1,
+            tokens_saved=1,
+            latency_ms=1.0,
+        )
+    text = await metrics.export()
+    series = text.count("headroom_requests_by_model{")
+    assert series <= MAX_DISTINCT_MODELS + 1
+    assert 'headroom_requests_by_model{model="other"}' in text

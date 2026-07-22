@@ -762,10 +762,11 @@ class PrometheusMetrics:
                 # is always a cold start (100% write, 0% read) — not a bust.
                 # Only flag as bust when a previously-warm model suddenly has
                 # high write ratio, indicating prefix invalidation.
-                # ponytail: bounded_model may be "other" under a cardinality attack,
-                # mixing models in this bust heuristic. Acceptable — only bites
-                # >MAX_DISTINCT_MODELS distinct models on cached anthropic traffic,
-                # worst case a mis-attributed bust stat; keeps the dict bounded.
+                # bounded_model can be "other" once the cardinality cap trips, which
+                # mixes distinct models in this bust heuristic. That is acceptable:
+                # it only happens past MAX_DISTINCT_MODELS distinct models on cached
+                # anthropic traffic, the worst case is a mis-attributed bust stat,
+                # and it keeps _cache_requests_by_model bounded.
                 model_req_num = self._cache_requests_by_model[bounded_model]
                 self._cache_requests_by_model[bounded_model] += 1
                 if provider == "anthropic" and model_req_num > 0:

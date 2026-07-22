@@ -55,7 +55,6 @@ def test_handlers_offload_token_counting_and_batch_apply() -> None:
         (OpenAIHandlerMixin, "handle_openai_responses"),
         (GeminiHandlerMixin, "handle_gemini_generate_content"),
         (GeminiHandlerMixin, "handle_google_cloudcode_stream"),
-        (GeminiHandlerMixin, "handle_gemini_stream_generate_content"),
         (GeminiHandlerMixin, "handle_gemini_count_tokens"),
     ):
         fn = getattr(mixin, method)
@@ -65,6 +64,13 @@ def test_handlers_offload_token_counting_and_batch_apply() -> None:
         assert "tokenizer = get_tokenizer(" not in src, (
             f"{method}: tokenizer resolved inline on the loop"
         )
+
+    fn = GeminiHandlerMixin.handle_gemini_stream_generate_content
+    assert inspect.iscoroutinefunction(fn)
+    src = inspect.getsource(fn)
+    assert "_count_texts_offloaded(" in src, "streaming Gemini text counting not offloaded"
+    assert "tokenizer = get_tokenizer(" not in src, "tokenizer resolved inline on the loop"
+    assert "count_text(" not in src, "streaming Gemini count_text still runs on the loop"
 
     for mixin, method in (
         (AnthropicHandlerMixin, "handle_anthropic_batch_create"),
@@ -175,11 +181,8 @@ async def test_count_tokens_offloaded_fails_open_on_executor_quarantine() -> Non
 
 
 async def test_count_tokens_offloaded_returns_count_text_capable_tokenizer() -> None:
-    """handle_gemini_stream_generate_content resolves the tokenizer via
-    ``_count_tokens_offloaded(model, [])`` (empty-messages call), then sums text
-    parts with ``tokenizer.count_text(...)``. The returned tokenizer must support
-    count_text on the fail-open path too, or that streaming handler 500s on
-    exactly the cold/quarantined tokenizer this offload exists to survive."""
+    """The fail-open tokenizer should still support text counting for callers
+    that need per-fragment accounting."""
     proxy = _make_proxy()
     # Quarantine forces the fail-open branch (an EstimatingTokenCounter).
     proxy._compression_timed_out_in_flight = 1
@@ -191,3 +194,22 @@ async def test_count_tokens_offloaded_returns_count_text_capable_tokenizer() -> 
     assert isinstance(tokenizer, EstimatingTokenCounter)
     # The streaming handler's per-part loop must not raise on the fallback.
     assert tokenizer.count_text("hello world") > 0
+
+
+async def test_count_texts_offloaded_runs_on_worker_thread(monkeypatch) -> None:  # noqa: ANN001
+    proxy = _make_proxy()
+    loop_thread = threading.current_thread().name
+    seen: dict[str, str] = {}
+
+    class _SpyTokenizer(EstimatingTokenCounter):
+        def count_text(self, text):  # noqa: ANN001, ANN201
+            seen["thread"] = threading.current_thread().name
+            return super().count_text(text)
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda *a, **k: _SpyTokenizer())
+
+    _, tokens = await proxy._count_texts_offloaded("gemini-pro", ["hello", "world"])
+
+    assert tokens > 0
+    assert seen["thread"].startswith("headroom-compress")
+    assert seen["thread"] != loop_thread

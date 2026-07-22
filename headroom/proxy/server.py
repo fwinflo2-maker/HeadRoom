@@ -1380,6 +1380,36 @@ class HeadroomProxy(
             estimator = EstimatingTokenCounter()
             return estimator, estimator.count_messages(messages)
 
+    async def _count_texts_offloaded(self, model, texts):  # noqa: ANN001, ANN201
+        """Resolve a tokenizer and count text fragments off the event loop."""
+        from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
+        from headroom.tokenizers import EstimatingTokenCounter, get_tokenizer
+
+        text_list = list(texts)
+
+        def _resolve_and_count():  # noqa: ANN202
+            tokenizer = get_tokenizer(model)
+            return tokenizer, sum(tokenizer.count_text(text) for text in text_list)
+
+        try:
+            return await self._run_compression_in_executor(
+                _resolve_and_count,
+                timeout=float(COMPRESSION_TIMEOUT_SECONDS),
+            )
+        except Exception as e:  # fail open — includes asyncio.TimeoutError
+            fallback_models = getattr(self, "_token_count_fallback_models", None)
+            if fallback_models is None:
+                fallback_models = set()
+                self._token_count_fallback_models = fallback_models
+            if model not in fallback_models:
+                fallback_models.add(model)
+                logger.warning(
+                    f"Token text counting for model {model} failed or timed out "
+                    f"({e.__class__.__name__}); falling back to estimation"
+                )
+            estimator = EstimatingTokenCounter()
+            return estimator, sum(estimator.count_text(text) for text in text_list)
+
     async def _run_compression_in_executor(
         self,
         fn,  # noqa: ANN001 — caller-supplied no-arg sync callable

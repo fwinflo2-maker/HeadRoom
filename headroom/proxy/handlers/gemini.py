@@ -1017,16 +1017,14 @@ class GeminiHandlerMixin:
             request_id=request_id,
         )
 
-        # Token counting — resolve the tokenizer off the event loop (GH #1701),
-        # then sum text parts on the warm result. The empty-messages call only
-        # forces the fail-open resolve; the count_text loop below is the count.
-        tokenizer, _ = await self._count_tokens_offloaded(model, [])
-        original_tokens = 0
-        for content in contents:
-            parts = content.get("parts", [])
-            for part in parts:
-                if "text" in part:
-                    original_tokens += tokenizer.count_text(part["text"])
+        # Token counting (offloaded off the event loop — GH #1701)
+        text_parts = []
+        for content in contents if isinstance(contents, list) else []:
+            parts = content.get("parts", []) if isinstance(content, dict) else []
+            for part in parts if isinstance(parts, list) else []:
+                if isinstance(part, dict) and "text" in part:
+                    text_parts.append(part["text"])
+        _, original_tokens = await self._count_texts_offloaded(model, text_parts)
 
         optimization_latency = (time.time() - start_time) * 1000
 

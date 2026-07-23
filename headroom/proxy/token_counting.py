@@ -32,9 +32,7 @@ def _record_fallback_model(owner: Any, model: Any, message: str) -> None:
         logger.warning(message)
 
 
-async def _count_offloaded(
-    owner: Any, model: Any, count: Callable[[Any], int]
-) -> tuple[Any, int]:
+async def _count_offloaded(owner: Any, model: Any, count: Callable[[Any], int]) -> tuple[Any, int]:
     """Resolve a tokenizer and apply ``count`` off the event loop when possible.
 
     ``count`` maps a resolved tokenizer to a token total. Returns

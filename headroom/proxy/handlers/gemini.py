@@ -1027,13 +1027,16 @@ class GeminiHandlerMixin:
             request_id=request_id,
         )
 
-        # Token counting (offloaded off the event loop — GH #1701)
-        text_parts = []
-        for content in contents if isinstance(contents, list) else []:
-            parts = content.get("parts", []) if isinstance(content, dict) else []
-            for part in parts if isinstance(parts, list) else []:
-                if isinstance(part, dict) and "text" in part:
-                    text_parts.append(part["text"])
+        # Token counting (offloaded off the event loop — GH #1701). Reuse the
+        # shared _dict_parts coercion and keep only str text values: count_text
+        # raises on a non-str part value and the fail-open path re-runs the same
+        # input, so a malformed part would otherwise 500 the streaming request.
+        text_parts = [
+            part["text"]
+            for content in (contents if isinstance(contents, list) else [])
+            for part in self._dict_parts(content)
+            if isinstance(part.get("text"), str)
+        ]
         _, original_tokens = await self._count_texts_offloaded(model, text_parts)
 
         optimization_latency = (time.time() - start_time) * 1000

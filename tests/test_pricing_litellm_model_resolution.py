@@ -87,13 +87,10 @@ def test_resolve_litellm_model_name_resolves_dated_vertex_model() -> None:
     model = "claude-haiku-4-5@20251001"
 
     assert (
-        resolve_litellm_model_name(model, {"claude-haiku-4-5"}.__contains__)
-        == "claude-haiku-4-5"
+        resolve_litellm_model_name(model, {"claude-haiku-4-5"}.__contains__) == "claude-haiku-4-5"
     )
     assert (
-        resolve_litellm_model_name(
-            model, {"anthropic/claude-haiku-4-5"}.__contains__
-        )
+        resolve_litellm_model_name(model, {"anthropic/claude-haiku-4-5"}.__contains__)
         == "anthropic/claude-haiku-4-5"
     )
 

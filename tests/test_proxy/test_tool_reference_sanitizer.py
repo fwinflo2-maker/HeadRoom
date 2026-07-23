@@ -114,6 +114,38 @@ class TestSanitizeStaleToolReferences:
             {"type": "something_else", "x": 1}
         ]
 
+    def test_dict_content_with_non_list_references_left_alone(self) -> None:
+        block = {"type": "tool_search_tool_result", "content": {"tool_references": "nope"}}
+        out, dropped = sanitize_stale_tool_references(_messages_with(block), set())
+        assert dropped == []
+        assert out is not None and out[1]["content"][1] is block
+
+    def test_list_shaped_content_all_resolvable_left_alone(self) -> None:
+        block = {
+            "type": "tool_search_tool_result",
+            "content": [{"type": "tool_reference", "tool_name": "kept"}],
+        }
+        messages = _messages_with(block)
+        out, dropped = sanitize_stale_tool_references(messages, {"kept"})
+        assert dropped == []
+        assert out is messages
+
+    def test_multiple_stale_blocks_across_messages(self) -> None:
+        # Two stale blocks in one message + a stale block in a second message:
+        # exercises the copy-on-write reuse paths (content and messages lists
+        # copied once, then written in place).
+        messages = [
+            {
+                "role": "assistant",
+                "content": [_search_result_block("gone_a"), _search_result_block("gone_b")],
+            },
+            {"role": "assistant", "content": [_search_result_block("gone_c")]},
+        ]
+        out, dropped = sanitize_stale_tool_references(messages, set())
+        assert sorted(dropped) == ["gone_a", "gone_b", "gone_c"]
+        for mi, bi in [(0, 0), (0, 1), (1, 0)]:
+            assert out[mi]["content"][bi]["content"]["tool_references"] == []
+
 
 class TestCollectToolReferenceNames:
     def test_collects_across_messages(self) -> None:
@@ -123,6 +155,45 @@ class TestCollectToolReferenceNames:
     def test_empty_and_malformed(self) -> None:
         assert collect_tool_reference_names(None) == set()
         assert collect_tool_reference_names([{"role": "user", "content": "hi"}]) == set()
+        assert (
+            collect_tool_reference_names(
+                [
+                    "not-a-dict-message",
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "tool_search_tool_result", "content": 7}],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_search_tool_result",
+                                "content": {"tool_references": "nope"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_search_tool_result",
+                                "content": {
+                                    "tool_references": [{"type": "tool_reference", "tool_name": 42}]
+                                },
+                            }
+                        ],
+                    },
+                ]
+            )
+            == set()
+        )
+
+    def test_list_shaped_content(self) -> None:
+        block = {
+            "type": "tool_search_tool_result",
+            "content": [{"type": "tool_reference", "tool_name": "listed"}],
+        }
+        assert collect_tool_reference_names(_messages_with(block)) == {"listed"}
 
 
 class TestShouldInjectCcrToolHistoryOverride:
@@ -261,6 +332,36 @@ def test_handler_drops_stale_reference_before_forwarding() -> None:
         forwarded = captured["body"]
         refs = forwarded["messages"][1]["content"][1]["content"]["tool_references"]
         assert [r["tool_name"] for r in refs] == ["mcp__headroom__headroom_retrieve"]
+
+
+def test_handler_fails_open_when_sanitizer_raises(monkeypatch) -> None:  # noqa: ANN001
+    # The rescue must never fail a request: a sanitizer crash forwards the
+    # body unmodified (upstream then rejects it, but that is the status quo).
+    captured: dict[str, object] = {}
+    messages = _messages_with(_search_result_block("gone"))
+
+    def _boom(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise RuntimeError("sanitizer exploded")
+
+    monkeypatch.setattr(
+        "headroom.proxy.tool_reference_sanitizer.sanitize_stale_tool_references", _boom
+    )
+
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = True
+        _disable_pipeline_extensions(proxy)
+        _capture_forwarded_body(proxy, captured)
+
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={"model": "claude-sonnet-4-6", "max_tokens": 64, "messages": messages},
+        )
+
+        assert response.status_code == 200
+        refs = captured["body"]["messages"][1]["content"][1]["content"]["tool_references"]
+        assert [r["tool_name"] for r in refs] == ["gone"]
 
 
 def test_handler_forces_ccr_injection_when_history_references_tool() -> None:

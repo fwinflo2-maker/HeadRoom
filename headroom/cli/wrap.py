@@ -4751,8 +4751,14 @@ def _detect_inbound_anthropic_upstream(port: int) -> str | None:
         parsed = urllib.parse.urlsplit(base_url)
     except ValueError:
         return None
-    if (parsed.hostname or "").lower() in _LOCAL_HOSTNAMES and parsed.port == port:
-        return None
+    hostname = (parsed.hostname or "").lower()
+    if hostname in _LOCAL_HOSTNAMES:
+        try:
+            parsed_port = parsed.port
+        except ValueError:
+            return None
+        if parsed_port == port:
+            return None
     return base_url
 
 

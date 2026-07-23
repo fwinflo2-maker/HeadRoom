@@ -13,6 +13,7 @@ from headroom.cli import wrap as wrap_cli
 
 _PROXY_PORT = 8787
 _LITELLM_URL = "https://litellm.example.internal/anthropic"
+_MALFORMED_LOCAL_PORT_URL = "http://localhost:notaport"
 
 
 def test_detects_custom_litellm_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -48,3 +49,8 @@ def test_returns_localhost_on_different_port(monkeypatch: pytest.MonkeyPatch) ->
     other_port_url = f"http://127.0.0.1:{_PROXY_PORT + 1}"
     monkeypatch.setenv("ANTHROPIC_BASE_URL", other_port_url)
     assert wrap_cli._detect_inbound_anthropic_upstream(_PROXY_PORT) == other_port_url
+
+
+def test_returns_none_for_malformed_local_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", _MALFORMED_LOCAL_PORT_URL)
+    assert wrap_cli._detect_inbound_anthropic_upstream(_PROXY_PORT) is None

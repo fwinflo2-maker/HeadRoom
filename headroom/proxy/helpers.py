@@ -2263,6 +2263,7 @@ def should_inject_ccr_tool(
     configured_inject_tool: bool,
     frozen_message_count: int,
     has_compressed_content: bool,
+    history_references_tool: bool = False,
 ) -> tuple[bool, bool]:
     """Decide whether the ``headroom_retrieve`` tool must be injected this turn.
 
@@ -2276,14 +2277,22 @@ def should_inject_ccr_tool(
     that case we override the deferral and inject anyway (one cache miss is
     cheaper than dropped content).
 
+    ``history_references_tool``: the replayed messages carry a server
+    tool-search ``tool_reference`` to the CCR tool. Upstream validates those
+    against this request's tools array and rejects the request with 400 when
+    the tool is missing, so an existing reference forces injection past the
+    frozen-prefix deferral (and past lost tracker state — the signal comes
+    from the request itself).
+
     Returns ``(should_inject, is_marker_override)``. ``is_marker_override`` is
-    True only when injection happens *because* of new markers despite a deferral,
-    so the caller can log the override distinctly.
+    True only when injection happens *because* of new markers or a replayed
+    reference despite a deferral, so the caller can log the override distinctly.
     """
     return _should_inject_ccr_tool(
         configured_inject_tool=configured_inject_tool,
         frozen_message_count=frozen_message_count,
         has_compressed_content=has_compressed_content,
+        history_references_tool=history_references_tool,
     )
 
 

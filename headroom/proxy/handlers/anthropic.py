@@ -1826,18 +1826,39 @@ class AnthropicHandlerMixin:
                     provider="anthropic",
                 )
 
+                # A replayed server tool-search reference to headroom_retrieve
+                # means upstream will 400 this request unless the tool is in
+                # the tools array — injection is mandatory, overriding the
+                # frozen-prefix deferral AND any lost tracker state (restart,
+                # LRU eviction): the trigger is derived from the request, not
+                # from in-memory session state.
+                from headroom.ccr.tool_injection import CCR_TOOL_NAME
+                from headroom.proxy.tool_reference_sanitizer import (
+                    collect_tool_reference_names,
+                )
+
+                history_references_ccr_tool = CCR_TOOL_NAME in collect_tool_reference_names(
+                    optimized_messages
+                )
+
                 should_inject, is_marker_override = should_inject_ccr_tool(
                     configured_inject_tool=configured_inject_tool,
                     frozen_message_count=frozen_message_count,
                     has_compressed_content=has_new_compressed_content,
+                    history_references_tool=history_references_ccr_tool,
                 )
                 if should_inject:
                     if is_marker_override:
+                        _override_why = (
+                            "replayed tool_search reference requires the tool"
+                            if history_references_ccr_tool
+                            else "new markers emitted but headroom_retrieve unavailable"
+                        )
                         logger.info(
                             f"[{request_id}] CCR: overriding injection deferral — "
-                            f"new markers emitted but headroom_retrieve unavailable "
+                            f"{_override_why} "
                             f"(frozen_message_count={frozen_message_count}); injecting to "
-                            "prevent unredeemable markers (#1006)"
+                            "prevent unredeemable markers / a stale-reference 400 (#1006)"
                         )
                     from headroom.proxy.helpers import apply_session_sticky_ccr_tool
 
@@ -1846,7 +1867,9 @@ class AnthropicHandlerMixin:
                         session_id=session_id,
                         request_id=request_id,
                         existing_tools=tools,
-                        has_compressed_content_this_turn=has_new_compressed_content,
+                        has_compressed_content_this_turn=(
+                            has_new_compressed_content or history_references_ccr_tool
+                        ),
                     )
                     if ccr_tool_injected:
                         logger.debug(
@@ -2458,6 +2481,50 @@ class AnthropicHandlerMixin:
                                 f"[{request_id}] OutputShaper(L{_level}/{_src}): "
                                 f"{shape_result.labels}"
                             )
+
+            # Stale tool-search reference rescue: the API validates every
+            # replayed tool_reference against THIS request's final tools array
+            # and 400s the whole request when one is missing — permanently,
+            # since the client replays the same history every turn. Runs after
+            # every tools/messages mutation (CCR injection, compaction,
+            # deferral, hooks) so it sees exactly what upstream will validate,
+            # and runs even under bypass: it only ever touches requests that
+            # would otherwise be rejected, so byte-faithful forwarding of any
+            # valid request is unaffected.
+            try:
+                from headroom.proxy.tool_reference_sanitizer import (
+                    sanitize_stale_tool_references,
+                )
+
+                _tool_names = {
+                    t["name"]
+                    for t in (body.get("tools") or [])
+                    if isinstance(t, dict) and isinstance(t.get("name"), str)
+                }
+                _sanitized_messages, _stale_refs_dropped = sanitize_stale_tool_references(
+                    body.get("messages") or [], _tool_names
+                )
+                if _stale_refs_dropped:
+                    body["messages"] = _sanitized_messages
+                    optimized_messages = _sanitized_messages
+                    body_mutation_tracker.mark_mutated("stale_tool_reference_sanitizer")
+                    transforms_applied.append(
+                        f"anthropic:stale_tool_refs_dropped:{len(_stale_refs_dropped)}"
+                    )
+                    logger.warning(
+                        "[%s] dropped %d stale tool_search reference(s) to %s — "
+                        "absent from this request's tools array; upstream would "
+                        "reject the request with 400 'Tool reference not found'",
+                        request_id,
+                        len(_stale_refs_dropped),
+                        sorted(set(_stale_refs_dropped)),
+                    )
+            except Exception as _stale_refs_exc:  # rescue only — never fail a request
+                logger.warning(
+                    "[%s] stale tool_reference sanitize FAILED: %s",
+                    request_id,
+                    _stale_refs_exc,
+                )
 
             # Unit 2: mark end of pre-upstream phase. Everything after this
             # point is upstream I/O or post-response bookkeeping.

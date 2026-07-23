@@ -35,11 +35,21 @@ def should_inject_ccr_tool(
     configured_inject_tool: bool,
     frozen_message_count: int,
     has_compressed_content: bool,
+    history_references_tool: bool = False,
 ) -> tuple[bool, bool]:
-    """Decide whether the CCR retrieval tool must be injected this turn."""
+    """Decide whether the CCR retrieval tool must be injected this turn.
+
+    ``history_references_tool`` is True when the replayed messages contain a
+    server tool-search ``tool_reference`` to the CCR tool: the API validates
+    those references against this request's tools array and 400s the whole
+    request if the tool is absent, so once a reference exists the tool must
+    stay injected on every turn — regardless of frozen-prefix deferral or
+    lost tracker state (the signal is derived from the request itself, so it
+    survives proxy restarts).
+    """
 
     inject_tool = configured_inject_tool
     if inject_tool and frozen_message_count > 0:
         inject_tool = False
-    is_marker_override = not inject_tool and has_compressed_content
+    is_marker_override = not inject_tool and (has_compressed_content or history_references_tool)
     return (inject_tool or is_marker_override), is_marker_override

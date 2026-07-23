@@ -23,6 +23,16 @@ from tests._skip_helpers import external_model_skip_reason
 # config instead of the test's. Scrub them so local runs match CI; tests
 # that need a value set it explicitly via monkeypatch or CliRunner env.
 @pytest.fixture(autouse=True)
+def _skip_proxy_dependency_gate_unless_exercised(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Most CLI tests run without headroom-ai[proxy] extras installed."""
+    if request.node.get_closest_marker("proxy_dependency_gate") is not None:
+        return
+    monkeypatch.setattr("headroom.cli.proxy.ensure_proxy_dependencies", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _scrub_developer_headroom_env(monkeypatch):
     for key in list(os.environ):
         if key.startswith("HEADROOM_"):

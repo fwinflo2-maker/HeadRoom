@@ -12,11 +12,12 @@ Kompressed marker-free; in CCR mode the same DROP tail can be dropped with a
 retrieval marker. Nothing here emits markers or calls a compressor.
 
 Segmentation is boundary-aware, not line-based: blank lines delimit records,
-indented continuation lines stay attached to their parent (so stack traces and
-pretty-printed blobs are scored as one unit), and dense blank-free streams
-(grep, tight logs) are packed into small fixed windows. The partition is
-lossless -- ``"".join(segment(content)) == content`` -- so KEEP runs
-reconstruct the original bytes exactly.
+indented continuation lines stay attached to their parent (so short stack
+traces and pretty-printed blobs are scored as one unit; a long indented run is
+windowed under ``max_chars`` rather than collapsed into one record), and dense
+blank-free streams (grep, tight logs) are packed into small fixed windows. The
+partition is lossless -- ``"".join(segment(content)) == content`` -- so KEEP
+runs reconstruct the original bytes exactly.
 """
 
 from __future__ import annotations
@@ -53,8 +54,10 @@ def segment(content: str, *, window: int = 8, max_chars: int = 1200) -> list[str
 
     Lossless partition: ``"".join(segment(content)) == content``. Blank lines
     delimit records; oversized or dense blank-free blocks are packed into
-    windows of at most ``window`` lines / ``max_chars`` chars, with indented
-    continuation lines held to their window so multi-line units aren't cut.
+    windows of ``window`` lines, with indented continuation lines attached up to
+    ``max_chars`` so multi-line units aren't cut mid-run (a long indented blob is
+    windowed, not collapsed into one record). The base ``window`` is sized by
+    line count, so a window of long lines can itself exceed ``max_chars``.
     """
     lines = content.splitlines(keepends=True)
     if len(lines) <= 1:

@@ -51,6 +51,30 @@ def test_segment_keeps_indented_continuation_attached():
         assert not s.startswith((" ", "\t"))  # every segment starts at a head line
 
 
+def test_segment_bounds_indented_continuation_by_max_chars():
+    # A long indented run (deep stack trace / indented log payload) must NOT
+    # collapse into one mega-segment: the continuation extension is bounded by
+    # max_chars, not just by indentation. Short lines keep each base window
+    # tiny, so with the bound in place every segment lands within budget and
+    # the blob splits into multiple scorable records instead of all-or-nothing.
+    text = "HEADER (not indented)\n" + "".join(f"    frame line {i:03d}\n" for i in range(300))
+    segs = segment(text)  # window=8, max_chars=1200 (defaults)
+    assert "".join(segs) == text  # partition stays lossless
+    assert len(segs) > 2  # split into records, not the pre-fix 1 mega-segment
+    assert all(len(s) <= 1200 for s in segs)  # continuation held to max_chars
+
+
+def test_segment_bounds_continuation_across_blank_delimited_blocks():
+    # Blank lines split blocks (Pass 1); a long indented run inside one block is
+    # still windowed under max_chars (Pass 2). The whole partition stays lossless
+    # across both passes with short surrounding paragraphs intact.
+    block = "head\n" + "".join(f"\tdetail {i:03d}\n" for i in range(200))
+    text = "intro paragraph\n\n" + block + "\ntail note\n"
+    segs = segment(text)
+    assert "".join(segs) == text
+    assert all(len(s) <= 1200 for s in segs)
+
+
 def test_split_keeps_relevant_drops_irrelevant():
     content = (
         "the oauth token refresh failed here\n"

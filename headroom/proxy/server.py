@@ -1333,36 +1333,6 @@ class HeadroomProxy(
             },
         )
 
-    async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
-        """Resolve a tokenizer and count messages off the event loop.
-
-        Tokenizer resolution can be expensive on first use (HuggingFace
-        backends may download vocab files) and counting a full Claude Code
-        conversation is CPU-bound, so both run on the compression executor
-        bounded by ``COMPRESSION_TIMEOUT_SECONDS`` (GH #1701: an unbounded
-        on-loop load froze the whole server). On timeout or error this
-        fails open to character-based estimation.
-
-        Shared by every provider handler mixin (Anthropic, OpenAI, Gemini):
-        the OpenAI ``/v1/chat/completions`` and ``/v1/responses`` endpoints
-        are multi-provider passthroughs, so an HF-routed model (qwen,
-        deepseek, llama, ...) can reach them and trigger the same cold load.
-
-        Returns:
-            Tuple of ``(tokenizer, token_count)``. The tokenizer is fully
-            initialized, so later ``count_messages`` calls on it are pure
-            CPU work.
-        """
-        from headroom.proxy.token_counting import count_tokens_offloaded
-
-        return await count_tokens_offloaded(self, model, messages)
-
-    async def _count_texts_offloaded(self, model, texts):  # noqa: ANN001, ANN201
-        """Resolve a tokenizer and count text fragments off the event loop."""
-        from headroom.proxy.token_counting import count_texts_offloaded
-
-        return await count_texts_offloaded(self, model, texts)
-
     async def _run_compression_in_executor(
         self,
         fn,  # noqa: ANN001 — caller-supplied no-arg sync callable

@@ -102,21 +102,23 @@ def _anthropic_content_references_tool(content: Any, tool_name: str) -> bool:
     """Match a bare ``tool_name`` in tool_reference/tool_use blocks (one level deep)."""
     if not isinstance(content, list):
         return False
+
+    def matches(block: Any) -> bool:
+        return (
+            isinstance(block, dict)
+            and block.get("type") in ("tool_reference", "tool_use")
+            and block.get("name") == tool_name
+        )
+
     for block in content:
         if not isinstance(block, dict):
             continue
-        if block.get("type") in ("tool_reference", "tool_use") and block.get("name") == tool_name:
+        if matches(block):
             return True
         # tool_search_tool_result / tool_result nest blocks one level down.
         nested = block.get("content")
-        if isinstance(nested, list):
-            for inner in nested:
-                if (
-                    isinstance(inner, dict)
-                    and inner.get("type") in ("tool_reference", "tool_use")
-                    and inner.get("name") == tool_name
-                ):
-                    return True
+        if isinstance(nested, list) and any(matches(inner) for inner in nested):
+            return True
     return False
 
 

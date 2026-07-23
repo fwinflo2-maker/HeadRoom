@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -55,28 +56,52 @@ PRICE_LOOKUP_PROVIDER_PREFIXES: tuple[str, ...] = (
 )
 
 
+def _strip_vertex_version_suffix(model: str) -> str:
+    """Strip a trailing Vertex/Anthropic ``@YYYYMMDD`` model version."""
+    return re.sub(r"@[0-9]{8}$", "", model)
+
+
 def resolution_candidates(model: str) -> tuple[str, ...]:
     """Return ordered LiteLLM keys to try for cost-per-token resolution."""
-    candidates = [model]
+    bare_model = _strip_vertex_version_suffix(model)
+    models = (model, bare_model) if bare_model != model else (model,)
+    candidates = list(models)
     candidates.extend(
         candidate
+        for candidate_model in models
         for rule in MODEL_PREFIX_RULES
-        for candidate in (rule.candidate_for(model),)
+        for candidate in (rule.candidate_for(candidate_model),)
         if candidate is not None
     )
-    alias = MODEL_ALIASES.get(model)
-    if alias:
-        candidates.append(alias)
+    if bare_model != model and bare_model.lower().startswith("claude-"):
+        candidates.extend((f"vertex_ai/{bare_model}", f"vertex_ai/{model}"))
+    candidates.extend(
+        alias
+        for candidate_model in models
+        for alias in (MODEL_ALIASES.get(candidate_model),)
+        if alias is not None
+    )
     return tuple(dict.fromkeys(candidates))
 
 
 def pricing_lookup_candidates(model: str) -> tuple[str, ...]:
     """Return ordered LiteLLM model_cost keys to try for pricing lookup."""
-    candidates = [model]
-    candidates.extend(f"{prefix}{model}" for prefix in PRICE_LOOKUP_PROVIDER_PREFIXES)
-    alias = MODEL_ALIASES.get(model)
-    if alias:
-        candidates.append(alias)
+    bare_model = _strip_vertex_version_suffix(model)
+    models = (model, bare_model) if bare_model != model else (model,)
+    candidates = list(models)
+    candidates.extend(
+        f"{prefix}{candidate_model}"
+        for candidate_model in models
+        for prefix in PRICE_LOOKUP_PROVIDER_PREFIXES
+    )
+    if bare_model != model and bare_model.lower().startswith("claude-"):
+        candidates.extend((f"vertex_ai/{bare_model}", f"vertex_ai/{model}"))
+    candidates.extend(
+        alias
+        for candidate_model in models
+        for alias in (MODEL_ALIASES.get(candidate_model),)
+        if alias is not None
+    )
     return tuple(dict.fromkeys(candidates))
 
 

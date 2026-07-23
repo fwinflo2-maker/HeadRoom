@@ -28,6 +28,21 @@ def test_resolution_candidates_try_bare_then_matching_prefix_then_alias() -> Non
     )
 
 
+def test_resolution_candidates_strip_dated_vertex_suffix() -> None:
+    candidates = resolution_candidates("claude-haiku-4-5@20251001")
+
+    assert candidates[:2] == (
+        "claude-haiku-4-5@20251001",
+        "claude-haiku-4-5",
+    )
+    assert "anthropic/claude-haiku-4-5" in candidates
+    assert "vertex_ai/claude-haiku-4-5" in candidates
+    assert resolution_candidates("claude-haiku-4-5@latest") == (
+        "claude-haiku-4-5@latest",
+        "anthropic/claude-haiku-4-5@latest",
+    )
+
+
 def test_pricing_lookup_candidates_include_provider_prefixes_and_aliases() -> None:
     candidates = pricing_lookup_candidates("claude-3-5-sonnet-20241022")
 
@@ -35,6 +50,17 @@ def test_pricing_lookup_candidates_include_provider_prefixes_and_aliases() -> No
     assert "anthropic/claude-3-5-sonnet-20241022" in candidates
     assert "minimax/claude-3-5-sonnet-20241022" in candidates
     assert candidates[-1] == MODEL_ALIASES["claude-3-5-sonnet-20241022"]
+
+
+def test_pricing_lookup_candidates_strip_dated_vertex_suffix() -> None:
+    candidates = pricing_lookup_candidates("claude-haiku-4-5@20251001")
+
+    assert candidates[:2] == (
+        "claude-haiku-4-5@20251001",
+        "claude-haiku-4-5",
+    )
+    assert "anthropic/claude-haiku-4-5" in candidates
+    assert "vertex_ai/claude-haiku-4-5" in candidates
 
 
 def test_retired_claude_3_sonnet_aliases_to_sonnet_tier_not_haiku() -> None:
@@ -55,6 +81,21 @@ def test_resolve_litellm_model_name_returns_first_known_candidate() -> None:
     known = {"openai/gpt-4o"}
 
     assert resolve_litellm_model_name("gpt-4o", known.__contains__) == "openai/gpt-4o"
+
+
+def test_resolve_litellm_model_name_resolves_dated_vertex_model() -> None:
+    model = "claude-haiku-4-5@20251001"
+
+    assert (
+        resolve_litellm_model_name(model, {"claude-haiku-4-5"}.__contains__)
+        == "claude-haiku-4-5"
+    )
+    assert (
+        resolve_litellm_model_name(
+            model, {"anthropic/claude-haiku-4-5"}.__contains__
+        )
+        == "anthropic/claude-haiku-4-5"
+    )
 
 
 def test_resolve_litellm_model_name_returns_original_when_unknown() -> None:

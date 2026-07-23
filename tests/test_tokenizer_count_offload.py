@@ -26,7 +26,11 @@ from headroom.proxy.server import (
     ProxyConfig,
     create_app,
 )
-from headroom.proxy.token_counting import count_tokens_offloaded
+from headroom.proxy.token_counting import (
+    _count_offloaded,
+    count_texts_offloaded,
+    count_tokens_offloaded,
+)
 from headroom.tokenizers import EstimatingTokenCounter
 
 
@@ -71,6 +75,10 @@ def test_handlers_offload_token_counting_and_batch_apply() -> None:
     assert "_count_texts_offloaded(" in src, "streaming Gemini text counting not offloaded"
     assert "tokenizer = get_tokenizer(" not in src, "tokenizer resolved inline on the loop"
     assert "count_text(" not in src, "streaming Gemini count_text still runs on the loop"
+    assert "_dict_parts(" in src, "streaming Gemini must reuse the shared _dict_parts coercion"
+    assert 'isinstance(part.get("text"), str)' in src, (
+        "streaming Gemini must skip non-str text so count_text can't 500"
+    )
 
     for mixin, method in (
         (AnthropicHandlerMixin, "handle_anthropic_batch_create"),
@@ -84,7 +92,7 @@ def test_handlers_offload_token_counting_and_batch_apply() -> None:
             assert "_run_compression_in_executor(" in src, f"{method}: apply() not offloaded"
             assert "COMPRESSION_TIMEOUT_SECONDS" in src, f"{method}: offload missing timeout"
 
-    helper_src = inspect.getsource(count_tokens_offloaded)
+    helper_src = inspect.getsource(_count_offloaded)
     assert "COMPRESSION_TIMEOUT_SECONDS" in helper_src
     assert "EstimatingTokenCounter" in helper_src, "helper must fail open to estimation"
 
@@ -213,3 +221,56 @@ async def test_count_texts_offloaded_runs_on_worker_thread(monkeypatch) -> None:
     assert tokens > 0
     assert seen["thread"].startswith("headroom-compress")
     assert seen["thread"] != loop_thread
+
+
+async def test_count_texts_offloaded_fails_open(monkeypatch) -> None:  # noqa: ANN001
+    """The texts variant downgrades to estimation on a resolution error, the same
+    as the messages variant (its fail-open branch was previously uncovered)."""
+    proxy = _make_proxy()
+
+    def _boom(*a, **k):  # noqa: ANN002, ANN003, ANN202
+        raise RuntimeError("tokenizer backend exploded")
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", _boom)
+
+    tokenizer, tokens = await proxy._count_texts_offloaded("deepseek-chat", ["hello", "world"])
+
+    assert isinstance(tokenizer, EstimatingTokenCounter)
+    assert tokens > 0
+    assert "deepseek-chat" in proxy._token_count_fallback_models
+
+
+async def test_count_offloaded_without_executor_estimates() -> None:
+    """An owner with no compression executor (a lightweight caller or test double)
+    fails open to estimation inline instead of crashing on the missing runner."""
+
+    class _NoExecutorOwner:
+        pass
+
+    owner = _NoExecutorOwner()
+
+    tok, n_msg = await count_tokens_offloaded(
+        owner, "gpt-4", [{"role": "user", "content": "hello world"}]
+    )
+    assert isinstance(tok, EstimatingTokenCounter)
+    assert n_msg > 0
+
+    tok2, n_txt = await count_texts_offloaded(owner, "gemini-pro", ["hello", "world"])
+    assert isinstance(tok2, EstimatingTokenCounter)
+    assert n_txt > 0
+
+
+async def test_count_texts_offloaded_sums_fragments(monkeypatch) -> None:  # noqa: ANN001
+    """The streaming rewrite sums per-fragment counts, matching the old per-part
+    count_text loop it replaced."""
+    proxy = _make_proxy()
+    monkeypatch.setattr(
+        "headroom.tokenizers.get_tokenizer", lambda *a, **k: EstimatingTokenCounter()
+    )
+    fragments = ["hello", "world", "foo"]
+
+    _, total = await proxy._count_texts_offloaded("gemini-pro", fragments)
+
+    est = EstimatingTokenCounter()
+    assert total == sum(est.count_text(f) for f in fragments)
+    assert total > 0

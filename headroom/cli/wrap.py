@@ -457,6 +457,116 @@ def _tool_search_mode_is_active(value: str) -> bool:
     return value.strip().lower() not in _TOOL_SEARCH_FALSY
 
 
+def _should_persist_tool_search_settings(
+    *,
+    flag_value: str | None,
+    resolved_value: str | None,
+) -> bool:
+    """Whether wrap should write ``ENABLE_TOOL_SEARCH`` into settings.local.json.
+
+    Daemon-spawned conversation workers read settings fresh (#951 / #2492), so a
+    process-env-only ``false`` never reaches them. Persist when the user asked
+    via ``--tool-search``, or when the resolved mode disables deferral (shell
+    ``ENABLE_TOOL_SEARCH=false`` / Foundry-compat defaults). Leaving the generic
+    ``true`` default unwritten avoids stomping a user settings value when wrap
+    did not change tool-search behavior.
+    """
+    if flag_value is not None:
+        return True
+    if resolved_value is None:
+        return False
+    stripped = resolved_value.strip()
+    if not stripped:
+        return False
+    return not _tool_search_mode_is_active(stripped)
+
+
+def _read_claude_settings_env_value(
+    key: str,
+    *,
+    settings_path: Path | None = None,
+) -> str | None:
+    """Return ``payload['env'][key]`` from a Claude settings file, or ``None``."""
+    path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(_read_text(path))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    env_map = payload.get("env")
+    if not isinstance(env_map, dict):
+        return None
+    value = env_map.get(key)
+    return value if isinstance(value, str) else None
+
+
+def _write_claude_wrap_tool_search(
+    value: str,
+    *,
+    settings_path: Path | None = None,
+) -> str | None:
+    """Persist ``ENABLE_TOOL_SEARCH`` into project-local settings for workers (#2492).
+
+    Same settings.local.json path as :func:`_write_claude_wrap_base_url` so
+    daemon-spawned conversation workers see the session's resolved tool-search
+    mode. Returns the previous value for restore on wrap exit.
+    """
+    path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
+    payload: dict[str, Any] = {}
+    if path.exists():
+        try:
+            payload = json.loads(_read_text(path))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
+    previous = env_map.get(_TOOL_SEARCH_ENV)
+    env_map[_TOOL_SEARCH_ENV] = value
+    payload["env"] = env_map
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_text(path, json.dumps(payload, indent=2) + "\n")
+    return previous if isinstance(previous, str) else None
+
+
+def _restore_claude_wrap_tool_search(
+    previous: str | None,
+    *,
+    settings_path: Path | None = None,
+) -> None:
+    """Restore (or remove) ``ENABLE_TOOL_SEARCH`` written by wrap (#2492)."""
+    path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
+    if not path.exists():
+        return
+    try:
+        payload = json.loads(_read_text(path))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(payload, dict):
+        return
+    env_map = payload.get("env")
+    if not isinstance(env_map, dict):
+        return
+    if previous is None:
+        if _TOOL_SEARCH_ENV not in env_map:
+            return
+        del env_map[_TOOL_SEARCH_ENV]
+        if env_map:
+            payload["env"] = env_map
+        else:
+            payload.pop("env", None)
+    else:
+        env_map[_TOOL_SEARCH_ENV] = previous
+        payload["env"] = env_map
+    if payload:
+        _write_text(path, json.dumps(payload, indent=2) + "\n")
+    else:
+        path.unlink(missing_ok=True)
+
+
 def _live_wrap_module() -> Any:
     """Return the current live wrap module instance."""
     return cast(Any, sys.modules[__name__])
@@ -4429,7 +4539,10 @@ def wrap_selfheal(marker: str | None) -> None:
         "proxy. MODE is true (default), auto, auto:N, or false. Without it, a "
         "custom ANTHROPIC_BASE_URL makes Claude Code load every tool schema "
         "eagerly, inflating local context (issue #746). A pre-set "
-        "ENABLE_TOOL_SEARCH env var is respected."
+        "ENABLE_TOOL_SEARCH env var is respected for the launched process. "
+        "Daemon-spawned conversation workers read settings.local.json fresh "
+        "(issue #951), so disabling tool search also reconciles that file "
+        "(issue #2492)."
     ),
 )
 @click.option(
@@ -4507,6 +4620,8 @@ def claude(
 
     proxy_holder: list[subprocess.Popen | None] = [None]
     _saved_base_url: list[str | None] = [None]  # previous settings.json value for restore
+    _saved_tool_search: list[str | None] = [None]  # previous ENABLE_TOOL_SEARCH for restore
+    _persisted_tool_search: list[bool] = [False]
     _settings_foundry: list[bool] = [False]
     port_holder: list[int] = [port]
     _settings_vertex: list[bool] = [False]
@@ -4738,6 +4853,7 @@ def claude(
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.
         _tool_search_value = _configure_tool_search_env(env, tool_search)
+        _resolved_tool_search = env.get(_TOOL_SEARCH_ENV)
         if _tool_search_value is not None:
             # Describe what the written value actually does: --tool-search
             # false/0/no/off turns deferral OFF, and the banner must say so
@@ -4754,6 +4870,55 @@ def claude(
             click.echo(
                 f"  {_TOOL_SEARCH_ENV}={env.get(_TOOL_SEARCH_ENV)} "
                 "(using your existing environment value)"
+            )
+
+        # Issue #2492: daemon workers read settings.local.json, not the parent
+        # process env. When the user disables tool search (flag or env), or
+        # passes an explicit --tool-search mode, reconcile the same file wrap
+        # already uses for the base URL (#951) so workers stop sending
+        # tool_search_server. Related: #2477 (Foundry default in process env).
+        _settings_tool_search = _read_claude_settings_env_value(
+            _TOOL_SEARCH_ENV, settings_path=_wrap_settings_path
+        )
+        if (
+            _settings_tool_search is not None
+            and _resolved_tool_search is not None
+            and _settings_tool_search.strip()
+            and _resolved_tool_search.strip()
+            and _settings_tool_search.strip().lower() != _resolved_tool_search.strip().lower()
+        ):
+            if _should_persist_tool_search_settings(
+                flag_value=tool_search, resolved_value=_resolved_tool_search
+            ):
+                click.echo(
+                    f"  Warning: {_wrap_settings_path} has "
+                    f"{_TOOL_SEARCH_ENV}={_settings_tool_search!r} but this "
+                    f"session uses {_resolved_tool_search!r}; reconciling "
+                    "settings for daemon workers (issue #2492)"
+                )
+            else:
+                click.echo(
+                    f"  Warning: {_wrap_settings_path} has "
+                    f"{_TOOL_SEARCH_ENV}={_settings_tool_search!r} while the "
+                    f"launched process uses {_resolved_tool_search!r}. Daemon "
+                    "workers read the settings file; pass --tool-search to "
+                    "reconcile (issue #2492)."
+                )
+        if _should_persist_tool_search_settings(
+            flag_value=tool_search, resolved_value=_resolved_tool_search
+        ):
+            if _resolved_tool_search is None or not _resolved_tool_search.strip():
+                raise click.ClickException(
+                    f"internal error: cannot persist empty {_TOOL_SEARCH_ENV} to settings"
+                )
+            _saved_tool_search[0] = _write_claude_wrap_tool_search(
+                _resolved_tool_search.strip(),
+                settings_path=_wrap_settings_path,
+            )
+            _persisted_tool_search[0] = True
+            click.echo(
+                f"  Wrote {_TOOL_SEARCH_ENV}={_resolved_tool_search.strip()} "
+                f"to {_wrap_settings_path} for daemon workers (issue #2492)"
             )
 
         # Issue #1158: opt-in 1M context window. Claude Code only sends the
@@ -4783,6 +4948,11 @@ def claude(
         click.echo(f"  Error: {e}")
         raise SystemExit(1) from e
     finally:
+        if _persisted_tool_search[0]:
+            _restore_claude_wrap_tool_search(
+                _saved_tool_search[0],
+                settings_path=_wrap_settings_path,
+            )
         _restore_claude_wrap_base_url(
             _saved_base_url[0],
             foundry_mode=_settings_foundry[0],

@@ -485,3 +485,28 @@ class TestUnloadKompressModel:
 
         # Should return False when no model is loaded
         assert unload_kompress_model() is False
+
+
+def test_timed_canary_treats_onnx_coreml_as_onnx() -> None:
+    """onnx_coreml must take the ONNX path (NumPy tensors, no torch .parameters()).
+
+    Regression for #2442: an exact-match ``backend == "onnx"`` skipped
+    ``onnx_coreml`` and fell into the PyTorch branch, calling
+    ``next(model.parameters())`` on an ``_OnnxModel`` that has no
+    ``parameters`` attribute → AttributeError.
+    """
+    from headroom.transforms import kompress_compressor as kmod
+
+    class _StubOnnxModel:
+        # Mirrors _OnnxModel: has get_keep_mask, but NO .parameters().
+        def get_keep_mask(self, input_ids, attention_mask):
+            return "mask"
+
+    def _stub_tokenizer(words, **kwargs):
+        return {"input_ids": [[1, 2, 3]], "attention_mask": [[1, 1, 1]]}
+
+    compressor = kmod.KompressCompressor()
+
+    elapsed = compressor._timed_canary(_StubOnnxModel(), _stub_tokenizer, "onnx_coreml")
+
+    assert isinstance(elapsed, float)

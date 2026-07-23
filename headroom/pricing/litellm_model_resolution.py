@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
+
+# Vertex AI appends @YYYYMMDD version tags to model names at runtime
+# (e.g. "claude-haiku-4-5@20251001"). LiteLLM's database stores bare
+# names without version suffixes, so we strip the suffix before lookup.
+_VERTEX_VERSION_SUFFIX_RE = re.compile(r"@\d{8}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +41,7 @@ MODEL_ALIASES: dict[str, str] = {
 
 MODEL_PREFIX_RULES: tuple[LiteLLMModelPrefixRule, ...] = (
     LiteLLMModelPrefixRule("claude-", "anthropic/"),
+    LiteLLMModelPrefixRule("claude-", "vertex_ai/"),
     LiteLLMModelPrefixRule("gpt-", "openai/"),
     LiteLLMModelPrefixRule("o1-", "openai/"),
     LiteLLMModelPrefixRule("o3-", "openai/"),
@@ -48,6 +55,7 @@ MODEL_PREFIX_RULES: tuple[LiteLLMModelPrefixRule, ...] = (
 PRICE_LOOKUP_PROVIDER_PREFIXES: tuple[str, ...] = (
     "openai/",
     "anthropic/",
+    "vertex_ai/",
     "google/",
     "mistral/",
     "deepseek/",
@@ -55,16 +63,32 @@ PRICE_LOOKUP_PROVIDER_PREFIXES: tuple[str, ...] = (
 )
 
 
+def _strip_vertex_version_suffix(model: str) -> str:
+    """Strip Vertex @YYYYMMDD version suffix if present."""
+    return _VERTEX_VERSION_SUFFIX_RE.sub("", model)
+
+
 def resolution_candidates(model: str) -> tuple[str, ...]:
     """Return ordered LiteLLM keys to try for cost-per-token resolution."""
     candidates = [model]
-    candidates.extend(
-        candidate
-        for rule in MODEL_PREFIX_RULES
-        for candidate in (rule.candidate_for(model),)
-        if candidate is not None
-    )
-    alias = MODEL_ALIASES.get(model)
+
+    # If the model has a Vertex @YYYYMMDD version suffix, also try the bare
+    # name. Vertex appends these at runtime; LiteLLM stores bare names only.
+    bare = _strip_vertex_version_suffix(model)
+    if bare != model:
+        candidates.append(bare)
+
+    # Apply prefix rules to both the original and bare name so that e.g.
+    # "anthropic/claude-haiku-4-5" is tried after "claude-haiku-4-5".
+    for m in dict.fromkeys([model, bare]):
+        candidates.extend(
+            candidate
+            for rule in MODEL_PREFIX_RULES
+            for candidate in (rule.candidate_for(m),)
+            if candidate is not None
+        )
+
+    alias = MODEL_ALIASES.get(model) or MODEL_ALIASES.get(bare)
     if alias:
         candidates.append(alias)
     return tuple(dict.fromkeys(candidates))
@@ -72,9 +96,17 @@ def resolution_candidates(model: str) -> tuple[str, ...]:
 
 def pricing_lookup_candidates(model: str) -> tuple[str, ...]:
     """Return ordered LiteLLM model_cost keys to try for pricing lookup."""
+    bare = _strip_vertex_version_suffix(model)
+
     candidates = [model]
-    candidates.extend(f"{prefix}{model}" for prefix in PRICE_LOOKUP_PROVIDER_PREFIXES)
-    alias = MODEL_ALIASES.get(model)
+    if bare != model:
+        candidates.append(bare)
+
+    # Try all provider prefixes for both the original and bare name.
+    for m in dict.fromkeys([model, bare]):
+        candidates.extend(f"{prefix}{m}" for prefix in PRICE_LOOKUP_PROVIDER_PREFIXES)
+
+    alias = MODEL_ALIASES.get(model) or MODEL_ALIASES.get(bare)
     if alias:
         candidates.append(alias)
     return tuple(dict.fromkeys(candidates))

@@ -83,8 +83,10 @@ def segment(content: str, *, window: int = 8, max_chars: int = 1200) -> list[str
         n = len(block)
         while i < n:
             j = min(i + window, n)
-            while j < n and block[j][:1] in (" ", "\t"):
-                j += 1  # don't cut off an indented continuation run
+            size = sum(len(x) for x in block[i:j])
+            while j < n and block[j][:1] in (" ", "\t") and size + len(block[j]) <= max_chars:
+                size += len(block[j])
+                j += 1  # attach an indented continuation run, but stay within max_chars
             segments.append("".join(block[i:j]))
             i = j
     return segments

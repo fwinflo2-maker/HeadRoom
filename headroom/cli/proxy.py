@@ -1053,6 +1053,8 @@ def proxy(
     Usage with OpenAI-compatible clients:
         OPENAI_BASE_URL=http://localhost:8787/v1 your-app
     """
+    ensure_proxy_dependencies()
+
     # Import here to avoid slow startup
     from headroom.proxy.server import (
         ProxyConfig,

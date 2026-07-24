@@ -23,21 +23,13 @@ def _settings(tmp_path: Path) -> Path:
 
 
 def test_should_persist_when_flag_set() -> None:
-    assert wrap_cli._should_persist_tool_search_settings(
-        flag_value="false", resolved_value="false"
-    )
-    assert wrap_cli._should_persist_tool_search_settings(
-        flag_value="true", resolved_value="true"
-    )
-    assert wrap_cli._should_persist_tool_search_settings(
-        flag_value="auto", resolved_value="auto"
-    )
+    assert wrap_cli._should_persist_tool_search_settings(flag_value="false", resolved_value="false")
+    assert wrap_cli._should_persist_tool_search_settings(flag_value="true", resolved_value="true")
+    assert wrap_cli._should_persist_tool_search_settings(flag_value="auto", resolved_value="auto")
 
 
 def test_should_persist_when_resolved_disables_without_flag() -> None:
-    assert wrap_cli._should_persist_tool_search_settings(
-        flag_value=None, resolved_value="false"
-    )
+    assert wrap_cli._should_persist_tool_search_settings(flag_value=None, resolved_value="false")
     assert wrap_cli._should_persist_tool_search_settings(flag_value=None, resolved_value="0")
     assert wrap_cli._should_persist_tool_search_settings(flag_value=None, resolved_value="off")
 
@@ -46,9 +38,7 @@ def test_should_not_persist_generic_true_default() -> None:
     assert not wrap_cli._should_persist_tool_search_settings(
         flag_value=None, resolved_value=TOOL_SEARCH_DEFAULT
     )
-    assert not wrap_cli._should_persist_tool_search_settings(
-        flag_value=None, resolved_value="auto"
-    )
+    assert not wrap_cli._should_persist_tool_search_settings(flag_value=None, resolved_value="auto")
     assert not wrap_cli._should_persist_tool_search_settings(flag_value=None, resolved_value=None)
     assert not wrap_cli._should_persist_tool_search_settings(flag_value=None, resolved_value="  ")
 
@@ -170,7 +160,9 @@ def test_env_false_without_flag_still_persists(tmp_path: Path) -> None:
 
 def test_read_settings_env_value(tmp_path: Path) -> None:
     path = _settings(tmp_path)
-    assert wrap_cli._read_claude_settings_env_value("ENABLE_TOOL_SEARCH", settings_path=path) is None
+    assert (
+        wrap_cli._read_claude_settings_env_value("ENABLE_TOOL_SEARCH", settings_path=path) is None
+    )
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps({"env": {"ENABLE_TOOL_SEARCH": "true"}}), encoding="utf-8")
     assert (
@@ -178,7 +170,9 @@ def test_read_settings_env_value(tmp_path: Path) -> None:
     )
 
 
-def test_init_foundry_defaults_tool_search_false(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_init_foundry_defaults_tool_search_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv("CLAUDE_CODE_USE_FOUNDRY", "1")
     settings = tmp_path / "settings.json"
     init_cli._ensure_claude_hooks(settings, profile="init-user", port=8787)

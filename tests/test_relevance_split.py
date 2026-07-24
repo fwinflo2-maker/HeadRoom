@@ -42,26 +42,59 @@ def test_segment_windows_dense_stream_losslessly():
 
 
 def test_segment_keeps_indented_continuation_attached():
-    # window=1 forces splitting, but indented continuation lines must stay
-    # with their head line (stack-trace / pretty-JSON safety).
+    # window=1 forces splitting, but a SHORT (sub-budget) indented continuation
+    # stays with its head line (stack-trace / pretty-JSON safety). This holds
+    # only while the run fits in max_chars; a longer run is bounded and its later
+    # segments start headless, pinned by the test two below.
     text = "ERROR boom\n  File a.py line 1\n  File b.py line 2\nnext record\n"
     segs = segment(text, window=1)
     assert "".join(segs) == text
     for s in segs:
-        assert not s.startswith((" ", "\t"))  # every segment starts at a head line
+        assert not s.startswith((" ", "\t"))  # sub-budget run: each segment has its head
 
 
 def test_segment_bounds_indented_continuation_by_max_chars():
     # A long indented run (deep stack trace / indented log payload) must NOT
-    # collapse into one mega-segment: the continuation extension is bounded by
-    # max_chars, not just by indentation. Short lines keep each base window
-    # tiny, so with the bound in place every segment lands within budget and
-    # the blob splits into multiple scorable records instead of all-or-nothing.
+    # collapse into one mega-segment: it is bounded by max_chars, not just by
+    # indentation, so the blob splits into multiple scorable records instead of
+    # being scored all-or-nothing as a single record.
     text = "HEADER (not indented)\n" + "".join(f"    frame line {i:03d}\n" for i in range(300))
-    segs = segment(text)  # window=8, max_chars=1200 (defaults)
+    segs = segment(text, window=8, max_chars=1200)
     assert "".join(segs) == text  # partition stays lossless
-    assert len(segs) > 2  # split into records, not the pre-fix 1 mega-segment
-    assert all(len(s) <= 1200 for s in segs)  # continuation held to max_chars
+    assert len(segs) > 2  # split into records, not one mega-segment
+    assert all(len(s) <= 1200 for s in segs)  # every segment held to max_chars
+
+
+def test_segment_long_indented_run_yields_headless_segments():
+    # The cost of bounding a long run: once the budget is spent mid-run the next
+    # segment necessarily begins on an indented continuation line, so it is
+    # scored without its head line. Pinned so the trade-off is deliberate rather
+    # than an accident, and so it is not mistaken for the head-line property the
+    # sub-budget test above asserts.
+    text = "ERROR boom\n" + "".join(f"    frame {i:03d} in handler\n" for i in range(200))
+    segs = segment(text, window=8, max_chars=1200)
+    assert "".join(segs) == text
+    assert len(segs) > 2
+    assert any(s.startswith((" ", "\t")) for s in segs)
+
+
+def test_segment_bounds_block_of_long_lines():
+    # The budget covers the whole segment, not only the continuation, so a block
+    # of plain (non-indented) long lines is windowed by chars rather than by line
+    # count alone. Without that, `window` lines of long text sail past max_chars.
+    text = "".join("L" * 500 + "\n" for _ in range(8))
+    segs = segment(text, window=8, max_chars=1200)
+    assert "".join(segs) == text
+    assert all(len(s) <= 1200 for s in segs)
+
+
+def test_segment_keeps_over_long_single_line_atomic():
+    # A single line longer than max_chars cannot be split without breaking the
+    # lossless partition, so it is emitted whole and the bound yields to it.
+    text = "X" * 5000 + "\n" + "short tail\n"
+    segs = segment(text, window=8, max_chars=1200)
+    assert "".join(segs) == text
+    assert len(segs[0]) == 5001
 
 
 def test_segment_bounds_continuation_across_blank_delimited_blocks():
@@ -70,7 +103,7 @@ def test_segment_bounds_continuation_across_blank_delimited_blocks():
     # across both passes with short surrounding paragraphs intact.
     block = "head\n" + "".join(f"\tdetail {i:03d}\n" for i in range(200))
     text = "intro paragraph\n\n" + block + "\ntail note\n"
-    segs = segment(text)
+    segs = segment(text, window=8, max_chars=1200)
     assert "".join(segs) == text
     assert all(len(s) <= 1200 for s in segs)
 

@@ -79,17 +79,22 @@ def segment(content: str, *, window: int = 8, max_chars: int = 1200) -> list[str
     # their window so stack traces / pretty JSON aren't split mid-unit.
     segments: list[str] = []
     for block in blocks:
-        if len(block) <= window and sum(len(x) for x in block) <= max_chars:
-            segments.append("".join(block))
-            continue
         i = 0
         n = len(block)
         while i < n:
-            j = min(i + window, n)
-            size = sum(len(x) for x in block[i:j])
-            while j < n and block[j][:1] in (" ", "\t") and size + len(block[j]) <= max_chars:
+            # Always take at least one line (a single over-long line is atomic --
+            # splitting it would break the lossless partition), then grow while the
+            # line window or an indented continuation asks for it AND the char
+            # budget still fits. One budget covers the whole segment, so max_chars
+            # binds every multi-line record instead of only the continuation.
+            j, size = i + 1, len(block[i])
+            while (
+                j < n
+                and (j - i < window or block[j][:1] in (" ", "\t"))
+                and size + len(block[j]) <= max_chars
+            ):
                 size += len(block[j])
-                j += 1  # attach an indented continuation run, but stay within max_chars
+                j += 1
             segments.append("".join(block[i:j]))
             i = j
     return segments

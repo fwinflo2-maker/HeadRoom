@@ -473,6 +473,86 @@ def test_memory_context_avoids_system_mutation_when_prefix_frozen() -> None:
         assert sent["messages"][2]["content"].endswith("MEMCTX")
 
 
+@pytest.mark.parametrize(
+    ("frozen_count", "shaped_before", "expect_tail"),
+    [
+        # Established prefix built WITHOUT the tail → skip, preserve cache.
+        (1, False, False),
+        # Fresh conversation → shape from turn 1 and mark the tracker.
+        (0, False, True),
+        # Conversation already shaped → keep shaping (dropping the tail
+        # would bust the prefix from the other direction).
+        (1, True, True),
+    ],
+)
+def test_output_shaper_respects_established_frozen_prefix(
+    monkeypatch, frozen_count: int, shaped_before: bool, expect_tail: bool
+) -> None:
+    from headroom.proxy import runtime_env
+    from headroom.proxy.output_verbosity_policy import STEERING_SENTINEL
+
+    runtime_env.clear_overrides()
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+
+    captured = {}
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = False
+        proxy.config.image_optimize = False
+        proxy.config.ccr_proactive_expansion = False
+
+        fake_tracker = _FakePrefixTracker(frozen_count=frozen_count)
+        fake_tracker.output_shaping_applied = shaped_before
+        proxy.session_tracker_store.compute_session_id = (
+            lambda request, model, messages, **_kwargs: "stable-session"
+        )
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            captured["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_shape_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {
+                        "input_tokens": 20,
+                        "output_tokens": 3,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "system": "base system",
+                "messages": [
+                    {"role": "user", "content": "frozen prefix"},
+                    {"role": "assistant", "content": "ack"},
+                    {"role": "user", "content": "latest user"},
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        sent = captured["body"]
+        if expect_tail:
+            assert STEERING_SENTINEL in str(sent["system"])
+            assert fake_tracker.output_shaping_applied is True
+        else:
+            assert sent["system"] == "base system"
+            assert fake_tracker.output_shaping_applied is False
+
+
 def test_ccr_system_instruction_injection_disabled_when_prefix_frozen(monkeypatch) -> None:
     captured = {"inject_system": None}
     with _make_proxy_client() as client:

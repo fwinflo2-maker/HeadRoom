@@ -2449,15 +2449,35 @@ class AnthropicHandlerMixin:
                     transforms_applied.append(stratum_label(_arm, _stratum))
 
                     if _arm == "treatment":
-                        _level, _src = resolve_verbosity_level(_shaper_settings)
-                        shape_result = shape_request(body, _shaper_settings, level_override=_level)
-                        if shape_result.changed:
-                            body_mutation_tracker.mark_mutated("output_shaper")
-                            transforms_applied.extend(shape_result.labels or [])
+                        # The system prompt is the head of the provider's cache
+                        # prefix: appending the shaping tail to a conversation
+                        # whose frozen prefix was established WITHOUT it
+                        # invalidates that whole prefix. Once a conversation has
+                        # been shaped, keep shaping — dropping the tail
+                        # mid-conversation busts the prefix from the other
+                        # direction.
+                        _shaped_before = bool(
+                            getattr(prefix_tracker, "output_shaping_applied", False)
+                        )
+                        if frozen_message_count > 0 and not _shaped_before:
                             logger.info(
-                                f"[{request_id}] OutputShaper(L{_level}/{_src}): "
-                                f"{shape_result.labels}"
+                                f"[{request_id}] OutputShaper: skipped — frozen "
+                                f"prefix ({frozen_message_count} messages) predates "
+                                "the shaping tail; preserving provider cache"
                             )
+                        else:
+                            _level, _src = resolve_verbosity_level(_shaper_settings)
+                            shape_result = shape_request(
+                                body, _shaper_settings, level_override=_level
+                            )
+                            prefix_tracker.output_shaping_applied = True
+                            if shape_result.changed:
+                                body_mutation_tracker.mark_mutated("output_shaper")
+                                transforms_applied.extend(shape_result.labels or [])
+                                logger.info(
+                                    f"[{request_id}] OutputShaper(L{_level}/{_src}): "
+                                    f"{shape_result.labels}"
+                                )
 
             # Unit 2: mark end of pre-upstream phase. Everything after this
             # point is upstream I/O or post-response bookkeeping.

@@ -464,6 +464,13 @@ class PrefixCacheTracker:
         # here so it shares the session's affinity and TTL cleanup.
         self.read_maturation_manager: Any = None
 
+        # Whether this conversation's forwarded system prompt has carried the
+        # output-shaping tail. The Anthropic handler consults this before
+        # mutating the system prompt of a conversation with an established
+        # frozen prefix: a prefix built without the tail must stay without it
+        # (and vice versa) or the provider cache is invalidated.
+        self.output_shaping_applied: bool = False
+
         # Stats
         self._busts_avoided: int = 0
         self._tokens_preserved: int = 0

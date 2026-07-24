@@ -13,11 +13,10 @@ retrieval marker. Nothing here emits markers or calls a compressor.
 
 Segmentation is boundary-aware, not line-based: blank lines delimit records,
 indented continuation lines stay attached to their parent (so short stack
-traces and pretty-printed blobs are scored as one unit; a long indented run is
-windowed under ``max_chars`` rather than collapsed into one record), and dense
-blank-free streams (grep, tight logs) are packed into small fixed windows. The
-partition is lossless -- ``"".join(segment(content)) == content`` -- so KEEP
-runs reconstruct the original bytes exactly.
+traces and pretty-printed blobs are scored as one unit), and dense blank-free
+streams (grep, tight logs) are packed into small fixed windows. The partition
+is lossless -- ``"".join(segment(content)) == content`` -- so KEEP runs
+reconstruct the original bytes exactly.
 """
 
 from __future__ import annotations
@@ -54,10 +53,12 @@ def segment(content: str, *, window: int = 8, max_chars: int = 1200) -> list[str
 
     Lossless partition: ``"".join(segment(content)) == content``. Blank lines
     delimit records; oversized or dense blank-free blocks are packed into
-    windows of ``window`` lines, with indented continuation lines attached up to
-    ``max_chars`` so multi-line units aren't cut mid-run (a long indented blob is
-    windowed, not collapsed into one record). The base ``window`` is sized by
-    line count, so a window of long lines can itself exceed ``max_chars``.
+    windows of at most ``window`` lines and ``max_chars`` chars, with indented
+    continuation lines held past the line window (still inside ``max_chars``) so
+    multi-line units aren't cut mid-run. One budget covers the whole segment, so
+    a long indented run is windowed rather than collapsed into one record. A
+    single line longer than ``max_chars`` is emitted whole, since splitting it
+    would break the partition.
     """
     lines = content.splitlines(keepends=True)
     if len(lines) <= 1:
@@ -165,6 +166,12 @@ def plan_relevance_split(
     caller applies one disposition per run. Returns a single KEEP run -- i.e.
     no split -- when the query is empty, the content is a single record, or it
     segments into more than ``max_records`` records (a latency guard).
+
+    Note that bounding long runs makes uniformly-indented output (YAML,
+    container logs, indented JSON) segment into several records with no head
+    line, so a blob that previously stayed one whole KEEP record can now be
+    dropped in part or in full. Recoverability of a DROP run is the caller's
+    concern, not this module's.
     """
     if not query.strip():
         return [(True, content)]

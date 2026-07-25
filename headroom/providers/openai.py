@@ -29,12 +29,7 @@ _PRICING_STALE_DAYS = 60  # Warn if pricing data is older than this
 _PRICING_WARNING_SHOWN = False
 _UNKNOWN_MODEL_WARNINGS: set[str] = set()
 
-try:
-    import tiktoken
-
-    TIKTOKEN_AVAILABLE = True
-except ImportError:
-    TIKTOKEN_AVAILABLE = False
+TIKTOKEN_AVAILABLE = importlib.util.find_spec("tiktoken") is not None
 
 LITELLM_AVAILABLE = importlib.util.find_spec("litellm") is not None
 
@@ -251,12 +246,21 @@ def _check_pricing_staleness() -> str | None:
 
 @lru_cache(maxsize=8)
 def _get_encoding(encoding_name: str) -> Any:
-    """Get tiktoken encoding, cached."""
+    """Get tiktoken encoding, cached.
+
+    Routes through the bounded loader so a stalled vocab download raises
+    :class:`~headroom.tokenizers.tiktoken_counter.TiktokenLoadError` after a
+    timeout instead of hanging the caller indefinitely — ``tiktoken`` fetches
+    vocabularies with no network timeout, and this runs on whatever thread
+    first counts tokens for a model, including proxy startup (GH #956).
+    """
     if not TIKTOKEN_AVAILABLE:
         raise RuntimeError(
             "tiktoken is required for OpenAI provider. Install with: pip install tiktoken"
         )
-    return tiktoken.get_encoding(encoding_name)
+    from ..tokenizers.tiktoken_counter import load_encoding
+
+    return load_encoding(encoding_name)
 
 
 def _get_encoding_name_for_model(model: str, custom_encodings: dict[str, str] | None = None) -> str:
@@ -296,6 +300,8 @@ class OpenAITokenCounter:
 
         Raises:
             RuntimeError: If tiktoken is not installed.
+            TiktokenLoadError: If the encoding's vocabulary can't be loaded
+                within the bounded timeout (e.g. stalled download).
         """
         self.model = model
         encoding_name = _get_encoding_name_for_model(model, custom_encodings)
@@ -416,7 +422,7 @@ class OpenAIProvider(Provider):
         if context_limits:
             self._context_limits.update(context_limits)
 
-        self._token_counters: dict[str, OpenAITokenCounter] = {}
+        self._token_counters: dict[str, TokenCounter] = {}
 
     @property
     def name(self) -> str:
@@ -439,11 +445,26 @@ class OpenAIProvider(Provider):
         )
 
     def get_token_counter(self, model: str) -> TokenCounter:
-        """Get token counter for an OpenAI model."""
+        """Get token counter for an OpenAI model.
+
+        Falls back to character-ratio estimation when the tiktoken vocabulary
+        can't be loaded within the bounded timeout (stalled download on a
+        blocked network), mirroring the tokenizer registry's behavior (GH #956).
+        The fallback is cached per model, so a request never re-blocks on the
+        same failed download.
+        """
         if model not in self._token_counters:
-            self._token_counters[model] = OpenAITokenCounter(
-                model=model, custom_encodings=self._encodings
-            )
+            from ..tokenizers.tiktoken_counter import TiktokenLoadError
+
+            try:
+                self._token_counters[model] = OpenAITokenCounter(
+                    model=model, custom_encodings=self._encodings
+                )
+            except TiktokenLoadError as exc:
+                logger.warning("tiktoken unavailable for %s (%s); using estimation.", model, exc)
+                from ..tokenizers.estimator import EstimatingTokenCounter
+
+                self._token_counters[model] = EstimatingTokenCounter()
         return self._token_counters[model]
 
     def get_context_limit(self, model: str) -> int:

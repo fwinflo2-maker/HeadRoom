@@ -359,7 +359,7 @@ def test_handle_openai_responses_strips_codex_lite_header_upstream(monkeypatch):
     assert lowered.get("x-openai-debug") == "keep-me"
 
 
-def test_handle_openai_responses_chatgpt_auth_skips_memory_tools(monkeypatch):
+def test_handle_openai_responses_chatgpt_auth_keeps_memory_tools(monkeypatch):
     token = _jwt(
         {
             "https://api.openai.com/auth": {
@@ -386,9 +386,12 @@ def test_handle_openai_responses_chatgpt_auth_skips_memory_tools(monkeypatch):
     assert handler.captured_request is not None
     _, url, _, body = handler.captured_request
     assert url == "https://chatgpt.com/backend-api/codex/responses"
+    # store must stay false: chatgpt.com answers store=true with HTTP 400
+    # {"detail":"Store must be set to false"}.
     assert body["store"] is False
-    assert "tools" not in body
-    assert memory_handler.compute_calls == 0
+    # Memory tools survive now that the continuation resends history instead of
+    # addressing a stored response.
+    assert {t["name"] for t in body["tools"]} >= {"memory_search"}
 
 
 def test_handle_openai_responses_chatgpt_codex_timeout_fails_open(monkeypatch):
@@ -423,7 +426,7 @@ def test_handle_openai_responses_chatgpt_codex_timeout_fails_open(monkeypatch):
     assert body["store"] is False
 
 
-def test_handle_openai_responses_api_auth_store_false_skips_memory_tools(monkeypatch):
+def test_handle_openai_responses_api_auth_store_false_keeps_memory_tools(monkeypatch):
     request = _build_request(
         {"model": "gpt-4o-mini", "input": "hello", "store": False},
         {"Authorization": "Bearer sk-test", "x-headroom-user-id": "user-1"},
@@ -443,8 +446,10 @@ def test_handle_openai_responses_api_auth_store_false_skips_memory_tools(monkeyp
     assert handler.captured_request is not None
     _, url, _, body = handler.captured_request
     assert url == "https://api.openai.com/v1/responses"
+    # An explicit store=false is honoured rather than rewritten...
     assert body["store"] is False
-    assert "tools" not in body
+    # ...and memory tools still work, via the stateless continuation.
+    assert {t["name"] for t in body["tools"]} >= {"memory_search"}
     assert memory_handler.compute_calls == 1
 
 

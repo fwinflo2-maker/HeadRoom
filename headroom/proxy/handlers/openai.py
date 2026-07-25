@@ -619,37 +619,137 @@ def _compact_openai_responses_tools(
     return compact_tools(payload)
 
 
-def _responses_request_allows_memory_tool_continuation(payload: dict[str, Any]) -> bool:
+def _responses_request_allows_memory_tool_continuation(
+    payload: dict[str, Any],
+    *,
+    stateless_continuation: bool = False,
+) -> bool:
     """Return whether Responses memory tools may rely on stored continuations.
 
-    Headroom memory tools use ``previous_response_id`` continuations after a
-    tool call. Those continuations require the originating response to be
-    stored. When a client explicitly sends ``store=false``, preserve that
-    contract and skip the Responses memory-tool injection path instead of
-    mutating the request.
+    Headroom memory tools continue after a tool call. A
+    ``previous_response_id`` continuation requires the originating response to
+    be stored, so when a client explicitly sends ``store=false`` that contract
+    is preserved by skipping injection rather than mutating the request.
+
+    ``stateless_continuation`` marks call sites that instead resend the history
+    via :func:`_build_memory_continuation_body`, which needs no stored
+    response. Those sites keep memory tools under ``store=false``.
     """
 
-    return payload.get("store") is not False
+    return stateless_continuation or payload.get("store") is not False
 
 
 def _ensure_responses_store_for_memory_tools(
     payload: dict[str, Any],
     *,
     memory_tools_injected: bool,
+    stateless_continuation: bool = False,
 ) -> bool:
-    """Return True when memory-tool injection requires and receives store=true."""
+    """Return True when memory-tool injection requires and receives store=true.
 
+    ``stateless_continuation`` marks call sites that resend the history rather
+    than addressing a stored response. They must not rewrite ``store``: the
+    ChatGPT Codex backend answers ``store=true`` with HTTP 400
+    ``{"detail":"Store must be set to false"}``, failing the whole turn.
+    """
+
+    if stateless_continuation:
+        return False
     if memory_tools_injected and payload.get("store") is not True:
         payload["store"] = True
         return True
     return False
 
 
-def _allow_responses_memory_tools(is_chatgpt_auth: bool) -> bool:
-    # ChatGPT Codex rejects Responses payloads unless store=false. The
-    # transparent memory-tool continuation flow needs stored responses, so keep
-    # it on the regular API path only.
-    return not is_chatgpt_auth
+def _responses_input_as_items(value: Any) -> list[Any]:
+    """Normalise a Responses ``input`` field to a list of items.
+
+    ``input`` is either a plain string (shorthand for a single user message) or
+    a list of typed items. Stateless continuations append to it, so the string
+    shorthand is expanded into its explicit item form.
+    """
+
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, str):
+        return [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": value}],
+            }
+        ]
+    return []
+
+
+def _build_memory_continuation_body(
+    body: dict[str, Any],
+    resp_json: dict[str, Any],
+    tool_outputs: list[Any],
+    *,
+    model: str,
+) -> tuple[dict[str, Any], bool]:
+    """Build the continuation request that returns memory tool results.
+
+    Two shapes, picked by whether the previous response is addressable:
+
+    * **previous_response_id** — the response was stored, so only the
+      ``function_call_output`` items need to be sent.
+    * **stateless** — the client sent ``store=false`` (ChatGPT Codex always
+      does, and that backend rejects ``store=true`` outright), so no
+      server-side state exists. Resend the history instead. ``body["input"]``
+      is the already-compressed payload, so compression is preserved. Prior
+      output is echoed verbatim and in order because a ``function_call``
+      replayed without its preceding ``reasoning`` item is rejected by
+      reasoning models.
+
+    Return ``(continuation_body, used_stateless)``.
+    """
+
+    response_id = resp_json.get("id")
+    if body.get("store") is False or not response_id:
+        continuation_body = {
+            **body,
+            "input": [
+                *_responses_input_as_items(body.get("input")),
+                *(resp_json.get("output") or []),
+                *tool_outputs,
+            ],
+        }
+        continuation_body.pop("previous_response_id", None)
+        continuation_body["stream"] = False
+        return continuation_body, True
+
+    stored_body: dict[str, Any] = {
+        "model": model,
+        "input": list(tool_outputs),
+        "previous_response_id": response_id,
+    }
+    existing_tools = body.get("tools")
+    if existing_tools:
+        stored_body["tools"] = existing_tools
+    return stored_body, False
+
+
+def _allow_responses_memory_tools(
+    is_chatgpt_auth: bool,
+    *,
+    stateless_continuation: bool = False,
+) -> bool:
+    """Return whether Responses memory tools may be injected.
+
+    ChatGPT Codex rejects Responses payloads unless ``store=false``, and a
+    ``previous_response_id`` continuation needs a stored response — so on that
+    backend the two requirements are mutually exclusive.
+
+    ``stateless_continuation`` marks call sites that resend the history via
+    :func:`_build_memory_continuation_body` instead of addressing a stored
+    response. Those sites work under ``store=false``, so memory tools stay
+    available there. Sites without it (the WebSocket turn loop, which still
+    continues through ``previous_response_id``) keep the API-key-only rule.
+    """
+
+    return stateless_continuation or not is_chatgpt_auth
 
 
 def _ensure_chatgpt_responses_store_false(
@@ -4584,7 +4684,11 @@ class OpenAIHandlerMixin:
             client = "codex"
         if _ensure_chatgpt_responses_store_false(body, is_chatgpt_auth=is_chatgpt_auth):
             logger.info(f"[{request_id}] Responses: forced store=false for ChatGPT auth")
-        responses_memory_tools_allowed = _allow_responses_memory_tools(is_chatgpt_auth)
+        # The HTTP continuation below resends history when store=false, so
+        # memory tools remain available under ChatGPT auth.
+        responses_memory_tools_allowed = _allow_responses_memory_tools(
+            is_chatgpt_auth, stateless_continuation=True
+        )
 
         # PR-A6 (P5-50, preps P0-6): session-sticky `OpenAI-Beta` merge
         # for /v1/responses. Compute a session_id off the same store the
@@ -4822,9 +4926,8 @@ class OpenAIHandlerMixin:
                     else:
                         memory_tool_defs_responses.append(t)
 
-                if (
-                    responses_memory_tools_allowed
-                    and _responses_request_allows_memory_tool_continuation(body)
+                if responses_memory_tools_allowed and _responses_request_allows_memory_tool_continuation(
+                    body, stateless_continuation=True
                 ):
                     resp_tools = body.get("tools") or []
                     resp_tools, mem_tools_injected = _apply_sticky_mem_tools_resp(
@@ -4844,6 +4947,7 @@ class OpenAIHandlerMixin:
                         if _ensure_responses_store_for_memory_tools(
                             body,
                             memory_tools_injected=True,
+                            stateless_continuation=True,
                         ):
                             body_mutation_tracker.mark_mutated("responses_memory_store")
                             logger.info(
@@ -5313,27 +5417,48 @@ class OpenAIHandlerMixin:
                                 )
 
                             if tool_outputs:
-                                # Make continuation request with tool results
-                                response_id = resp_json.get("id")
-                                continuation_body = {
-                                    "model": model,
-                                    "input": tool_outputs,
-                                }
-                                if response_id:
-                                    continuation_body["previous_response_id"] = response_id
-                                existing_tools = body.get("tools")
-                                if existing_tools:
-                                    continuation_body["tools"] = existing_tools
+                                # Make continuation request with tool results.
+                                # Stateless when the client sent store=false;
+                                # see `_build_memory_continuation_body`.
+                                (
+                                    continuation_body,
+                                    used_stateless,
+                                ) = _build_memory_continuation_body(
+                                    body, resp_json, tool_outputs, model=model
+                                )
 
                                 cont_response = await self._retry_request(
                                     "POST", url, headers, continuation_body
                                 )
-                                resp_json = cont_response.json()
-                                response = cont_response
-                                logger.info(
-                                    f"[{request_id}] Memory: Handled {len(tool_outputs)} "
-                                    f"tool call(s) with continuation for user {memory_user_id} (responses)"
-                                )
+                                if cont_response.status_code == 200:
+                                    resp_json = cont_response.json()
+                                    response = cont_response
+                                    logger.info(
+                                        f"[{request_id}] Memory: Handled {len(tool_outputs)} "
+                                        f"tool call(s) with "
+                                        f"{'stateless' if used_stateless else 'previous_response_id'} "
+                                        f"continuation for user {memory_user_id} (responses)"
+                                    )
+                                else:
+                                    # Never hand the client an unresolved call
+                                    # for a tool Headroom injected and it
+                                    # cannot see.
+                                    logger.warning(
+                                        "[%s] Memory: continuation failed status=%s "
+                                        "stateless=%s — stripping memory tool calls",
+                                        request_id,
+                                        cont_response.status_code,
+                                        used_stateless,
+                                    )
+                                    resp_json["output"] = [
+                                        item
+                                        for item in (resp_json.get("output") or [])
+                                        if not (
+                                            isinstance(item, dict)
+                                            and item.get("type") == "function_call"
+                                            and item.get("name") in MEMORY_TOOL_NAMES
+                                        )
+                                    ]
                         except Exception as e:
                             logger.warning(
                                 f"[{request_id}] Memory tool handling failed (responses): {e}"

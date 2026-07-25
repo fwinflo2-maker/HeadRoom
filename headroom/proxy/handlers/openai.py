@@ -2384,7 +2384,14 @@ class OpenAIHandlerMixin:
                 tools=working.get("tools"),
                 config=getattr(self, "config", None),
             )
-            run_request_hooks(_req_ctx)
+            # The Responses path (HTTP /v1/responses, WS, and passthrough) never
+            # runs on_response hooks — only handle_openai_chat does. So a
+            # buffered-only hook that re-drives the model in on_response (defer a
+            # tool, reload it when asked) would have its on_request applied here
+            # but its on_response never fire, leaving the turn half-transformed.
+            # Restrict to stream-safe (fold-only) hooks, whose on_request stands
+            # alone — the same guard the streamed chat path uses (#2549).
+            run_request_hooks(_req_ctx, stream_safe_only=True)
             if _req_ctx.tools is not working.get("tools"):
                 working["tools"] = _req_ctx.tools
             # A hook may also fold the messages (replace or in-place). Write back a

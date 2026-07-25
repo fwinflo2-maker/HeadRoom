@@ -27,6 +27,46 @@ def _handler_with_router(router: ContentRouter) -> OpenAIHandlerMixin:
     return handler
 
 
+def test_responses_payload_runs_only_stream_safe_hooks_on_request():
+    """The Responses path never runs on_response hooks, so a buffered-only
+    (re-drive) hook must not have its on_request applied there — it would leave
+    the turn half-transformed. Only fold-only (stream_safe) hooks run, matching
+    the streamed chat path (#2549)."""
+    from headroom.proxy.turn_hooks import clear_turn_hooks, register_turn_hook
+
+    class Fold:
+        name = "fold"
+        stream_safe = True  # opts in — safe without an on_response
+
+        def on_request(self, ctx):  # noqa: ANN001, ANN201
+            ctx.tools = list(ctx.tools or []) + [{"name": "fold_ran"}]
+
+    class Redrive:
+        name = "redrive"  # no stream_safe attr → buffered-only
+
+        def on_request(self, ctx):  # noqa: ANN001, ANN201
+            ctx.tools = list(ctx.tools or []) + [{"name": "redrive_ran"}]
+
+    clear_turn_hooks()
+    register_turn_hook(Fold())
+    register_turn_hook(Redrive())
+    try:
+        handler = _handler_with_router(ContentRouter())
+        payload = {
+            "model": "gpt-5",
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+            "tools": [{"name": "existing"}],
+        }
+        new_payload = handler._compress_openai_responses_payload(
+            payload, model="gpt-5", request_id="req_test"
+        )[0]
+        names = {t.get("name") for t in new_payload.get("tools", [])}
+        assert "fold_ran" in names  # stream-safe hook's on_request applied
+        assert "redrive_ran" not in names  # buffered-only hook skipped on Responses
+    finally:
+        clear_turn_hooks()
+
+
 def test_openai_responses_unit_parallelism_env_defaults_and_clamps(monkeypatch):
     monkeypatch.delenv("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", raising=False)
     assert openai_handler._openai_responses_unit_parallelism() == 4

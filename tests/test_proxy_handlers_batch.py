@@ -1513,3 +1513,32 @@ async def test_compress_batch_jsonl_compresses_when_no_usage_reporter(
 
     assert len(applied) == 1
     assert stats["total_tokens_saved"] == 40
+
+
+@pytest.mark.asyncio
+async def test_batch_passthrough_records_request_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bypassed batch create must still reach the funnel.
+
+    Routing bypass to the passthrough forwarder would otherwise drop the
+    request from dashboards entirely — the compressed path records at the
+    end of handle_batch_create, and _google_batch_passthrough records too.
+    """
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+
+    async def request_payload(request):  # noqa: ANN001
+        return {"input_file_id": "file-1", "endpoint": "/v1/chat/completions"}
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+
+    response = await handler.handle_batch_create(
+        FakeRequest("{}", headers={"x-headroom-bypass": "true", "x-headroom-client": "test"})
+    )
+
+    assert response.status_code == 200
+    assert len(handler.metrics.record_calls) == 1
+    recorded = handler.metrics.record_calls[0]
+    assert recorded["provider"] == "openai"
+    assert recorded["tokens_saved"] == 0

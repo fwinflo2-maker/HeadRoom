@@ -1248,9 +1248,13 @@ class BatchHandlerMixin:
             log_outbound_request,
         )
 
+        start_time = time.time()
+
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("content-length", None)
+        client = classify_client(headers)
+        tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         _pre_strip_count_obp = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
         headers = _strip_internal_headers(headers)
@@ -1288,6 +1292,27 @@ class BatchHandlerMixin:
         )
         response = await self.http_client.post(  # type: ignore[union-attr]
             url, content=outbound_bytes, headers=outbound_headers
+        )
+
+        # No compression here, just an upstream forward. Funnel records via
+        # zero defaults so the request still shows up in dashboards, matching
+        # _google_batch_passthrough — otherwise a bypassed batch create
+        # disappears from the funnel entirely.
+        latency_ms = (time.time() - start_time) * 1000
+        await self._record_request_outcome(
+            RequestOutcome(
+                request_id=await self._next_request_id(),
+                provider="openai",
+                model="passthrough:batch",
+                original_tokens=0,
+                optimized_tokens=0,
+                output_tokens=0,
+                tokens_saved=0,
+                attempted_input_tokens=0,
+                total_latency_ms=latency_ms,
+                tags=tags,
+                client=client,
+            )
         )
 
         response_headers = dict(response.headers)

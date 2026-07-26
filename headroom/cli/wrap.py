@@ -5286,9 +5286,7 @@ def _warn_if_proxy_env_leaked(port: int) -> None:
             leaked.append((name, value))
     if not leaked:
         return
-    click.echo(
-        "  ⚠ Headroom's proxy URL is still exported in this shell's environment:"
-    )
+    click.echo("  ⚠ Headroom's proxy URL is still exported in this shell's environment:")
     for name, value in leaked:
         click.echo(f"      {name}={value}")
     click.echo(

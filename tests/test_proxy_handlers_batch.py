@@ -1264,3 +1264,169 @@ async def test_compress_batch_jsonl_skips_blank_lines_and_preserves_tools_when_n
     assert body["tools"] == [{"name": "orig"}]
     assert stats["total_requests"] == 1
     assert stats["errors"] == 0
+
+
+# ── x-headroom-bypass: the client's "don't touch my bytes" contract ──────
+# batch.py was never migrated onto CompressionDecision (see that module's
+# docstring: the same omission on the Gemini paths was "a real bug"), so
+# these lock the contract in on both batch surfaces.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bypass_headers",
+    [
+        {"x-headroom-bypass": "true"},
+        {"x-headroom-mode": "passthrough"},
+    ],
+)
+async def test_handle_batch_create_bypass_skips_compression_entirely(
+    monkeypatch: pytest.MonkeyPatch,
+    bypass_headers: dict[str, str],
+) -> None:
+    """Bypass must reach the byte-faithful passthrough without rewriting the file.
+
+    Compressing would re-serialize every JSONL line and upload a NEW file id,
+    so "skip compression" is not enough — the download/upload pair must not run.
+    """
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+
+    async def request_payload(request):  # noqa: ANN001
+        return {"input_file_id": "file-1", "endpoint": "/v1/chat/completions"}
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+
+    called: list[str] = []
+
+    async def fail_download(file_id, headers):  # noqa: ANN001
+        called.append("download")
+        return "downloaded"
+
+    async def fail_upload(content, filename, headers):  # noqa: ANN001
+        called.append("upload")
+        return "file-2"
+
+    async def fail_compress(content, request_id):  # noqa: ANN001
+        called.append("compress")
+        raise AssertionError("compression ran despite bypass")
+
+    monkeypatch.setattr(handler, "_download_openai_file", fail_download)
+    monkeypatch.setattr(handler, "_upload_openai_file", fail_upload)
+    monkeypatch.setattr(handler, "_compress_batch_jsonl", fail_compress)
+
+    passthrough_response = SimpleNamespace(marker="passthrough")
+
+    async def fake_passthrough(request, body):  # noqa: ANN001
+        called.append("passthrough")
+        return passthrough_response
+
+    monkeypatch.setattr(handler, "_batch_passthrough", fake_passthrough)
+
+    response = await handler.handle_batch_create(FakeRequest("{}", headers=bypass_headers))
+
+    assert response is passthrough_response
+    assert called == ["passthrough"]
+
+
+@pytest.mark.asyncio
+async def test_handle_google_batch_create_bypass_skips_compression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same contract on the Google inline-batch path (batch.py's other gate)."""
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    install_batch_support_modules(monkeypatch)
+
+    async def request_payload(request):  # noqa: ANN001
+        return {
+            "batch": {
+                "input_config": {
+                    "requests": {
+                        "requests": [
+                            {
+                                "request": {"contents": [{"parts": [{"text": "hello"}]}]},
+                                "metadata": {"key": "request-1"},
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+
+    def fail_apply(**kwargs):  # noqa: ANN003
+        raise AssertionError("pipeline ran despite bypass")
+
+    handler.openai_pipeline = SimpleNamespace(apply=fail_apply)
+
+    passthrough_response = SimpleNamespace(marker="google-passthrough")
+    called: list[str] = []
+
+    async def fake_passthrough(request, model, body=None):  # noqa: ANN001
+        called.append("passthrough")
+        return passthrough_response
+
+    monkeypatch.setattr(handler, "_google_batch_passthrough", fake_passthrough)
+
+    response = await handler.handle_google_batch_create(
+        FakeRequest("{}", headers={"x-headroom-bypass": "true"}),
+        "gemini-2.0-flash",
+    )
+
+    assert response is passthrough_response
+    assert called == ["passthrough"]
+
+
+@pytest.mark.asyncio
+async def test_handle_batch_create_without_bypass_still_compresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard for the fix itself.
+
+    Gating on ``CompressionDecision.decide(messages=None)`` looks right and is
+    wrong: ``None`` hits the ``no_messages`` precedence step and returns
+    ``should_compress=False``, silently disabling compression for EVERY batch.
+    This test fails if that shortcut is ever taken.
+    """
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+
+    async def request_payload(request):  # noqa: ANN001
+        return {"input_file_id": "file-1", "endpoint": "/v1/chat/completions"}
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+
+    async def fake_download(file_id, headers):  # noqa: ANN001
+        return "downloaded"
+
+    compressed_calls: list[str] = []
+
+    async def fake_compress(content, request_id):  # noqa: ANN001
+        compressed_calls.append(content)
+        return ['{"body":{}}'], {
+            "total_requests": 1,
+            "total_original_tokens": 20,
+            "total_compressed_tokens": 10,
+            "total_tokens_saved": 10,
+            "savings_percent": 50.0,
+            "errors": 0,
+        }
+
+    async def fake_upload(content, filename, headers):  # noqa: ANN001
+        return "file-compressed"
+
+    monkeypatch.setattr(handler, "_download_openai_file", fake_download)
+    monkeypatch.setattr(handler, "_compress_batch_jsonl", fake_compress)
+    monkeypatch.setattr(handler, "_upload_openai_file", fake_upload)
+
+    handler.http_client.post_response = FakeResponse(content=b'{"id":"batch_123","object":"batch"}')
+
+    response = await handler.handle_batch_create(
+        FakeRequest("{}", headers={"authorization": "Bearer test"})
+    )
+
+    assert response.status_code == 200
+    assert compressed_calls == ["downloaded"]
+    assert dict(response.headers)["x-headroom-tokens-saved"] == "10"

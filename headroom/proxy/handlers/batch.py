@@ -15,7 +15,11 @@ if TYPE_CHECKING:
     from fastapi.responses import Response
 
 from headroom.proxy.auth_mode import classify_client
-from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS, extract_tags
+from headroom.proxy.helpers import (
+    COMPRESSION_TIMEOUT_SECONDS,
+    _headroom_bypass_enabled,
+    extract_tags,
+)
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
@@ -97,6 +101,14 @@ class BatchHandlerMixin:
         if not requests_list:
             # No inline requests - might be using file input, pass through
             logger.debug(f"[{request_id}] Google batch: No inline requests, passing through")
+            return await self._google_batch_passthrough(request, model, body)
+
+        # Same bypass contract as the OpenAI batch path below. Skipping the
+        # compression loop also skips the CCR context store, which is correct:
+        # that store only exists to resolve markers left BY compression, and
+        # handle_google_batch_results already passes through on a missing one.
+        if _headroom_bypass_enabled(request.headers):
+            logger.info(f"[{request_id}] Google batch: compression skipped: reason=bypass_header")
             return await self._google_batch_passthrough(request, model, body)
 
         # Extract headers
@@ -856,6 +868,14 @@ class BatchHandlerMixin:
         # Only compress chat completions endpoint
         if endpoint != "/v1/chat/completions":
             # Pass through for other endpoints
+            return await self._batch_passthrough(request, body)
+
+        # The client's explicit "don't touch my bytes" contract. Compressing
+        # would re-serialize every JSONL line and upload a NEW file id, so
+        # skipping compression alone isn't enough — route to the byte-faithful
+        # passthrough before the download/upload pair runs.
+        if _headroom_bypass_enabled(request.headers):
+            logger.info(f"[{request_id}] Batch: compression skipped: reason=bypass_header")
             return await self._batch_passthrough(request, body)
 
         headers = dict(request.headers.items())

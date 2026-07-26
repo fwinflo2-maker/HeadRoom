@@ -729,6 +729,9 @@ class CostTracker:
             cache_read_tokens: Tokens served from cache (~10% of input rate)
             cache_write_tokens: Tokens written to cache (~125% of input rate)
         """
+        if model.startswith("passthrough:"):
+            return None
+
         litellm = _get_litellm_module()
         if litellm is None:
             _warn_pricing_once(
@@ -918,6 +921,8 @@ class CostTracker:
         per_model = {}
         total_saved = 0
         for model in sorted(self._tokens_saved_by_model.keys()):
+            if model.startswith("passthrough:"):
+                continue
             saved = self._tokens_saved_by_model[model]
             sent = self._tokens_sent_by_model.get(model, 0)
             reqs = self._requests_by_model.get(model, 0)
@@ -941,6 +946,8 @@ class CostTracker:
         total_billed_input_tokens = 0
         total_input_tokens = 0
         for model in self._tokens_saved_by_model:
+            if model.startswith("passthrough:"):
+                continue
             saved = self._tokens_saved_by_model[model]
             sent = self._tokens_sent_by_model.get(model, 0)
             cr = self._api_cache_read_by_model.get(model, 0)
@@ -967,6 +974,8 @@ class CostTracker:
         # at the published $/token rate for its model. Not affected by cache mix.
         savings_usd = 0.0
         for model in self._tokens_saved_by_model:
+            if model.startswith("passthrough:"):
+                continue
             saved = self._tokens_saved_by_model[model]
             if saved <= 0:
                 continue
@@ -979,8 +988,16 @@ class CostTracker:
             "total_tokens_saved": total_saved,
             "total_input_tokens": total_input_tokens,
             "total_input_cost_usd": round(cost_with_headroom, 4),
-            "cache_write_5m_tokens": sum(self._api_cache_write_5m_by_model.values()),
-            "cache_write_1h_tokens": sum(self._api_cache_write_1h_by_model.values()),
+            "cache_write_5m_tokens": sum(
+                tokens
+                for model, tokens in self._api_cache_write_5m_by_model.items()
+                if not model.startswith("passthrough:")
+            ),
+            "cache_write_1h_tokens": sum(
+                tokens
+                for model, tokens in self._api_cache_write_1h_by_model.items()
+                if not model.startswith("passthrough:")
+            ),
             "per_model": per_model,
             "cost_with_headroom_usd": round(cost_with_headroom, 4),
             "savings_usd": round(savings_usd, 4),

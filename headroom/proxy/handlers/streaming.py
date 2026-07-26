@@ -30,6 +30,49 @@ from headroom.copilot_auth import apply_copilot_api_auth
 logger = logging.getLogger("headroom.proxy")
 
 
+# Upstream controls every SSE event body, so the shape of anything reached
+# through `json.loads` is not guaranteed. These normalize a wrong-shaped value
+# to a harmless one instead of letting it raise on the streaming path, where
+# the raise escapes into `_finalize_stream_response` and tears down a stream
+# the client is already reading. They guard *shape*, not value validity.
+
+
+def _sse_dict(value: Any) -> dict[str, Any]:
+    """Upstream-supplied object, or ``{}`` when it is not one.
+
+    An explicit ``"key": null`` bypasses a ``.get(key, {})`` default — the
+    default only applies to a *missing* key — so nested objects are
+    type-checked rather than defaulted.
+    """
+    return value if isinstance(value, dict) else {}
+
+
+def _sse_str(value: Any) -> str:
+    """Upstream-supplied text, or ``""`` when it is not a string.
+
+    Accumulating a non-string delta would raise ``TypeError`` on ``+``.
+    """
+    return value if isinstance(value, str) else ""
+
+
+def _sse_index(value: Any, default: int | None = None) -> int | None:
+    """Upstream-supplied block index, or ``default`` when unusable as a key.
+
+    ``index`` keys ``blocks_by_index`` and ``appended_block_keys``; a list or
+    dict there raises ``TypeError: unhashable type``. ``bool`` is rejected too
+    so ``true`` cannot silently alias index ``1``.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return default
+    return value
+
+
+# Keys `_parse_sse_to_response` owns on its in-progress block dicts. Upstream
+# must not seed them via the non-standard-block copy-through, or a non-string
+# would reach the delta accumulators. `type` is set explicitly, not copied.
+_BLOCK_SCRATCH_KEYS = frozenset({"type", "_partial_json", "thinking_buffer"})
+
+
 def _parse_completion_tokens_from_sse_chunk(chunk_bytes: bytes) -> int | None:
     """Extract `usage.completion_tokens` from a single SSE chunk if present.
 
@@ -179,6 +222,9 @@ class StreamingMixin:
                 except json.JSONDecodeError:
                     continue
 
+                if not isinstance(data, dict):
+                    continue
+
                 usage = {}
 
                 if provider == "anthropic":
@@ -187,8 +233,7 @@ class StreamingMixin:
                     event_type = data.get("type", "")
 
                     if event_type == "message_start":
-                        msg = data.get("message", {})
-                        msg_usage = msg.get("usage", {})
+                        msg_usage = _sse_dict(_sse_dict(data.get("message")).get("usage"))
                         if msg_usage:
                             usage["input_tokens"] = msg_usage.get("input_tokens", 0)
                             usage["cache_read_input_tokens"] = msg_usage.get(
@@ -204,24 +249,24 @@ class StreamingMixin:
                             usage["cache_creation_ephemeral_1h_input_tokens"] = cache_write_1h
 
                     elif event_type == "message_delta":
-                        delta_usage = data.get("usage", {})
+                        delta_usage = _sse_dict(data.get("usage"))
                         if delta_usage:
                             usage["output_tokens"] = delta_usage.get("output_tokens", 0)
 
                 elif provider == "openai":
                     # OpenAI sends usage in final chunk (when stream_options.include_usage=true)
-                    chunk_usage = data.get("usage")
+                    chunk_usage = _sse_dict(data.get("usage"))
                     if chunk_usage:
                         usage["input_tokens"] = chunk_usage.get("prompt_tokens", 0)
                         usage["output_tokens"] = chunk_usage.get("completion_tokens", 0)
                         # OpenAI has cached tokens in prompt_tokens_details
-                        details = chunk_usage.get("prompt_tokens_details") or {}
+                        details = _sse_dict(chunk_usage.get("prompt_tokens_details"))
                         usage["cache_read_input_tokens"] = details.get("cached_tokens", 0)
 
                 elif provider == "gemini":
                     # Gemini sends usageMetadata in each streaming chunk
                     # Format: {"usageMetadata": {"promptTokenCount": N, "candidatesTokenCount": M}}
-                    usage_meta = data.get("usageMetadata")
+                    usage_meta = _sse_dict(data.get("usageMetadata"))
                     if usage_meta:
                         usage["input_tokens"] = usage_meta.get("promptTokenCount", 0)
                         usage["output_tokens"] = usage_meta.get("candidatesTokenCount", 0)
@@ -275,11 +320,18 @@ class StreamingMixin:
             except json.JSONDecodeError:
                 continue
 
+            # The upstream controls the event body. A valid-JSON non-object
+            # (a bare array or string, e.g. from an overloaded frontend's
+            # error page framed as SSE) makes `.get` raise AttributeError,
+            # which the JSONDecodeError guard above does not catch. Skip it
+            # like any other unusable event.
+            if not isinstance(data, dict):
+                continue
+
             if provider == "anthropic":
                 event_type = data.get("type", "")
                 if event_type == "message_start":
-                    msg = data.get("message", {})
-                    msg_usage = msg.get("usage", {})
+                    msg_usage = _sse_dict(_sse_dict(data.get("message")).get("usage"))
                     if msg_usage:
                         usage_found["input_tokens"] = msg_usage.get("input_tokens", 0)
                         usage_found["cache_read_input_tokens"] = msg_usage.get(
@@ -299,7 +351,7 @@ class StreamingMixin:
                             f"cache_write={usage_found.get('cache_creation_input_tokens')}"
                         )
                 elif event_type == "message_delta":
-                    delta_usage = data.get("usage", {})
+                    delta_usage = _sse_dict(data.get("usage"))
                     if delta_usage:
                         usage_found["output_tokens"] = delta_usage.get("output_tokens", 0)
 
@@ -339,7 +391,7 @@ class StreamingMixin:
                         )
 
             elif provider == "gemini":
-                usage_meta = data.get("usageMetadata")
+                usage_meta = _sse_dict(data.get("usageMetadata"))
                 if usage_meta:
                     usage_found["input_tokens"] = usage_meta.get("promptTokenCount", 0)
                     usage_found["output_tokens"] = usage_meta.get("candidatesTokenCount", 0)
@@ -402,29 +454,36 @@ class StreamingMixin:
             except json.JSONDecodeError:
                 continue
 
+            # Same upstream-controlled shape guard as
+            # ``_parse_sse_usage_from_buffer``: a valid-JSON non-object event
+            # would raise AttributeError below, and here that escapes into
+            # ``_finalize_stream_response`` and tears down a stream the client
+            # was already reading.
+            if not isinstance(data, dict):
+                continue
+
             event_type = data.get("type", "")
 
             if event_type == "message_start":
-                msg = data.get("message", {})
+                msg = _sse_dict(data.get("message"))
                 response["id"] = msg.get("id")
                 response["model"] = msg.get("model")
                 response["role"] = msg.get("role", "assistant")
                 response["stop_reason"] = msg.get("stop_reason")
                 if "stop_details" in msg:
                     response["stop_details"] = msg["stop_details"]
-                if msg.get("usage"):
-                    response["usage"].update(msg["usage"])
+                response["usage"].update(_sse_dict(msg.get("usage")))
 
             elif event_type == "content_block_start":
-                block = data.get("content_block", {})
-                block_index = data.get("index", len(response["content"]))
+                block = _sse_dict(data.get("content_block"))
+                block_index = _sse_index(data.get("index"), len(response["content"]))
                 btype = block.get("type")
                 current_block = {
                     "type": btype,
                     "index": block_index,
                 }
                 if btype == "text":
-                    current_block["text"] = block.get("text", "")
+                    current_block["text"] = _sse_str(block.get("text"))
                 elif btype == "tool_use":
                     current_block["id"] = block.get("id")
                     current_block["name"] = block.get("name")
@@ -433,7 +492,7 @@ class StreamingMixin:
                     # Thinking block — accumulate text via
                     # `thinking_delta`; signature arrives via
                     # `signature_delta` (single value, not accumulated).
-                    current_block["thinking_buffer"] = block.get("thinking", "")
+                    current_block["thinking_buffer"] = _sse_str(block.get("thinking"))
                     if "signature" in block:
                         current_block["signature"] = block["signature"]
                 elif btype == "redacted_thinking":
@@ -450,31 +509,33 @@ class StreamingMixin:
                     # {type, index}. Mirrors the sibling reconstructor
                     # `_reconstruct_anthropic_response`, which does `dict(block)`.
                     for _k, _v in block.items():
-                        if _k != "type":
+                        if _k not in _BLOCK_SCRATCH_KEYS:
                             current_block[_k] = _v
                 blocks_by_index[block_index] = current_block
 
             elif event_type == "content_block_delta":
                 # Resolve the target block by index (preferred) or fall
                 # back to current_block for legacy linear streams.
-                idx = data.get("index")
+                idx = _sse_index(data.get("index"))
                 target = (blocks_by_index.get(idx) if idx is not None else None) or current_block
                 if target is not None:
-                    delta = data.get("delta", {})
+                    # `"delta": null` bypasses a `.get(..., {})` default the same
+                    # way `"message": null` does on message_start.
+                    delta = _sse_dict(data.get("delta"))
                     dtype = delta.get("type")
                     if dtype == "text_delta":
-                        target["text"] = target.get("text", "") + delta.get("text", "")
+                        target["text"] = _sse_str(target.get("text")) + _sse_str(delta.get("text"))
                     elif dtype == "input_json_delta":
                         # Accumulate partial JSON for tool input.
-                        partial = delta.get("partial_json", "")
-                        target["_partial_json"] = target.get("_partial_json", "") + partial
+                        partial = _sse_str(delta.get("partial_json"))
+                        target["_partial_json"] = _sse_str(target.get("_partial_json")) + partial
                     elif dtype == "thinking_delta":
                         # Accumulate thinking text into the dedicated
                         # buffer so it never collides with `text` on
                         # text blocks (separate field per guide §2.7).
-                        target["thinking_buffer"] = target.get("thinking_buffer", "") + delta.get(
-                            "thinking", ""
-                        )
+                        target["thinking_buffer"] = _sse_str(
+                            target.get("thinking_buffer")
+                        ) + _sse_str(delta.get("thinking"))
                     elif dtype == "signature_delta":
                         # Single value, not accumulated. Last-write
                         # wins per Anthropic spec.
@@ -485,13 +546,18 @@ class StreamingMixin:
                         # list so multi-citation blocks reconstruct
                         # correctly. Per guide §2.5: each delta carries
                         # one full citation object under `citation`.
-                        citations = target.setdefault("citations", [])
+                        # A non-standard block start can copy a non-list
+                        # `citations` through, which `.append` would reject.
+                        citations = target.get("citations")
+                        if not isinstance(citations, list):
+                            citations = []
+                            target["citations"] = citations
                         citation = delta.get("citation")
                         if citation is not None:
                             citations.append(citation)
 
             elif event_type == "content_block_stop":
-                idx = data.get("index")
+                idx = _sse_index(data.get("index"))
                 target = (blocks_by_index.get(idx) if idx is not None else None) or current_block
                 if target is not None:
                     # Parse accumulated JSON into `input` for any block that
@@ -525,13 +591,15 @@ class StreamingMixin:
                     current_block = None
 
             elif event_type == "message_delta":
-                delta = data.get("delta", {})
+                delta = _sse_dict(data.get("delta"))
                 if "stop_reason" in delta:
                     response["stop_reason"] = delta["stop_reason"]
                 if "stop_details" in delta:
                     response["stop_details"] = delta["stop_details"]
-                if data.get("usage"):
-                    response["usage"].update(data["usage"])
+                # Type-checked, not truthiness-checked: `dict.update` on a
+                # non-mapping raises. The message_start twin above already
+                # guarded this; this sibling did not.
+                response["usage"].update(_sse_dict(data.get("usage")))
 
         return response if response.get("content") else None
 

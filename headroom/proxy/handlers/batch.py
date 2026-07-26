@@ -108,7 +108,7 @@ class BatchHandlerMixin:
         # that store only exists to resolve markers left BY compression, and
         # handle_google_batch_results already passes through on a missing one.
         if _headroom_bypass_enabled(request.headers):
-            logger.info(f"[{request_id}] Google batch: compression skipped: reason=bypass_header")
+            logger.info(f"[{request_id}] Compression skipped: reason=bypass_header")
             # Pass body=None so the helper forwards the original wire bytes.
             # Handing it the parsed dict would re-serialize canonically and log
             # body_mutated=True, which is the opposite of what bypass promises.
@@ -135,7 +135,7 @@ class BatchHandlerMixin:
         # reporter configured, or no license info yet, both mean compress.
         license_ok = self.usage_reporter.should_compress if self.usage_reporter else True
         if not license_ok:
-            logger.info(f"[{request_id}] Google batch: compression skipped: reason=license_denied")
+            logger.info(f"[{request_id}] Compression skipped: reason=license_denied")
 
         # Track compression stats
         total_original_tokens = 0
@@ -884,7 +884,7 @@ class BatchHandlerMixin:
         # skipping compression alone isn't enough — route to the byte-faithful
         # passthrough before the download/upload pair runs.
         if _headroom_bypass_enabled(request.headers):
-            logger.info(f"[{request_id}] Batch: compression skipped: reason=bypass_header")
+            logger.info(f"[{request_id}] Compression skipped: reason=bypass_header")
             return await self._batch_passthrough(request, body)
 
         headers = dict(request.headers.items())
@@ -1123,7 +1123,7 @@ class BatchHandlerMixin:
         # no license info yet, both mean compress.
         license_ok = self.usage_reporter.should_compress if self.usage_reporter else True
         if not license_ok:
-            logger.info(f"[{request_id}] Batch: compression skipped: reason=license_denied")
+            logger.info(f"[{request_id}] Compression skipped: reason=license_denied")
 
         lines = content.strip().split("\n")
         compressed_lines = []

@@ -1576,3 +1576,32 @@ async def test_google_batch_bypass_forwards_original_bytes(
     )
 
     assert handler.http_client.posts[-1]["content"] == raw.encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_batch_passthrough_records_upstream_failure_as_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 5xx on a bypassed batch create must not land in the success funnel.
+
+    RequestOutcome.status_code defaults to 200, and emit_request_outcome only
+    diverts to record_failed at >= 500, so omitting it books a failed upstream
+    call as a success and inflates the save-rate.
+    """
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    handler.http_client.post_response = FakeResponse(status_code=503, content=b'{"error":"busy"}')
+
+    async def request_payload(request):  # noqa: ANN001
+        return {"input_file_id": "file-1", "endpoint": "/v1/chat/completions"}
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+
+    response = await handler.handle_batch_create(
+        FakeRequest("{}", headers={"x-headroom-bypass": "true"})
+    )
+
+    assert response.status_code == 503
+    assert handler.metrics.record_calls == []
+    assert len(handler.metrics.failed_calls) == 1
+    assert handler.metrics.failed_calls[0]["provider"] == "openai"

@@ -1307,6 +1307,7 @@ class BatchHandlerMixin:
                 request_id=await self._next_request_id(),
                 provider="openai",
                 model="passthrough:batch",
+                status_code=response.status_code,
                 original_tokens=0,
                 optimized_tokens=0,
                 output_tokens=0,

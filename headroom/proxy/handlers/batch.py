@@ -128,6 +128,13 @@ class BatchHandlerMixin:
             request_id=request_id,
         )
 
+        # Commercial gate, as on the OpenAI batch path. Fails open: no
+        # reporter configured, or no license info yet, both mean compress.
+        _reporter = getattr(self, "usage_reporter", None)
+        license_ok = _reporter.should_compress if _reporter is not None else True
+        if not license_ok:
+            logger.info(f"[{request_id}] Google batch: compression skipped: reason=license_denied")
+
         # Track compression stats
         total_original_tokens = 0
         total_optimized_tokens = 0
@@ -141,8 +148,8 @@ class BatchHandlerMixin:
             metadata = batch_req.get("metadata", {})
             contents = req_content.get("contents", [])
 
-            if not contents or not self.config.optimize:
-                # No contents or optimization disabled - pass through unchanged
+            if not contents or not self.config.optimize or not license_ok:
+                # No contents, optimization disabled, or license denied
                 compressed_requests.append(batch_req)
                 continue
 
@@ -1109,6 +1116,14 @@ class BatchHandlerMixin:
         from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
 
+        # Commercial gate, the other half of the conjunction the shared
+        # decision factory applies. Fails open: no reporter configured, or
+        # no license info yet, both mean compress.
+        _reporter = getattr(self, "usage_reporter", None)
+        license_ok = _reporter.should_compress if _reporter is not None else True
+        if not license_ok:
+            logger.info(f"[{request_id}] Batch: compression skipped: reason=license_denied")
+
         lines = content.strip().split("\n")
         compressed_lines = []
         total_original_tokens = 0
@@ -1135,7 +1150,7 @@ class BatchHandlerMixin:
                     continue
 
                 # Compress messages using the OpenAI pipeline
-                if self.config.optimize:
+                if self.config.optimize and license_ok:
                     try:
                         context_limit = self.openai_provider.get_context_limit(model)
                         # Offload off the event loop (#1701); timeouts fall to

@@ -1356,10 +1356,20 @@ async def test_handle_google_batch_create_bypass_skips_compression(
 
     monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
 
-    def fail_apply(**kwargs):  # noqa: ANN003
-        raise AssertionError("pipeline ran despite bypass")
+    # Count invocations rather than raising: the Google compression loop
+    # swallows exceptions per request, so a raise here would be masked.
+    applied: list[dict] = []
 
-    handler.openai_pipeline = SimpleNamespace(apply=fail_apply)
+    def apply(**kwargs):  # noqa: ANN003
+        applied.append(kwargs)
+        return SimpleNamespace(
+            messages=[{"role": "user", "content": "hi"}],
+            tokens_before=50,
+            tokens_after=10,
+            timing={},
+        )
+
+    handler.openai_pipeline = SimpleNamespace(apply=apply)
 
     passthrough_response = SimpleNamespace(marker="google-passthrough")
     called: list[str] = []
@@ -1377,6 +1387,7 @@ async def test_handle_google_batch_create_bypass_skips_compression(
 
     assert response is passthrough_response
     assert called == ["passthrough"]
+    assert applied == []
 
 
 @pytest.mark.asyncio
@@ -1430,3 +1441,75 @@ async def test_handle_batch_create_without_bypass_still_compresses(
     assert response.status_code == 200
     assert compressed_calls == ["downloaded"]
     assert dict(response.headers)["x-headroom-tokens-saved"] == "10"
+
+
+@pytest.mark.asyncio
+async def test_compress_batch_jsonl_skips_when_license_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """License denial gates compression, the other half of the conjunction.
+
+    Unlike bypass this is not a byte-fidelity contract, so it gates the
+    pipeline in place rather than rerouting to the passthrough forwarder.
+    """
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    handler.usage_reporter = SimpleNamespace(should_compress=False)
+    install_batch_support_modules(monkeypatch, tokenizer_count=7)
+
+    # Count invocations rather than raising: _compress_batch_jsonl wraps the
+    # pipeline call in `except Exception`, which would swallow an AssertionError
+    # and let this pass via the fallback path even with the gate removed.
+    applied: list[dict] = []
+
+    def apply(**kwargs):  # noqa: ANN003
+        applied.append(kwargs)
+        return SimpleNamespace(
+            messages=[{"role": "user", "content": "hi"}],
+            tokens_before=50,
+            tokens_after=10,
+        )
+
+    handler.openai_pipeline = SimpleNamespace(apply=apply)
+
+    line = json.dumps(
+        {"body": {"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}}
+    )
+    lines, stats = await handler._compress_batch_jsonl(line, "req-license")
+
+    assert applied == []
+    assert stats["total_requests"] == 1
+    assert stats["total_tokens_saved"] == 0
+    assert json.loads(lines[0])["body"]["messages"] == [{"role": "user", "content": "hello"}]
+
+
+@pytest.mark.asyncio
+async def test_compress_batch_jsonl_compresses_when_no_usage_reporter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fails open: no reporter configured means compress, not passthrough."""
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    install_batch_support_modules(monkeypatch)
+
+    applied: list[dict] = []
+
+    def apply(**kwargs):  # noqa: ANN003
+        applied.append(kwargs)
+        return SimpleNamespace(
+            messages=[{"role": "user", "content": "hi"}],
+            tokens_before=50,
+            tokens_after=10,
+        )
+
+    handler.openai_pipeline = SimpleNamespace(apply=apply)
+
+    assert not hasattr(handler, "usage_reporter")
+
+    line = json.dumps(
+        {"body": {"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}}
+    )
+    _lines, stats = await handler._compress_batch_jsonl(line, "req-nolicense")
+
+    assert len(applied) == 1
+    assert stats["total_tokens_saved"] == 40

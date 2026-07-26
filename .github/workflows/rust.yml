@@ -28,6 +28,10 @@ concurrency:
   group: rust-${{ github.ref }}
   cancel-in-progress: true
 
+# THROWAWAY DIAGNOSTIC — do not merge. This comment exists only to make the
+# `dashboard` paths-filter in ci.yml match (it includes '.github/workflows/**'),
+# so `test-dashboard-ui` runs against unmodified main content. See #2567.
+
 # Default permissions: read-only. Individual jobs override only what they need.
 # Mitigates CodeQL/CWE-275 (missing-workflow-permissions): the GITHUB_TOKEN
 # defaults to whatever the repo policy is, which can be read-write. Pinning

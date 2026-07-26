@@ -133,8 +133,7 @@ class BatchHandlerMixin:
 
         # Commercial gate, as on the OpenAI batch path. Fails open: no
         # reporter configured, or no license info yet, both mean compress.
-        _reporter = getattr(self, "usage_reporter", None)
-        license_ok = _reporter.should_compress if _reporter is not None else True
+        license_ok = self.usage_reporter.should_compress if self.usage_reporter else True
         if not license_ok:
             logger.info(f"[{request_id}] Google batch: compression skipped: reason=license_denied")
 
@@ -1122,8 +1121,7 @@ class BatchHandlerMixin:
         # Commercial gate, the other half of the conjunction the shared
         # decision factory applies. Fails open: no reporter configured, or
         # no license info yet, both mean compress.
-        _reporter = getattr(self, "usage_reporter", None)
-        license_ok = _reporter.should_compress if _reporter is not None else True
+        license_ok = self.usage_reporter.should_compress if self.usage_reporter else True
         if not license_ok:
             logger.info(f"[{request_id}] Batch: compression skipped: reason=license_denied")
 

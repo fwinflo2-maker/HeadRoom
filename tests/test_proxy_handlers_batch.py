@@ -90,6 +90,9 @@ class DummyBatchHandler(batch_module.BatchHandlerMixin, GeminiHandlerMixin):
         )
         self.openai_provider = SimpleNamespace(get_context_limit=lambda model: 8192)
         self.openai_pipeline = SimpleNamespace(apply=lambda **kwargs: None)
+        # Mirror of HeadroomProxy.usage_reporter (server.py), which is always
+        # set, None when no licensing system is configured.
+        self.usage_reporter = None
         self._request_counter = 0
         self._retry_response = FakeResponse()
 
@@ -964,6 +967,7 @@ async def test_handle_google_batch_create_preserves_functioncall_response_order(
                 optimize=True, ccr_inject_tool=False, ccr_inject_system_instructions=False
             )
             self.openai_provider = SimpleNamespace(get_context_limit=lambda m: 8192)
+            self.usage_reporter = None
             # No-op pipeline: return the messages unchanged, no token inflation.
             self.openai_pipeline = SimpleNamespace(
                 apply=lambda **kw: SimpleNamespace(
@@ -1053,6 +1057,7 @@ async def test_handle_google_batch_create_preserves_sibling_tools(
                 optimize=True, ccr_inject_tool=False, ccr_inject_system_instructions=False
             )
             self.openai_provider = SimpleNamespace(get_context_limit=lambda m: 8192)
+            self.usage_reporter = None
             self.openai_pipeline = SimpleNamespace(
                 apply=lambda **kw: SimpleNamespace(
                     messages=kw["messages"], timing={}, tokens_before=100, tokens_after=100
@@ -1504,7 +1509,7 @@ async def test_compress_batch_jsonl_compresses_when_no_usage_reporter(
 
     handler.openai_pipeline = SimpleNamespace(apply=apply)
 
-    assert not hasattr(handler, "usage_reporter")
+    assert handler.usage_reporter is None
 
     line = json.dumps(
         {"body": {"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}}

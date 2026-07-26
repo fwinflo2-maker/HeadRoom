@@ -487,6 +487,7 @@ class BatchHandlerMixin:
                 request_id=request_id_files,
                 provider="google",
                 model=f"passthrough:batch:{model}",
+                status_code=response.status_code,
                 original_tokens=0,
                 optimized_tokens=0,
                 output_tokens=0,

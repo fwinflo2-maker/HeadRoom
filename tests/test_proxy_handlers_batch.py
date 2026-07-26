@@ -1610,3 +1610,38 @@ async def test_batch_passthrough_records_upstream_failure_as_failed(
     assert handler.metrics.record_calls == []
     assert len(handler.metrics.failed_calls) == 1
     assert handler.metrics.failed_calls[0]["provider"] == "openai"
+
+
+@pytest.mark.asyncio
+async def test_google_batch_passthrough_records_upstream_failure_as_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same 5xx contract as the OpenAI passthrough, on the Google path.
+
+    The bypass guard routes traffic into this helper, so an omitted
+    status_code books a failed Gemini call as a served request.
+    """
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    handler.http_client.post_response = FakeResponse(status_code=503, content=b'{"error":"busy"}')
+
+    raw = (
+        '{"batch": {"input_config": {"requests": {"requests": '
+        '[{"request": {"contents": [{"parts": [{"text": "hi"}]}]}, '
+        '"metadata": {"key": "r1"}}]}}}}'
+    )
+
+    async def request_payload(request):  # noqa: ANN001
+        return json.loads(raw)
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+
+    response = await handler.handle_google_batch_create(
+        FakeRequest(raw, headers={"x-headroom-bypass": "true"}),
+        "gemini-2.0-flash",
+    )
+
+    assert response.status_code == 503
+    assert handler.metrics.record_calls == []
+    assert len(handler.metrics.failed_calls) == 1
+    assert handler.metrics.failed_calls[0]["provider"] == "google"

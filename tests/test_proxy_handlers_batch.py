@@ -1399,12 +1399,16 @@ async def test_handle_google_batch_create_bypass_skips_compression(
 async def test_handle_batch_create_without_bypass_still_compresses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression guard for the fix itself.
+    """The bypass guard must not misfire on an ordinary request.
 
-    Gating on ``CompressionDecision.decide(messages=None)`` looks right and is
-    wrong: ``None`` hits the ``no_messages`` precedence step and returns
-    ``should_compress=False``, silently disabling compression for EVERY batch.
-    This test fails if that shortcut is ever taken.
+    Gating the handler on ``CompressionDecision.decide(messages=None)`` looks
+    right and is wrong: ``None`` hits the ``no_messages`` precedence step and
+    returns ``should_compress=False``, sending every batch to passthrough.
+    This test turns red on that shortcut.
+
+    Scope: the handler-level guard only. ``_compress_batch_jsonl`` is stubbed
+    here, so the same mistake made *inside* that method would sail past this
+    test. ``test_compress_batch_jsonl_*`` cover the per-line gates.
     """
     handler = DummyBatchHandler()
     handler.config.optimize = True
@@ -1645,3 +1649,48 @@ async def test_google_batch_passthrough_records_upstream_failure_as_failed(
     assert handler.metrics.record_calls == []
     assert len(handler.metrics.failed_calls) == 1
     assert handler.metrics.failed_calls[0]["provider"] == "google"
+
+
+@pytest.mark.asyncio
+async def test_google_batch_create_skips_compression_when_license_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The license gate's third disjunct at the Google per-item guard.
+
+    Arc coverage marks that line hit via the other two disjuncts, so
+    without this the `not license_ok` branch never actually decides.
+    """
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    handler.usage_reporter = SimpleNamespace(should_compress=False)
+    install_batch_support_modules(monkeypatch)
+
+    applied: list[dict] = []
+
+    def apply(**kwargs):  # noqa: ANN003
+        applied.append(kwargs)
+        return SimpleNamespace(
+            messages=[{"role": "user", "content": "hi"}],
+            tokens_before=50,
+            tokens_after=10,
+            timing={},
+        )
+
+    handler.openai_pipeline = SimpleNamespace(apply=apply)
+    handler.http_client.post_response = FakeResponse(content=b'{"name":"batches/b1"}')
+
+    raw = (
+        '{"batch": {"input_config": {"requests": {"requests": '
+        '[{"request": {"contents": [{"parts": [{"text": "hello"}]}]}, '
+        '"metadata": {"key": "r1"}}]}}}}'
+    )
+
+    async def request_payload(request):  # noqa: ANN001
+        return json.loads(raw)
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+
+    await handler.handle_google_batch_create(FakeRequest(raw), "gemini-2.0-flash")
+
+    assert applied == []
+    assert handler.metrics.record_calls[-1]["tokens_saved"] == 0

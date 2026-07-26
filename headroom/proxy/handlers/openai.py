@@ -1569,6 +1569,7 @@ class OpenAIHandlerMixin:
         body: dict[str, Any],
         *,
         request_id: str,
+        request_context: Any = None,
     ) -> None:
         """Feed one Responses HTTP request into the live traffic learner."""
         traffic_learner = getattr(self, "traffic_learner", None)
@@ -1576,6 +1577,9 @@ class OpenAIHandlerMixin:
             return
         try:
             memory_handler = getattr(self, "memory_handler", None)
+            if memory_handler and memory_handler.is_project_unresolved(request_context):
+                logger.info("[%s] Traffic learner skipped: project_unresolved", request_id)
+                return
             if (
                 traffic_learner._backend is None
                 and memory_handler
@@ -1605,6 +1609,7 @@ class OpenAIHandlerMixin:
         messages: list[dict[str, Any]],
         *,
         request_id: str,
+        request_context: Any = None,
     ) -> None:
         """Feed one chat/completions request into the live traffic learner.
 
@@ -1621,6 +1626,9 @@ class OpenAIHandlerMixin:
             return
         try:
             memory_handler = getattr(self, "memory_handler", None)
+            if memory_handler and memory_handler.is_project_unresolved(request_context):
+                logger.info("[%s] Traffic learner skipped: project_unresolved", request_id)
+                return
             if (
                 traffic_learner._backend is None
                 and memory_handler
@@ -3049,12 +3057,6 @@ class OpenAIHandlerMixin:
 
         stream = body.get("stream", False)
 
-        # Learn from the original client payload before memory context or
-        # compression mutates it, mirroring the Responses and Anthropic
-        # ingestion paths. Without this, chat/completions traffic (Copilot CLI,
-        # opencode, OpenAI SDKs) fed nothing to the learner (part of #2060).
-        await self._observe_openai_chat_traffic(original_client_messages, request_id=request_id)
-
         # Bypass: skip ALL compression for explicit opt-out
         _bypass = self._headroom_bypass_enabled(request.headers)
         if _bypass:
@@ -3187,6 +3189,12 @@ class OpenAIHandlerMixin:
                     getattr(self.memory_handler.config, "project_root_override", "") or None
                 ),
             )
+
+        await self._observe_openai_chat_traffic(
+            original_client_messages,
+            request_id=request_id,
+            request_context=memory_request_ctx,
+        )
 
         # Canonical memory-injection gate (parallels Anthropic). Pre-
         # PR-this the inline conjunction at the memory site silently
@@ -5115,10 +5123,6 @@ class OpenAIHandlerMixin:
         bind_scope(tags, request.scope)
         client = classify_client(headers)
 
-        # Learn from the original client payload before memory context or
-        # compression mutates it. This mirrors the Anthropic ingestion path.
-        await self._observe_openai_responses_traffic(body, request_id=request_id)
-
         # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
         # headers AFTER `_extract_tags` reads them. Memory user-id reads
         # `request.headers` below.
@@ -5219,6 +5223,12 @@ class OpenAIHandlerMixin:
                     getattr(self.memory_handler.config, "project_root_override", "") or None
                 ),
             )
+
+        await self._observe_openai_responses_traffic(
+            body,
+            request_id=request_id,
+            request_context=memory_request_ctx,
+        )
 
         # Rate limiting
         if self.rate_limiter:
@@ -6029,13 +6039,13 @@ class OpenAIHandlerMixin:
                                 except (json.JSONDecodeError, TypeError):
                                     args = {}
 
-                                await self.memory_handler._ensure_initialized()
-                                if self.memory_handler._backend:
-                                    result = await self.memory_handler._execute_memory_tool(
-                                        name, args, memory_user_id, "openai"
-                                    )
-                                else:
-                                    result = json.dumps({"error": "Memory backend not initialized"})
+                                result = await self.memory_handler._execute_memory_tool(
+                                    name,
+                                    args,
+                                    memory_user_id,
+                                    "openai",
+                                    request_context=memory_request_ctx,
+                                )
 
                                 tool_outputs.append(
                                     {
@@ -8359,16 +8369,13 @@ class OpenAIHandlerMixin:
                                     except (json.JSONDecodeError, TypeError):
                                         fc_args = {}
 
-                                    await self.memory_handler._ensure_initialized()
-                                    if self.memory_handler._backend:
-                                        result = await self.memory_handler._execute_memory_tool(
-                                            fc_name,
-                                            fc_args,
-                                            memory_user_id,
-                                            "openai",
-                                        )
-                                    else:
-                                        result = json.dumps({"error": "backend not ready"})
+                                    result = await self.memory_handler._execute_memory_tool(
+                                        fc_name,
+                                        fc_args,
+                                        memory_user_id,
+                                        "openai",
+                                        request_context=memory_request_ctx,
+                                    )
 
                                     tool_outputs.append(
                                         {

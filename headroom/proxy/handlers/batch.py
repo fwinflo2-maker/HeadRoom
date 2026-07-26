@@ -109,7 +109,10 @@ class BatchHandlerMixin:
         # handle_google_batch_results already passes through on a missing one.
         if _headroom_bypass_enabled(request.headers):
             logger.info(f"[{request_id}] Google batch: compression skipped: reason=bypass_header")
-            return await self._google_batch_passthrough(request, model, body)
+            # Pass body=None so the helper forwards the original wire bytes.
+            # Handing it the parsed dict would re-serialize canonically and log
+            # body_mutated=True, which is the opposite of what bypass promises.
+            return await self._google_batch_passthrough(request, model, None)
 
         # Extract headers
         headers = dict(request.headers.items())

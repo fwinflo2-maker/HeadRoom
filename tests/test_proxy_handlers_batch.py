@@ -1542,3 +1542,37 @@ async def test_batch_passthrough_records_request_outcome(
     recorded = handler.metrics.record_calls[0]
     assert recorded["provider"] == "openai"
     assert recorded["tokens_saved"] == 0
+
+
+@pytest.mark.asyncio
+async def test_google_batch_bypass_forwards_original_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bypass on the Google path must forward the wire bytes untouched.
+
+    The sibling bypass test stubs _google_batch_passthrough, so it proves
+    routing but not the contract. This one lets the real helper run: handing
+    it the parsed dict re-serializes canonically (dropping the client's
+    whitespace) and logs body_mutated=True, which is what bypass forbids.
+    """
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    handler.http_client.post_response = FakeResponse(content=b"ok")
+
+    raw = (
+        '{"batch": {"input_config": {"requests": {"requests": '
+        '[{"request": {"contents": [{"parts": [{"text": "hi"}]}]}, '
+        '"metadata": {"key": "r1"}}]}}},  "spaced":  true}'
+    )
+
+    async def request_payload(request):  # noqa: ANN001
+        return json.loads(raw)
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+
+    await handler.handle_google_batch_create(
+        FakeRequest(raw, headers={"x-headroom-bypass": "true"}),
+        "gemini-2.0-flash",
+    )
+
+    assert handler.http_client.posts[-1]["content"] == raw.encode("utf-8")

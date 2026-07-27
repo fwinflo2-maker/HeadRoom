@@ -1314,9 +1314,14 @@ async def test_handle_batch_create_bypass_skips_compression_entirely(
         called.append("upload")
         return "file-2"
 
+    # Records rather than raising. handle_batch_create wraps its whole body in
+    # `except Exception`, which swallows an AssertionError and books a 500 — so
+    # that message never reached anyone, and `called` below is the real guard.
+    # The zero-request stats short-circuit the reverted path at the
+    # total_requests==0 check, before it can reach the upload.
     async def fail_compress(content, request_id):  # noqa: ANN001
         called.append("compress")
-        raise AssertionError("compression ran despite bypass")
+        return [], {"total_requests": 0}
 
     monkeypatch.setattr(handler, "_download_openai_file", fail_download)
     monkeypatch.setattr(handler, "_upload_openai_file", fail_upload)

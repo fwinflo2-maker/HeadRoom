@@ -136,9 +136,13 @@ class BatchHandlerMixin:
             request_id=request_id,
         )
 
-        # Commercial gate, as on the OpenAI batch path. Fails open: no
-        # reporter configured, or no license info yet, both mean compress.
-        license_ok = self.usage_reporter.should_compress if self.usage_reporter else True
+        # Commercial gate — the other half of the conjunction the shared decision
+        # factory applies. Fails open: no reporter configured, or no license info
+        # yet, both mean compress. `is not None` rather than truthiness so this
+        # cannot drift from compression_decision.py:120, which spells it that way.
+        license_ok = (
+            self.usage_reporter.should_compress if self.usage_reporter is not None else True
+        )
         if not license_ok:
             logger.info(f"[{request_id}] Compression skipped: reason=license_denied")
             tags["passthrough_reason"] = "license_denied"
@@ -1131,10 +1135,11 @@ class BatchHandlerMixin:
         from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
 
-        # Commercial gate, the other half of the conjunction the shared
-        # decision factory applies. Fails open: no reporter configured, or
-        # no license info yet, both mean compress.
-        license_ok = self.usage_reporter.should_compress if self.usage_reporter else True
+        # Same commercial gate as handle_google_batch_create — see there for why
+        # it fails open and why `is not None` matches the decision factory.
+        license_ok = (
+            self.usage_reporter.should_compress if self.usage_reporter is not None else True
+        )
         if not license_ok:
             logger.info(f"[{request_id}] Compression skipped: reason=license_denied")
 

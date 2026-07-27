@@ -888,6 +888,27 @@ def _setup_rtk(verbose: bool = False) -> Path | None:
     return rtk_path
 
 
+def _link_managed_rtk_into(target_dir: Path, target: Path) -> Path | None:
+    """Symlink ``target_dir/rtk`` -> managed rtk, conservatively.
+
+    Returns the link if it now points at ``target`` (created or already correct),
+    else ``None``. Never clobbers an existing real file or a foreign symlink.
+    """
+    link = target_dir / "rtk"
+    try:
+        if link.is_symlink() and link.resolve() == target:
+            return link
+        # Never clobber a real file or a link pointing elsewhere.
+        if link.exists() or link.is_symlink():
+            return None
+        if not target_dir.is_dir() or not os.access(target_dir, os.W_OK):
+            return None
+        link.symlink_to(target)
+        return link
+    except OSError:
+        return None
+
+
 def _ensure_rtk_on_path(rtk_path: Path, path_dirs: list[str] | None = None) -> Path | None:
     """Make the Headroom-managed rtk resolvable as a bare ``rtk`` on PATH.
 
@@ -906,59 +927,58 @@ def _ensure_rtk_on_path(rtk_path: Path, path_dirs: list[str] | None = None) -> P
     leave the canonical hook untouched and link the managed binary into a PATH
     directory so bare ``rtk`` resolves.
 
+    A bare ``rtk`` that resolves in the *interactive* shell is not enough: agents
+    launched from a GUI (e.g. Claude Code) execute their PreToolUse hook with a
+    different, minimal PATH that often excludes the dir the interactive lookup
+    found — so ``rtk hook`` fails with ``No such file or directory`` even though
+    ``rtk`` is "on PATH" (issue #1955). To cover that, always ensure a managed
+    link in ``~/.local/bin`` — the durable, conventional user bin those hook
+    PATHs typically include — regardless of whether some other ``rtk`` already
+    resolves. When bare ``rtk`` still would not resolve on the current PATH, also
+    link into the first writable PATH dir.
+
     Idempotent and conservative:
-      * no-op if a ``rtk`` already resolves on PATH (managed or system);
+      * always keeps a managed ``~/.local/bin/rtk`` link (created on demand);
       * no-op on Windows (symlinks need privilege; hooks resolve differently);
       * only creates/refreshes a symlink Headroom owns — never clobbers an
         existing real file or foreign binary.
 
-    Returns the link path that was created or already correct, else ``None``.
+    Returns a link path that was created or already correct, else ``None``.
     """
     if sys.platform == "win32":
-        return None
-
-    # A bare `rtk` already resolves — the hook will find it, nothing to do.
-    if shutil.which("rtk"):
         return None
 
     if path_dirs is None:
         path_dirs = os.environ.get("PATH", "").split(os.pathsep)
 
+    target = rtk_path.resolve()
     preferred = Path.home() / ".local" / "bin"
 
-    # Prefer ~/.local/bin (conventionally on PATH), then any other PATH dir.
-    ordered: list[Path] = []
-    if str(preferred) in path_dirs:
-        ordered.append(preferred)
-    for entry in path_dirs:
-        if not entry:
-            continue
-        candidate = Path(entry)
-        if candidate not in ordered:
-            ordered.append(candidate)
+    # Always guarantee a managed link in ~/.local/bin so a GUI-launched hook's
+    # PATH can resolve bare `rtk` even when the interactive shell found it
+    # elsewhere (#1955). Create it on demand; never clobber a foreign rtk.
+    try:
+        preferred.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    primary = _link_managed_rtk_into(preferred, target)
 
-    target = rtk_path.resolve()
-
-    for target_dir in ordered:
-        link = target_dir / "rtk"
-        try:
-            # Existing correct link — done.
-            if link.is_symlink() and link.resolve() == target:
-                return link
-            # Never clobber a real file or a link pointing elsewhere.
-            if link.exists() or link.is_symlink():
+    # If bare `rtk` still would not resolve on the current PATH, also link into
+    # the first writable PATH dir so terminal-launched setups (where ~/.local/bin
+    # may not be on PATH) resolve it too.
+    fallback: Path | None = None
+    if not shutil.which("rtk"):
+        for entry in path_dirs:
+            if not entry:
                 continue
-            # Create ~/.local/bin on demand; other PATH dirs must already exist.
-            if target_dir == preferred:
-                target_dir.mkdir(parents=True, exist_ok=True)
-            if not target_dir.is_dir() or not os.access(target_dir, os.W_OK):
+            candidate = Path(entry)
+            if candidate == preferred:
                 continue
-            link.symlink_to(target)
-            return link
-        except OSError:
-            continue
+            fallback = _link_managed_rtk_into(candidate, target)
+            if fallback is not None:
+                break
 
-    return None
+    return primary or fallback
 
 
 def _setup_lean_ctx_agent(agent: str, verbose: bool = False) -> Path | None:

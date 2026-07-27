@@ -75,6 +75,12 @@ def _require_manifest(profile: str) -> DeploymentManifest:
     return manifest
 
 
+def _is_windows() -> bool:
+    """Return whether this command is running on Windows."""
+
+    return sys.platform.startswith("win")
+
+
 def _start_deployment(manifest: DeploymentManifest, *, assume_start_lock: bool = False) -> None:
     if not assume_start_lock:
         with acquire_runtime_start_lock(manifest.profile) as acquired:
@@ -593,6 +599,16 @@ def install_apply(
         bedrock_profile=bedrock_profile,
         extra_env=combined_env,
     )
+    if (
+        preset == InstallPreset.PERSISTENT_SERVICE.value
+        and manifest.preset == InstallPreset.PERSISTENT_TASK.value
+        and _is_windows()
+    ):
+        click.echo(
+            "Warning: persistent-service is not supported on Windows because the "
+            "Python runner cannot act as a Windows service. Falling back to "
+            "persistent-task with Task Scheduler."
+        )
 
     _apply_manifest(manifest)
     _echo_installed(manifest)

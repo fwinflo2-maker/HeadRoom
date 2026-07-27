@@ -1026,6 +1026,47 @@ def _openai_responses_to_sse(response: dict[str, Any]) -> list[bytes]:
     return events
 
 
+def _openai_responses_from_sse(sse_text: str) -> dict[str, Any] | None:
+    """Reassemble the final Responses API JSON body from an SSE stream.
+
+    Inverse of ``_openai_responses_to_sse``, for upstreams that answer a
+    ``stream: false`` request with a valid ``200 text/event-stream`` body
+    (#2613). The terminal ``response.completed`` event carries the complete
+    response object, so no delta accumulation is needed. Returns ``None``
+    when no terminal event is present — the caller forwards the raw body
+    unchanged in that case.
+    """
+    completed: dict[str, Any] | None = None
+    data_lines: list[str] = []
+
+    def _consume(lines: list[str]) -> None:
+        nonlocal completed
+        if not lines:
+            return
+        data_str = "\n".join(lines)
+        if data_str == "[DONE]":
+            return
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            return
+        if isinstance(data, dict) and data.get("type") == "response.completed":
+            response = data.get("response")
+            if isinstance(response, dict):
+                completed = response
+
+    for raw_line in sse_text.split("\n"):
+        line = raw_line.rstrip("\r")
+        if not line:
+            _consume(data_lines)
+            data_lines = []
+        elif line.startswith("data:"):
+            # Per the SSE spec, strip at most one leading space after the colon.
+            data_lines.append(line[5:].removeprefix(" "))
+    _consume(data_lines)
+    return completed
+
+
 def _output_shaping_holdout_fraction() -> float:
     from headroom.proxy import runtime_env
 
@@ -5136,6 +5177,45 @@ class OpenAIHandlerMixin:
                         metadata={"stream": stream, "auth_mode": auth_mode.value},
                     )
                     total_latency = (time.time() - start_time) * 1000
+
+                    # Some OpenAI-compatible upstreams answer a ``stream: false``
+                    # request with a valid 200 SSE body carrying Responses API
+                    # events (#2613). Reassemble the terminal response JSON so
+                    # the buffered path keeps working — previously
+                    # ``response.json()`` raised JSONDecodeError past the
+                    # narrow usage-extraction catch below and the successful
+                    # upstream reply surfaced as a 502 proxy_error.
+                    upstream_content_type = response.headers.get("content-type", "")
+                    if (
+                        response.status_code == 200
+                        and "text/event-stream" in upstream_content_type.lower()
+                    ):
+                        completed_json = _openai_responses_from_sse(response.text)
+                        if completed_json is None:
+                            # No terminal event to adapt — forward the
+                            # successful upstream body unchanged rather than
+                            # fabricating a 502.
+                            return Response(
+                                content=response.content,
+                                status_code=response.status_code,
+                                headers=_sanitize_forwarded_response_headers(response.headers),
+                            )
+                        adapted_headers = {
+                            k: v
+                            for k, v in response.headers.items()
+                            if k.lower()
+                            not in (
+                                "content-type",
+                                "content-length",
+                                "content-encoding",
+                                "transfer-encoding",
+                            )
+                        }
+                        response = httpx.Response(
+                            status_code=response.status_code,
+                            content=json.dumps(completed_json).encode(),
+                            headers={**adapted_headers, "content-type": "application/json"},
+                        )
 
                     total_input_tokens = original_tokens  # fallback
                     output_tokens = 0

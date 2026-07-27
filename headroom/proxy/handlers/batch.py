@@ -98,21 +98,26 @@ class BatchHandlerMixin:
         requests_wrapper = input_config.get("requests", {})
         requests_list = requests_wrapper.get("requests", [])
 
-        if not requests_list:
-            # No inline requests - might be using file input, pass through
-            logger.debug(f"[{request_id}] Google batch: No inline requests, passing through")
-            return await self._google_batch_passthrough(request, model, body)
-
-        # Same bypass contract as the OpenAI batch path below. Skipping the
-        # compression loop also skips the CCR context store, which is correct:
-        # that store only exists to resolve markers left BY compression, and
-        # handle_google_batch_results already passes through on a missing one.
+        # Same bypass contract as the OpenAI batch path below, and it has to sit
+        # above the empty-requests return — a file-input batch carries no inline
+        # `requests`, and that return hands the helper the parsed dict, which
+        # re-serializes canonically. Kept below the extraction so a later
+        # CompressionDecision migration can pass `requests_list` as messages.
+        # Skipping the compression loop also skips the CCR context store, which
+        # is correct: that store only exists to resolve markers left BY
+        # compression, and handle_google_batch_results already passes through on
+        # a missing one.
         if _headroom_bypass_enabled(request.headers):
             logger.info(f"[{request_id}] Compression skipped: reason=bypass_header")
             # Pass body=None so the helper forwards the original wire bytes.
             # Handing it the parsed dict would re-serialize canonically and log
             # body_mutated=True, which is the opposite of what bypass promises.
             return await self._google_batch_passthrough(request, model, None)
+
+        if not requests_list:
+            # No inline requests - might be using file input, pass through
+            logger.debug(f"[{request_id}] Google batch: No inline requests, passing through")
+            return await self._google_batch_passthrough(request, model, body)
 
         # Extract headers
         headers = dict(request.headers.items())

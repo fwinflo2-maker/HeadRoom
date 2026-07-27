@@ -1694,3 +1694,35 @@ async def test_google_batch_create_skips_compression_when_license_denied(
 
     assert applied == []
     assert handler.metrics.record_calls[-1]["tokens_saved"] == 0
+
+
+@pytest.mark.asyncio
+async def test_google_batch_bypass_beats_the_empty_requests_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bypass must be checked above the empty-`requests` early return.
+
+    A file-input batch carries no inline `requests`, so it takes that return —
+    which hands `_google_batch_passthrough` the parsed dict and re-serializes
+    canonically, dropping the client's whitespace. Below the return, bypass
+    silently mutated exactly the bodies it promised not to touch.
+    """
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    handler.http_client.post_response = FakeResponse(content=b"ok")
+
+    # No inline requests (file input), and deliberately non-canonical spacing:
+    # a canonical re-serialize collapses it, so the byte compare catches it.
+    raw = '{"batch": {"input_config": {"file_name":  "files/abc"}},  "spaced":  true}'
+
+    async def request_payload(request):  # noqa: ANN001
+        return json.loads(raw)
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+
+    await handler.handle_google_batch_create(
+        FakeRequest(raw, headers={"x-headroom-bypass": "true"}),
+        "gemini-2.0-flash",
+    )
+
+    assert handler.http_client.posts[-1]["content"] == raw.encode("utf-8")

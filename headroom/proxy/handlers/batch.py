@@ -112,7 +112,7 @@ class BatchHandlerMixin:
             # Pass body=None so the helper forwards the original wire bytes.
             # Handing it the parsed dict would re-serialize canonically and log
             # body_mutated=True, which is the opposite of what bypass promises.
-            return await self._google_batch_passthrough(request, model, None)
+            return await self._google_batch_passthrough(request, model, None, "bypass_header")
 
         if not requests_list:
             # No inline requests - might be using file input, pass through
@@ -141,6 +141,7 @@ class BatchHandlerMixin:
         license_ok = self.usage_reporter.should_compress if self.usage_reporter else True
         if not license_ok:
             logger.info(f"[{request_id}] Compression skipped: reason=license_denied")
+            tags["passthrough_reason"] = "license_denied"
 
         # Track compression stats
         total_original_tokens = 0
@@ -403,6 +404,7 @@ class BatchHandlerMixin:
         request: Request,
         model: str,
         body: dict | None = None,
+        passthrough_reason: str | None = None,
     ) -> Response:
         """Pass through Google batch request without modification."""
         from fastapi.responses import Response
@@ -414,6 +416,9 @@ class BatchHandlerMixin:
         headers.pop("content-length", None)
         client = classify_client(headers)
         tags = extract_tags(headers)
+        # Same slice label the non-batch handlers get from apply_to_tags.
+        if passthrough_reason:
+            tags["passthrough_reason"] = passthrough_reason
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
@@ -891,7 +896,7 @@ class BatchHandlerMixin:
         # passthrough before the download/upload pair runs.
         if _headroom_bypass_enabled(request.headers):
             logger.info(f"[{request_id}] Compression skipped: reason=bypass_header")
-            return await self._batch_passthrough(request, body)
+            return await self._batch_passthrough(request, body, "bypass_header")
 
         headers = dict(request.headers.items())
         headers.pop("host", None)
@@ -929,6 +934,8 @@ class BatchHandlerMixin:
             # Step 2: Parse and compress each line
             logger.info(f"[{request_id}] Batch: Compressing JSONL content")
             compressed_lines, stats = await self._compress_batch_jsonl(file_content, request_id)
+            if stats.get("passthrough_reason"):
+                tags["passthrough_reason"] = stats["passthrough_reason"]
 
             if stats["total_requests"] == 0:
                 return JSONResponse(
@@ -1235,11 +1242,19 @@ class BatchHandlerMixin:
             "total_tokens_saved": total_tokens_saved,
             "savings_percent": savings_percent,
             "errors": errors,
+            # Surfaced so the caller can tag the outcome — the license is read
+            # here, but only the caller holds the tags the funnel sees.
+            "passthrough_reason": None if license_ok else "license_denied",
         }
 
         return compressed_lines, stats
 
-    async def _batch_passthrough(self, request: Request, body: dict) -> Response:
+    async def _batch_passthrough(
+        self,
+        request: Request,
+        body: dict,
+        passthrough_reason: str | None = None,
+    ) -> Response:
         """Pass through batch request to OpenAI without compression.
 
         Byte-faithful (PR-A3, fixes P0-2). The original request bytes are
@@ -1262,6 +1277,11 @@ class BatchHandlerMixin:
         headers.pop("content-length", None)
         client = classify_client(headers)
         tags = extract_tags(headers)
+        # What CompressionDecision.apply_to_tags stamps everywhere else, so the
+        # dashboard can slice passthrough traffic by cause instead of guessing
+        # why a batch reported zero savings.
+        if passthrough_reason:
+            tags["passthrough_reason"] = passthrough_reason
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         _pre_strip_count_obp = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
         headers = _strip_internal_headers(headers)

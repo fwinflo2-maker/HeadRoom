@@ -2885,6 +2885,14 @@ _TOOL_SEARCH_CORE_TOOLS = frozenset(
 )
 _TOOL_SEARCH_DEFAULT_TYPE = "tool_search_tool_regex_20251119"
 _TOOL_SEARCH_DEFAULT_NAME = "tool_search_tool_regex"
+# Harnesses that defer *client-side* (Claude Code with ENABLE_TOOL_SEARCH) keep the
+# deferred schemas in their own process and ship a plain function tool by this name
+# to load them on demand. Those schemas never reach the request body, so a
+# server-side search cannot see them: injecting one gives the model a second search
+# tool whose index is missing exactly the tools it is hunting for, and an empty
+# result reads as "that MCP server is down". Detected by name because the tool has
+# no ``type`` to match on.
+_CLIENT_SIDE_TOOL_SEARCH_NAMES = frozenset({"toolsearch", "tool_search"})
 # Below this many tools the ~search round-trip isn't worth it (Anthropic's own
 # guidance: standard calling is better under ~10 tools).
 _TOOL_SEARCH_MIN_TOOLS = 12
@@ -2901,8 +2909,9 @@ def inject_tool_search_deferral(
     """Return a new ``tools`` list with non-core tools deferred + a search tool
     injected, or the original list unchanged when injection doesn't apply.
 
-    No-op when: not a list, fewer than ``_TOOL_SEARCH_MIN_TOOLS``, a tool_search
-    tool is already present (client already defers), or nothing would be deferred.
+    No-op when: not a list, fewer than ``_TOOL_SEARCH_MIN_TOOLS``, the client already
+    defers (a ``tool_search_tool_*`` tool, or a client-side ``ToolSearch`` function
+    tool — see ``_CLIENT_SIDE_TOOL_SEARCH_NAMES``), or nothing would be deferred.
 
     ``session_id`` makes deferral **sticky**: once a session has had tools
     deferred, the tool-count threshold stops applying to it. Without that, a
@@ -2930,10 +2939,15 @@ def inject_tool_search_deferral(
     if len(tools) < _TOOL_SEARCH_MIN_TOOLS and not session_has_deferred(session_id):
         return tools
     for tool in tools:
-        if isinstance(tool, dict) and str(tool.get("type", "")).startswith(
-            _TOOL_SEARCH_TOOL_TYPE_PREFIX
-        ):
+        if not isinstance(tool, dict):
+            continue
+        if str(tool.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX):
             return tools  # client already uses tool search — leave it alone
+        if (
+            not tool.get("type")
+            and str(tool.get("name", "")).lower() in _CLIENT_SIDE_TOOL_SEARCH_NAMES
+        ):
+            return tools  # client defers client-side — a second index would be blind
 
     search_tool = {"type": search_type, "name": search_name}
     out: list[Any] = [search_tool]
@@ -2942,8 +2956,17 @@ def inject_tool_search_deferral(
     last_resident_real: dict[str, Any] | None = None
     resident_has_cache_control = False
 
+    # Core names are compared case-insensitively: ``core_tools`` is spelled in
+    # opencode's snake_case, while Claude-Code-shaped harnesses name the same tools
+    # ``Read``/``Edit``/``Bash``. An exact match there deferred the whole edit/read/run
+    # loop and charged a search round-trip per edit.
+    core_lower = {name.lower() for name in core_tools}
     for tool in tools:
-        if not isinstance(tool, dict) or tool.get("type") or tool.get("name") in core_tools:
+        if (
+            not isinstance(tool, dict)
+            or tool.get("type")
+            or str(tool.get("name", "")).lower() in core_lower
+        ):
             # Non-dict, server/typed tools (web_search, computer, …), and core
             # tools stay resident and unchanged.
             out.append(tool)

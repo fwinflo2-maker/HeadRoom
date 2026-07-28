@@ -257,3 +257,30 @@ def test_non_dict_and_typed_tools_stay_resident() -> None:
     out = inject_tool_search_deferral(tools)
     typed = [t for t in out if t.get("type") == "web_search_20250305"]
     assert len(typed) == 1 and typed[0].get("defer_loading") is None
+
+
+def test_noop_when_client_defers_client_side_via_toolsearch() -> None:
+    # Claude Code with ENABLE_TOOL_SEARCH keeps the deferred schemas in its own
+    # process and ships a plain `ToolSearch` function tool. Those schemas never
+    # reach the request body, so a server-side search index would be blind to
+    # exactly the tools the model hunts for — an empty result the model reads as
+    # "that MCP server is down".
+    tools = _tools(20) + [
+        {"name": "ToolSearch", "description": "load deferred", "input_schema": {}}
+    ]
+    assert inject_tool_search_deferral(tools) is tools
+    # sticky sessions must not override the guard either
+    assert inject_tool_search_deferral(tools, session_id="s-cc") is tools
+
+
+def test_core_tools_match_case_insensitively() -> None:
+    # `core_tools` is spelled snake_case (opencode); Claude-Code-shaped harnesses
+    # name the same tools Read/Edit/Bash. An exact match deferred the whole
+    # edit/read/run loop.
+    pascal = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Task", "WebFetch"]
+    tools = [{"name": n, "input_schema": {}} for n in pascal] + _tools(12)
+    out = inject_tool_search_deferral(tools)
+    by_name = {t.get("name"): t for t in out if "name" in t}
+    for name in pascal:
+        assert by_name[name].get("defer_loading") is None, name
+    assert by_name["mcp_tool_5"].get("defer_loading") is True

@@ -41,7 +41,6 @@ MODEL_ALIASES: dict[str, str] = {
 
 MODEL_PREFIX_RULES: tuple[LiteLLMModelPrefixRule, ...] = (
     LiteLLMModelPrefixRule("claude-", "anthropic/"),
-    LiteLLMModelPrefixRule("claude-", "vertex_ai/"),
     LiteLLMModelPrefixRule("gpt-", "openai/"),
     LiteLLMModelPrefixRule("o1-", "openai/"),
     LiteLLMModelPrefixRule("o3-", "openai/"),
@@ -75,7 +74,8 @@ def resolution_candidates(model: str) -> tuple[str, ...]:
     # If the model has a Vertex @YYYYMMDD version suffix, also try the bare
     # name. Vertex appends these at runtime; LiteLLM stores bare names only.
     bare = _strip_vertex_version_suffix(model)
-    if bare != model:
+    is_vertex_versioned = bare != model
+    if is_vertex_versioned:
         candidates.append(bare)
 
     # Apply prefix rules to both the original and bare name so that e.g.
@@ -87,6 +87,13 @@ def resolution_candidates(model: str) -> tuple[str, ...]:
             for candidate in (rule.candidate_for(m),)
             if candidate is not None
         )
+
+    # Only add vertex_ai/ candidates for models with @YYYYMMDD suffix —
+    # these are known Vertex-routed models. Non-versioned models should not
+    # get vertex_ai/ candidates to avoid matching wrong pricing tier.
+    if is_vertex_versioned:
+        for m in dict.fromkeys([model, bare]):
+            candidates.append(f"vertex_ai/{m}")
 
     alias = MODEL_ALIASES.get(model) or MODEL_ALIASES.get(bare)
     if alias:

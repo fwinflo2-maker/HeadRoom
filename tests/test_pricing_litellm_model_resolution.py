@@ -25,7 +25,7 @@ def test_resolution_candidates_try_bare_then_matching_prefix_then_alias() -> Non
     candidates = resolution_candidates(retired)
     assert candidates[0] == retired
     assert f"anthropic/{retired}" in candidates
-    assert f"vertex_ai/{retired}" in candidates
+    assert f"vertex_ai/{retired}" not in candidates  # no @YYYYMMDD suffix = not Vertex
     assert MODEL_ALIASES[retired] in candidates
 
 
@@ -70,18 +70,21 @@ def test_strip_vertex_version_suffix() -> None:
 
 
 def test_resolution_candidates_vertex_versioned_models() -> None:
-    # Vertex appends @YYYYMMDD — bare name must appear as a candidate
+    # Vertex appends @YYYYMMDD — bare name and vertex_ai/ must be candidates
     candidates = resolution_candidates("claude-haiku-4-5@20251001")
     assert "claude-haiku-4-5" in candidates
     assert "anthropic/claude-haiku-4-5" in candidates
+    assert "vertex_ai/claude-haiku-4-5" in candidates  # vertex_ai/ only for versioned
 
     candidates = resolution_candidates("claude-opus-4@20250514")
     assert "claude-opus-4" in candidates
     assert "anthropic/claude-opus-4" in candidates
+    assert "vertex_ai/claude-opus-4" in candidates
 
-    # Non-versioned names should work as before
+    # Non-versioned names should NOT get vertex_ai/ candidates
     candidates = resolution_candidates("claude-sonnet-4-6")
     assert candidates[0] == "claude-sonnet-4-6"
+    assert "vertex_ai/claude-sonnet-4-6" not in candidates
     assert "anthropic/claude-sonnet-4-6" in candidates
 
 

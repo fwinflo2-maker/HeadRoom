@@ -400,6 +400,29 @@ def _anthropic_tool_use_msg(name=CCR_TOOL_NAME):
     }
 
 
+def _tool_search_result_msg(name=CCR_TOOL_NAME):
+    """The server-side tool-search shape: references nested in a DICT ``content``."""
+    return {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "server_tool_use",
+                "id": "srvtoolu_1",
+                "name": "tool_search_tool_regex",
+                "input": {"pattern": "retrieve"},
+            },
+            {
+                "type": "tool_search_tool_result",
+                "tool_use_id": "srvtoolu_1",
+                "content": {
+                    "type": "tool_search_tool_search_result",
+                    "tool_references": [{"type": "tool_reference", "tool_name": name}],
+                },
+            },
+        ],
+    }
+
+
 def _openai_tool_call_msg(name=CCR_TOOL_NAME):
     return {
         "role": "assistant",
@@ -422,7 +445,7 @@ def test_transcript_ref_matches_anthropic_tool_use():
 
 
 def test_transcript_ref_matches_nested_one_level():
-    """tool_search_tool_result / tool_result nest the reference one level down."""
+    """The mid-conversation tool_reference shape keys the tool as ``name``."""
     msg = {
         "role": "user",
         "content": [
@@ -436,11 +459,43 @@ def test_transcript_ref_matches_nested_one_level():
     assert transcript_references_ccr_tool([msg]) is True
 
 
+def test_transcript_ref_matches_tool_search_tool_result():
+    """The production shape: a tool-search result nests references in a DICT content.
+
+    ``inject_tool_search_deferral`` marks headroom_retrieve ``defer_loading`` when
+    HEADROOM_TOOL_SEARCH is on, so the model discovers it via tool search and the
+    transcript accumulates this block. Replaying it without the tool in ``tools``
+    is what produces the 400 this scan recovers from.
+    """
+    assert transcript_references_ccr_tool([_tool_search_result_msg()]) is True
+
+
+def test_transcript_ref_matches_custom_tool_search_tool_result():
+    """Client-side tool search returns tool_reference (``tool_name``) in a list content."""
+    msg = {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_9",
+                "content": [{"type": "tool_reference", "tool_name": CCR_TOOL_NAME}],
+            }
+        ],
+    }
+    assert transcript_references_ccr_tool([msg]) is True
+
+
 def test_transcript_ref_ignores_mcp_prefixed_name():
     """Client-owned mcp__headroom__headroom_retrieve must NOT trigger injection."""
-    ref = _anthropic_tool_reference_msg(name="mcp__headroom__headroom_retrieve")
-    use = _anthropic_tool_use_msg(name="mcp__headroom__headroom_retrieve")
-    assert transcript_references_ccr_tool([ref, use]) is False
+    mcp_name = "mcp__headroom__headroom_retrieve"
+    messages = [
+        _anthropic_tool_reference_msg(name=mcp_name),
+        _anthropic_tool_use_msg(name=mcp_name),
+        # Same guard on the tool_name spelling and the nested search-result shape.
+        {"role": "user", "content": [{"type": "tool_reference", "tool_name": mcp_name}]},
+    ]
+    assert transcript_references_ccr_tool(messages) is False
+    assert transcript_references_ccr_tool([_tool_search_result_msg(mcp_name)]) is False
 
 
 def test_transcript_ref_tolerates_string_and_malformed_content():

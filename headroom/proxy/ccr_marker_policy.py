@@ -99,24 +99,35 @@ def transcript_references_ccr_tool(
 
 
 def _anthropic_content_references_tool(content: Any, tool_name: str) -> bool:
-    """Match a bare ``tool_name`` in tool_reference/tool_use blocks (one level deep)."""
+    """Match a bare ``tool_name`` in tool_reference/tool_use blocks (one level deep).
+
+    The two block types key the tool differently, so the match is split by type:
+    ``tool_use`` carries ``name``, while a ``tool_reference`` carries ``tool_name``
+    (tool-search results and the custom client-side tool-search shape) or ``name``
+    (the mid-conversation ``tool_addition``/``tool_removal`` shape).
+    """
     if not isinstance(content, list):
         return False
 
     def matches(block: Any) -> bool:
-        return (
-            isinstance(block, dict)
-            and block.get("type") in ("tool_reference", "tool_use")
-            and block.get("name") == tool_name
-        )
+        if not isinstance(block, dict):
+            return False
+        block_type = block.get("type")
+        if block_type == "tool_reference":
+            return tool_name in (block.get("tool_name"), block.get("name"))
+        return block_type == "tool_use" and block.get("name") == tool_name
 
     for block in content:
         if not isinstance(block, dict):
             continue
         if matches(block):
             return True
-        # tool_search_tool_result / tool_result nest blocks one level down.
+        # ``tool_result`` nests a plain list of blocks; ``tool_search_tool_result``
+        # nests a ``tool_search_tool_search_result`` dict whose ``tool_references``
+        # holds them.
         nested = block.get("content")
+        if isinstance(nested, dict):
+            nested = nested.get("tool_references")
         if isinstance(nested, list) and any(matches(inner) for inner in nested):
             return True
     return False

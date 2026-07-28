@@ -2441,7 +2441,7 @@ class AnthropicHandlerMixin:
                 from headroom.proxy.helpers import inject_tool_search_deferral
 
                 _ts_before = body.get("tools")
-                _ts_after = inject_tool_search_deferral(_ts_before)
+                _ts_after = inject_tool_search_deferral(_ts_before, session_id=session_id)
                 if _ts_after is not _ts_before:
                     _ts_deferred = [
                         t for t in _ts_after if isinstance(t, dict) and t.get("defer_loading")
@@ -2494,6 +2494,37 @@ class AnthropicHandlerMixin:
                 if _req_ctx.tools is not body.get("tools"):
                     tools = _req_ctx.tools
                     body["tools"] = tools
+
+            # Dangling tool_reference recovery. Every name the transcript
+            # references must still have a definition in `tools` or Anthropic 400s
+            # ("Tool reference 'X' not found in available tools"). Tools leave the
+            # array for reasons outside this proxy — an MCP server disconnects, the
+            # client trims its surface for a subagent turn — while the transcript
+            # keeps replaying the reference, so reconcile the two once the outbound
+            # tools and messages are final (post turn hooks). Best-effort: a bug
+            # here must never block forwarding.
+            try:
+                from headroom.proxy.tool_search_recovery import reconcile_tool_references
+
+                _recon = reconcile_tool_references(
+                    optimized_messages, body.get("tools"), session_id=session_id
+                )
+                if _recon.changed:
+                    if _recon.tools is not body.get("tools"):
+                        tools = _recon.tools
+                        body["tools"] = tools
+                    if _recon.messages is not optimized_messages:
+                        optimized_messages = _recon.messages
+                        body["messages"] = optimized_messages
+                    body_mutation_tracker.mark_mutated("tool_reference_recovery")
+                    logger.info(
+                        "[%s] tool_reference recovery: re-injected=%s sanitized=%s",
+                        request_id,
+                        _recon.reinjected,
+                        _recon.sanitized,
+                    )
+            except Exception:
+                logger.debug("tool_reference recovery skipped", exc_info=True)
 
             # Consistency: report tok_before/tok_after with ONE tokenizer. The pipeline
             # and the handler use different token estimators, and cache-mode branches

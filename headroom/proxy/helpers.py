@@ -2893,6 +2893,7 @@ _TOOL_SEARCH_MIN_TOOLS = 12
 def inject_tool_search_deferral(
     tools: Any,
     *,
+    session_id: str | None = None,
     core_tools: frozenset[str] = _TOOL_SEARCH_CORE_TOOLS,
     search_type: str = _TOOL_SEARCH_DEFAULT_TYPE,
     search_name: str = _TOOL_SEARCH_DEFAULT_NAME,
@@ -2903,13 +2904,30 @@ def inject_tool_search_deferral(
     No-op when: not a list, fewer than ``_TOOL_SEARCH_MIN_TOOLS``, a tool_search
     tool is already present (client already defers), or nothing would be deferred.
 
+    ``session_id`` makes deferral **sticky**: once a session has had tools
+    deferred, the tool-count threshold stops applying to it. Without that, a
+    client whose surface shrinks mid-session (an MCP server disconnects, a
+    subagent turn ships fewer tools) drops below the threshold, the search tool
+    and every deferred definition vanish from ``tools``, and Anthropic 400s on the
+    ``tool_reference`` blocks the transcript still replays. The deferred
+    definitions are also remembered so
+    :func:`headroom.proxy.tool_search_recovery.reconcile_tool_references` can
+    restore any that later go missing.
+
     Invariants enforced (else Anthropic 400s): the search tool is never deferred;
     at least one tool stays non-deferred; a deferred tool never carries
     ``cache_control`` — if the client's tools cache breakpoint sat on a now-deferred
     tool, it is moved to the last non-deferred real tool so the (smaller) tools
     prefix still caches.
     """
-    if not isinstance(tools, list) or len(tools) < _TOOL_SEARCH_MIN_TOOLS:
+    from headroom.proxy.tool_search_recovery import (
+        remember_deferred_tools,
+        session_has_deferred,
+    )
+
+    if not isinstance(tools, list):
+        return tools
+    if len(tools) < _TOOL_SEARCH_MIN_TOOLS and not session_has_deferred(session_id):
         return tools
     for tool in tools:
         if isinstance(tool, dict) and str(tool.get("type", "")).startswith(
@@ -2942,13 +2960,20 @@ def inject_tool_search_deferral(
         out.append(new_tool)
         deferred += 1
 
-    if deferred == 0:
+    if deferred == 0 and not session_has_deferred(session_id):
         return tools  # nothing to defer → don't perturb the cache prefix
+    # Sticky sessions keep the search tool declared even on a turn with nothing to
+    # defer: the transcript still carries ``server_tool_use`` blocks naming it, and
+    # a search tool that comes and goes orphans them. Stable beats absent for the
+    # tools cache prefix too.
     # Preserve a tools cache breakpoint: if we stripped cache_control off a
     # deferred tool and no resident tool carries one, move it to the last
     # resident real tool (never the search tool, to keep its shape canonical).
     if dropped_cache_control and not resident_has_cache_control and last_resident_real is not None:
         last_resident_real["cache_control"] = {"type": "ephemeral"}
+    # Remember what we deferred so a later turn can restore any definition the
+    # client stops sending, and so deferral stays sticky for this session.
+    remember_deferred_tools(session_id, out)
     return out
 
 

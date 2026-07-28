@@ -3276,6 +3276,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     @app.get("/debug/warmup", dependencies=[Depends(_require_loopback)])
     async def debug_warmup():
+        # Reconcile Kompress status the same way /health does (see
+        # _reconcile_kompress_health) before serializing, otherwise a
+        # deferred-at-startup load that finishes later never gets reflected
+        # here and this endpoint reports "deferred" forever.
+        _reconcile_kompress_health()
         warmup_registry = getattr(proxy, "warmup", None)
         payload = warmup_registry.to_dict() if warmup_registry is not None else {}
         payload["runtime"] = _runtime_payload()

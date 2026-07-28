@@ -464,12 +464,14 @@ class PrefixCacheTracker:
         # here so it shares the session's affinity and TTL cleanup.
         self.read_maturation_manager: Any = None
 
-        # Whether this conversation's forwarded system prompt has carried the
-        # output-shaping tail. The Anthropic handler consults this before
-        # mutating the system prompt of a conversation with an established
-        # frozen prefix: a prefix built without the tail must stay without it
-        # (and vice versa) or the provider cache is invalidated.
-        self.output_shaping_applied: bool = False
+        # The output-shaping verbosity level this conversation's forwarded
+        # system prompt was established at, or ``None`` if the handler has
+        # never shaped it. The Anthropic handler pins this level for as long as
+        # the frozen prefix stands: the tail is part of the cached prefix, so
+        # adding it, dropping it, or changing its level all invalidate the
+        # provider cache. Level 0 is a real pinned value (no tail) and is
+        # deliberately distinct from ``None`` (never shaped).
+        self.output_shaping_level: int | None = None
 
         # Stats
         self._busts_avoided: int = 0

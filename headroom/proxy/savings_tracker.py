@@ -148,6 +148,23 @@ def _normalize_provider(value: Any) -> str:
     return cleaned or PROVIDER_UNKNOWN
 
 
+AGENT_UNKNOWN = "unknown"
+
+
+def _normalize_agent(value: Any) -> str:
+    """Normalize a client/agent label, falling back to a stable sentinel.
+
+    The agent is the harness classified from User-Agent / X-Client
+    (claude-code, codex, opencode, grok_build, ...). Checkpoints persisted
+    before per-agent attribution existed have no agent field and collapse
+    into ``AGENT_UNKNOWN``.
+    """
+    if not isinstance(value, str):
+        return AGENT_UNKNOWN
+    cleaned = value.strip()
+    return cleaned or AGENT_UNKNOWN
+
+
 MODEL_UNKNOWN = "unknown"
 
 
@@ -616,6 +633,7 @@ class SavingsTracker:
         model: str,
         tokens_saved: int,
         provider: str | None = None,
+        agent: str | None = None,
         total_input_tokens: int | None = None,
         total_input_cost_usd: float | None = None,
         timestamp: datetime | str | None = None,
@@ -668,6 +686,7 @@ class SavingsTracker:
                 {
                     "timestamp": _to_utc_iso(timestamp_dt),
                     "provider": _normalize_provider(provider),
+                    "agent": _normalize_agent(agent),
                     "model": _normalize_model(model),
                     "total_tokens_saved": lifetime["tokens_saved"],
                     "compression_savings_usd": lifetime["compression_savings_usd"],
@@ -687,6 +706,7 @@ class SavingsTracker:
         tokens_saved: int,
         output_tokens_saved: int = 0,
         provider: str | None = None,
+        agent: str | None = None,
         project: str | None = None,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
@@ -842,6 +862,7 @@ class SavingsTracker:
                     {
                         "timestamp": _to_utc_iso(timestamp_dt),
                         "provider": _normalize_provider(provider),
+                        "agent": _normalize_agent(agent),
                         "model": _normalize_model(model),
                         "total_tokens_saved": lifetime["tokens_saved"],
                         "compression_savings_usd": lifetime["compression_savings_usd"],
@@ -1601,6 +1622,7 @@ class SavingsTracker:
                     "output_tokens_saved_delta": 0,
                     "output_savings_usd_delta": 0.0,
                     "by_provider": {},
+                    "by_agent": {},
                     "by_model": {},
                 },
             )
@@ -1647,6 +1669,32 @@ class SavingsTracker:
                 prov["total_input_tokens_delta"] += delta_input_tokens
                 prov["total_input_cost_usd_delta"] = round(
                     prov["total_input_cost_usd_delta"] + delta_input_cost_usd,
+                    6,
+                )
+
+                # Same single-owner attribution by agent. Providers cannot
+                # separate clients that share an upstream (Claude Code vs
+                # OpenCode both hit anthropic; Codex vs OpenCode both hit
+                # openai), so dashboards need this dimension for honest
+                # per-connector rows.
+                agent = _normalize_agent(point.get("agent"))
+                agent_entry = entry["by_agent"].setdefault(
+                    agent,
+                    {
+                        "tokens_saved": 0,
+                        "compression_savings_usd_delta": 0.0,
+                        "total_input_tokens_delta": 0,
+                        "total_input_cost_usd_delta": 0.0,
+                    },
+                )
+                agent_entry["tokens_saved"] += delta_tokens
+                agent_entry["compression_savings_usd_delta"] = round(
+                    agent_entry["compression_savings_usd_delta"] + delta_usd,
+                    6,
+                )
+                agent_entry["total_input_tokens_delta"] += delta_input_tokens
+                agent_entry["total_input_cost_usd_delta"] = round(
+                    agent_entry["total_input_cost_usd_delta"] + delta_input_cost_usd,
                     6,
                 )
 

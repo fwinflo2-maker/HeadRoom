@@ -51,16 +51,13 @@ def _capture_popen_kwargs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> di
     return captured
 
 
-def test_start_proxy_uses_safe_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """The proxy subprocess must run with -P so its cwd never shadows the
-    installed package -- e.g. `headroom wrap claude` invoked from inside a
-    checkout that has its own top-level `headroom/` package would otherwise
-    import that unbuilt source tree instead, dropping `headroom._core`."""
-    captured_cmd: list[Any] = []
+def _capture_proxy_command(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[Any]:
+    """Invoke ``_start_proxy`` with all I/O stubbed; return its command."""
+    captured: list[Any] = []
 
     def _fake_popen(cmd: Any, **kwargs: Any) -> _FakeProc:
-        captured_cmd.clear()
-        captured_cmd.extend(cmd)
+        captured.clear()
+        captured.extend(cmd)
         return _FakeProc()
 
     monkeypatch.setattr(wrap_cli.subprocess, "Popen", _fake_popen)
@@ -70,9 +67,37 @@ def test_start_proxy_uses_safe_path(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     monkeypatch.setattr(wrap_cli, "_resolve_wrap_proxy_timeout_seconds", lambda: 1)
 
     wrap_cli._start_proxy(8787)
+    return captured
+
+
+def test_start_proxy_uses_safe_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The proxy subprocess must run with -P so its cwd never shadows the
+    installed package -- e.g. `headroom wrap claude` invoked from inside a
+    checkout that has its own top-level `headroom/` package would otherwise
+    import that unbuilt source tree instead, dropping `headroom._core`."""
+    monkeypatch.setattr(wrap_cli.sys, "version_info", (3, 11, 0))
+
+    captured_cmd = _capture_proxy_command(monkeypatch, tmp_path)
 
     assert captured_cmd[0] == wrap_cli.sys.executable
     assert captured_cmd[1] == "-P"
+
+
+def test_start_proxy_uses_compat_runner_on_python_310(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Python 3.10 must remove cwd from sys.path without using unsupported ``-P``."""
+    monkeypatch.setattr(wrap_cli.sys, "version_info", (3, 10, 14))
+
+    captured_cmd = _capture_proxy_command(monkeypatch, tmp_path)
+
+    assert captured_cmd[:2] == [wrap_cli.sys.executable, "-c"]
+    assert "-P" not in captured_cmd
+    assert "sys.path.pop(0)" in captured_cmd[2]
+    assert (
+        "runpy.run_module('headroom.cli', run_name='__main__', alter_sys=True)" in captured_cmd[2]
+    )
+    assert captured_cmd[3:] == ["proxy", "--port", "8787"]
 
 
 def test_start_proxy_detaches_on_windows(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

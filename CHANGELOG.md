@@ -95,11 +95,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `min(4, cpu)` × 1). The ONNX embedder already capped its threads; this brings
   the torch path to parity
   ([#198](https://github.com/headroomlabs-ai/headroom/issues/198)).
-- `headroom wrap <tool>` now launches its proxy subprocess with `-P`
-  (`PYTHONSAFEPATH`). Without it, running `headroom wrap` from inside a
-  checkout that has its own top-level `headroom/` package (e.g. this repo)
-  shadowed the installed package with the unbuilt source tree, dropping the
-  compiled `headroom._core` extension and failing with
+- `headroom wrap <tool>` now keeps the launching cwd out of its proxy
+  subprocess's Python path. This prevents a checkout with its own top-level
+  `headroom/` package (e.g. this repo) from shadowing the installed package,
+  dropping the compiled `headroom._core` extension, and failing with
   `No module named 'headroom._core'`.
 
 ### Changed

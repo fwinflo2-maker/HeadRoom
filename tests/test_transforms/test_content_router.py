@@ -944,6 +944,50 @@ class TestExcludeTools:
         assert tool_result_block["content"] == messages[1]["content"][0]["content"]
         assert "router:excluded:ccr_retrieve" in result.transforms_applied
 
+    def test_anthropic_mcp_bare_tool_alias_exclude_tools_generic(self, tokenizer):
+        """General #1822 coverage: bare-name alias matching through the
+        config-driven ``excluded_tool_ids``/``DEFAULT_VERBATIM_EXCLUDE_TOOLS``
+        path for an arbitrary tool that is NOT ``headroom_retrieve`` (which now
+        has its own unconditional guard that would otherwise mask this path —
+        see ``test_anthropic_mcp_bare_tool_alias_exclude_tools`` above)."""
+        config = ContentRouterConfig(
+            min_section_tokens=10,
+            exclude_tools={"measure"},
+        )
+        router = ContentRouter(config)
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_measure_1",
+                        "name": "mcp_build123d_measure",
+                        "input": {"key": "abc123"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_measure_1",
+                        "content": generate_json_data(50),
+                    }
+                ],
+            },
+        ]
+
+        result = router.apply(messages, tokenizer)
+
+        tool_result_block = result.messages[1]["content"][0]
+        assert json.loads(tool_result_block["content"]) == json.loads(
+            messages[1]["content"][0]["content"]
+        )
+        assert "router:excluded:lossless_json" in result.transforms_applied
+
     def test_is_tool_excluded_helper(self):
         """is_tool_excluded: exact (case-insensitive) and glob matching."""
         from headroom.config import is_tool_excluded

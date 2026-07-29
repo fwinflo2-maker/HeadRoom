@@ -213,6 +213,9 @@ class AnchorConfig:
 # Bash is NOT excluded — its outputs (build logs, test output) are ideal compression targets.
 # To protect Bash or other non-excluded tools from lossy compression, use
 # HEADROOM_PROTECT_TOOL_RESULTS=Bash or --protect-tool-results Bash.
+# headroom_retrieve: its entire contract is returning already-retrieved, original
+# CCR content verbatim. Recompressing it writes a new <<ccr:hash>> marker the
+# agent can never redeem (#1077).
 DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
     {
         "Read",
@@ -222,9 +225,6 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         "Edit",
         "WebSearch",
         "WebFetch",
-        # headroom_retrieve: its entire contract is returning already-retrieved,
-        # original CCR content verbatim. Recompressing it writes a new
-        # <<ccr:hash>> marker the agent can never redeem (#1077).
         "headroom_retrieve",
         # Lowercase variants for case-insensitive matching
         "read",

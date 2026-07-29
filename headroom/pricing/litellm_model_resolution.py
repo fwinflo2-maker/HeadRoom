@@ -54,7 +54,6 @@ MODEL_PREFIX_RULES: tuple[LiteLLMModelPrefixRule, ...] = (
 PRICE_LOOKUP_PROVIDER_PREFIXES: tuple[str, ...] = (
     "openai/",
     "anthropic/",
-    "vertex_ai/",
     "google/",
     "mistral/",
     "deepseek/",
@@ -104,14 +103,20 @@ def resolution_candidates(model: str) -> tuple[str, ...]:
 def pricing_lookup_candidates(model: str) -> tuple[str, ...]:
     """Return ordered LiteLLM model_cost keys to try for pricing lookup."""
     bare = _strip_vertex_version_suffix(model)
+    is_vertex_versioned = bare != model
 
     candidates = [model]
-    if bare != model:
+    if is_vertex_versioned:
         candidates.append(bare)
 
     # Try all provider prefixes for both the original and bare name.
     for m in dict.fromkeys([model, bare]):
         candidates.extend(f"{prefix}{m}" for prefix in PRICE_LOOKUP_PROVIDER_PREFIXES)
+
+    # Only add vertex_ai/ candidates for models with @YYYYMMDD suffix.
+    if is_vertex_versioned:
+        for m in dict.fromkeys([model, bare]):
+            candidates.append(f"vertex_ai/{m}")
 
     alias = MODEL_ALIASES.get(model) or MODEL_ALIASES.get(bare)
     if alias:

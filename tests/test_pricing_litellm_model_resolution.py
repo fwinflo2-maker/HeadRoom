@@ -99,6 +99,11 @@ def test_pricing_lookup_candidates_vertex_versioned_models() -> None:
     assert "claude-opus-4" in candidates
     assert "vertex_ai/claude-opus-4" in candidates
 
+    # Non-versioned names should NOT get vertex_ai/ pricing candidates
+    candidates = pricing_lookup_candidates("claude-sonnet-4-6")
+    assert "vertex_ai/claude-sonnet-4-6" not in candidates
+    assert "anthropic/claude-sonnet-4-6" in candidates
+
 
 def test_vertex_versioned_model_resolves_to_known_key() -> None:
     # Simulate LiteLLM knowing the bare model name (not the versioned one)

@@ -359,6 +359,33 @@ def overlay_cached_prefix(
     return list(prev_fwd[:k]) + list(optimized_messages[k:])
 
 
+def is_append_only_extension(
+    current_original_messages: list[dict[str, Any]],
+    previous_original_messages: list[dict[str, Any]] | None,
+) -> bool:
+    """Return True iff ``previous_original_messages`` is a full canonical
+    prefix of ``current_original_messages``.
+
+    This is the same append-only condition ``overlay_cached_prefix`` requires
+    before it will replay ANY previously-forwarded content — a position is
+    only guaranteed to hold last turn's cached bytes when this holds for the
+    ENTIRE previous message list, not just a leading run of it. Used by
+    handler-level injection guards to detect "this exact tail position was
+    already forwarded last turn" without duplicating the canonicalization
+    logic.
+    """
+    if not previous_original_messages:
+        return False
+    n = len(previous_original_messages)
+    if len(current_original_messages) < n:
+        return False
+    return all(
+        _canonicalize_for_prefix_compare(current_original_messages[i])
+        == _canonicalize_for_prefix_compare(previous_original_messages[i])
+        for i in range(n)
+    )
+
+
 def normalize_message_cache_control(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:

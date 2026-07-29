@@ -3353,6 +3353,7 @@ class OpenAIHandlerMixin:
                         from headroom.proxy.helpers import (
                             append_text_to_latest_user_chat_message,
                             get_memory_injection_mode,
+                            injection_target_already_forwarded,
                             log_memory_injection,
                         )
 
@@ -3362,6 +3363,21 @@ class OpenAIHandlerMixin:
                                 request_id=request_id,
                                 session_id=None,
                                 decision="skipped_disabled",
+                                bytes_injected=0,
+                                query=None,
+                            )
+                        elif injection_target_already_forwarded(
+                            optimized_messages,
+                            prefix_tracker=openai_prefix_tracker,
+                            current_original_messages=original_client_messages,
+                        ):
+                            # Tail position already forwarded last turn; the
+                            # overlay replayed it byte-identical, so appending
+                            # here would double-inject (#2186).
+                            log_memory_injection(
+                                request_id=request_id,
+                                session_id=None,
+                                decision="skipped_already_forwarded",
                                 bytes_injected=0,
                                 query=None,
                             )

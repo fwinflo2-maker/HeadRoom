@@ -1046,6 +1046,73 @@ def _openai_responses_to_sse(response: dict[str, Any]) -> list[bytes]:
     return events
 
 
+def _responses_body_to_chat_completion_body(
+    model: str, responses_body: dict[str, Any]
+) -> dict[str, Any]:
+    """Convert a Responses-API request body into a Chat-Completions request body.
+
+    Used when a Copilot-hosted /responses request is downgraded to
+    /chat/completions by `_resolve_openai_responses_handler_path` (non-reasoning
+    model on a session pinned to the Responses wire API, see #1745 / #2643).
+    GitHub's /chat/completions endpoint requires a `messages` array and rejects
+    Responses-shaped bodies (`input`/`instructions`) with 400 "messages must be
+    non-empty". Delegates to litellm's own Responses<->Chat-Completions bridge
+    (the same transform litellm uses internally for providers that only
+    implement `.completion()`) rather than hand-rolling item/message parsing.
+
+    Always forces ``stream: false`` on the returned body: the upstream reply
+    is buffered and translated back to a Responses-API JSON object, then (if
+    the client asked for streaming) replayed as synthetic SSE via
+    `_openai_responses_to_sse`, mirroring the existing buffered-CCR path.
+    True incremental token streaming is not attempted for this bridged case.
+    """
+    from litellm.responses.litellm_completion_transformation.transformation import (
+        LiteLLMCompletionResponsesConfig,
+    )
+
+    chat_kwargs = (
+        LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+            model=model,
+            input=responses_body.get("input", ""),
+            responses_api_request=responses_body,
+            stream=False,
+        )
+    )
+    # Drop litellm-internal plumbing keys that aren't valid OpenAI
+    # chat-completions wire fields.
+    chat_kwargs.pop("custom_llm_provider", None)
+    chat_kwargs.pop("extra_headers", None)
+    chat_kwargs.pop("context_management", None)
+    chat_kwargs["stream"] = False
+    return chat_kwargs
+
+
+def _chat_completion_json_to_responses_json(
+    *,
+    responses_api_request: dict[str, Any],
+    chat_completion_json: dict[str, Any],
+) -> dict[str, Any]:
+    """Convert a raw Chat-Completions JSON reply into a Responses-API JSON body.
+
+    Mirror image of `_responses_body_to_chat_completion_body` for the reply
+    direction: GitHub's /chat/completions endpoint replies with
+    `choices[].message`, but the client called /v1/responses and expects a
+    Responses-API shaped reply (`output[]`, `usage.input_tokens`, ...). Uses
+    litellm's own transform so tool calls, finish_reason, and usage map
+    correctly.
+    """
+    from litellm.responses.litellm_completion_transformation.transformation import (
+        LiteLLMCompletionResponsesConfig,
+    )
+
+    responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+        request_input=responses_api_request.get("input", ""),
+        responses_api_request=responses_api_request,
+        chat_completion_response=chat_completion_json,
+    )
+    return responses_api_response.model_dump(exclude_none=True, mode="json")
+
+
 def _output_shaping_holdout_fraction() -> float:
     from headroom.proxy import runtime_env
 
@@ -4892,6 +4959,14 @@ class OpenAIHandlerMixin:
 
         # Route to correct endpoint based on auth mode.
         # ChatGPT session auth (codex login) uses chatgpt.com, not api.openai.com.
+        # `is_copilot_chat_bridge` tracks whether _resolve_openai_responses_handler_path
+        # downgraded this Copilot-hosted request to /chat/completions (non-reasoning
+        # model on a session pinned to the Responses wire API, see #1745 / #2643).
+        # That endpoint requires a `messages` array and rejects Responses-shaped
+        # bodies (`input`/`instructions`) with 400 "messages must be non-empty", so
+        # the request/response bodies must be bridged between the two API shapes
+        # further down (see the `_buffered_ccr_operation` closure below).
+        is_copilot_chat_bridge = False
         if is_chatgpt_auth:
             url = codex_responses_http_url()
         else:
@@ -4901,6 +4976,7 @@ class OpenAIHandlerMixin:
                 resolved_upstream_base_url,
                 model,
             )
+            is_copilot_chat_bridge = handler_path_suffix == _OPENAI_CHAT_COMPLETIONS_PATH
             handler_path = (
                 _resolve_openai_handler_path(request.headers, handler_path=handler_path_suffix)
                 if custom_upstream_base_url is not None
@@ -5098,8 +5174,17 @@ class OpenAIHandlerMixin:
                 "upstream request for server-side retrieval handling"
             )
 
+        if is_copilot_chat_bridge and stream:
+            logger.info(
+                f"[{request_id}] Copilot responses/chat-completions bridge: "
+                f"model {model} does not support /responses on Copilot's hosted "
+                "API; using a buffered stream:false /chat/completions request, "
+                "translating the reply back to Responses-API shape, and "
+                "replaying it as synthetic SSE for the client."
+            )
+
         try:
-            if stream and not buffered_stream_ccr:
+            if stream and not buffered_stream_ccr and not is_copilot_chat_bridge:
                 # Streaming for Responses API uses semantic events
                 return await self._stream_response(
                     url,
@@ -5126,11 +5211,17 @@ class OpenAIHandlerMixin:
                 async def _buffered_ccr_operation():
                     nonlocal headers
                     headers = await apply_copilot_api_auth(headers, url=url)
+                    outbound_body = body
+                    if is_copilot_chat_bridge:
+                        outbound_body = _responses_body_to_chat_completion_body(model, body)
+                        body_mutation_tracker.mark_mutated(
+                            "copilot_responses_to_chat_completions_bridge"
+                        )
                     response = await self._retry_request(
                         "POST",
                         url,
                         headers,
-                        body,
+                        outbound_body,
                         original_body_bytes=original_body_bytes,
                         body_mutated=body_mutation_tracker.mutated,
                         mutation_reasons=body_mutation_tracker.reasons,
@@ -5138,6 +5229,63 @@ class OpenAIHandlerMixin:
                         forwarder_name="openai_responses",
                         path_for_log=url,
                     )
+                    if is_copilot_chat_bridge and response.status_code == 200:
+                        try:
+                            translated_json = _chat_completion_json_to_responses_json(
+                                responses_api_request=body,
+                                chat_completion_json=response.json(),
+                            )
+                            response = httpx.Response(
+                                status_code=response.status_code,
+                                content=json.dumps(translated_json).encode(),
+                                headers={
+                                    k: v
+                                    for k, v in response.headers.items()
+                                    if k.lower() not in ("content-length", "content-encoding")
+                                },
+                            )
+                        except Exception as _bridge_exc:
+                            # Fail closed: the raw chat-completions reply is
+                            # NOT Responses-API shaped (no `output[]`), so
+                            # returning it untranslated with the original 200
+                            # would silently hand the client a malformed
+                            # success response it can't parse. An explicit
+                            # 502 is easier for the client to recover from.
+                            logger.error(
+                                f"[{request_id}] Copilot responses/chat-completions "
+                                "bridge: failed to translate the upstream "
+                                f"chat-completion reply back to Responses-API "
+                                f"shape: {type(_bridge_exc).__name__}: {_bridge_exc}"
+                            )
+                            response = httpx.Response(
+                                status_code=502,
+                                content=json.dumps(
+                                    {
+                                        "error": {
+                                            "message": (
+                                                "headroom: failed to translate the "
+                                                "Copilot chat-completions reply back "
+                                                "to Responses API shape."
+                                            ),
+                                            "type": "server_error",
+                                            "code": "copilot_responses_bridge_error",
+                                        }
+                                    }
+                                ).encode(),
+                                headers={
+                                    **{
+                                        k: v
+                                        for k, v in response.headers.items()
+                                        if k.lower()
+                                        not in (
+                                            "content-length",
+                                            "content-encoding",
+                                            "content-type",
+                                        )
+                                    },
+                                    "content-type": "application/json",
+                                },
+                            )
                     _response_body_for_debug: Any = None
                     _response_raw_for_debug: str | None = None
                     try:
@@ -5436,7 +5584,12 @@ class OpenAIHandlerMixin:
                     # Remove compression headers
                     response_headers = _sanitize_forwarded_response_headers(response.headers)
 
-                    if buffered_stream_ccr and response.status_code == 200 and resp_json:
+                    if (
+                        (buffered_stream_ccr or is_copilot_chat_bridge)
+                        and stream
+                        and response.status_code == 200
+                        and resp_json
+                    ):
                         sse_headers = {
                             k: v
                             for k, v in response_headers.items()
@@ -5488,7 +5641,7 @@ class OpenAIHandlerMixin:
                         headers=response_headers,
                     )
 
-            if buffered_stream_ccr:
+            if buffered_stream_ccr or (is_copilot_chat_bridge and stream):
                 operation = asyncio.create_task(_buffered_ccr_operation())
                 record_failed = self.metrics.record_failed
 

@@ -37,6 +37,8 @@ from typing import Any
 
 _TOOL_REFERENCE_TYPE = "tool_reference"
 
+_UNAVAILABLE_TEXT = "(referenced tool is no longer available)"
+
 # A proxy process serves many sessions for a long time, so the cache is LRU-capped
 # rather than unbounded. A session's deferred surface is the client's whole
 # non-core tool list, hence the generous per-session cap.
@@ -201,10 +203,28 @@ def _sanitize_content_block(block: Any, orphans: set[str]) -> Any:
             return block
         if not kept:
             # A tool_result needs content; say why the reference went away.
-            kept = [{"type": "text", "text": "(referenced tool is no longer available)"}]
+            kept = [{"type": "text", "text": _UNAVAILABLE_TEXT}]
         return {**block, "content": kept}
 
     return block
+
+
+def _sanitize_content(content: list[Any], orphans: set[str]) -> list[Any]:
+    """One message's content with every orphaned reference gone.
+
+    A top-level ``tool_reference`` *is* the orphan, so the whole block is dropped;
+    the nested carriers are rewritten by :func:`_sanitize_content_block`.
+    """
+    kept = [
+        _sanitize_content_block(block, orphans)
+        for block in content
+        if reference_name(block) not in orphans
+    ]
+    if content and not kept:
+        # Anthropic rejects an empty content array, so trading the dropped
+        # reference for a 400 would defeat the point.
+        return [{"type": "text", "text": _UNAVAILABLE_TEXT}]
+    return kept
 
 
 @dataclass
@@ -268,8 +288,10 @@ def reconcile_tool_references(
             if not isinstance(content, list):
                 rebuilt.append(message)
                 continue
-            new_content = [_sanitize_content_block(block, orphans) for block in content]
-            if any(new is not old for new, old in zip(new_content, content)):
+            new_content = _sanitize_content(content, orphans)
+            if len(new_content) != len(content) or any(
+                new is not old for new, old in zip(new_content, content)
+            ):
                 rebuilt.append({**message, "content": new_content})
             else:
                 rebuilt.append(message)

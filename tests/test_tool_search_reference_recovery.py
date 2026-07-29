@@ -200,6 +200,43 @@ def test_sanitizes_tool_result_shape_with_text_placeholder():
     assert content == [{"type": "text", "text": "(referenced tool is no longer available)"}]
 
 
+def test_sanitizes_top_level_reference_block():
+    """A bare reference IS the orphan, so the whole block is dropped."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "searching"},
+                {"type": "tool_reference", "tool_name": "ghost_tool"},
+            ],
+        }
+    ]
+
+    result = reconcile_tool_references(messages, _tools(6), session_id="s1")
+
+    assert result.reinjected == []
+    # A trailing orphan shortens the list without changing any surviving block,
+    # so only a length comparison notices the rewrite.
+    assert result.sanitized == ["ghost_tool"]
+    assert result.messages[0]["content"] == [{"type": "text", "text": "searching"}]
+    # Inputs are never mutated in place.
+    assert len(messages[0]["content"]) == 2
+
+
+def test_sanitizing_a_lone_top_level_reference_keeps_content_non_empty():
+    messages = [
+        {"role": "assistant", "content": [{"type": "tool_reference", "tool_name": "ghost"}]}
+    ]
+
+    result = reconcile_tool_references(messages, _tools(6), session_id="s1")
+
+    assert result.sanitized == ["ghost"]
+    # An empty content array is itself a 400, so the block is replaced, not removed.
+    assert result.messages[0]["content"] == [
+        {"type": "text", "text": "(referenced tool is no longer available)"}
+    ]
+
+
 def test_tool_addition_is_left_alone():
     """Explicit client instructions are never rewritten — only reported."""
     messages = [

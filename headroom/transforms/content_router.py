@@ -4575,6 +4575,7 @@ class ContentRouter(Transform):
         # Routing reason counters for summary logging
         route_counts: dict[str, int] = {
             "excluded_tool": 0,
+            "ccr_retrieve": 0,
             "user_msg": 0,
             "small": 0,
             "recent_code": 0,
@@ -4727,7 +4728,7 @@ class ContentRouter(Transform):
             ):
                 result_slots[i] = message
                 transforms_applied.append("router:excluded:ccr_retrieve")
-                route_counts["excluded_tool"] += 1
+                route_counts["ccr_retrieve"] += 1
                 continue
 
             # Skip OpenAI-style tool messages for excluded tools
@@ -5666,7 +5667,7 @@ class ContentRouter(Transform):
                     new_blocks.append(block)
                     transforms_applied.append("router:excluded:ccr_retrieve")
                     if route_counts is not None:
-                        route_counts["excluded_tool"] += 1
+                        route_counts["ccr_retrieve"] = route_counts.get("ccr_retrieve", 0) + 1
                     continue
                 if tool_use_id in excluded_tool_ids:
                     tool_name = tool_name_map.get(tool_use_id, "") if tool_name_map else ""
@@ -5853,7 +5854,7 @@ class ContentRouter(Transform):
                         new_blocks.append(block)
                         transforms_applied.append("router:excluded:ccr_retrieve")
                         if route_counts is not None:
-                            route_counts["excluded_tool"] += 1
+                            route_counts["ccr_retrieve"] = route_counts.get("ccr_retrieve", 0) + 1
                         continue
                 text_content = block.get("text", "")
                 if isinstance(text_content, str) and (

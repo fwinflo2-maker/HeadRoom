@@ -239,9 +239,9 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
 
 # These excluded web-tool results must remain byte-faithful. Even the
 # excluded-tool lossless fold rewrites formatted JSON.
-# Three independent consumers key off this frozenset: ContentRouter's two
-# per-block CCR-retrieve guards (transforms/content_router.py), and
-# _cross_turn_dedup_messages's verbatim_tool_ids (same file) -- the latter has
+# Three independent consumers key off this frozenset, all in
+# transforms/content_router.py: ContentRouter's two per-block CCR-retrieve
+# guards, and _cross_turn_dedup_messages's verbatim_tool_ids -- the latter has
 # no dedicated guard of its own, so removing headroom_retrieve from here would
 # silently reopen the retrieval loop for that path with cross-turn dedup on.
 DEFAULT_VERBATIM_EXCLUDE_TOOLS: frozenset[str] = frozenset(

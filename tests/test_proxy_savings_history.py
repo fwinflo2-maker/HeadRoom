@@ -76,6 +76,7 @@ def test_savings_tracker_helpers_normalize_inputs_and_paths(tmp_path, monkeypatc
         "timestamp": "2026-03-27T09:00:00Z",
         "provider": "unknown",
         "model": "unknown",
+        "agent": "unknown",
         "total_tokens_saved": 12,
         "compression_savings_usd": 0.5,
         "cache_read_tokens": 0,
@@ -141,6 +142,7 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
             "timestamp": "2026-03-27T09:00:00Z",
             "provider": "unknown",
             "model": "unknown",
+            "agent": "unknown",
             "total_tokens_saved": 30,
             "compression_savings_usd": 0.03,
             "cache_read_tokens": 0,
@@ -965,6 +967,44 @@ def test_savings_tracker_rollup_attributes_savings_per_agent(tmp_path, monkeypat
     second = hourly[1]
     assert set(second["by_agent"]) == {"unknown"}
     assert second["by_agent"]["unknown"]["tokens_saved"] == 15
+
+
+def test_savings_tracker_rollup_reloads_persisted_agent_field(tmp_path):
+    """Persisted checkpoints keep their agent across a reload.
+
+    ``_normalize_history_entry`` runs on every load; if it drops the ``agent``
+    key, a real ``agent: "claude-code"`` checkpoint collapses into "unknown"
+    on the next restart even though in-memory attribution was correct.
+    """
+    path = tmp_path / "proxy_savings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "history": [
+                    {
+                        "timestamp": "2026-03-27T09:10:00Z",
+                        "provider": "anthropic",
+                        "agent": "claude-code",
+                        "model": "claude-3-5-sonnet",
+                        "total_tokens_saved": 100,
+                        "compression_savings_usd": 0.1,
+                        "total_input_tokens": 120,
+                        "total_input_cost_usd": 0.24,
+                    }
+                ]
+            }
+        )
+    )
+
+    tracker = SavingsTracker(
+        path=str(path),
+        max_history_points=100,
+        max_history_age_days=30,
+    )
+
+    by_agent = tracker.history_response()["series"]["hourly"][0]["by_agent"]
+    assert set(by_agent) == {"claude-code"}
+    assert by_agent["claude-code"]["tokens_saved"] == 100
 
 
 def test_savings_tracker_rollup_attributes_savings_per_model(tmp_path, monkeypatch):

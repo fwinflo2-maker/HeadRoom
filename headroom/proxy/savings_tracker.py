@@ -397,6 +397,7 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
     output_savings_usd = 0.0
     provider = PROVIDER_UNKNOWN
     model = MODEL_UNKNOWN
+    agent = AGENT_UNKNOWN
 
     if isinstance(entry, dict):
         timestamp = _parse_timestamp(entry.get("timestamp"))
@@ -413,6 +414,7 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         output_savings_usd = _coerce_float(entry.get("output_savings_usd"))
         provider = _normalize_provider(entry.get("provider"))
         model = _normalize_model(entry.get("model"))
+        agent = _normalize_agent(entry.get("agent"))
     elif isinstance(entry, list | tuple) and len(entry) >= 2:
         timestamp = _parse_timestamp(entry[0])
         total_tokens_saved = _coerce_int(entry[1])
@@ -432,6 +434,7 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         "timestamp": _to_utc_iso(timestamp),
         "provider": provider,
         "model": model,
+        "agent": agent,
         "total_tokens_saved": total_tokens_saved,
         "compression_savings_usd": round(compression_savings_usd, 6),
         "cache_read_tokens": cache_read_tokens,

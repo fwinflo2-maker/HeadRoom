@@ -1083,6 +1083,27 @@ def _responses_body_to_chat_completion_body(
     chat_kwargs.pop("custom_llm_provider", None)
     chat_kwargs.pop("extra_headers", None)
     chat_kwargs.pop("context_management", None)
+    # This bridge only ever runs for non-reasoning models (see
+    # _resolve_openai_responses_handler_path: it downgrades to
+    # /chat/completions precisely when model_prefers_responses_api(model) is
+    # False). A Copilot session pinned to the Responses wire API by a
+    # reasoning main model still puts `reasoning: {effort: ...}` on every
+    # request on that connection, including subagent requests for a
+    # different, non-reasoning model. Forwarding that as `reasoning_effort`
+    # to a model that doesn't support it causes GitHub's hosted API to
+    # either reject the request outright ("reasoning_effort ... was
+    # provided, but model X does not support reasoning effort") or -- worse
+    # -- silently return an empty completion. Drop it unconditionally here.
+    chat_kwargs.pop("reasoning_effort", None)
+    # Also drop optional fields that are either OpenAI/Responses-specific
+    # extensions or not universally supported across the model families
+    # this bridge targets (Claude, Gemini, older GPT); GitHub's
+    # /chat/completions endpoint appears to validate the body strictly and
+    # rejects unrecognized/unsupported fields with 400 "Request body JSON
+    # is invalid" rather than ignoring them.
+    chat_kwargs.pop("web_search_options", None)
+    chat_kwargs.pop("service_tier", None)
+    chat_kwargs.pop("metadata", None)
     chat_kwargs["stream"] = False
     return chat_kwargs
 

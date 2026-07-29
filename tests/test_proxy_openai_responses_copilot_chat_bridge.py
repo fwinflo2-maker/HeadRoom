@@ -131,6 +131,67 @@ def test_bridge_translates_non_streaming_request_and_response(
     assert output[0]["content"][0]["text"] == "Hello from the bridge!"
 
 
+def test_bridge_strips_reasoning_effort_for_non_reasoning_subagent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces a live failure: a Copilot session pinned to the Responses
+    wire API by a reasoning main model (e.g. gpt-5.4) puts `reasoning:
+    {effort: ...}` on every request on that connection, including a
+    subagent's request for a non-reasoning model. Forwarded unchanged,
+    GitHub either rejects it ('reasoning_effort "medium" was provided, but
+    model X does not support reasoning effort') or silently returns an
+    empty completion (observed live: 200 status with zero output tokens
+    across every non-reasoning model tested). The bridge must drop it.
+    """
+    client, captured = _build_bridge_client(monkeypatch, chat_response_json=_chat_completion_json())
+
+    response = client.post(
+        "/v1/responses",
+        headers={
+            "Authorization": "******",
+            "x-headroom-base-url": _COPILOT_BASE,
+            "x-headroom-original-path": "/responses",
+        },
+        json={
+            "model": "claude-sonnet-4.6",
+            "input": "Hi there",
+            "reasoning": {"effort": "medium"},
+            "stream": False,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    outbound_body = captured["body"]
+    assert "reasoning_effort" not in outbound_body
+    assert "reasoning" not in outbound_body
+
+
+def test_bridge_strips_unsupported_optional_fields() -> None:
+    """web_search_options / service_tier / metadata are OpenAI/Responses
+    extensions that GitHub's /chat/completions endpoint validates strictly
+    and rejects with 400 "Request body JSON is invalid" for models that
+    don't expect them; drop them for the bridged wire body."""
+    from headroom.proxy.handlers.openai import _responses_body_to_chat_completion_body
+
+    outbound = _responses_body_to_chat_completion_body(
+        "claude-sonnet-4.6",
+        {
+            "model": "claude-sonnet-4.6",
+            "input": "Hi there",
+            "reasoning": {"effort": "medium"},
+            "metadata": {"some": "value"},
+            "service_tier": "auto",
+        },
+    )
+    assert "reasoning_effort" not in outbound
+    assert "web_search_options" not in outbound
+    assert "service_tier" not in outbound
+    assert "metadata" not in outbound
+    assert outbound["stream"] is False
+    assert outbound["model"] == "claude-sonnet-4.6"
+    assert "messages" in outbound
+
+
 def test_bridge_translates_streaming_request_to_synthetic_sse(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

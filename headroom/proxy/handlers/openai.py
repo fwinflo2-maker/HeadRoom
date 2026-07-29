@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -128,6 +129,101 @@ _OPENAI_RESPONSES_PATH = "/responses"
 _OPENAI_ORIGINAL_PATH_HEADER = "x-headroom-original-path"
 _OPENAI_BASE_URL_HEADER = "x-headroom-base-url"
 _decode_openai_bearer_payload = decode_openai_bearer_payload
+
+#: Known GitHub Copilot model IDs, used only as a best-effort target set for
+#: `normalize_copilot_model_id()`. Not a source of truth for what a given
+#: account/integration can actually access (that varies by entitlement, see
+#: `model_not_available_for_integrator` upstream errors) -- just the set of
+#: canonical spellings a casually-typed model name might be corrected to.
+_KNOWN_COPILOT_MODEL_IDS: frozenset[str] = frozenset(
+    {
+        "gpt-4.1",
+        "gpt-4.1-2025-04-14",
+        "gpt-4",
+        "gpt-4-0613",
+        "gpt-4o",
+        "gpt-4o-mini",
+        "gpt-4o-mini-2024-07-18",
+        "gpt-4o-2024-05-13",
+        "gpt-4o-2024-08-06",
+        "gpt-4o-2024-11-20",
+        "gpt-3.5-turbo",
+        "gpt-3.5-turbo-0613",
+        "gpt-5-mini",
+        "gpt-5.2",
+        "gpt-5.3-codex",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.5",
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "o1-experimental",
+        "claude-haiku-4.5",
+        "claude-opus-4.5",
+        "claude-opus-4.6",
+        "claude-opus-4.7",
+        "claude-opus-4.8",
+        "claude-opus-5",
+        "claude-sonnet-4.5",
+        "claude-sonnet-4.6",
+        "claude-sonnet-5",
+        "gemini-2.5-pro",
+        "gemini-3.1-pro-preview",
+        "gemini-3.5-flash",
+        "gemini-3.6-flash",
+        "kimi-k2.7-code",
+        "mai-code-1-flash-picker",
+    }
+)
+
+_MODEL_NORMALIZATION_STRIP_RE = re.compile(r"[()]")
+_MODEL_NORMALIZATION_WHITESPACE_RE = re.compile(r"\s+")
+
+#: Explicit aliases for common nicknames that don't derive from casing/
+#: whitespace normalization alone (e.g. "GPT Sol" is missing the "5.6"
+#: version segment present in the real ID "gpt-5.6-sol"). Keys must already
+#: be lowercased/hyphenated (i.e. in the same shape normalization produces).
+_MODEL_NICKNAME_ALIASES: dict[str, str] = {
+    "gpt-sol": "gpt-5.6-sol",
+    "sol": "gpt-5.6-sol",
+    "gpt-luna": "gpt-5.6-luna",
+    "luna": "gpt-5.6-luna",
+    "gpt-terra": "gpt-5.6-terra",
+    "terra": "gpt-5.6-terra",
+}
+
+
+def normalize_copilot_model_id(model: str | None) -> str | None:
+    """Best-effort correction of a casually-typed model name to its API ID.
+
+    Clients occasionally send a human-readable model label instead of the
+    exact Copilot API model ID -- e.g. an orchestrating agent asked to
+    "review with Claude Opus 4.8" may pass the literal string
+    ``"Claude Opus 4.8"`` as the ``model`` field instead of
+    ``"claude-opus-4.8"``. GitHub's hosted API does not accept these labels
+    and rejects them with ``400 The requested model is not supported``.
+
+    This normalizes casing/whitespace/parentheses (``"Claude Opus 4.8"`` ->
+    ``"claude-opus-4.8"``, ``"Gemini 3.1 Pro (Preview)"`` ->
+    ``"gemini-3.1-pro-preview"``) and only substitutes the result if it
+    matches a known Copilot model ID or a known nickname alias (e.g. "GPT
+    Sol" -> "gpt-5.6-sol") -- an ambiguous or unrecognized label (e.g. bare
+    "Gemini", which could mean any of several Gemini models) is left
+    untouched rather than guessed, so an unresolvable name still fails with
+    a clear upstream error instead of silently being routed to the wrong
+    model.
+    """
+    if not model or model in _KNOWN_COPILOT_MODEL_IDS:
+        return model
+    normalized = _MODEL_NORMALIZATION_STRIP_RE.sub("", model).strip().lower()
+    normalized = _MODEL_NORMALIZATION_WHITESPACE_RE.sub("-", normalized)
+    if normalized in _KNOWN_COPILOT_MODEL_IDS:
+        return normalized
+    aliased = _MODEL_NICKNAME_ALIASES.get(normalized)
+    if aliased is not None:
+        return aliased
+    return model
 
 
 def _normalize_openai_max_tokens(
@@ -4602,6 +4698,17 @@ class OpenAIHandlerMixin:
         model = body.get("model", "unknown")
         stream = body.get("stream", False)
         body_mutation_tracker = BodyMutationTracker()
+        _normalized_model = normalize_copilot_model_id(model if isinstance(model, str) else None)
+        if _normalized_model and _normalized_model != model:
+            logger.info(
+                "[%s] Normalized casually-typed model name %r -> %r",
+                request_id,
+                model,
+                _normalized_model,
+            )
+            body["model"] = _normalized_model
+            model = _normalized_model
+            body_mutation_tracker.mark_mutated("model_id_normalization")
         _bypass = self._headroom_bypass_enabled(request.headers)
         if _bypass:
             logger.info(

@@ -4688,6 +4688,18 @@ class ContentRouter(Transform):
             # adaptive protection window (age-based decay).
             if role == "tool":
                 tool_call_id = message.get("tool_call_id", "")
+                # A headroom_retrieve result IS already-retrieved, original CCR content —
+                # recompressing it writes a new <<ccr:hash>> marker the agent can never
+                # redeem (unresolvable retrieval loop; same failure mode as #1077, which
+                # SmartCrusher.apply() already guards against on its own call path — this
+                # is ContentRouter's equivalent, via is_tool_excluded() since MCP-served
+                # tools appear here under their qualified name, e.g.
+                # mcp__headroom__headroom_retrieve, not the bare tool name).
+                if is_tool_excluded(tool_name_map.get(tool_call_id, ""), ("headroom_retrieve",)):
+                    result_slots[i] = message
+                    transforms_applied.append("router:excluded:ccr_retrieve")
+                    route_counts["excluded_tool"] += 1
+                    continue
                 if tool_call_id in excluded_tool_ids:
                     tool_name = tool_name_map.get(tool_call_id, "")
                     if tool_name and is_tool_excluded(tool_name, DEFAULT_VERBATIM_EXCLUDE_TOOLS):
@@ -5607,6 +5619,20 @@ class ContentRouter(Transform):
                     if route_counts is not None:
                         route_counts.setdefault("read_protected", 0)
                         route_counts["read_protected"] += 1
+                    continue
+                # Mirrors the OpenAI-shape guard above (issue #1077 / SmartCrusher.apply()'s
+                # existing guard on its own call path): a headroom_retrieve result IS
+                # already-retrieved, original CCR content and must never be recompressed.
+                # is_tool_excluded() (not a bare comparison) because MCP-served tools appear
+                # here under their qualified name, e.g. mcp__headroom__headroom_retrieve.
+                if is_tool_excluded(
+                    tool_name_map.get(tool_use_id, "") if tool_name_map else "",
+                    ("headroom_retrieve",),
+                ):
+                    new_blocks.append(block)
+                    transforms_applied.append("router:excluded:ccr_retrieve")
+                    if route_counts is not None:
+                        route_counts["excluded_tool"] = route_counts.get("excluded_tool", 0) + 1
                     continue
                 if tool_use_id in excluded_tool_ids:
                     tool_name = tool_name_map.get(tool_use_id, "") if tool_name_map else ""

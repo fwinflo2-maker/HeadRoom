@@ -893,7 +893,19 @@ class TestExcludeTools:
         assert "router:excluded:lossless_json" in result.transforms_applied
 
     def test_anthropic_mcp_bare_tool_alias_exclude_tools(self, tokenizer):
-        """Bare tool exclusions match custom-agent MCP wrappers (#1822)."""
+        """Bare tool exclusions match custom-agent MCP wrappers (#1822).
+
+        Any MCP wrapper's bare tool name can be excluded via config — this test
+        uses a fictitious "HeadroomZai" server name to prove the alias match is
+        server-name-agnostic. ``headroom_retrieve`` specifically is now also an
+        unconditional, config-independent exclusion (see the fix for the
+        ContentRouter self-recompression bug: SmartCrusher.apply() already
+        guarded #1077 on its own call path, but ContentRouter called
+        SmartCrusher.crush() directly, bypassing it). That guard fires before
+        the config-driven `excluded_tool_ids` check below, giving byte-identical
+        passthrough rather than the lossless-JSON fold a narrower custom
+        `exclude_tools` used to produce for this specific tool name.
+        """
         config = ContentRouterConfig(
             min_section_tokens=10,
             exclude_tools={"headroom_retrieve"},
@@ -927,10 +939,10 @@ class TestExcludeTools:
         result = router.apply(messages, tokenizer)
 
         tool_result_block = result.messages[1]["content"][0]
-        assert json.loads(tool_result_block["content"]) == json.loads(
-            messages[1]["content"][0]["content"]
-        )
-        assert "router:excluded:lossless_json" in result.transforms_applied
+        # Byte-identical, not just JSON-semantically-equal: the unconditional
+        # ccr_retrieve guard passes the original block through untouched.
+        assert tool_result_block["content"] == messages[1]["content"][0]["content"]
+        assert "router:excluded:ccr_retrieve" in result.transforms_applied
 
     def test_is_tool_excluded_helper(self):
         """is_tool_excluded: exact (case-insensitive) and glob matching."""

@@ -222,6 +222,10 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         "Edit",
         "WebSearch",
         "WebFetch",
+        # headroom_retrieve: its entire contract is returning already-retrieved,
+        # original CCR content verbatim. Recompressing it writes a new
+        # <<ccr:hash>> marker the agent can never redeem (#1077).
+        "headroom_retrieve",
         # Lowercase variants for case-insensitive matching
         "read",
         "glob",
@@ -241,6 +245,7 @@ DEFAULT_VERBATIM_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         "WebFetch",
         "web_search",
         "web_fetch",
+        "headroom_retrieve",
     }
 )
 

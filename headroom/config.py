@@ -239,6 +239,11 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
 
 # These excluded web-tool results must remain byte-faithful. Even the
 # excluded-tool lossless fold rewrites formatted JSON.
+# Three independent consumers key off this frozenset: ContentRouter's two
+# per-block CCR-retrieve guards (transforms/content_router.py), and
+# _cross_turn_dedup_messages's verbatim_tool_ids (same file) -- the latter has
+# no dedicated guard of its own, so removing headroom_retrieve from here would
+# silently reopen the retrieval loop for that path with cross-turn dedup on.
 DEFAULT_VERBATIM_EXCLUDE_TOOLS: frozenset[str] = frozenset(
     {
         "WebSearch",
@@ -252,6 +257,12 @@ DEFAULT_VERBATIM_EXCLUDE_TOOLS: frozenset[str] = frozenset(
 
 def _tool_name_aliases(name: str) -> tuple[str, ...]:
     """Return equivalent spellings for tool exclusion matching."""
+    if not isinstance(name, str):
+        # Pre-existing fragility (not introduced here): a malformed message can
+        # put a non-string value in the tool-name map (see _build_tool_name_map's
+        # truthy-only `if tc_id and name:` filter). Fail safe -- no aliases means
+        # is_tool_excluded() returns False -- rather than crashing the pipeline.
+        return ()
     aliases = [name]
     lname = name.lower()
 

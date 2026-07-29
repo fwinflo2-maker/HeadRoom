@@ -92,6 +92,7 @@ split_into_sections = _mixed_content.split_into_sections
 _detect_backend_warned = False
 _detect_panic_warned = False
 _detect_native_unhealthy = False  # circuit breaker: native detect hung once (#575)
+_detect_native_verified = False  # native detect has returned once -> skip the watchdog
 
 
 # Shared calibrated fallback estimator (tiktoken cl100k_base ~90% accuracy,
@@ -871,6 +872,7 @@ def _detect_content(content: str) -> DetectionResult:
     `_strategy_from_detection` keys off that field alone.
     """
     global _detect_backend_warned, _detect_panic_warned, _detect_native_unhealthy
+    global _detect_native_verified
 
     # Detect on the unwrapped payload so a tool-output envelope's tags don't get
     # the whole result misclassified as HTML/XML (#route-converter corruption).
@@ -896,14 +898,19 @@ def _detect_content(content: str) -> DetectionResult:
     from headroom._core import detect_content_type as _rust_detect
 
     try:
-        if sys.platform == "win32":
-            # Windows is the only platform where the native detector can deadlock
-            # on first use (#575); bound it with a watchdog so a hang degrades to
-            # the pure-Python detector below. Elsewhere it is the trusted default
-            # hot path — call it directly, with no per-call thread overhead.
+        # The native detector can deadlock on FIRST use (#575 — seen on Windows
+        # and macOS/arm64). Bound it with a watchdog so a hang degrades to the
+        # pure-Python detector; the previous win32-only guard left other
+        # platforms unprotected, so a hung Linux sidecar silently stopped
+        # compressing (every request failed open to passthrough). Watchdog until
+        # the native detector has returned once, then use the direct fast path —
+        # the hang is first-use only, so steady state pays no per-call thread
+        # overhead. win32 keeps watchdogging every call (unchanged).
+        if sys.platform == "win32" or not _detect_native_verified:
             rust_result = _rust_detect_watchdogged(_rust_detect, content, _detect_timeout_secs())
         else:
             rust_result = _rust_detect(content)
+        _detect_native_verified = True  # returned without hanging -> trusted hot path
         # Rust's `content_type` is the lowercase string tag (e.g.
         # "json_array"); translate to the Python `ContentType` enum so
         # downstream mapping keys match.
@@ -2800,6 +2807,7 @@ class ContentRouter(Transform):
         language: str | None = None,
         question: str | None = None,
         bias: float = 1.0,
+        _allow_embedded: bool = True,
     ) -> tuple[str, int, list[str]]:
         """Apply a compression strategy to content.
 
@@ -2820,6 +2828,37 @@ class ContentRouter(Transform):
             log]``). Log readers use this to see *how* we got to the
             final compressor without parsing decision_reason strings.
         """
+        # ── STRUCTURAL (embedded) JSON routing ───────────────────────────────
+        # Before anything else: if this block is not a single JSON value but
+        # CONTAINS balanced JSON span(s), route each span through this very
+        # dispatch and splice the result back (surrounding bytes kept exact).
+        # This is how nested/embedded JSON reaches the JSON compressors at all —
+        # today's linear splitter never sees it. Each span goes through the
+        # UNCHANGED path, so SmartCrusher/CodeCompressor register their
+        # `<<ccr:…>>` markers exactly as for a whole-block JSON (CCR is hash-
+        # keyed → location-agnostic). `_allow_embedded=False` on the recursive
+        # call is a one-shot re-entrancy guard (NOT a depth cap). Deterministic +
+        # benefit-gated (no size/min thresholds) → prefix-cache- and CCR-store-
+        # stable, and a strict no-op when the block has no embedded JSON.
+        if _allow_embedded:
+            from headroom.transforms.recursive_json import route_embedded_json
+
+            def _dispatch_span(span: str) -> str | None:
+                strat = self._strategy_from_detection_type(_detect_content(span).content_type)
+                text, _t, _c = self._apply_strategy_to_content(
+                    span,
+                    strat,
+                    context,
+                    question=question,
+                    bias=bias,
+                    _allow_embedded=False,
+                )
+                return text if text != span else None
+
+            routed = route_embedded_json(content, _dispatch_span, tok=_estimate_tokens)
+            if routed is not None:
+                return routed, _estimate_tokens(routed), ["embedded_json"]
+
         # Track original tokens for TOIN recording
         original_tokens = _estimate_tokens(content)
         compressed: str | None = None

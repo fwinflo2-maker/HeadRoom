@@ -31,7 +31,7 @@ from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
-from headroom.proxy.helpers import extract_tags
+from headroom.proxy.helpers import extract_tags, injection_target_already_forwarded
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
@@ -1977,6 +1977,7 @@ class AnthropicHandlerMixin:
                                     workspace_key=ccr_workspace_key,
                                     query_context=entry.get("query_context", ""),
                                     sample_content=entry.get("compressed_content", "")[:500],
+                                    session_id=session_id,
                                 )
                     elif self.ccr_context_tracker and not ccr_workspace_key:
                         logger.info(
@@ -2011,7 +2012,23 @@ class AnthropicHandlerMixin:
                         user_query,
                         self._turn_counter,
                         workspace_key=ccr_workspace_key,
+                        session_id=session_id,
                     )
+                    expansion_dedup_tracker = None
+                    if recommendations and session_id:
+                        from headroom.proxy.helpers import (
+                            get_session_expansion_dedup_tracker,
+                        )
+
+                        expansion_dedup_tracker = get_session_expansion_dedup_tracker()
+                        new_hash_keys = set(
+                            expansion_dedup_tracker.filter_new(
+                                session_id, [r.hash_key for r in recommendations]
+                            )
+                        )
+                        recommendations = [
+                            r for r in recommendations if r.hash_key in new_hash_keys
+                        ]
                     if recommendations:
                         expansions = self.ccr_context_tracker.execute_expansions(recommendations)
                         if expansions:
@@ -2031,14 +2048,32 @@ class AnthropicHandlerMixin:
                                     f"[{request_id}] CCR: skipping proactive expansion append "
                                     "in cache mode to preserve next-turn prefix stability"
                                 )
-                            else:
-                                optimized_messages = (
-                                    self._append_context_to_latest_non_frozen_user_turn(
-                                        optimized_messages,
-                                        expansion_text,
-                                        frozen_message_count=frozen_message_count,
-                                    )
+                            elif injection_target_already_forwarded(
+                                optimized_messages,
+                                prefix_tracker=prefix_tracker,
+                                current_original_messages=original_client_messages,
+                            ):
+                                logger.info(
+                                    f"[{request_id}] CCR: skipping proactive expansion append — "
+                                    "tail position already forwarded last turn "
+                                    "(would double-inject, #2186)"
                                 )
+                            else:
+                                new_optimized = self._append_context_to_latest_non_frozen_user_turn(
+                                    optimized_messages,
+                                    expansion_text,
+                                    frozen_message_count=frozen_message_count,
+                                )
+                                # The helper returns the SAME list object unchanged
+                                # when the latest turn is frozen or has no eligible
+                                # text block — nothing was injected, so don't mark
+                                # the hashes as seen (a later turn may retry).
+                                if new_optimized is not optimized_messages:
+                                    optimized_messages = new_optimized
+                                    if expansion_dedup_tracker and session_id:
+                                        expansion_dedup_tracker.record_injected(
+                                            session_id, [e["hash"] for e in expansions]
+                                        )
 
             # Traffic Learner: Extract patterns from inbound tool results
             if self.traffic_learner:
@@ -2124,6 +2159,21 @@ class AnthropicHandlerMixin:
                                     request_id=request_id,
                                     session_id=session_id,
                                     decision="skipped_cache_mode",
+                                    bytes_injected=0,
+                                    query=user_query,
+                                )
+                            elif injection_target_already_forwarded(
+                                optimized_messages,
+                                prefix_tracker=prefix_tracker,
+                                current_original_messages=original_client_messages,
+                            ):
+                                # Tail position already forwarded last turn; the
+                                # overlay replayed it byte-identical, so appending
+                                # here would double-inject (#2186).
+                                log_memory_injection(
+                                    request_id=request_id,
+                                    session_id=session_id,
+                                    decision="skipped_already_forwarded",
                                     bytes_injected=0,
                                     query=user_query,
                                 )

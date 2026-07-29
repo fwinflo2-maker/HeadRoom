@@ -244,6 +244,26 @@ def _resolve_openai_chat_handler_path(base_url: str, model: str | None) -> str:
     return _OPENAI_CHAT_COMPLETIONS_PATH
 
 
+def _resolve_openai_responses_handler_path(base_url: str, model: str | None) -> str:
+    """Return the upstream path suffix for an OpenAI Responses-API request.
+
+    GitHub Copilot's hosted API only serves gpt-5*/o1*/o3* reasoning models via
+    ``/responses``; every other model family (gpt-4.x, Claude, Gemini, etc.) is
+    only served via ``/chat/completions``. A Copilot session pins one wire API
+    for the whole process based on the *main* model, so once the main model is
+    a reasoning model, the CLI sends every request on that connection --
+    including subagent ("task tool") requests for a different, non-reasoning
+    model -- to ``/v1/responses``. Forwarding those verbatim causes GitHub's
+    hosted API to reject them with ``400 unsupported_api_for_model``. Route
+    those specific requests to ``/chat/completions`` instead, mirroring
+    ``_resolve_openai_chat_handler_path``'s Copilot-aware routing in the
+    opposite direction.
+    """
+    if is_copilot_api_url(base_url) and not model_prefers_responses_api(model):
+        return _OPENAI_CHAT_COMPLETIONS_PATH
+    return _OPENAI_RESPONSES_PATH
+
+
 def _append_request_query(url: str, query: str) -> str:
     if not query:
         return url
@@ -4875,14 +4895,19 @@ class OpenAIHandlerMixin:
         if is_chatgpt_auth:
             url = codex_responses_http_url()
         else:
-            upstream_base_url = _resolve_openai_upstream_base(request.headers)
+            custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
+            resolved_upstream_base_url = custom_upstream_base_url or self.OPENAI_API_URL
+            handler_path_suffix = _resolve_openai_responses_handler_path(
+                resolved_upstream_base_url,
+                model,
+            )
             handler_path = (
-                _resolve_openai_handler_path(request.headers, handler_path=_OPENAI_RESPONSES_PATH)
-                if upstream_base_url is not None
-                else "/v1/responses"
+                _resolve_openai_handler_path(request.headers, handler_path=handler_path_suffix)
+                if custom_upstream_base_url is not None
+                else f"/v1{handler_path_suffix}"
             )
             url = build_copilot_upstream_url(
-                upstream_base_url or self.OPENAI_API_URL,
+                resolved_upstream_base_url,
                 handler_path,
             )
             url = _append_request_query(url, request.url.query)

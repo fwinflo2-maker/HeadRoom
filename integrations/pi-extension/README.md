@@ -35,6 +35,62 @@ pi --extension "$PWD/src/index.ts"
 omp --extension "$PWD/src/index.ts"
 ```
 
+### Persistent OMP development setup
+
+The extension does not start the Headroom proxy. To load the extension from a source checkout in every normal OMP session and keep the local proxy running under the operating system's service supervisor:
+
+1. Install the source dependencies from the repository root:
+
+   ```bash
+   uv sync --extra proxy
+   npm --prefix integrations/pi-extension ci
+   npm --prefix integrations/pi-extension run build
+   ```
+
+2. Add the source entry to the existing `extensions` list in `~/.omp/agent/config.yml`:
+
+   ```yaml
+   extensions:
+     - /absolute/path/to/headroom/integrations/pi-extension/src/index.ts
+   ```
+
+   A named OMP profile uses `~/.omp/profiles/<name>/agent/config.yml` instead.
+
+3. Install and start a persistent proxy from the checkout:
+
+   ```bash
+   uv run headroom install apply \
+     --preset persistent-service \
+     --runtime python \
+     --scope provider \
+     --providers manual \
+     --profile omp-dev \
+     --port 8787 \
+     --mode token \
+     --no-telemetry
+   ```
+
+   This command starts the checkout's Python environment without changing provider configuration. On macOS, it installs a `LaunchAgent` with `RunAtLoad` and `KeepAlive`.
+
+4. Restart OMP, then verify both layers:
+
+   ```bash
+   uv run headroom install status --profile omp-dev
+   ```
+
+   ```text
+   /headroom health
+   /headroom status
+   ```
+
+OMP loads TypeScript extension changes when a new session starts. Restart the persistent proxy after changing Python source:
+
+```bash
+uv run headroom install restart --profile omp-dev
+```
+
+Remove the development service with `uv run headroom install remove --profile omp-dev`; remove the source entry from OMP's `config.yml` separately.
+
 The default configuration needs no file or environment variables. New sessions connect to `http://127.0.0.1:8787` and fail open: if Headroom is unavailable, original tool results continue to the model unchanged.
 
 ## Remove

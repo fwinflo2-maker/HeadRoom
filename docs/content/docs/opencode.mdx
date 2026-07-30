@@ -33,6 +33,57 @@ headroom unwrap opencode
 | Backup | Snapshots `opencode.json` to `opencode.json.headroom-backup` before making any changes |
 | Launch | Starts the `opencode` binary through the proxy |
 
+## MCP, Proxy, and Plugin Routing
+
+OpenCode MCP connectivity and model routing are separate concerns. A connected
+Headroom MCP server gives OpenCode access to `headroom_compress`,
+`headroom_retrieve`, and `headroom_stats`; it does not automatically route
+OpenCode's model requests through the proxy.
+
+Choose one of these routing paths:
+
+| Setup | Model traffic | RTK |
+|---|---|---|
+| MCP only | Not routed through Headroom; compression is on demand when the model calls an MCP tool | Not installed automatically |
+| `headroom wrap opencode` | Routed through the generated `headroom` provider | RTK or `lean-ctx` guidance is configured unless disabled |
+| Native OpenCode plugin | Existing provider traffic is intercepted in-process and sent through the proxy | Configure separately |
+| Manual `headroom/<model>` provider | Routed through the proxy URL in that provider | Configure separately |
+
+Therefore, a green `headroom Connected` status only proves that the MCP
+process started. To verify proxy routing, make a model request and check that
+the same proxy instance records it:
+
+```bash
+curl -s http://127.0.0.1:8787/stats | jq '{
+  proxy_requests: .proxy_inbound.total,
+  proxy_tokens_saved: .tokens.proxy_compression_saved,
+  cli_tokens_saved: .tokens.cli_filtering_saved,
+  cli_filtering_available: .context_tool.available
+}'
+```
+
+Use the same port for the running proxy, the MCP `HEADROOM_PROXY_URL`, and the
+provider or native plugin configuration. Each proxy process has its own
+request and savings counters, so checking `8787` while OpenCode sends traffic
+to `8788` will look like zero activity.
+
+## RTK and Headroom Together
+
+RTK and Headroom operate at different layers and can be used together:
+
+```text
+shell command -> RTK output filtering -> Headroom proxy compression -> model
+```
+
+RTK reduces shell output before it enters the model context. Headroom compresses
+the request context that reaches the provider. RTK does not replace proxy
+routing, and an MCP connection does not replace RTK's OpenCode plugin or hook.
+
+Headroom's combined savings include both layers when both are available. Use
+`proxy_compression_saved` to isolate proxy savings and `cli_filtering_saved` to
+isolate RTK or `lean-ctx` savings. The combined number is an accounting sum,
+not evidence that the same tokens were compressed twice.
+
 ## Options
 
 ```bash

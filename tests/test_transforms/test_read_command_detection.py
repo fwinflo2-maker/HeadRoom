@@ -23,6 +23,8 @@ from headroom.transforms.content_router import _is_read_command
         "sudo cat foo.py",
         "rtk cat foo.py",
         'bash -lc "cat foo.py"',
+        # The `-c` argument is not the first token after the shell.
+        'bash --norc -lc "cat foo.py"',
     ],
 )
 def test_simple_reads_are_detected(command: str) -> None:
@@ -41,6 +43,9 @@ def test_simple_reads_are_detected(command: str) -> None:
         "sed 's/a/b/' foo.py && cat -n bar.py",
         # A read in the first segment survives a non-read tail.
         "cat foo.py && pytest -q",
+        # Trailing and doubled separators produce empty segments, which are skipped.
+        "cat foo.py;",
+        "ls -la; ; cat foo.py",
     ],
 )
 def test_chained_reads_are_detected(command: str) -> None:
@@ -65,6 +70,11 @@ def test_chained_reads_are_detected(command: str) -> None:
         "cat uv.lock",
         # `-n` from a sibling segment must not qualify a bare `sed`.
         "sed 's/a/b/' foo.py && ls -n",
+        # A segment that is only an env assignment resolves to no program.
+        "FOO=1",
+        # A shell invocation with no `-c` argument runs a script, not a read.
+        "bash --norc",
+        "bash script.sh",
     ],
 )
 def test_non_reads_are_not_detected(command: str) -> None:

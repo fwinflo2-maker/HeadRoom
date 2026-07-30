@@ -112,6 +112,12 @@ class TestWriteLearned:
         write_learned({"openai": {"ttl_seconds": 600}}, str(out))
         assert json.loads(out.read_text())["openai"]["ttl_seconds"] == 600
 
+    def test_non_dict_existing_file_is_replaced_not_merged(self, tmp_path):
+        out = tmp_path / "learned.json"
+        out.write_text("[1, 2]")
+        write_learned({"openai": {"ttl_seconds": 600}}, str(out))
+        assert json.loads(out.read_text()) == {"openai": {"ttl_seconds": 600}}
+
 
 class TestMain:
     @pytest.fixture()
@@ -126,7 +132,9 @@ class TestMain:
         obs, out = paths
         rows = _corpus([120, 300, 480], [600, 900])
         rows += [_row(idle=650, hit=False)]
-        obs.write_text("\n".join(json.dumps(r) for r in rows) + "\nnot-json\n")
+        # Trailing junk the parser must skip: invalid JSON, a blank line,
+        # and valid JSON that is not an object.
+        obs.write_text("\n".join(json.dumps(r) for r in rows) + '\nnot-json\n\n[1, 2]\n"scalar"\n')
 
         assert main([]) == 0
         assert resolve_learned_ttl("openai", "gpt-5.5") == 600

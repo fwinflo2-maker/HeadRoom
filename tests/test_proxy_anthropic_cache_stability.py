@@ -633,8 +633,7 @@ def test_ccr_tool_stays_in_forwarded_tools_across_frozen_transition() -> None:
                 "type": "tool_result",
                 "tool_use_id": "toolu_bash_x",
                 "content": (
-                    "[50 items compressed to 5. "
-                    "Retrieve more: hash=abc123def456abc123def456]"
+                    "[50 items compressed to 5. Retrieve more: hash=abc123def456abc123def456]"
                 ),
             }
         ],
@@ -651,12 +650,10 @@ def test_ccr_tool_stays_in_forwarded_tools_across_frozen_transition() -> None:
             proxy.config.ccr_inject_system_instructions = False
 
             fake_tracker = _FakePrefixTracker(frozen_count=0)
-            proxy.session_tracker_store.compute_session_id = (
-                lambda request, model, messages: "frozen-transition-session"
+            proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+                "frozen-transition-session"
             )
-            proxy.session_tracker_store.get_or_create = (
-                lambda session_id, provider: fake_tracker
-            )
+            proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
 
             async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
                 forwarded.append(body)
@@ -721,11 +718,9 @@ def test_ccr_tool_stays_in_forwarded_tools_across_frozen_transition() -> None:
     )
     # Byte-identity, not ``==``: a re-serialized definition with a different key
     # order compares equal as a dict but busts the cache just as hard.
-    assert serialize_tool_definition_canonical(
-        turn1[0]
-    ) == serialize_tool_definition_canonical(turn2[0]), (
-        "headroom_retrieve was re-serialized rather than replayed byte-for-byte"
-    )
+    assert serialize_tool_definition_canonical(turn1[0]) == serialize_tool_definition_canonical(
+        turn2[0]
+    ), "headroom_retrieve was re-serialized rather than replayed byte-for-byte"
 
 
 def test_previous_turns_always_frozen_only_final_turn_mutable() -> None:

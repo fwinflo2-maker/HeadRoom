@@ -64,8 +64,7 @@ class TestMarkersImplyRedeemableTool:
 
         tool_names = [t.get("name") for t in tools_out]
         assert CCR_TOOL_NAME in tool_names, (
-            f"headroom_retrieve not injected when markers were emitted (#1006). "
-            f"tools={tool_names}"
+            f"headroom_retrieve not injected when markers were emitted (#1006). tools={tool_names}"
         )
 
     def test_no_marker_on_session_that_never_compressed_skips_tool(self):

@@ -361,6 +361,19 @@ class TestMemoryBackend:
         assert "pip install 'headroom-ai[memory-stack]'" in result.output
         assert "config" not in mock_run_server
 
+    def test_qdrant_neo4j_starts_when_memory_stack_is_installed(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        with patch("headroom.cli.proxy.importlib.util.find_spec", return_value=object()):
+            result = runner.invoke(
+                main,
+                ["proxy", "--memory-backend", "qdrant-neo4j"],
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].memory_backend == "qdrant-neo4j"
+
 
 class TestMissingProxyDepsError:
     """When proxy dependencies are absent the CLI should print an actionable error and exit 1."""

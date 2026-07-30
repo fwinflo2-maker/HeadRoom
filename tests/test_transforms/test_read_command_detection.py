@@ -46,6 +46,11 @@ def test_simple_reads_are_detected(command: str) -> None:
         # Trailing and doubled separators produce empty segments, which are skipped.
         "cat foo.py;",
         "ls -la; ; cat foo.py",
+        # A write in a SIBLING segment does not unprotect the read segment: the
+        # output still carries the exact bytes of foo.py.
+        "cat foo.py && echo done > marker",
+        "echo done > marker && cat foo.py",
+        "sed -n '1,60p' foo.py; touch out >> log",
     ],
 )
 def test_chained_reads_are_detected(command: str) -> None:
@@ -64,7 +69,11 @@ def test_chained_reads_are_detected(command: str) -> None:
         "grep -n x foo.py | head -40",
         # Writes are never reads.
         "cat > foo.py",
+        # The write lives in the read segment itself — a pipeline is one segment,
+        # so `tee` is still visible after the split.
         "cat foo.py | tee bar.py",
+        "cat foo.py > copy.py && echo done",
+        "sed -n '1,60p' foo.py >> out.txt",
         "sed 's/a/b/' foo.py",
         # Lockfiles are regenerated, never byte-patched.
         "cat uv.lock",

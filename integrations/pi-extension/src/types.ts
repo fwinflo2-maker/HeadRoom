@@ -26,4 +26,3 @@ export interface PreparedEntry extends Candidate {
   createdAt: number;
   lastAccessedAt: number;
 }
-

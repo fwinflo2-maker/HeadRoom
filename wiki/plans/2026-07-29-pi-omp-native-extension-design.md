@@ -38,26 +38,26 @@ The integration must preserve Headroom's safety invariant: never drop user or as
 
 ### Golden path
 
-**Given** Headroom is deployed locally, the extension is enabled, and a Pi or OMP session has a large eligible tool result,  
-**when** the result becomes older than the protected working set and a later model turn is assembled,  
+**Given** Headroom is deployed locally, the extension is enabled, and a Pi or OMP session has a large eligible tool result,
+**when** the result becomes older than the protected working set and a later model turn is assembled,
 **then** the provider receives a validated Headroom-compressed text block, the raw transcript remains unchanged, and every CCR marker resolves to the exact original content.
 
 ### Provider switch
 
-**Given** a session switches from Anthropic to OpenAI Codex, Gemini, or another Pi-supported provider,  
-**when** the next context is assembled,  
+**Given** a session switches from Anthropic to OpenAI Codex, Gemini, or another Pi-supported provider,
+**when** the next context is assembled,
 **then** the same cached transformation applies without changing endpoint, credential, or provider configuration.
 
 ### Headroom unavailable
 
-**Given** Headroom is stopped, unhealthy, or times out,  
-**when** Pi or OMP assembles context,  
+**Given** Headroom is stopped, unhealthy, or times out,
+**when** Pi or OMP assembles context,
 **then** the original context is returned immediately and the agent request proceeds normally.
 
 ### Retrieval miss
 
-**Given** a compressed result refers to a hash that is no longer present in Headroom's process cache,  
-**when** the model calls `headroom_retrieve`,  
+**Given** a compressed result refers to a hash that is no longer present in Headroom's process cache,
+**when** the model calls `headroom_retrieve`,
 **then** the extension checks its bounded in-memory original map, then Headroom's `/v1/retrieve` endpoint, and otherwise returns an explicit miss that tells the model to rerun the originating tool.
 
 ## Architecture

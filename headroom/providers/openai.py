@@ -337,6 +337,18 @@ class OpenAITokenCounter:
                             tokens += self.count_text(part.get("text", ""))
                         elif part.get("type") == "image_url":
                             tokens += 85  # Low detail image estimate
+                        elif part.get("type") == "tool_use":
+                            # Anthropic-style tool call in content (Claude Code,
+                            # aider/cursor in Anthropic mode). Previously counted
+                            # as 0; mirror AnthropicTokenCounter.
+                            tokens += self.count_text(part.get("name", ""))
+                            tokens += self.count_text(str(part.get("input", {})))
+                        elif part.get("type") == "tool_result":
+                            # The bulk of a coding-agent conversation lives here.
+                            # Left uncounted, request-level token savings on the
+                            # OpenAI path read ~0 even when this block is
+                            # compressed. Mirror AnthropicTokenCounter.
+                            tokens += self.count_text(str(part.get("content", "")))
                     elif isinstance(part, str):
                         tokens += self.count_text(part)
 

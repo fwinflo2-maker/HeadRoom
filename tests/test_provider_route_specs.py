@@ -89,12 +89,14 @@ def test_direct_handler_routes_model_endpoint_intent() -> None:
             "/v1beta/models/{model}:generateContent",
             "handle_gemini_generate_content",
             "model",
+            True,
         ),
         ProviderHandlerRoute(
             "POST",
             "/v1beta/models/{model}:streamGenerateContent",
             "handle_gemini_stream_generate_content",
             "model",
+            True,
         ),
         ProviderHandlerRoute(
             "POST",
@@ -115,6 +117,20 @@ def test_direct_handler_routes_model_endpoint_intent() -> None:
             "handle_google_cloudcode_stream",
         ),
     )
+
+
+def test_gemini_custom_base_adapter_is_limited_to_generation_routes() -> None:
+    assert {
+        (spec.path, spec.handler_name)
+        for spec in GEMINI_HANDLER_ROUTES
+        if spec.supports_custom_base_url
+    } == {
+        ("/v1beta/models/{model}:generateContent", "handle_gemini_generate_content"),
+        ("/v1beta/models/{model}:streamGenerateContent", "handle_gemini_stream_generate_content"),
+    }
+    assert not next(
+        spec for spec in GEMINI_HANDLER_ROUTES if spec.path.endswith(":countTokens")
+    ).supports_custom_base_url
 
 
 def test_batch_handler_routes_model_endpoint_intent() -> None:

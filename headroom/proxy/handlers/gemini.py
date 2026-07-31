@@ -990,9 +990,17 @@ class GeminiHandlerMixin:
         self,
         request: Request,
         model: str,
-    ) -> StreamingResponse | JSONResponse:
+        upstream_base_url: str | None = None,
+    ) -> Response | StreamingResponse | JSONResponse:
         """Handle Gemini streaming endpoint /v1beta/models/{model}:streamGenerateContent."""
         from fastapi.responses import JSONResponse
+
+        if upstream_base_url:
+            return await self.handle_gemini_generate_content(
+                request,
+                model,
+                upstream_base_url=upstream_base_url,
+            )
 
         from headroom.proxy.helpers import _read_request_json
 

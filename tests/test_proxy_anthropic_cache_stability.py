@@ -1250,9 +1250,18 @@ _LIVE_ASSISTANT_TURN = {"role": "assistant", "content": [{"type": "text", "text"
 def test_cache_mode_anchors_live_same_message_append_frontier() -> None:
     """Two real turns through the handler, with the real SessionTrackerStore.
 
-    Nothing about the tracker is stubbed here: turn one's forwarded body and the
-    assistant reply are recorded by the handler's own ``update_from_response``
-    call, and turn two reads that recorded state back.
+    Nothing about the tracker is stubbed here: the session id, the lineage
+    lookup, and the recorded prior state all come from the real
+    ``SessionTrackerStore``. Turn one's forwarded body and the assistant reply
+    are recorded by the handler's own ``update_from_response`` call, and turn two
+    reads that state back.
+
+    The issue warns that the previously forwarded messages arrive empty on every
+    turn for this caller shape, which would leave any marker fix inert. That is
+    the lineage lookup: it required the whole prior history to canonicalize-equal
+    the current prefix, which a message that grew by blocks never does, so every
+    turn allocated a fresh tracker. Routing the lookup through the shared
+    append-only classifier is what makes the prior state non-empty here.
     """
     captured_bodies = []
     with _make_proxy_client() as client:
@@ -1260,11 +1269,6 @@ def test_cache_mode_anchors_live_same_message_append_frontier() -> None:
         proxy.config.optimize = True
         proxy.config.mode = "cache"
         proxy.config.image_optimize = False
-
-        # Only the session key is pinned, so both turns land on one lineage.
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
-            "stable-session"
-        )
 
         async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
             captured_bodies.append(body)

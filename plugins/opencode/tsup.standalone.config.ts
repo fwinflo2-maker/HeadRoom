@@ -6,7 +6,10 @@ import { defineConfig } from "tsup";
 // with node_modules present; pip installs have no node_modules, so this
 // variant bundles every dependency into a single loadable file.
 export default defineConfig({
-  entry: { "entry.opencode": "src/entry.opencode.ts" },
+  entry: {
+    "entry.opencode": "src/entry.opencode.ts",
+    "hook-shim/handler": "src/entry.hook-shim.ts",
+  },
   outDir: "dist-standalone",
   format: ["esm"],
   splitting: false,

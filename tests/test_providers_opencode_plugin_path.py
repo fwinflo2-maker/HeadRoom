@@ -10,6 +10,7 @@ import headroom.providers.opencode.runtime as oc_runtime
 from headroom.providers.opencode.runtime import headroom_opencode_plugin_path
 
 _PACKAGED = Path(oc_runtime.__file__).resolve().parent / "_dist" / "entry.opencode.js"
+_PACKAGED_SHIM = Path(oc_runtime.__file__).resolve().parent / "hook-shim" / "handler.js"
 _REPO_BUILD = (
     Path(oc_runtime.__file__).resolve().parents[3]
     / "plugins"
@@ -29,6 +30,16 @@ def test_packaged_bundle_is_committed_and_self_contained() -> None:
     # allowed (site-packages has no node_modules to resolve anything else).
     assert 'from "headroom-ai"' not in text
     assert 'from "@opencode-ai/plugin"' not in text
+
+
+def test_packaged_hook_shim_is_committed_and_self_contained() -> None:
+    assert _PACKAGED_SHIM.is_file(), (
+        "committed wheel hook shim missing - run npm run build:standalone"
+    )
+    text = _PACKAGED_SHIM.read_text(encoding="utf-8")
+    assert len(text) > 10_000, "hook shim suspiciously small - not the standalone build?"
+    assert "../dist/index.js" not in text
+    assert 'from "headroom-ai"' not in text
 
 
 def test_plugin_path_env_override_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

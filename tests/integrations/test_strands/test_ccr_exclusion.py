@@ -23,16 +23,56 @@ def hook(monkeypatch: pytest.MonkeyPatch) -> hooks.HeadroomHookProvider:
     return provider
 
 
-def _event(tool_name: str, content: str) -> Mock:
-    event = Mock()
-    event.tool_use = {"name": tool_name, "toolUseId": "tool_1"}
-    event.result = {"content": [{"text": content}]}
-    return event
+class _Registry:
+    """Stand-in for Strands' HookRegistry that dispatches like the real one."""
+
+    def __init__(self) -> None:
+        self._callbacks: dict[object, list] = {}
+
+    def add_callback(self, event_type: object, callback) -> None:  # noqa: ANN001
+        self._callbacks.setdefault(event_type, []).append(callback)
+
+    def dispatch(self, event_type: object, event: object) -> None:
+        for callback in self._callbacks[event_type]:
+            callback(event)
 
 
-def test_qualified_ccr_tool_result_is_preserved(hook: hooks.HeadroomHookProvider) -> None:
+def _event(tool_name: str, content: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        tool_use={"name": tool_name, "toolUseId": "tool_1"},
+        result={"content": [{"text": content}]},
+    )
+
+
+def test_qualified_ccr_result_is_preserved_through_the_registered_hook(
+    hook: hooks.HeadroomHookProvider,
+) -> None:
+    """Drive the seam Strands actually drives: register_hooks, then dispatch."""
+    registry = _Registry()
+    hook.register_hooks(registry)
+
     content = "x" * 400
     event = _event("mcp__headroom__headroom_retrieve", content)
+    registry.dispatch(hooks.AfterToolCallEvent, event)
+
+    assert event.result["content"][0]["text"] == content
+    assert hook.metrics_history[0].skip_reason == "tool_excluded"
+    hook._crusher.crush.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "mcp__headroom__headroom_retrieve",
+        "mcp_headroom_headroom_retrieve",
+        "headroom_retrieve",
+    ],
+)
+def test_qualified_ccr_tool_result_is_preserved(
+    hook: hooks.HeadroomHookProvider, tool_name: str
+) -> None:
+    content = "x" * 400
+    event = _event(tool_name, content)
 
     hook._compress_tool_result(event)
 

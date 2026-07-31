@@ -1137,10 +1137,26 @@ def test_cache_mode_skips_same_message_append_rewrite_to_preserve_stability() ->
 
         tracker = _FakePrefixTracker(frozen_count=0)
         tracker._last_original_messages = [
-            {"role": "user", "content": "shared-prefix"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "shared-prefix"},
+                    {"type": "text", "text": "stable-frontier"},
+                ],
+            },
         ]
         tracker._last_forwarded_messages = [
-            {"role": "user", "content": "COMPRESSED_PREFIX"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "shared-prefix"},
+                    {
+                        "type": "text",
+                        "text": "stable-frontier",
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                    },
+                ],
+            },
         ]
         tracker.get_last_original_messages = lambda: tracker._last_original_messages.copy()
         tracker.get_last_forwarded_messages = lambda: tracker._last_forwarded_messages.copy()
@@ -1190,16 +1206,104 @@ def test_cache_mode_skips_same_message_append_rewrite_to_preserve_stability() ->
                 "model": "claude-sonnet-4-6",
                 "max_tokens": 64,
                 "messages": [
-                    {"role": "user", "content": "shared-prefix + raw suffix"},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "shared-prefix"},
+                            {"type": "text", "text": "stable-frontier"},
+                            {
+                                "type": "text",
+                                "text": "raw suffix",
+                                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                            },
+                        ],
+                    },
                 ],
             },
         )
 
         assert response.status_code == 200
         assert captured["calls"] == []
-        assert captured["body"]["messages"] == [
-            {"role": "user", "content": "shared-prefix + raw suffix"},
-        ]
+        sent_content = captured["body"]["messages"][0]["content"]
+        assert sent_content[1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+        assert "cache_control" not in sent_content[2]
+
+
+def test_cache_mode_anchors_live_same_message_append_frontier() -> None:
+    captured_bodies = []
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = True
+        proxy.config.mode = "cache"
+        proxy.config.image_optimize = False
+
+        tracker = _FakePrefixTracker(frozen_count=0)
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "stable-session"
+        )
+        proxy.session_tracker_store.resolve_tracker = lambda session_id, provider, messages: tracker
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            captured_bodies.append(body)
+            return httpx.Response(
+                200,
+                json={
+                    "id": f"msg_live_{len(captured_bodies)}",
+                    "type": "message",
+                    "role": "user",
+                    "content": [],
+                    "usage": {
+                        "input_tokens": 80,
+                        "output_tokens": 3,
+                        "cache_read_input_tokens": 40 if len(captured_bodies) > 1 else 0,
+                        "cache_creation_input_tokens": 40,
+                    },
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        def _blocks(*texts, marked=None):
+            return [
+                {
+                    "type": "text",
+                    "text": text,
+                    **(
+                        {"cache_control": {"type": "ephemeral", "ttl": "1h"}}
+                        if index == marked
+                        else {}
+                    ),
+                }
+                for index, text in enumerate(texts)
+            ]
+
+        headers = {"x-api-key": "test-key", "anthropic-version": "2023-06-01"}
+        first = client.post(
+            "/v1/messages",
+            headers=headers,
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": _blocks("a", "b", marked=1)}],
+            },
+        )
+        second = client.post(
+            "/v1/messages",
+            headers=headers,
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": _blocks("a", "b", "c", marked=2)}],
+            },
+        )
+
+        assert first.status_code == second.status_code == 200
+        second_content = captured_bodies[1]["messages"][0]["content"]
+        assert second_content[1]["cache_control"] == {
+            "type": "ephemeral",
+            "ttl": "1h",
+        }
+        assert "cache_control" not in second_content[2]
 
 
 # ─── Issue #327 regression tests ─────────────────────────────────────────────

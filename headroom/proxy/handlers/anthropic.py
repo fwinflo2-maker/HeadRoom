@@ -1639,7 +1639,20 @@ class AnthropicHandlerMixin:
             # a single breakpoint on the last block (caches the whole prefix;
             # content-keyed cache so re-placing never busts). Applied last so the
             # forwarded AND recorded (next_forwarded) messages stay bounded.
-            _norm = normalize_message_cache_control(optimized_messages)
+            _norm = normalize_message_cache_control(
+                optimized_messages,
+                current_original_messages=original_client_messages,
+                previous_original_messages=(
+                    prefix_tracker.get_last_original_messages()
+                    if hasattr(prefix_tracker, "get_last_original_messages")
+                    else None
+                ),
+                previous_forwarded_messages=(
+                    prefix_tracker.get_last_forwarded_messages()
+                    if hasattr(prefix_tracker, "get_last_forwarded_messages")
+                    else None
+                ),
+            )
             if _norm is not optimized_messages:
                 optimized_messages = _norm
 

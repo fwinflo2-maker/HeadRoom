@@ -229,6 +229,50 @@ def _canonicalize_for_prefix_compare(obj: Any) -> Any:
     return obj
 
 
+@dataclass(frozen=True)
+class AppendOnlyClassification:
+    """Canonical relationship between two consecutive message histories."""
+
+    block_frontier: tuple[int, int] | None = None
+
+
+def _classify_append_only_canonical(
+    current_messages: list[Any],
+    previous_messages: list[Any],
+) -> AppendOnlyClassification | None:
+    """Classify a history that preserves the previous history's semantics."""
+    if len(current_messages) < len(previous_messages):
+        return None
+
+    block_frontier: tuple[int, int] | None = None
+    for index, previous_message in enumerate(previous_messages):
+        current_message = current_messages[index]
+        if current_message == previous_message:
+            continue
+
+        # A single existing message may grow by appending content blocks. Any
+        # replacement, insertion, or second changed message is a divergence.
+        if block_frontier is not None:
+            return None
+        previous_content = (
+            previous_message.get("content") if isinstance(previous_message, dict) else None
+        )
+        current_content = (
+            current_message.get("content") if isinstance(current_message, dict) else None
+        )
+        if (
+            not isinstance(previous_content, list)
+            or not isinstance(current_content, list)
+            or len(current_content) <= len(previous_content)
+            or current_content[: len(previous_content)] != previous_content
+        ):
+            return None
+        if previous_content:
+            block_frontier = (index, len(previous_content) - 1)
+
+    return AppendOnlyClassification(block_frontier=block_frontier)
+
+
 def extract_cache_stable_delta(
     current_messages: list[dict[str, Any]],
     previous_original_messages: list[dict[str, Any]] | None,
@@ -251,12 +295,11 @@ def extract_cache_stable_delta(
     """
     if not previous_original_messages or previous_forwarded_messages is None:
         return None
+    match = classify_append_only_prefix(current_messages, previous_original_messages)
+    if match is None or match.block_frontier is not None:
+        return None
     prefix_len = len(previous_original_messages)
     if len(current_messages) < prefix_len:
-        return None
-    if _canonicalize_for_prefix_compare(
-        current_messages[:prefix_len]
-    ) != _canonicalize_for_prefix_compare(previous_original_messages):
         return None
     return (
         copy.deepcopy(previous_forwarded_messages),
@@ -311,6 +354,31 @@ def overlay_cached_prefix(
             n,
         )
         return optimized_messages
+    match = classify_append_only_prefix(current_original_messages, prev_orig)
+    if match is not None and match.block_frontier is not None:
+        message_index, _ = match.block_frontier
+        previous_message = prev_fwd[message_index]
+        current_message = optimized_messages[message_index]
+        previous_content = (
+            previous_message.get("content") if isinstance(previous_message, dict) else None
+        )
+        current_content = (
+            current_message.get("content") if isinstance(current_message, dict) else None
+        )
+        if (
+            isinstance(previous_content, list)
+            and isinstance(current_content, list)
+            and len(current_content) >= len(previous_content)
+        ):
+            merged = copy.deepcopy(previous_message)
+            merged["content"] = copy.deepcopy(previous_content) + copy.deepcopy(
+                current_content[len(previous_content) :]
+            )
+            return (
+                list(prev_fwd[:message_index])
+                + [merged]
+                + list(optimized_messages[message_index + 1 :])
+            )
     # Append-only guard on CONTENT ONLY, message-by-message. Replay the
     # previously-forwarded (cached, compressed) bytes for the longest LEADING
     # run of messages that is byte-for-byte (content-canonical) identical to
@@ -361,6 +429,10 @@ def overlay_cached_prefix(
 
 def normalize_message_cache_control(
     messages: list[dict[str, Any]],
+    *,
+    current_original_messages: list[dict[str, Any]] | None = None,
+    previous_original_messages: list[dict[str, Any]] | None = None,
+    previous_forwarded_messages: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Own message-level cache_control placement so breakpoints stay bounded.
 
@@ -412,13 +484,52 @@ def normalize_message_cache_control(
                 last_block_idx = i
         else:
             out.append(msg)
-    # Re-place exactly one breakpoint on the last block-style message.
+    match = None
+    if previous_original_messages:
+        match = classify_append_only_prefix(
+            current_original_messages or messages,
+            previous_original_messages,
+        )
+
+    # A same-message append keeps the provider's old cache frontier. The
+    # current marker still supplies its explicit TTL when present.
+    target_block_idx: tuple[int, int] | None = None
+    prior_marker: dict[str, Any] | None = None
+    if match and match.block_frontier:
+        message_idx, block_idx = match.block_frontier
+        if message_idx < len(out) and isinstance(out[message_idx].get("content"), list):
+            content = out[message_idx]["content"]
+            if block_idx < len(content):
+                target_block_idx = (message_idx, block_idx)
+                if previous_forwarded_messages and message_idx < len(previous_forwarded_messages):
+                    previous_message = previous_forwarded_messages[message_idx]
+                    previous_content = (
+                        previous_message.get("content")
+                        if isinstance(previous_message, dict)
+                        else None
+                    )
+                    if isinstance(previous_content, list) and block_idx < len(previous_content):
+                        previous_block = previous_content[block_idx]
+                        if isinstance(previous_block, dict):
+                            marker = previous_block.get("cache_control")
+                            if isinstance(marker, dict):
+                                prior_marker = marker
+
+    # Re-place exactly one breakpoint, anchored to the prior block frontier
+    # when a message grew in place, otherwise on the newest block-style message.
     if last_block_idx >= 0:
-        msg = out[last_block_idx]
+        target_message_idx, target_block_idx_value = target_block_idx or (
+            last_block_idx,
+            len(out[last_block_idx]["content"]) - 1,
+        )
+        msg = out[target_message_idx]
         content = list(msg["content"])
-        marker = dict(last_marker) if last_marker else {"type": "ephemeral"}
-        content[-1] = {**content[-1], "cache_control": marker}
-        out[last_block_idx] = {**msg, "content": content}
+        marker = dict(last_marker or prior_marker or {"type": "ephemeral"})
+        content[target_block_idx_value] = {
+            **content[target_block_idx_value],
+            "cache_control": marker,
+        }
+        out[target_message_idx] = {**msg, "content": content}
         changed = True
     return out if changed else messages
 
@@ -806,6 +917,18 @@ def _lineage_snapshot(obj: Any) -> Any:
     return obj
 
 
+def classify_append_only_prefix(
+    current_messages: list[dict[str, Any]],
+    previous_messages: list[dict[str, Any]],
+) -> AppendOnlyClassification | None:
+    """Return the shared append-only classification for two message histories."""
+    if not current_messages or not previous_messages:
+        return None
+    current = _lineage_snapshot(_canonicalize_for_prefix_compare(current_messages))
+    previous = _lineage_snapshot(_canonicalize_for_prefix_compare(previous_messages))
+    return _classify_append_only_canonical(current, previous)
+
+
 class SessionTrackerStore:
     """Manages PrefixCacheTracker instances across sessions.
 
@@ -918,13 +1041,13 @@ class SessionTrackerStore:
 
         family = self._lineages.setdefault(session_id, OrderedDict())
 
-        # Longest recorded chain that prefixes the incoming history wins.
+        # Longest recorded append-only chain that matches the incoming history wins.
         best_key: str | None = None
         best_len = -1
         for key, chain in family.items():
             if len(chain) > len(snap) or len(chain) <= best_len:
                 continue
-            if snap[: len(chain)] == chain:
+            if classify_append_only_prefix(snap, chain) is not None:
                 best_key, best_len = key, len(chain)
 
         if best_key is None:

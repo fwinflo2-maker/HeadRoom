@@ -602,6 +602,58 @@ class TestConversationLineageResolution:
         )
         assert t2 is t1
 
+    def test_same_message_block_append_reuses_lineage(self, store):
+        sid = "shared"
+        first = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "stable-1"},
+                    {"type": "text", "text": "stable-2"},
+                ],
+            },
+            {"role": "assistant", "content": "ack"},
+        ]
+        tracker = store.resolve_tracker(sid, "anthropic", messages=first)
+        grown = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "stable-1"},
+                    {"type": "text", "text": "stable-2"},
+                    {"type": "text", "text": "appended"},
+                ],
+            },
+            {"role": "assistant", "content": "ack"},
+        ]
+        assert store.resolve_tracker(sid, "anthropic", messages=grown) is tracker
+
+    def test_same_message_block_edit_starts_new_lineage(self, store):
+        sid = "shared"
+        first = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "stable-1"},
+                    {"type": "text", "text": "stable-2"},
+                ],
+            },
+            {"role": "assistant", "content": "ack"},
+        ]
+        tracker = store.resolve_tracker(sid, "anthropic", messages=first)
+        edited = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "edited"},
+                    {"type": "text", "text": "stable-2"},
+                    {"type": "text", "text": "appended"},
+                ],
+            },
+            {"role": "assistant", "content": "ack"},
+        ]
+        assert store.resolve_tracker(sid, "anthropic", messages=edited) is not tracker
+
     @pytest.mark.parametrize(
         "requote",
         [

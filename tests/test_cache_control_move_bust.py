@@ -224,3 +224,44 @@ def test_normalize_ttl_survives_many_turns():
         conv = normalize_message_cache_control(conv)
         assert _markers(conv) == 1
         assert conv[-1]["content"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+
+def test_normalize_anchors_same_message_append_to_prior_frontier():
+    previous = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "stable-1"},
+                {
+                    "type": "text",
+                    "text": "stable-2",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                },
+            ],
+        },
+        {"role": "assistant", "content": "ack"},
+    ]
+    current = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "stable-1"},
+                {"type": "text", "text": "stable-2"},
+                {
+                    "type": "text",
+                    "text": "appended",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                },
+            ],
+        },
+        {"role": "assistant", "content": "ack"},
+    ]
+    out = normalize_message_cache_control(
+        current,
+        current_original_messages=current,
+        previous_original_messages=previous,
+        previous_forwarded_messages=previous,
+    )
+    assert out[0]["content"][1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert "cache_control" not in out[0]["content"][2]
+    assert _markers(out) == 1

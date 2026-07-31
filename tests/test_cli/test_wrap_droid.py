@@ -2,8 +2,9 @@
 
 `wrap droid` routes Factory Droid through Headroom by pointing Droid's gateway
 at the local proxy via ``FACTORY_API_BASE_URL`` and forwarding to the resolved
-Factory upstream. These tests pin the env wiring and upstream precedence; every
-test runs from a tmp cwd so the real project ``AGENTS.md`` is never touched.
+Factory upstream. These tests pin the env wiring and upstream precedence. The
+command does no filesystem surgery (the CLI context tools were removed upstream
+in #2677), but every test still runs from a tmp cwd as a guard.
 """
 
 from __future__ import annotations
@@ -60,7 +61,7 @@ def test_resolve_factory_upstream_precedence(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_wrap_droid_missing_binary_exits_with_install_hint(runner: CliRunner) -> None:
     with patch("headroom.cli.wrap.shutil.which", return_value=None):
-        result = runner.invoke(main, ["wrap", "droid", "--no-context-tool"])
+        result = runner.invoke(main, ["wrap", "droid"])
 
     assert result.exit_code == 1
     assert "docs.factory.ai" in result.output
@@ -78,7 +79,7 @@ def test_wrap_droid_points_child_at_proxy_and_forwards_default_upstream(
         patch("headroom.cli.wrap.shutil.which", return_value="droid"),
         patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
     ):
-        result = runner.invoke(main, ["wrap", "droid", "--no-context-tool", "--", "exec", "say hi"])
+        result = runner.invoke(main, ["wrap", "droid", "--", "exec", "say hi"])
 
     assert result.exit_code == 0, result.output
     assert captured["tool_label"] == "DROID"
@@ -107,7 +108,6 @@ def test_wrap_droid_explicit_upstream_and_custom_port(runner: CliRunner) -> None
             [
                 "wrap",
                 "droid",
-                "--no-context-tool",
                 "--port",
                 "9191",
                 "--factory-api-url",
@@ -132,7 +132,7 @@ def test_wrap_droid_inherits_ambient_factory_base_url_as_upstream(
         patch("headroom.cli.wrap.shutil.which", return_value="droid"),
         patch("headroom.cli.wrap._launch_tool", side_effect=lambda **kw: captured.update(kw)),
     ):
-        result = runner.invoke(main, ["wrap", "droid", "--no-context-tool"])
+        result = runner.invoke(main, ["wrap", "droid"])
 
     assert result.exit_code == 0, result.output
     # The caller's existing gateway becomes the upstream the proxy forwards to,
@@ -145,19 +145,29 @@ def test_wrap_droid_inherits_ambient_factory_base_url_as_upstream(
 
 def test_wrap_droid_prepare_only_reports_wiring(runner: CliRunner) -> None:
     with patch("headroom.cli.wrap.shutil.which", return_value="droid"):
-        result = runner.invoke(main, ["wrap", "droid", "--no-context-tool", "--prepare-only"])
+        result = runner.invoke(main, ["wrap", "droid", "--prepare-only"])
 
     assert result.exit_code == 0, result.output
     assert "FACTORY_API_BASE_URL=http://127.0.0.1:8787" in result.output
     assert f"upstream={DEFAULT_FACTORY_API_URL}" in result.output
 
 
-def test_wrap_droid_no_context_tool_skips_agents_md(runner: CliRunner, tmp_path: Path) -> None:
+def test_wrap_droid_does_not_write_agents_md(runner: CliRunner, tmp_path: Path) -> None:
+    """Droid inference routing is proxy-only; it never does filesystem surgery."""
     with (
         patch("headroom.cli.wrap.shutil.which", return_value="droid"),
         patch("headroom.cli.wrap._launch_tool"),
     ):
-        result = runner.invoke(main, ["wrap", "droid", "--no-context-tool"])
+        result = runner.invoke(main, ["wrap", "droid"])
 
     assert result.exit_code == 0, result.output
     assert not (tmp_path / "AGENTS.md").exists()
+
+
+def test_wrap_droid_rejects_retired_context_tool_flag(runner: CliRunner) -> None:
+    """The CLI context tools were removed upstream (#2677); the flag is rejected."""
+    with patch("headroom.cli.wrap.shutil.which", return_value="droid"):
+        result = runner.invoke(main, ["wrap", "droid", "--no-context-tool"])
+
+    assert result.exit_code != 0
+    assert "have been removed" in result.output

@@ -8313,20 +8313,9 @@ def omp(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
+@_retired_context_tool_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
-@click.option(
-    "--no-context-tool",
-    "--no-rtk",
-    "no_rtk",
-    is_flag=True,
-    help="Skip CLI context-tool setup",
-)
-@click.option(
-    "--no-project-rtk",
-    is_flag=True,
-    help="Keep the project AGENTS.md unchanged (only used on the rtk-instructions fallback)",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
@@ -8341,8 +8330,6 @@ def omp(
 @click.argument("droid_args", nargs=-1, type=click.UNPROCESSED)
 def droid(
     port: int,
-    no_rtk: bool,
-    no_project_rtk: bool,
     no_proxy: bool,
     learn: bool,
     memory: bool,
@@ -8357,63 +8344,20 @@ def droid(
     Droid talks to Factory's gateway and honors ``FACTORY_API_BASE_URL`` to
     redirect that traffic. This command starts the proxy in Factory mode and
     launches ``droid`` with ``FACTORY_API_BASE_URL`` pointed at the local proxy.
-    The proxy compresses the Anthropic-shaped ``/api/llm/a/v1/messages``
-    inference route and forwards every other Factory REST path verbatim to the
-    real upstream, passing the Factory session credential through untouched. Use
-    Droid normally: any model, including Droid Core, is compressed on your
-    Factory subscription. No ``customModels`` edits and no API keys.
-
-    \b
-    Context tool: tries to register rtk's native Droid PreToolUse hook; if the
-    available rtk build does not support ``--agent droid``, it falls back to
-    injecting rtk guidance into ``AGENTS.md`` at the project root (and the
-    global ``~/.factory/AGENTS.md``). Either way, Droid's API traffic is
-    compressed by the proxy.
-
-    \b
-    Uninstall: there is no ``headroom unwrap droid`` subcommand. If the rtk
-    instructions fallback wrote to ``AGENTS.md``, remove everything between
-    ``<!-- headroom:rtk-instructions -->`` and
-    ``<!-- /headroom:rtk-instructions -->`` (inclusive).
+    The proxy compresses the Anthropic-shaped ``/api/llm/a/v1/messages`` and the
+    OpenAI-shaped ``/api/llm/o/v1/chat/completions`` inference routes and
+    forwards every other Factory REST path verbatim to the real upstream,
+    passing the Factory session credential through untouched. Use Droid
+    normally: any model, including Droid Core, is compressed on your Factory
+    subscription. No ``customModels`` edits and no API keys.
 
     \b
     Examples:
-        headroom wrap droid                     # Start proxy + context tool + droid
+        headroom wrap droid                     # Start proxy + droid
         headroom wrap droid -- exec "say hi"    # Pass args to droid
-        headroom wrap droid --no-context-tool   # Skip CLI context-tool setup
         headroom wrap droid --port 9999         # Custom proxy port
     """
     from headroom.providers.droid import proxy_base_url, resolve_factory_upstream
-
-    # Droid reads instructions from AGENTS.md; pre-compute the marker path so
-    # the KeyboardInterrupt handler can report it even if the interrupt fires
-    # during the inner _ensure_rtk_binary download.
-    agents_md: Path | None = Path.cwd() / "AGENTS.md" if not no_rtk else None
-    if not no_rtk:
-
-        def _register_droid_hook(rtk_path: Path) -> None:
-            # Prefer rtk's native Droid PreToolUse hook, but only when the
-            # pinned rtk actually supports it (i.e. "droid" is in the native
-            # set). The pinned rtk does not yet, so this falls through to the
-            # AGENTS.md instructions; a future rtk bump that adds "droid" to
-            # RTK_NATIVE_HOOK_AGENTS lights up the silent hook automatically.
-            from headroom.rtk.installer import RTK_NATIVE_HOOK_AGENTS, register_agent_hooks
-
-            if "droid" in RTK_NATIVE_HOOK_AGENTS and register_agent_hooks(rtk_path, agent="droid"):
-                if verbose:
-                    click.echo("  rtk hook registered for Droid")
-                return
-            if not no_project_rtk:
-                _inject_rtk_instructions(cast(Path, agents_md), verbose=verbose)
-            _inject_rtk_instructions(Path.home() / ".factory" / "AGENTS.md", verbose=verbose)
-
-        _setup_context_tool_for_agent(
-            agent="droid",
-            agent_display="Droid",
-            marker_path=agents_md,
-            on_rtk_ready=_register_droid_hook,
-            verbose=verbose,
-        )
 
     factory_upstream = resolve_factory_upstream(factory_api_url)
 

@@ -26,7 +26,6 @@ Factory exposes two inference shapes and Droid picks per model: Anthropic Messag
 | Proxy | Starts the Headroom proxy in Factory mode unless `--no-proxy` is set |
 | Redirect | Launches Droid with `FACTORY_API_BASE_URL=http://127.0.0.1:<port>` |
 | Compress | The `/api/llm/a/v1/messages` and `/api/llm/o/v1/chat/completions` inference routes are compressed; all other Factory paths are forwarded as-is |
-| Context tool | Registers rtk's native Droid PreToolUse hook when the rtk build supports it; otherwise injects rtk guidance into the project `AGENTS.md` and global `~/.factory/AGENTS.md` |
 | Upstream | Forwards to `https://api.factory.ai` by default, or to an existing `FACTORY_API_BASE_URL` / `--factory-api-url` (enterprise or EU gateway) |
 
 ## Options
@@ -35,8 +34,6 @@ Factory exposes two inference shapes and Droid picks per model: Anthropic Messag
 headroom wrap droid \
   --port 8787 \                              # proxy port (default 8787)
   --factory-api-url https://api.factory.ai \ # Factory upstream to forward to
-  --no-context-tool \                        # skip rtk / lean-ctx setup
-  --no-project-rtk \                         # keep project AGENTS.md unchanged (rtk-instructions fallback only)
   --no-proxy \                               # reuse an already-running proxy
   --learn \                                  # enable live traffic learning
   --verbose
@@ -48,4 +45,4 @@ The upstream is resolved with this precedence: `--factory-api-url`, then an exis
 
 - Proxy dashboards bucket the traffic under the `factory` provider and the actual Droid model (for example `minimax-m3` on the Anthropic route, or the Fireworks-backed Kimi model on the OpenAI route). Droid also fires small internal helper calls (for example a Haiku "oneshot"); those are attributed to whatever model they carry.
 - If the target port already runs a non-Factory Headroom proxy that other wrap sessions are attached to (for example a shared `headroom wrap claude` on the default `8787`), `wrap droid` cannot upgrade it to Factory mode without disrupting them, so it stops with an error. Run Droid on a dedicated port instead, e.g. `headroom wrap droid --port 8790`.
-- There is no `headroom unwrap droid`. If the rtk-instructions fallback wrote to `AGENTS.md`, remove everything between `<!-- headroom:rtk-instructions -->` and `<!-- /headroom:rtk-instructions -->` (inclusive) to undo it.
+- There is no `headroom unwrap droid`, and nothing durable is written: the wrap only sets the child `FACTORY_API_BASE_URL` env var for the launched Droid process, so ending the session fully undoes it.

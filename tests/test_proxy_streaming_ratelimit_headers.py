@@ -323,8 +323,12 @@ class TestStreamingRatelimitHeaderForwarding:
             503,
             "https://api.anthropic.com/v1/messages",
         )
-        proxy.metrics.record_request.assert_awaited_once()
-        proxy.cost_tracker.record_tokens.assert_called_once()
+        # A 503 is an upstream failure, so it books via record_failed and stops
+        # before the savings/cost success path — otherwise a failed request
+        # inflates the save-rate (#1568).
+        proxy.metrics.record_failed.assert_awaited_once()
+        proxy.metrics.record_request.assert_not_awaited()
+        proxy.cost_tracker.record_tokens.assert_not_called()
         mock_response.aclose.assert_awaited_once()
 
     @pytest.mark.asyncio

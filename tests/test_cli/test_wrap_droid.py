@@ -34,6 +34,15 @@ def _tmp_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("FACTORY_API_BASE_URL", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _no_running_proxy():  # type: ignore[no-untyped-def]
+    """Default: no proxy is running, so the automatic-port logic never probes the
+    real machine's ports (non-deterministic). Tests that need a running proxy
+    re-patch ``_check_proxy`` explicitly inside their own ``with`` block."""
+    with patch("headroom.cli.wrap._check_proxy", return_value=False):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # runtime helpers
 # ---------------------------------------------------------------------------
@@ -171,3 +180,38 @@ def test_wrap_droid_rejects_retired_context_tool_flag(runner: CliRunner) -> None
 
     assert result.exit_code != 0
     assert "have been removed" in result.output
+
+
+def test_wrap_droid_falls_back_to_free_port_when_incompatible(runner: CliRunner) -> None:
+    """A non-Factory proxy on the port -> start a dedicated proxy on a free port."""
+    captured: dict[str, object] = {}
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="droid"),
+        patch("headroom.cli.wrap._check_proxy", return_value=True),
+        patch("headroom.cli.wrap._query_proxy_config", return_value={"factory_api_url": None}),
+        patch("headroom.cli.wrap._find_available_port", return_value=8790),
+        patch("headroom.cli.wrap._launch_tool", side_effect=lambda **kw: captured.update(kw)),
+    ):
+        result = runner.invoke(main, ["wrap", "droid"])
+    assert result.exit_code == 0, result.output
+    assert captured["port"] == 8790
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["FACTORY_API_BASE_URL"] == "http://127.0.0.1:8790"
+
+
+def test_wrap_droid_reuses_matching_factory_proxy(runner: CliRunner) -> None:
+    """A Factory proxy for the SAME upstream on the port is reused (no fallback)."""
+    captured: dict[str, object] = {}
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="droid"),
+        patch("headroom.cli.wrap._check_proxy", return_value=True),
+        patch(
+            "headroom.cli.wrap._query_proxy_config",
+            return_value={"factory_api_url": DEFAULT_FACTORY_API_URL},
+        ),
+        patch("headroom.cli.wrap._launch_tool", side_effect=lambda **kw: captured.update(kw)),
+    ):
+        result = runner.invoke(main, ["wrap", "droid"])
+    assert result.exit_code == 0, result.output
+    assert captured["port"] == 8787

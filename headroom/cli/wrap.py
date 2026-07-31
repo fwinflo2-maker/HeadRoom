@@ -8372,6 +8372,28 @@ def droid(
         click.echo("Install Factory Droid: https://docs.factory.ai")
         raise SystemExit(1)
 
+    # Automatic port selection (no --port needed). Reuse a running Factory proxy
+    # for the same upstream; otherwise a proxy on this port belongs to a
+    # different session (a shared `wrap claude`, or a Factory proxy for another
+    # upstream) whose routes would misroute Droid, so start a dedicated proxy on
+    # the next free port instead of disrupting it or failing. `_launch_tool`
+    # rewrites FACTORY_API_BASE_URL to the actual port, so Droid follows.
+    if not no_proxy and _check_proxy(port):
+        running_config = _query_proxy_config(port)
+        running_factory = (
+            _normalize_proxy_api_url(running_config.get("factory_api_url"))
+            if running_config
+            else None
+        )
+        if running_factory != _normalize_proxy_api_url(factory_upstream):
+            new_port = _find_available_port(port + 1)
+            if new_port != port:
+                click.echo(
+                    f"  Port {port} is serving a different session; using port "
+                    f"{new_port} for this Droid session."
+                )
+                port = new_port
+
     env = os.environ.copy()
     env["FACTORY_API_BASE_URL"] = proxy_base_url(port)
     env_vars_display = [

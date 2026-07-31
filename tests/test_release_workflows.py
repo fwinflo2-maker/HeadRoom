@@ -1247,6 +1247,10 @@ def test_release_please_config_and_manifest_are_present_and_consistent() -> None
         "release-please must bump plugins/openclaw/package.json so the "
         "openclaw npm publish stays in sync."
     )
+    assert "plugins/opencode/package.json" in extra_paths, (
+        "release-please must bump plugins/opencode/package.json so the "
+        "opencode npm publish stays in sync."
+    )
 
 
 def test_release_metadata_sync_runs_on_release_please_branch() -> None:
@@ -1310,7 +1314,3 @@ def test_version_sync_covers_every_file_the_verifier_gates() -> None:
         "server.json",
     ]:
         assert fragment in sync, f"version-sync.py no longer propagates a version to {fragment}"
-    assert "plugins/opencode/package.json" in extra_paths, (
-        "release-please must bump plugins/opencode/package.json so the "
-        "opencode npm publish stays in sync."
-    )

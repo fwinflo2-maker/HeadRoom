@@ -1451,7 +1451,7 @@ def test_factory_openai_chat_route_ignores_spoofed_routing_headers(monkeypatch) 
     # Regression: a client must not be able to override Factory routing by
     # sending its own x-headroom-* headers. The route now replaces (not
     # appends) them, and handle_openai_chat resolves the upstream via
-    # `request.headers.get(...)`, which returns the FIRST duplicate — so a
+    # `request.headers.get(...)`, which returns the FIRST duplicate, so a
     # leftover spoofed value would win. Assert the injected Factory base/path
     # are authoritative and the spoofed values are gone entirely.
     seen: list[tuple[str, str | None, str | None]] = []

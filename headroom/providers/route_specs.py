@@ -142,6 +142,7 @@ GEMINI_HANDLER_ROUTES: tuple[ProviderHandlerRoute, ...] = (
         "/v1beta/models/{model}:countTokens",
         "handle_gemini_count_tokens",
         "model",
+        True,
     ),
 )
 

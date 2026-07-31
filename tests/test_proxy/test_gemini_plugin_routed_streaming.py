@@ -88,7 +88,6 @@ def test_plugin_generate_content_uses_native_gemini_route_and_preserves_body() -
             "/v1beta/models/gemini-2.5-flash:generateContent",
             headers={
                 "x-headroom-base-url": PLUGIN_BASE_URL,
-                "x-headroom-original-path": "/v1beta/models/gemini-2.5-flash:generateContent",
             },
             json=body,
         )
@@ -142,7 +141,6 @@ def test_plugin_stream_generate_content_preserves_sse_and_native_parts() -> None
             "/v1beta/models/gemini-2.5-flash:streamGenerateContent",
             headers={
                 "x-headroom-base-url": PLUGIN_BASE_URL,
-                "x-headroom-original-path": "/v1beta/models/gemini-2.5-flash:streamGenerateContent",
             },
             json=body,
         )
@@ -224,8 +222,9 @@ def test_adjacent_custom_base_path_stays_passthrough() -> None:
 def test_plugin_routed_streaming_reaches_the_transform_pipeline() -> None:
     """The reported symptom is `transforms=none` on plugin-routed Gemini traffic.
 
-    Base forwards these requests through the passthrough branch, so the pipeline
-    never runs and `_stream_response` receives an empty transforms list.
+    On base the streaming handler is reached but nothing hands it the tagged
+    upstream, so it forwards to generativelanguage.googleapis.com with an empty
+    transforms list.
     """
     body = {
         "contents": [
@@ -262,7 +261,6 @@ def test_plugin_routed_streaming_reaches_the_transform_pipeline() -> None:
             "/v1beta/models/gemini-2.5-flash:streamGenerateContent",
             headers={
                 "x-headroom-base-url": PLUGIN_BASE_URL,
-                "x-headroom-original-path": "/v1beta/models/gemini-2.5-flash:streamGenerateContent",
             },
             json=body,
         )
@@ -303,7 +301,12 @@ def test_direct_gemini_stream_path_still_bypasses_the_pipeline() -> None:
     assert captured["transforms_applied"] == []
 
 
-def test_gemini_count_tokens_does_not_opt_into_plugin_adapter() -> None:
+def test_gemini_count_tokens_follows_the_same_tagged_upstream() -> None:
+    """Counting and generating must agree on the upstream.
+
+    Otherwise the client counts tokens at Google for a model the tagged gateway
+    serves, and the gateway's key travels to Google.
+    """
     app = create_app(_config())
     with TestClient(app) as client:
         proxy = client.app.state.proxy
@@ -319,4 +322,20 @@ def test_gemini_count_tokens_does_not_opt_into_plugin_adapter() -> None:
     call = proxy.handle_gemini_count_tokens.await_args
     assert call is not None
     assert call.args[1] == "gemini-2.5-flash"
+    assert call.kwargs == {"upstream_base_url": PLUGIN_BASE_URL}
+
+
+def test_gemini_count_tokens_without_the_header_stays_on_the_default_upstream() -> None:
+    app = create_app(_config())
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        proxy.handle_gemini_count_tokens = AsyncMock(return_value=JSONResponse({"ok": True}))
+        response = client.post(
+            "/v1beta/models/gemini-2.5-flash:countTokens",
+            json={"contents": []},
+        )
+
+    assert response.status_code == 200, response.text
+    call = proxy.handle_gemini_count_tokens.await_args
+    assert call is not None
     assert call.kwargs == {}

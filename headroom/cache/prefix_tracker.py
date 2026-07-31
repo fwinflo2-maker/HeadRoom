@@ -21,6 +21,7 @@ import hashlib
 import itertools
 import json
 import logging
+import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -384,8 +385,81 @@ def _stable_leading_block_run(
     return k
 
 
+# Env kill switch for the stable-boundary breakpoint placement below. Default on;
+# set to 0/false/no/off to restore the newest-block placement unconditionally.
+# This sits on the cache-key path of every Anthropic request, so it needs a
+# rollback that does not require shipping a new build.
+_STABLE_BOUNDARY_ENV = "HEADROOM_STABLE_BOUNDARY_BREAKPOINT"
+
+# Below this many blocks a message cannot benefit from relocation: the provider
+# walks back up to 20 content-block boundaries from the breakpoint looking for a
+# previous write, so a short message's prefix is still found from the newest
+# block, and anchoring backwards would only shrink what gets cached.
+_MIN_BLOCKS_FOR_RELOCATION = 20
+
+
+def _stable_boundary_enabled() -> bool:
+    return os.environ.get(_STABLE_BOUNDARY_ENV, "").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _breakpoint_index(
+    content: list[Any],
+    msg: dict[str, Any],
+    msg_idx: int,
+    previous_forwarded_messages: list[dict[str, Any]] | None,
+) -> int:
+    """Index within ``content`` that should carry the single message breakpoint.
+
+    Default is the newest block, which is right whenever the provider's 20-block
+    lookback can still reach last turn's write from there — a cold turn, or a
+    conversation that grows by appending messages.
+
+    It is wrong for a message that grows IN PLACE with a varying tail: the
+    breakpoint then rides a block that never repeats, so no stable prefix is ever
+    found and the whole message re-writes every turn. For that shape the
+    breakpoint belongs at the end of the static prefix, which is the previous
+    turn's counterpart message compared block by block.
+
+    The counterpart is looked up by position AND role: the recorded forwarded
+    list is last turn's, so a growing conversation only lines up where the shape
+    really is stable, and any mismatch falls back to the newest block.
+    """
+    newest = len(content) - 1
+    if not previous_forwarded_messages or not _stable_boundary_enabled():
+        return newest
+    if len(content) < _MIN_BLOCKS_FOR_RELOCATION or msg_idx >= len(previous_forwarded_messages):
+        return newest
+    counterpart = previous_forwarded_messages[msg_idx]
+    if not isinstance(counterpart, dict) or counterpart.get("role") != msg.get("role"):
+        return newest
+    previous_blocks = counterpart.get("content")
+    if not isinstance(previous_blocks, list):
+        return newest
+    run = _stable_leading_block_run(content, previous_blocks)
+    # Only anchor backwards when the stable run is real (the message diverged
+    # before its end) and covers most of the message. A short run would cache
+    # less than the newest-block placement writes, which is a worse trade even
+    # though it reads.
+    if 1 <= run < len(content) and run * 2 >= len(content):
+        logger.debug(
+            "cache breakpoint anchored to the stable run of %d/%d blocks in message %d "
+            "(its newest block varies turn over turn)",
+            run,
+            len(content),
+            msg_idx,
+        )
+        return run - 1
+    return newest
+
+
 def normalize_message_cache_control(
     messages: list[dict[str, Any]],
+    previous_forwarded_messages: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Own message-level cache_control placement so breakpoints stay bounded.
 
@@ -396,13 +470,29 @@ def normalize_message_cache_control(
     so on a long conversation the accumulation eventually 400s.
 
     Fix: strip EVERY message-level cache_control and re-place a **single**
-    ephemeral breakpoint on the last block of the last block-style message. One
-    breakpoint caches the whole message prefix up to it, and — because the
-    provider's cache key is message CONTENT, not marker presence (moving the
-    breakpoint forward is the documented client pattern and it hits) — stripping
-    and re-placing markers never busts. system/tools breakpoints live outside
-    ``messages`` and are left untouched (they still count toward the 4 limit, so
-    holding messages to one breakpoint leaves room for them).
+    ephemeral breakpoint. One breakpoint caches the whole message prefix up to
+    it, and — because the provider's cache key is message CONTENT, not marker
+    presence (moving the breakpoint forward is the documented client pattern and
+    it hits) — stripping and re-placing markers never busts. system/tools
+    breakpoints live outside ``messages`` and are left untouched (they still
+    count toward the 4 limit, so holding messages to one breakpoint leaves room
+    for them).
+
+    WHERE that one breakpoint goes is the last block of the last block-style
+    message — except when that message grew IN PLACE since last turn. Sub-call
+    shapes pack a transcript into one block-style message and rewrite its tail
+    each turn, so a breakpoint on its newest block can never match next turn and
+    pins ``cache_read`` at the system+tools constant forever, however stable the
+    rest of the message is. When ``previous_forwarded_messages`` shows that the
+    same message diverged partway through, the breakpoint is anchored to the end
+    of its byte-stable leading run instead: that boundary IS cached, so the run
+    reads from cache and the breakpoint advances one turn behind the growth.
+
+    Relocation only fires when the stable run covers most of the message
+    (otherwise anchoring backwards would cache less than it saves) and only for
+    the same message position and role, so a main conversation — whose newest
+    message is genuinely new each turn — keeps the newest-block placement.
+    ``HEADROOM_STABLE_BOUNDARY_BREAKPOINT=0`` restores it unconditionally.
 
     Headroom owns WHERE the breakpoint goes; the client still owns WHAT it says:
     the re-placed marker reuses the newest client marker verbatim, so an explicit
@@ -442,7 +532,8 @@ def normalize_message_cache_control(
         msg = out[last_block_idx]
         content = list(msg["content"])
         marker = dict(last_marker) if last_marker else {"type": "ephemeral"}
-        content[-1] = {**content[-1], "cache_control": marker}
+        bp_idx = _breakpoint_index(content, msg, last_block_idx, previous_forwarded_messages)
+        content[bp_idx] = {**content[bp_idx], "cache_control": marker}
         out[last_block_idx] = {**msg, "content": content}
         changed = True
     return out if changed else messages

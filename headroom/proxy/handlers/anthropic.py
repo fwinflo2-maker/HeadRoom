@@ -1616,6 +1616,12 @@ class AnthropicHandlerMixin:
                 overlay_cached_prefix,
             )
 
+            # Read the previously-forwarded prefix once and reuse it for both the
+            # overlay replay and the breakpoint placement below — each call deep-
+            # copies the whole transcript and both only READ it, so one copy is
+            # enough on this per-request hot path.
+            _prev_forwarded = prefix_tracker.get_last_forwarded_messages()
+
             # On a confirmed-cold turn we deliberately do NOT replay the previously
             # forwarded prefix: the cache is dead (nothing to keep byte-identical for)
             # and the replay would clobber the whole-prefix recompaction we just did.
@@ -1626,7 +1632,7 @@ class AnthropicHandlerMixin:
                     optimized_messages,
                     original_client_messages,
                     prefix_tracker.get_last_original_messages(),
-                    prefix_tracker.get_last_forwarded_messages(),
+                    _prev_forwarded,
                 )
                 _overlay_replayed = _ov != optimized_messages
                 if _overlay_replayed:
@@ -1636,10 +1642,12 @@ class AnthropicHandlerMixin:
             # Own cache_control placement: the client moves the breakpoint each
             # turn and the overlay replays past markers, so they accumulate ~1/turn
             # and Anthropic hard-errors at >4. Strip message-level markers and keep
-            # a single breakpoint on the last block (caches the whole prefix;
-            # content-keyed cache so re-placing never busts). Applied last so the
+            # a single breakpoint (caches the whole prefix; content-keyed cache so
+            # re-placing never busts). Pass last turn's forwarded messages so the
+            # breakpoint can be anchored to the static prefix of a message that
+            # grows in place, whose newest block never repeats. Applied last so the
             # forwarded AND recorded (next_forwarded) messages stay bounded.
-            _norm = normalize_message_cache_control(optimized_messages)
+            _norm = normalize_message_cache_control(optimized_messages, _prev_forwarded)
             if _norm is not optimized_messages:
                 optimized_messages = _norm
 

@@ -238,7 +238,7 @@
                           x-text="formatNumber(scopeCompressionTokensSaved) + ' proxy tokens · ' + scopeFreshnessText"></span>
                     <span x-show="scopeCompressionUnavailable">Unavailable for selected scope</span>
                     <span x-show="!hasMetricScopes && (stats.persistent_savings?.lifetime?.compression_savings_usd || 0) > 0"
-                          x-text="formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' proxy tokens only; ' + cliFilteringLabel + ' excluded from $'"></span>
+                          x-text="formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' proxy tokens'"></span>
                     <span x-show="!hasMetricScopes && !((stats.persistent_savings?.lifetime?.compression_savings_usd || 0) > 0) && stats.litellm_available !== false"
                           x-text="formatNumber(stats.requests?.total || 0) + ' requests processed'"></span>
                     <!-- Pricing is LiteLLM-only. LiteLLM currently can't install on

@@ -655,6 +655,63 @@ class TestConversationLineageResolution:
         assert store.resolve_tracker(sid, "anthropic", messages=edited) is not tracker
 
     @pytest.mark.parametrize(
+        ("label", "blocks"),
+        [
+            ("removed", ["stable-1"]),
+            ("reordered", ["stable-2", "stable-1"]),
+            ("inserted", ["stable-1", "inserted", "stable-2"]),
+            ("replaced", ["stable-1", "other", "appended"]),
+        ],
+    )
+    def test_non_append_block_rewrites_start_new_lineage(self, store, label, blocks):
+        from headroom.cache.prefix_tracker import classify_append_only_prefix
+
+        sid = f"shared-{label}"
+        first = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "stable-1"},
+                    {"type": "text", "text": "stable-2"},
+                ],
+            },
+            {"role": "assistant", "content": "ack"},
+        ]
+        tracker = store.resolve_tracker(sid, "anthropic", messages=first)
+        rewritten = [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": text} for text in blocks],
+            },
+            {"role": "assistant", "content": "ack"},
+        ]
+        assert classify_append_only_prefix(rewritten, first) is None
+        assert store.resolve_tracker(sid, "anthropic", messages=rewritten) is not tracker
+
+    def test_block_append_with_changed_message_field_is_not_append_only(self, store):
+        """Growing blocks while any non-content field moves is a replacement."""
+        from headroom.cache.prefix_tracker import classify_append_only_prefix
+
+        first = [
+            {
+                "role": "user",
+                "name": "alice",
+                "content": [{"type": "text", "text": "stable-1"}],
+            },
+        ]
+        renamed = [
+            {
+                "role": "user",
+                "name": "bob",
+                "content": [
+                    {"type": "text", "text": "stable-1"},
+                    {"type": "text", "text": "appended"},
+                ],
+            },
+        ]
+        assert classify_append_only_prefix(renamed, first) is None
+
+    @pytest.mark.parametrize(
         "requote",
         [
             lambda m: {**m, "content": [{"type": "text", "text": m["content"]}]},

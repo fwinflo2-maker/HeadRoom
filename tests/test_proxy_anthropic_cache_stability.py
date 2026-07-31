@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -1224,12 +1225,35 @@ def test_cache_mode_skips_same_message_append_rewrite_to_preserve_stability() ->
 
         assert response.status_code == 200
         assert captured["calls"] == []
-        sent_content = captured["body"]["messages"][0]["content"]
-        assert sent_content[1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
-        assert "cache_control" not in sent_content[2]
+        # Stable blocks survive verbatim, the appended block is forwarded, and the
+        # single breakpoint stays on the prior frontier rather than moving to the
+        # newest block.
+        assert captured["body"]["messages"] == [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "shared-prefix"},
+                    {
+                        "type": "text",
+                        "text": "stable-frontier",
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                    },
+                    {"type": "text", "text": "raw suffix"},
+                ],
+            },
+        ]
+
+
+_LIVE_ASSISTANT_TURN = {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
 
 
 def test_cache_mode_anchors_live_same_message_append_frontier() -> None:
+    """Two real turns through the handler, with the real SessionTrackerStore.
+
+    Nothing about the tracker is stubbed here: turn one's forwarded body and the
+    assistant reply are recorded by the handler's own ``update_from_response``
+    call, and turn two reads that recorded state back.
+    """
     captured_bodies = []
     with _make_proxy_client() as client:
         proxy = client.app.state.proxy
@@ -1237,11 +1261,10 @@ def test_cache_mode_anchors_live_same_message_append_frontier() -> None:
         proxy.config.mode = "cache"
         proxy.config.image_optimize = False
 
-        tracker = _FakePrefixTracker(frozen_count=0)
+        # Only the session key is pinned, so both turns land on one lineage.
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.resolve_tracker = lambda session_id, provider, messages: tracker
 
         async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
             captured_bodies.append(body)
@@ -1250,8 +1273,8 @@ def test_cache_mode_anchors_live_same_message_append_frontier() -> None:
                 json={
                     "id": f"msg_live_{len(captured_bodies)}",
                     "type": "message",
-                    "role": "user",
-                    "content": [],
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
                     "usage": {
                         "input_tokens": 80,
                         "output_tokens": 3,
@@ -1287,23 +1310,56 @@ def test_cache_mode_anchors_live_same_message_append_frontier() -> None:
                 "messages": [{"role": "user", "content": _blocks("a", "b", marked=1)}],
             },
         )
+        # The client resends the recorded history with the first message grown by
+        # one block, which is the append-only shape the issue reports.
         second = client.post(
             "/v1/messages",
             headers=headers,
             json={
                 "model": "claude-sonnet-4-6",
                 "max_tokens": 64,
-                "messages": [{"role": "user", "content": _blocks("a", "b", "c", marked=2)}],
+                "messages": [
+                    {"role": "user", "content": _blocks("a", "b", "c", marked=2)},
+                    copy.deepcopy(_LIVE_ASSISTANT_TURN),
+                ],
             },
         )
 
         assert first.status_code == second.status_code == 200
         second_content = captured_bodies[1]["messages"][0]["content"]
+        assert [block["text"] for block in second_content] == ["a", "b", "c"]
         assert second_content[1]["cache_control"] == {
             "type": "ephemeral",
             "ttl": "1h",
         }
+        assert "cache_control" not in second_content[0]
         assert "cache_control" not in second_content[2]
+
+
+def test_same_message_append_with_changed_role_is_not_append_only() -> None:
+    """A message that grew blocks *and* changed role is a replacement.
+
+    ``overlay_cached_prefix`` replays the previously forwarded message's fields
+    under the merged block list, so classifying this as append-only would forward
+    last turn's role with this turn's blocks.
+    """
+    from headroom.cache.prefix_tracker import (
+        classify_append_only_prefix,
+        overlay_cached_prefix,
+    )
+
+    previous = [{"role": "user", "content": [{"type": "text", "text": "a"}]}]
+    current = [
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}],
+        }
+    ]
+
+    assert classify_append_only_prefix(current, previous) is None
+
+    forwarded = [{"role": "user", "content": [{"type": "text", "text": "A"}]}]
+    assert overlay_cached_prefix(current, current, previous, forwarded) == current
 
 
 # ─── Issue #327 regression tests ─────────────────────────────────────────────

@@ -236,6 +236,11 @@ class AppendOnlyClassification:
     block_frontier: tuple[int, int] | None = None
 
 
+def _message_fields_outside_content(message: dict[str, Any]) -> dict[str, Any]:
+    """The message minus its ``content``, for identity comparison."""
+    return {key: value for key, value in message.items() if key != "content"}
+
+
 def _classify_append_only_canonical(
     current_messages: list[Any],
     previous_messages: list[Any],
@@ -254,12 +259,19 @@ def _classify_append_only_canonical(
         # replacement, insertion, or second changed message is a divergence.
         if block_frontier is not None:
             return None
-        previous_content = (
-            previous_message.get("content") if isinstance(previous_message, dict) else None
-        )
-        current_content = (
-            current_message.get("content") if isinstance(current_message, dict) else None
-        )
+        if not isinstance(previous_message, dict) or not isinstance(current_message, dict):
+            return None
+        # Everything outside ``content`` must be unchanged. A message whose
+        # role, name, tool ids, or any other field moved is a replacement, not a
+        # block append: ``overlay_cached_prefix`` replays the previously
+        # forwarded message's fields under the merged block list, so a changed
+        # field would silently forward last turn's metadata.
+        if _message_fields_outside_content(previous_message) != _message_fields_outside_content(
+            current_message
+        ):
+            return None
+        previous_content = previous_message.get("content")
+        current_content = current_message.get("content")
         if (
             not isinstance(previous_content, list)
             or not isinstance(current_content, list)
@@ -358,16 +370,29 @@ def overlay_cached_prefix(
     if match is not None and match.block_frontier is not None:
         message_index, _ = match.block_frontier
         previous_message = prev_fwd[message_index]
+        previous_original_message = prev_orig[message_index]
         current_message = optimized_messages[message_index]
         previous_content = (
             previous_message.get("content") if isinstance(previous_message, dict) else None
         )
+        previous_original_content = (
+            previous_original_message.get("content")
+            if isinstance(previous_original_message, dict)
+            else None
+        )
         current_content = (
             current_message.get("content") if isinstance(current_message, dict) else None
         )
+        # Block-level analog of the message-count guard above: the split point
+        # below indexes the current blocks by the forwarded block count, which
+        # only lines up when last turn forwarded one block per original block.
+        # A compressed run that merged or dropped blocks shifts that mapping, so
+        # bail rather than duplicate or swallow appended blocks.
         if (
             isinstance(previous_content, list)
             and isinstance(current_content, list)
+            and isinstance(previous_original_content, list)
+            and len(previous_content) == len(previous_original_content)
             and len(current_content) >= len(previous_content)
         ):
             merged = copy.deepcopy(previous_message)

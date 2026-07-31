@@ -359,6 +359,31 @@ def overlay_cached_prefix(
     return list(prev_fwd[:k]) + list(optimized_messages[k:])
 
 
+def _stable_leading_block_run(
+    current_blocks: list[Any],
+    previous_blocks: list[Any] | None,
+) -> int:
+    """Length of the longest leading run of content blocks that canonicalize-
+    equal the previous turn's blocks.
+
+    Uses :func:`_canonicalize_for_prefix_compare`, which drops ``cache_control``
+    and other non-semantic keys, so a moved breakpoint or per-turn annotation
+    churn does not shorten the run. Two blocks canonicalize-equal iff their
+    forwarded content is the same, which is exactly what the provider's prefix
+    cache keys on — so this run is the part of a message that can still be read
+    from cache.
+    """
+    if not previous_blocks:
+        return 0
+    limit = min(len(current_blocks), len(previous_blocks))
+    k = 0
+    while k < limit and _canonicalize_for_prefix_compare(
+        current_blocks[k]
+    ) == _canonicalize_for_prefix_compare(previous_blocks[k]):
+        k += 1
+    return k
+
+
 def normalize_message_cache_control(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -806,6 +831,67 @@ def _lineage_snapshot(obj: Any) -> Any:
     return obj
 
 
+def _is_message_continuation(recorded: Any, incoming: Any) -> bool:
+    """Return True iff ``incoming`` is ``recorded`` grown in place.
+
+    Client histories are append-only at MESSAGE granularity, which is what
+    lineage matching assumes — except for sub-call shapes that pack a transcript
+    into one block-style message and extend that message's block list each turn.
+    Such a turn is the same conversation continuing, but its newest message is
+    not equal to the recorded one, so the whole-message prefix test rejects it.
+
+    "Grown in place" is deliberately narrow, because a false match makes two
+    concurrent conversations share one tracker (the thrash lineages exist to
+    prevent): same role, block-style content that did not shrink, and a leading
+    run of byte-stable blocks covering MOST of the recorded version. Templated
+    fan-outs that diverge in their newest message share few or no leading blocks
+    and are still split apart.
+    """
+    if not (isinstance(recorded, dict) and isinstance(incoming, dict)):
+        return False
+    if recorded.get("role") != incoming.get("role"):
+        return False
+    old = recorded.get("content")
+    new = incoming.get("content")
+    if not (isinstance(old, list) and isinstance(new, list)):
+        return False
+    if not old or len(new) < len(old):
+        return False
+    run = _stable_leading_block_run(new, old)
+    return run * 2 >= len(old)
+
+
+def _chain_matches(chain: Any, snap: Any, strict: bool) -> bool:
+    """Does ``snap`` continue the conversation recorded as ``chain``?
+
+    ``strict`` requires every recorded message to re-compare equal. Otherwise the
+    recorded messages before the last must still match exactly and the last one
+    only has to have grown in place (see :func:`_is_message_continuation`).
+    """
+    if len(chain) > len(snap):
+        return False
+    if strict:
+        return bool(snap[: len(chain)] == chain)
+    head = len(chain) - 1
+    return bool(snap[:head] == chain[:head]) and _is_message_continuation(chain[head], snap[head])
+
+
+def _match_lineage(family: OrderedDict[str, Any], snap: Any) -> str | None:
+    """Pick the recorded lineage that this history continues, or None.
+
+    Longest matching chain wins, so the walk goes longest-first and returns on
+    the first hit. A whole-message prefix match is preferred; only when no chain
+    matches strictly does an in-place-growth match count, so an exact
+    continuation is never displaced by a looser one.
+    """
+    by_length = sorted(family.items(), key=lambda kv: len(kv[1]), reverse=True)
+    for strict in (True, False):
+        for key, chain in by_length:
+            if _chain_matches(chain, snap, strict):
+                return key
+    return None
+
+
 class SessionTrackerStore:
     """Manages PrefixCacheTracker instances across sessions.
 
@@ -918,14 +1004,7 @@ class SessionTrackerStore:
 
         family = self._lineages.setdefault(session_id, OrderedDict())
 
-        # Longest recorded chain that prefixes the incoming history wins.
-        best_key: str | None = None
-        best_len = -1
-        for key, chain in family.items():
-            if len(chain) > len(snap) or len(chain) <= best_len:
-                continue
-            if snap[: len(chain)] == chain:
-                best_key, best_len = key, len(chain)
+        best_key = _match_lineage(family, snap)
 
         if best_key is None:
             cap = self._default_config.max_lineages_per_session

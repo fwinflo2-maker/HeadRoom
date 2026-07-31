@@ -655,6 +655,79 @@ class TestConversationLineageResolution:
         assert fresh is not tracker
         assert store.active_sessions == 2
 
+    @staticmethod
+    def _in_place_growth(stable: int, churn: int, tail: str) -> list[dict]:
+        """The sub-call shape: a transcript packed into ONE block-style message
+        whose leading blocks are stable and whose tail is rewritten each turn.
+        This history grows at BLOCK granularity, not message granularity."""
+        blocks = [{"type": "text", "text": f"stable {i} " + "x" * 200} for i in range(stable)]
+        blocks += [{"type": "text", "text": f"{tail} churn {i}"} for i in range(churn)]
+        return [{"role": "user", "content": "kickoff"}, {"role": "user", "content": blocks}]
+
+    def test_in_place_message_growth_keeps_its_lineage(self, store):
+        """Lineage matching assumes histories append MESSAGES. A conversation
+        whose newest message grows in place used to fail that test on every turn
+        and get a FRESH tracker each time — no frozen prefix, no overlay replay,
+        and one leaked lineage per turn. It must reuse its own tracker instead."""
+        sid = "sub-call"
+        first = None
+        for turn, churn in enumerate([2, 4, 7, 11], start=1):
+            history = self._in_place_growth(20, churn, f"t{turn}")
+            tracker = store.resolve_tracker(sid, "anthropic", messages=history)
+            first = first or tracker
+            assert tracker is first, f"turn {turn} switched trackers"
+            # The previous turn's state has to actually ARRIVE, not just exist.
+            if turn > 1:
+                assert tracker.get_last_forwarded_messages(), f"turn {turn} lost prev messages"
+            tracker.update_from_response(
+                cache_read_tokens=1000,
+                cache_write_tokens=500,
+                messages=history,
+                original_messages=history,
+            )
+        assert store.active_sessions == 1, "one conversation must not leak lineages"
+        assert first._turn_number == 4
+
+    def test_fan_out_diverging_in_its_newest_message_still_splits(self, store):
+        """Guard on the loosened match: templated fan-outs share the head and
+        differ from the first block of the newest message. They must keep
+        separate trackers (that thrash is what lineages exist to prevent)."""
+        sid = "shared-fallback-id"
+        a = self._in_place_growth(0, 6, "agent-a")
+        b = self._in_place_growth(0, 6, "agent-b")
+        assert store.resolve_tracker(sid, "anthropic", messages=a) is not store.resolve_tracker(
+            sid, "anthropic", messages=b
+        )
+
+    def test_mostly_rewritten_newest_message_gets_a_fresh_tracker(self, store):
+        """Continuation requires MOST of the recorded message to survive. A
+        message rewritten past that point is a new conversation, not growth."""
+        sid = "shared"
+        tracker = store.resolve_tracker(
+            sid, "anthropic", messages=self._in_place_growth(2, 20, "t1")
+        )
+        rewritten = self._in_place_growth(2, 20, "t2")  # only 2 of 22 blocks survive
+        assert store.resolve_tracker(sid, "anthropic", messages=rewritten) is not tracker
+
+    def test_shrinking_newest_message_gets_a_fresh_tracker(self, store):
+        """Growth only. A shorter block list means the client dropped content,
+        so the provider's cache line for it is gone."""
+        sid = "shared"
+        tracker = store.resolve_tracker(
+            sid, "anthropic", messages=self._in_place_growth(20, 8, "t1")
+        )
+        shrunk = self._in_place_growth(20, 2, "t1")
+        assert store.resolve_tracker(sid, "anthropic", messages=shrunk) is not tracker
+
+    def test_strict_prefix_match_wins_over_in_place_growth(self, store):
+        """An exact continuation must never be displaced by a looser one."""
+        sid = "shared"
+        base = self._in_place_growth(20, 4, "t1")
+        exact = store.resolve_tracker(sid, "anthropic", messages=base)
+        # A second lineage that would ALSO match `base` under in-place growth.
+        store.resolve_tracker(sid, "anthropic", messages=self._in_place_growth(20, 2, "t1"))
+        assert store.resolve_tracker(sid, "anthropic", messages=base) is exact
+
     @pytest.mark.parametrize("messages", [None, []], ids=["none", "empty"])
     def test_resolve_without_messages_matches_legacy_get_or_create(self, store, messages):
         tracker = store.resolve_tracker("sid", "anthropic", messages=messages)

@@ -7,6 +7,8 @@ from typing import Any, cast
 
 from headroom.providers.codex import resolve_codex_routing
 from headroom.providers.codex.endpoints import CHATGPT_BACKEND_API_URL
+from headroom.providers.grok.runtime import DEFAULT_API_URL as XAI_API_URL
+from headroom.providers.grok.runtime import is_grok_cli_request
 from headroom.providers.vertex import vertex_target_for_location as _vertex_target_for_location
 
 LEGACY_API_TARGET_ATTRS: dict[str, str] = {
@@ -29,6 +31,18 @@ def vertex_target_for_location(proxy: Any, location: str) -> str:
     return _vertex_target_for_location(api_target(proxy, "vertex"), location)
 
 
+def openai_compatible_base_url(proxy: Any, headers: Mapping[str, str]) -> str:
+    """Resolve upstream for OpenAI-compatible metadata/passthrough traffic.
+
+    Official Grok CLI cannot set ``x-headroom-base-url``; when its wire
+    signals are present, prefer ``api.x.ai`` over the process OpenAI default
+    so ``GET /v1/models`` and catch-all passthrough succeed on a shared proxy.
+    """
+    if is_grok_cli_request(headers):
+        return XAI_API_URL
+    return api_target(proxy, "openai")
+
+
 def select_passthrough_base_url(proxy: Any, headers: Mapping[str, str]) -> str:
     """Resolve the upstream base URL for catch-all proxy passthrough requests."""
     routing = resolve_codex_routing(headers)
@@ -41,4 +55,6 @@ def select_passthrough_base_url(proxy: Any, headers: Mapping[str, str]) -> str:
         if azure_base:
             return azure_base.rstrip("/")
     provider_name = proxy.provider_runtime.model_metadata_provider(headers)
+    if provider_name == "openai":
+        return openai_compatible_base_url(proxy, headers)
     return api_target(proxy, provider_name)

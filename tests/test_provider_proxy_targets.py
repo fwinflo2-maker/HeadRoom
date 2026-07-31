@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from headroom.providers.proxy_targets import (
     api_target,
+    openai_compatible_base_url,
     select_passthrough_base_url,
     vertex_target_for_location,
 )
@@ -67,3 +68,27 @@ def test_select_passthrough_base_url_handles_special_auth_modes() -> None:
         "https://legacy.anthropic.test"
     )
     assert select_passthrough_base_url(proxy, {}) == "https://legacy.openai.test"
+    # Official Grok CLI on a shared proxy (process OpenAI default) must hit xAI.
+    assert (
+        select_passthrough_base_url(
+            proxy,
+            {
+                "x-xai-token-auth": "xai-grok-cli",
+                "user-agent": "grok-shell/0.2.117",
+            },
+        )
+        == "https://api.x.ai"
+    )
+
+
+def test_openai_compatible_base_url_routes_grok_to_xai() -> None:
+    proxy = _proxy(OPENAI_API_URL="https://legacy.openai.test")
+
+    assert (
+        openai_compatible_base_url(
+            proxy,
+            {"user-agent": "grok-pager/0.2.117 grok-shell/0.2.117"},
+        )
+        == "https://api.x.ai"
+    )
+    assert openai_compatible_base_url(proxy, {}) == "https://legacy.openai.test"

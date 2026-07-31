@@ -306,6 +306,7 @@ def test_anthropic_third_party_upstream_strips_tool_search_tools():
     request = _build_request(
         {
             "model": "claude-3-5-sonnet-latest",
+            "max_tokens": 100,
             "messages": [{"role": "user", "content": "use a tool"}],
             "tools": tools,
         },

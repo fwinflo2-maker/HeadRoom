@@ -430,6 +430,8 @@ class HeadroomHookProvider(HookProvider):  # type: ignore[misc]
 
         Args:
             result: The tool result to check.
+            tool_name: The name of the tool that produced the result, used to
+                honor the shared tool-exclusion set.
 
         Returns:
             Skip reason string if should skip, None if should compress.

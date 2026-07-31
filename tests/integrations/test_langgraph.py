@@ -43,7 +43,24 @@ def test_qualified_ccr_retrieval_message_is_preserved(tool_name: str) -> None:
 
 def test_near_match_ccr_tool_name_is_not_excluded() -> None:
     messages = _messages("mcp__Headroom__headroom_retrieve_extra")
+    original = messages[1].content
 
     result = compress_tool_messages(messages)
 
     assert result.metrics[0].skip_reason != "tool_excluded"
+    assert result.messages[1].content != original
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    ["mcp__Headroom__headroom_retrieve", "mcp_Headroom_headroom_retrieve"],
+)
+def test_qualified_name_on_the_tool_message_is_enough(tool_name: str) -> None:
+    """`ToolNode` populates `ToolMessage.name`, so the id index is only a fallback."""
+    messages = [ToolMessage(content=_large_output(), tool_call_id="call_1", name=tool_name)]
+    original = messages[0].content
+
+    result = compress_tool_messages(messages)
+
+    assert result.messages[0].content == original
+    assert result.metrics[0].skip_reason == "tool_excluded"

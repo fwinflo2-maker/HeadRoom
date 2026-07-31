@@ -454,10 +454,6 @@ def overlay_cached_prefix(
 
 def normalize_message_cache_control(
     messages: list[dict[str, Any]],
-    *,
-    current_original_messages: list[dict[str, Any]] | None = None,
-    previous_original_messages: list[dict[str, Any]] | None = None,
-    previous_forwarded_messages: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Own message-level cache_control placement so breakpoints stay bounded.
 
@@ -509,52 +505,18 @@ def normalize_message_cache_control(
                 last_block_idx = i
         else:
             out.append(msg)
-    match = None
-    if previous_original_messages:
-        match = classify_append_only_prefix(
-            current_original_messages or messages,
-            previous_original_messages,
-        )
-
-    # A same-message append keeps the provider's old cache frontier. The
-    # current marker still supplies its explicit TTL when present.
-    target_block_idx: tuple[int, int] | None = None
-    prior_marker: dict[str, Any] | None = None
-    if match and match.block_frontier:
-        message_idx, block_idx = match.block_frontier
-        if message_idx < len(out) and isinstance(out[message_idx].get("content"), list):
-            content = out[message_idx]["content"]
-            if block_idx < len(content):
-                target_block_idx = (message_idx, block_idx)
-                if previous_forwarded_messages and message_idx < len(previous_forwarded_messages):
-                    previous_message = previous_forwarded_messages[message_idx]
-                    previous_content = (
-                        previous_message.get("content")
-                        if isinstance(previous_message, dict)
-                        else None
-                    )
-                    if isinstance(previous_content, list) and block_idx < len(previous_content):
-                        previous_block = previous_content[block_idx]
-                        if isinstance(previous_block, dict):
-                            marker = previous_block.get("cache_control")
-                            if isinstance(marker, dict):
-                                prior_marker = marker
-
-    # Re-place exactly one breakpoint, anchored to the prior block frontier
-    # when a message grew in place, otherwise on the newest block-style message.
+    # Re-place exactly one breakpoint on the last block-style message. Anthropic
+    # writes a cache entry only at the breakpoint and looks backward up to 20
+    # blocks for a prior write, so the newest block is the position that both
+    # reads last turn's entry and writes this turn's growth. Anchoring further
+    # back would re-write a prefix that is already cached and leave the appended
+    # blocks out of the cache entirely.
     if last_block_idx >= 0:
-        target_message_idx, target_block_idx_value = target_block_idx or (
-            last_block_idx,
-            len(out[last_block_idx]["content"]) - 1,
-        )
-        msg = out[target_message_idx]
+        msg = out[last_block_idx]
         content = list(msg["content"])
-        marker = dict(last_marker or prior_marker or {"type": "ephemeral"})
-        content[target_block_idx_value] = {
-            **content[target_block_idx_value],
-            "cache_control": marker,
-        }
-        out[target_message_idx] = {**msg, "content": content}
+        marker = dict(last_marker) if last_marker else {"type": "ephemeral"}
+        content[-1] = {**content[-1], "cache_control": marker}
+        out[last_block_idx] = {**msg, "content": content}
         changed = True
     return out if changed else messages
 
@@ -1072,7 +1034,12 @@ class SessionTrackerStore:
         for key, chain in family.items():
             if len(chain) > len(snap) or len(chain) <= best_len:
                 continue
-            if classify_append_only_prefix(snap, chain) is not None:
+            # `snap` and `chain` are already canonical projections, so this
+            # calls the classifier's inner form directly. Going through
+            # `classify_append_only_prefix` would re-canonicalize both on every
+            # recorded lineage, which is ~30x the cost of the comparison itself
+            # on a long history.
+            if _classify_append_only_canonical(snap, chain) is not None:
                 best_key, best_len = key, len(chain)
 
         if best_key is None:

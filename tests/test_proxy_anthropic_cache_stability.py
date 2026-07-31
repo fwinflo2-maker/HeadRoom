@@ -1150,12 +1150,8 @@ def test_cache_mode_skips_same_message_append_rewrite_to_preserve_stability() ->
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "shared-prefix"},
-                    {
-                        "type": "text",
-                        "text": "stable-frontier",
-                        "cache_control": {"type": "ephemeral", "ttl": "1h"},
-                    },
+                    {"type": "text", "text": "COMPRESSED_PREFIX"},
+                    {"type": "text", "text": "COMPRESSED_FRONTIER"},
                 ],
             },
         ]
@@ -1225,20 +1221,22 @@ def test_cache_mode_skips_same_message_append_rewrite_to_preserve_stability() ->
 
         assert response.status_code == 200
         assert captured["calls"] == []
-        # Stable blocks survive verbatim, the appended block is forwarded, and the
-        # single breakpoint stays on the prior frontier rather than moving to the
-        # newest block.
+        # The previously forwarded (compressed) blocks are replayed byte-identical
+        # and the appended block rides after them, so the prefix the provider
+        # hashed last turn is still there to hit. The single breakpoint stays on
+        # the newest block, which is where Anthropic writes the entry that covers
+        # the whole prefix including the new tail.
         assert captured["body"]["messages"] == [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "shared-prefix"},
+                    {"type": "text", "text": "COMPRESSED_PREFIX"},
+                    {"type": "text", "text": "COMPRESSED_FRONTIER"},
                     {
                         "type": "text",
-                        "text": "stable-frontier",
+                        "text": "raw suffix",
                         "cache_control": {"type": "ephemeral", "ttl": "1h"},
                     },
-                    {"type": "text", "text": "raw suffix"},
                 ],
             },
         ]
@@ -1247,7 +1245,7 @@ def test_cache_mode_skips_same_message_append_rewrite_to_preserve_stability() ->
 _LIVE_ASSISTANT_TURN = {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
 
 
-def test_cache_mode_anchors_live_same_message_append_frontier() -> None:
+def test_cache_mode_reuses_lineage_across_a_live_same_message_append() -> None:
     """Two real turns through the handler, with the real SessionTrackerStore.
 
     Nothing about the tracker is stubbed here: the session id, the lineage
@@ -1257,11 +1255,11 @@ def test_cache_mode_anchors_live_same_message_append_frontier() -> None:
     reads that state back.
 
     The issue warns that the previously forwarded messages arrive empty on every
-    turn for this caller shape, which would leave any marker fix inert. That is
-    the lineage lookup: it required the whole prior history to canonicalize-equal
-    the current prefix, which a message that grew by blocks never does, so every
-    turn allocated a fresh tracker. Routing the lookup through the shared
-    append-only classifier is what makes the prior state non-empty here.
+    turn for this caller shape, which is what left an earlier attempt inert. That
+    is the lineage lookup: it required the whole prior history to
+    canonicalize-equal the current prefix, which a message that grew by blocks
+    never does, so every turn allocated a fresh tracker with no recorded state.
+    Turn two here has to find turn one's tracker.
     """
     captured_bodies = []
     with _make_proxy_client() as client:
@@ -1289,6 +1287,18 @@ def test_cache_mode_anchors_live_same_message_append_frontier() -> None:
             )
 
         proxy._retry_request = _fake_retry
+
+        # Spy on the real lookup rather than replacing it, so the assertion sees
+        # which tracker each turn actually resolved to.
+        resolved = []
+        real_resolve = proxy.session_tracker_store.resolve_tracker
+
+        def _spy_resolve(session_id, provider, messages=None):
+            tracker = real_resolve(session_id, provider, messages=messages)
+            resolved.append(tracker)
+            return tracker
+
+        proxy.session_tracker_store.resolve_tracker = _spy_resolve
 
         def _blocks(*texts, marked=None):
             return [
@@ -1330,14 +1340,39 @@ def test_cache_mode_anchors_live_same_message_append_frontier() -> None:
         )
 
         assert first.status_code == second.status_code == 200
+
+        # Turn two resolved turn one's tracker rather than allocating a fresh
+        # one, so the recorded forwarded prefix was there to replay.
+        assert len(resolved) == 2
+        assert resolved[1] is resolved[0]
+        assert resolved[1].get_last_forwarded_messages()
+
+        first_content = captured_bodies[0]["messages"][0]["content"]
         second_content = captured_bodies[1]["messages"][0]["content"]
         assert [block["text"] for block in second_content] == ["a", "b", "c"]
-        assert second_content[1]["cache_control"] == {
-            "type": "ephemeral",
-            "ttl": "1h",
-        }
-        assert "cache_control" not in second_content[0]
-        assert "cache_control" not in second_content[2]
+        assert [
+            {k: v for k, v in block.items() if k != "cache_control"} for block in second_content[:2]
+        ] == [
+            {k: v for k, v in block.items() if k != "cache_control"} for block in first_content[:2]
+        ]
+
+        # Exactly one breakpoint in the whole body, on the last block of the last
+        # block-style message. That is the position Anthropic writes the entry
+        # at, and its backward lookup finds last turn's entry from there.
+        markers = [
+            (message_index, block_index)
+            for message_index, message in enumerate(captured_bodies[1]["messages"])
+            if isinstance(message.get("content"), list)
+            for block_index, block in enumerate(message["content"])
+            if isinstance(block, dict) and "cache_control" in block
+        ]
+        last_block_message = max(
+            index
+            for index, message in enumerate(captured_bodies[1]["messages"])
+            if isinstance(message.get("content"), list)
+        )
+        last_block = len(captured_bodies[1]["messages"][last_block_message]["content"]) - 1
+        assert markers == [(last_block_message, last_block)]
 
 
 def test_same_message_append_with_changed_role_is_not_append_only() -> None:
@@ -1364,6 +1399,37 @@ def test_same_message_append_with_changed_role_is_not_append_only() -> None:
 
     forwarded = [{"role": "user", "content": [{"type": "text", "text": "A"}]}]
     assert overlay_cached_prefix(current, current, previous, forwarded) == current
+
+
+def test_overlay_bails_when_forwarded_block_count_differs_from_original() -> None:
+    """Compression that merged blocks breaks the positional block mapping.
+
+    The merge splits the current block list at the forwarded block count, so a
+    forwarded message with fewer blocks than its original would swallow or
+    duplicate the appended tail. Leave the turn untouched instead.
+    """
+    from headroom.cache.prefix_tracker import overlay_cached_prefix
+
+    previous_original = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}],
+        }
+    ]
+    # Last turn forwarded the two originals merged into one compressed block.
+    previous_forwarded = [{"role": "user", "content": [{"type": "text", "text": "ab"}]}]
+    current = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "a"},
+                {"type": "text", "text": "b"},
+                {"type": "text", "text": "c"},
+            ],
+        }
+    ]
+
+    assert overlay_cached_prefix(current, current, previous_original, previous_forwarded) == current
 
 
 # ─── Issue #327 regression tests ─────────────────────────────────────────────

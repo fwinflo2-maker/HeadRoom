@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import os
 import socket
 import sys
@@ -79,6 +80,9 @@ def test_live_auth_modes_and_derived_paths(monkeypatch) -> None:
     assert _ensure_live_authorization({"authorization": "Bearer client-key"}) == {
         "authorization": "Bearer client-key"
     }
+    monkeypatch.delenv("OPENAI_API_KEY")
+    existing_headers = {"X-Trace": "keep"}
+    assert _ensure_live_authorization(existing_headers) == existing_headers
 
     assert (
         codex_live_websocket_url(
@@ -219,7 +223,7 @@ def _free_port() -> int:
 
 
 @pytest.mark.asyncio
-async def test_live_handler_propagates_close_metadata_and_cleans_tasks(monkeypatch) -> None:
+async def test_live_handler_propagates_close_metadata_and_cleans_tasks(monkeypatch, caplog) -> None:
     class _Client:
         headers = {"authorization": "Bearer sk-live"}
         url = SimpleNamespace(query="turn=1")
@@ -229,6 +233,7 @@ async def test_live_handler_propagates_close_metadata_and_cleans_tasks(monkeypat
             self.fail_accept = fail_accept
             self.accepted = False
             self.closed: list[tuple[int | None, str | None]] = []
+            self.cancelled = False
 
         async def accept(self, **kwargs: Any) -> None:
             if self.fail_accept:
@@ -240,7 +245,11 @@ async def test_live_handler_propagates_close_metadata_and_cleans_tasks(monkeypat
 
         async def receive(self) -> dict[str, Any]:
             if self.message.get("type") == "wait":
-                await asyncio.Event().wait()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cancelled = True
+                    raise
             return self.message
 
         async def send_text(self, message: str) -> None:
@@ -255,9 +264,11 @@ async def test_live_handler_propagates_close_metadata_and_cleans_tasks(monkeypat
         def __init__(self, error: Exception | None = None) -> None:
             self.error = error
             self.close_calls: list[tuple[int | None, str | None]] = []
+            self.sent: list[str | bytes] = []
+            self.cancelled = False
 
         async def send(self, message: str | bytes) -> None:
-            del message
+            self.sent.append(message)
 
         async def close(self, code=None, reason=None) -> None:
             self.close_calls.append((code, reason))
@@ -266,7 +277,11 @@ async def test_live_handler_propagates_close_metadata_and_cleans_tasks(monkeypat
             async def _events():
                 if self.error is not None:
                     raise self.error
-                await asyncio.Event().wait()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cancelled = True
+                    raise
                 if False:
                     yield b""
 
@@ -336,6 +351,78 @@ async def test_live_handler_propagates_close_metadata_and_cleans_tasks(monkeypat
         "/v1/live",
     )
     assert fallback_connect["headers"]["Authorization"] == "Bearer env-live-key"
+
+    no_auth_client = _Client({"type": "websocket.disconnect", "code": 1000, "reason": "done"})
+    no_auth_client.headers = {}
+    no_auth_connect: dict[str, Any] = {}
+    no_auth_upstream = _Upstream()
+
+    async def connect_without_auth(*args: Any, **kwargs: Any) -> Any:
+        no_auth_connect["headers"] = kwargs["additional_headers"]
+        return no_auth_upstream
+
+    monkeypatch.delenv("OPENAI_API_KEY")
+    caplog.set_level(logging.WARNING, logger="headroom.providers.codex.live")
+    monkeypatch.setattr(websockets, "connect", connect_without_auth)
+    await handle_codex_live_websocket(
+        no_auth_client,
+        proxy,
+        "https://api.openai.test",
+        "/v1/live",
+    )
+    assert no_auth_connect["headers"] == {}
+    assert "Codex Live has no Authorization header or OPENAI_API_KEY" in caplog.text
+
+    class _QueuedClient(_Client):
+        def __init__(self, messages: list[dict[str, Any]]) -> None:
+            super().__init__(messages[0])
+            self.messages = iter(messages)
+
+        async def receive(self) -> dict[str, Any]:
+            try:
+                return next(self.messages)
+            except StopIteration:
+                return {"type": "websocket.disconnect", "code": 1000, "reason": "done"}
+
+    queued_client = _QueuedClient(
+        [
+            {"type": "websocket.other"},
+            {"type": "websocket.receive"},
+            {"type": "websocket.disconnect", "code": 1000, "reason": "done"},
+        ]
+    )
+    queued_upstream = _Upstream()
+    monkeypatch.setattr(websockets, "connect", lambda *args, **kwargs: _await(queued_upstream))
+    await handle_codex_live_websocket(
+        queued_client,
+        proxy,
+        "https://api.openai.test",
+        "/v1/live",
+    )
+    assert queued_upstream.sent == []
+    assert queued_upstream.close_calls[0] == (1000, "done")
+
+    cancellation_client = _Client({"type": "wait"})
+    cancellation_upstream = _Upstream()
+    monkeypatch.setattr(
+        websockets, "connect", lambda *args, **kwargs: _await(cancellation_upstream)
+    )
+    handler_task = asyncio.create_task(
+        handle_codex_live_websocket(
+            cancellation_client,
+            proxy,
+            "https://api.openai.test",
+            "/v1/live",
+        )
+    )
+    while not cancellation_client.accepted:
+        await asyncio.sleep(0)
+    handler_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await handler_task
+    assert cancellation_client.cancelled
+    assert cancellation_upstream.cancelled
+    assert cancellation_upstream.close_calls
 
     class _UpstreamFailure(Exception):
         rcvd = SimpleNamespace(code=1013, reason="upstream busy")

@@ -192,6 +192,37 @@ def test_a_narrow_compressor_override_still_works_for_an_excluded_client() -> No
     assert calls == ["req-opencode"]
 
 
+def test_native_responses_compressor_reraises_internal_type_error() -> None:
+    """An internal compressor TypeError is propagated without a signature retry."""
+    calls = 0
+    handler = object.__new__(OpenAIHandlerMixin)
+    sentinel = TypeError("internal compressor failure")
+
+    async def _run_compression(fn, *, timeout):  # noqa: ANN001, ANN202
+        return fn()
+
+    def _compress(payload, *, model, request_id, client_can_tool_search, timing=None):  # noqa: ANN001, ANN202
+        nonlocal calls
+        calls += 1
+        raise sentinel
+
+    handler._run_compression_in_executor = _run_compression
+    handler._compress_openai_responses_payload = _compress
+
+    with pytest.raises(TypeError) as exc_info:
+        asyncio.run(
+            handler._compress_openai_responses_payload_in_executor(
+                {"input": "hello"},
+                model=TOOL_SEARCH_MODEL,
+                request_id="req-opencode",
+                client_can_tool_search=False,
+            )
+        )
+
+    assert exc_info.value is sentinel
+    assert calls == 1
+
+
 class _ResponsesRequest:
     method = "POST"
     url = SimpleNamespace(path="/custom/v1/responses", query="")

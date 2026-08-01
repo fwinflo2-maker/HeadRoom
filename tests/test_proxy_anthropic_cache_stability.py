@@ -1401,6 +1401,79 @@ def test_same_message_append_with_changed_role_is_not_append_only() -> None:
     assert overlay_cached_prefix(current, current, previous, forwarded) == current
 
 
+def test_growth_on_a_directive_only_message_is_not_a_clean_prefix_match() -> None:
+    """A message whose blocks all canonicalize away still grew.
+
+    ``_canonicalize_for_prefix_compare`` drops pure cache-directive blocks, so
+    the previous canonical content can be empty. Reporting no frontier would let
+    the delta path read this as a whole-message append and slice the newly
+    appended block out of the forwarded request.
+    """
+    from headroom.cache.prefix_tracker import (
+        classify_append_only_prefix,
+        extract_cache_stable_delta,
+    )
+
+    previous = [{"role": "user", "content": [{"cachePoint": {"type": "default"}}]}]
+    current = [
+        {
+            "role": "user",
+            "content": [
+                {"cachePoint": {"type": "default"}},
+                {"type": "text", "text": "NEW BLOCK"},
+            ],
+        }
+    ]
+
+    match = classify_append_only_prefix(current, previous)
+    assert match is not None
+    assert match.block_frontier is not None
+
+    # The delta path must refuse rather than forward last turn's bytes with the
+    # appended block missing.
+    assert extract_cache_stable_delta(current, previous, previous) is None
+
+
+def test_overlay_split_uses_raw_blocks_not_the_canonical_frontier() -> None:
+    """The frontier index is canonical; the block lists it would slice are raw.
+
+    Here canonicalization drops the directive block, so a canonical-space split
+    point lands mid-list: it would drop the appended "B" and emit the directive
+    block twice.
+    """
+    from headroom.cache.prefix_tracker import overlay_cached_prefix
+
+    previous_original = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "A"}, {"cachePoint": {}}],
+        }
+    ]
+    previous_forwarded = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "A_compressed"}, {"cachePoint": {}}],
+        }
+    ]
+    current = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "A"},
+                {"type": "text", "text": "B"},
+                {"cachePoint": {}},
+                {"type": "text", "text": "C"},
+            ],
+        }
+    ]
+
+    out = overlay_cached_prefix(current, current, previous_original, previous_forwarded)
+
+    blocks = out[0]["content"]
+    assert {"type": "text", "text": "B"} in blocks
+    assert sum(1 for block in blocks if "cachePoint" in block) == 1
+
+
 def test_overlay_bails_when_forwarded_block_count_differs_from_original() -> None:
     """Compression that merged blocks breaks the positional block mapping.
 

@@ -279,8 +279,13 @@ def _classify_append_only_canonical(
             or current_content[: len(previous_content)] != previous_content
         ):
             return None
-        if previous_content:
-            block_frontier = (index, len(previous_content) - 1)
+        # Record the frontier unconditionally. An empty previous content list
+        # still means this message grew, and reporting no frontier would let
+        # ``extract_cache_stable_delta`` read the history as a pure
+        # whole-message append and slice the appended blocks away. A canonical
+        # content list is empty whenever every block projected to ``{}``, which
+        # is what a pure cache-directive block does.
+        block_frontier = (index, len(previous_content) - 1)
 
     return AppendOnlyClassification(block_frontier=block_frontier)
 
@@ -369,41 +374,51 @@ def overlay_cached_prefix(
     match = classify_append_only_prefix(current_original_messages, prev_orig)
     if match is not None and match.block_frontier is not None:
         message_index, _ = match.block_frontier
-        previous_message = prev_fwd[message_index]
-        previous_original_message = prev_orig[message_index]
-        current_message = optimized_messages[message_index]
-        previous_content = (
-            previous_message.get("content") if isinstance(previous_message, dict) else None
-        )
-        previous_original_content = (
-            previous_original_message.get("content")
-            if isinstance(previous_original_message, dict)
-            else None
-        )
-        current_content = (
-            current_message.get("content") if isinstance(current_message, dict) else None
-        )
-        # Block-level analog of the message-count guard above: the split point
-        # below indexes the current blocks by the forwarded block count, which
-        # only lines up when last turn forwarded one block per original block.
-        # A compressed run that merged or dropped blocks shifts that mapping, so
-        # bail rather than duplicate or swallow appended blocks.
-        if (
-            isinstance(previous_content, list)
-            and isinstance(current_content, list)
-            and isinstance(previous_original_content, list)
-            and len(previous_content) == len(previous_original_content)
-            and len(current_content) >= len(previous_content)
-        ):
-            merged = copy.deepcopy(previous_message)
-            merged["content"] = copy.deepcopy(previous_content) + copy.deepcopy(
-                current_content[len(previous_content) :]
+        if message_index < len(optimized_messages):
+            previous_message = prev_fwd[message_index]
+            previous_original_message = prev_orig[message_index]
+            current_message = optimized_messages[message_index]
+            previous_content = (
+                previous_message.get("content") if isinstance(previous_message, dict) else None
             )
-            return (
-                list(prev_fwd[:message_index])
-                + [merged]
-                + list(optimized_messages[message_index + 1 :])
+            previous_original_content = (
+                previous_original_message.get("content")
+                if isinstance(previous_original_message, dict)
+                else None
             )
+            current_content = (
+                current_message.get("content") if isinstance(current_message, dict) else None
+            )
+            # The frontier index comes from the CANONICAL projection, so it
+            # cannot be used to slice raw block lists: canonicalization drops
+            # pure directive blocks, and compression can change the count too.
+            # Re-establish the split in raw terms instead. Last turn must have
+            # forwarded one block per original block, and this turn's leading
+            # blocks must still be last turn's originals verbatim. Then, and
+            # only then, replaying the forwarded blocks and appending the rest
+            # is exactly the growth.
+            split = (
+                len(previous_original_content)
+                if isinstance(previous_original_content, list)
+                else -1
+            )
+            if (
+                isinstance(previous_content, list)
+                and isinstance(current_content, list)
+                and isinstance(previous_original_content, list)
+                and len(previous_content) == split
+                and len(current_content) >= split
+                and current_content[:split] == previous_original_content
+            ):
+                merged = copy.deepcopy(previous_message)
+                merged["content"] = copy.deepcopy(previous_content) + copy.deepcopy(
+                    current_content[split:]
+                )
+                return (
+                    list(prev_fwd[:message_index])
+                    + [merged]
+                    + list(optimized_messages[message_index + 1 :])
+                )
     # Append-only guard on CONTENT ONLY, message-by-message. Replay the
     # previously-forwarded (cached, compressed) bytes for the longest LEADING
     # run of messages that is byte-for-byte (content-canonical) identical to

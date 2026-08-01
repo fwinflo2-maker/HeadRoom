@@ -157,3 +157,34 @@ def test_resident_names_match_case_insensitively():
     for name in ("Bash", "Read", "Edit", "Terminal", "ToolSearch"):
         assert by_name[name].get("defer_loading") is None, name
     assert by_name["slack_0"].get("defer_loading") is True
+
+
+# --- client-harness exclusion (GH #2660) -------------------------------------
+
+
+def test_noop_for_a_client_that_cannot_execute_the_search_tool():
+    # GH #2660 reports opencode resolving tool calls against its own registry
+    # and rejecting the injected tool as unavailable, so its tools stay resident
+    # and untouched.
+    tools = _tools()
+    snapshot = copy.deepcopy(tools)
+
+    out = inject_tool_search_deferral_openai(tools, "gpt-5.5", client_can_tool_search=False)
+
+    assert out is tools
+    assert tools == snapshot
+    assert not any(t.get("type") == "tool_search" for t in out)
+    assert not any(t.get("defer_loading") for t in out)
+
+
+def test_supported_clients_keep_the_existing_deferral():
+    # The exclusion is per-client, not a global default flip: anything that can
+    # search still gets the same payload it got before.
+    tools = _tools()
+
+    explicit = inject_tool_search_deferral_openai(tools, "gpt-5.5", client_can_tool_search=True)
+    implicit = inject_tool_search_deferral_openai(tools, "gpt-5.5")
+
+    assert explicit == implicit
+    assert implicit[0] == {"type": "tool_search"}
+    assert any(t.get("defer_loading") for t in implicit)

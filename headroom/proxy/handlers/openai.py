@@ -130,6 +130,26 @@ _OPENAI_ORIGINAL_PATH_HEADER = "x-headroom-original-path"
 _OPENAI_BASE_URL_HEADER = "x-headroom-base-url"
 _decode_openai_bearer_payload = decode_openai_bearer_payload
 
+# Harnesses that resolve tool calls against their own local registry and reject
+# a proxy-injected `tool_search` tool as unavailable (GH #2660). Keyed on the
+# name `classify_client` already resolves from X-Client / User-Agent, so this
+# reuses the existing client-identity authority instead of adding a second one.
+_OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"opencode"})
+
+
+def openai_tool_search_client_supported(client: str | None) -> bool:
+    """Whether this client harness can execute an injected Responses search tool."""
+    return client not in _OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS
+
+
+def _openai_tool_search_kwargs(client: str | None) -> dict[str, bool]:
+    """Compressor kwargs for one request; empty for every client that can search.
+
+    Only an unsupported harness carries the flag, so the argument list a
+    compressor override sees is unchanged on every other request.
+    """
+    return {} if openai_tool_search_client_supported(client) else {"client_can_tool_search": False}
+
 
 def _normalize_openai_max_tokens(
     body: dict[str, Any], *, backend_owns_translation: bool = False
@@ -2207,6 +2227,7 @@ class OpenAIHandlerMixin:
         *,
         model: str,
         request_id: str,
+        client_can_tool_search: bool = True,
         timing: dict[str, float] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
@@ -2345,7 +2366,11 @@ class OpenAIHandlerMixin:
         # one — hence a transform tag but no tokens_saved claim.
         from headroom.proxy.helpers import inject_tool_search_deferral_openai
 
-        _deferred_tools = inject_tool_search_deferral_openai(working.get("tools"), model)
+        _deferred_tools = inject_tool_search_deferral_openai(
+            working.get("tools"),
+            model,
+            client_can_tool_search=client_can_tool_search,
+        )
         if _deferred_tools is not working.get("tools"):
             if working is payload:
                 working = copy.deepcopy(payload)
@@ -2546,11 +2571,13 @@ class OpenAIHandlerMixin:
         *,
         model: str,
         request_id: str,
+        client_can_tool_search: bool = True,
         timeout: float = COMPRESSION_TIMEOUT_SECONDS,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         timing: dict[str, float] = {}
 
         def _compress():  # noqa: ANN202
+            tool_search_kwargs = {} if client_can_tool_search else {"client_can_tool_search": False}
             # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER) runs before
             # compression so the turn classifier sees the client's input as
             # sent, and the steering/effort mutations ride the same rewrite
@@ -2566,10 +2593,14 @@ class OpenAIHandlerMixin:
                     payload,
                     model=model,
                     request_id=request_id,
+                    **tool_search_kwargs,
                     timing=timing,
                 )
             except TypeError as exc:
-                if "unexpected keyword argument 'timing'" not in str(exc):
+                # A compressor override predating either optional keyword still
+                # has to work: drop both and retry rather than turning a narrow
+                # signature into a failed request.
+                if "unexpected keyword argument" not in str(exc):
                     raise
                 result = self._compress_openai_responses_payload(
                     payload,
@@ -4556,6 +4587,7 @@ class OpenAIHandlerMixin:
         headers.pop("content-encoding", None)
         tags = extract_tags(headers)
         client = classify_client(headers)
+        openai_tool_search_kwargs = _openai_tool_search_kwargs(client)
 
         # Learn from the original client payload before memory context or
         # compression mutates it. This mirrors the Anthropic ingestion path.
@@ -4916,6 +4948,7 @@ class OpenAIHandlerMixin:
                     body,
                     model=model,
                     request_id=request_id,
+                    **openai_tool_search_kwargs,
                 )
                 attempted_input_tokens = int(_attempted_tokens)
                 if _transforms:
@@ -5668,6 +5701,7 @@ class OpenAIHandlerMixin:
         # Identify the WS harness before downstream auth/header rewrites.
         # Captured in closure so per-turn RequestOutcome can stamp it.
         client = classify_client(ws_headers)
+        openai_tool_search_kwargs = _openai_tool_search_kwargs(client)
         # WS sessions bypass the HTTP middleware, so bind the project here;
         # per-turn outcome emission inside this task inherits the context.
         set_current_project(classify_project(ws_headers))
@@ -6568,6 +6602,7 @@ class OpenAIHandlerMixin:
                                 _inner,
                                 model=_model,
                                 request_id=request_id,
+                                **openai_tool_search_kwargs,
                                 timeout=_codex_ws_compression_timeout_seconds()
                                 if client == "codex"
                                 else COMPRESSION_TIMEOUT_SECONDS,
@@ -6913,6 +6948,7 @@ class OpenAIHandlerMixin:
                                     inner_payload,
                                     model=model_for_frame,
                                     request_id=request_id,
+                                    **openai_tool_search_kwargs,
                                     timeout=_codex_ws_compression_timeout_seconds()
                                     if client == "codex"
                                     else COMPRESSION_TIMEOUT_SECONDS,
@@ -8629,7 +8665,12 @@ class OpenAIHandlerMixin:
                 },
             )
 
-    async def _maybe_compress_passthrough_responses(self, body: bytes) -> bytes:
+    async def _maybe_compress_passthrough_responses(
+        self,
+        body: bytes,
+        *,
+        client_can_tool_search: bool = True,
+    ) -> bytes:
         """Compress an OpenAI Responses-shaped passthrough body, fail-open.
 
         Reuses the native `/v1/responses` compression path so custom
@@ -8656,6 +8697,7 @@ class OpenAIHandlerMixin:
                 payload,
                 model=model,
                 request_id=request_id,
+                **({} if client_can_tool_search else {"client_can_tool_search": False}),
             )
         except Exception as exc:  # noqa: BLE001 — fail-open on any compressor error
             logger.warning(
@@ -8771,7 +8813,10 @@ class OpenAIHandlerMixin:
             and path.rstrip("/").endswith("/responses")
             and body
         ):
-            compressed = await self._maybe_compress_passthrough_responses(body)
+            compressed = await self._maybe_compress_passthrough_responses(
+                body,
+                client_can_tool_search=openai_tool_search_client_supported(client),
+            )
             if compressed != body:
                 body = compressed
                 # Body size changed — let httpx recompute Content-Length.

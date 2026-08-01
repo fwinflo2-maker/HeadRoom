@@ -2406,7 +2406,12 @@ def inject_tool_search_deferral(
 # (only name+description remain) until the model searches for one — while every
 # tool stays callable and the prompt cache is preserved. Same win as Anthropic
 # (~15-25k tool-schema tokens -> ~200) for clients that ship a big tool surface
-# and never opt into tool search themselves (opencode, plain API clients).
+# and never opt into tool search themselves (plain API clients).
+#
+# One harness is excluded. GH #2660 reports opencode resolving tool calls
+# against its own local registry and rejecting the injected `tool_search` tool
+# as unavailable, so the caller passes `client_can_tool_search=False` for it and
+# its tools stay resident. Every other client keeps the existing behavior.
 #
 # Differences from the Anthropic path that require a separate function:
 #   * Responses function tools carry ``type: "function"`` (Anthropic real tools
@@ -2455,21 +2460,23 @@ def inject_tool_search_deferral_openai(
     tools: Any,
     model: str | None,
     *,
+    client_can_tool_search: bool = True,
     core_tools: frozenset[str] = _TOOL_SEARCH_CORE_TOOLS,
 ) -> Any:
     """Return a new Responses ``tools`` list with non-core function/MCP tools
     deferred + a ``{"type": "tool_search"}`` tool injected, or the original list
     unchanged when injection doesn't apply.
 
-    No-op when: the model doesn't support tool search (gpt-5.4+ only), ``tools``
-    is not a list, there are fewer than ``_OPENAI_TOOL_SEARCH_MIN_TOOLS``, a
-    tool_search tool is already present (client already defers), or nothing would
-    be deferred. Core coding tools and hosted/typed tools (web_search,
+    No-op when: the client harness cannot execute an injected search tool, the
+    model doesn't support tool search (gpt-5.4+ only), ``tools`` is not a list, there
+    are fewer than ``_OPENAI_TOOL_SEARCH_MIN_TOOLS``, a tool_search tool is
+    already present (client already defers), or nothing would be deferred. Core
+    coding tools and hosted/typed tools (web_search,
     file_search, code_interpreter, computer, …) stay resident and unchanged, so
     routine edit/read/run loops never pay a search round-trip and the request
     stays valid; the injected search tool is itself resident.
     """
-    if not _model_supports_openai_tool_search(model):
+    if not client_can_tool_search or not _model_supports_openai_tool_search(model):
         return tools
     if not isinstance(tools, list) or len(tools) < _OPENAI_TOOL_SEARCH_MIN_TOOLS:
         return tools

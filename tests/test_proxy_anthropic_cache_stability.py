@@ -1720,3 +1720,95 @@ def test_issue_327_streaming_and_non_streaming_compute_same_frozen_count() -> No
         f"{captured_b['frozen_message_count']}. The optimization path must "
         f"be identical for both."
     )
+
+
+def _bp_index_of_last_message(body: dict) -> int:
+    """Index of the cache_control breakpoint inside the last block-style message."""
+    for message in reversed(body["messages"]):
+        content = message.get("content")
+        if isinstance(content, list):
+            return next(
+                (i for i, b in enumerate(content) if isinstance(b, dict) and "cache_control" in b),
+                -1,
+            )
+    return -1
+
+
+def test_handler_passes_previous_forwarded_messages_to_breakpoint_placement() -> None:
+    """The breakpoint can only move off the newest block if the HANDLER hands
+    last turn's forwarded messages to normalize_message_cache_control.
+
+    Store-level tests cannot catch that wiring: the parameter defaults to None,
+    so dropping it at the call site silently degrades to newest-block placement
+    with every unit test still green — which is exactly how an earlier attempt at
+    this fix shipped inert. This drives two real requests through the proxy and
+    asserts the second forwarded body anchors to the static prefix.
+    """
+    stable, suffix = 40, {"type": "text", "text": "end-of-transcript"}
+
+    def grown(turn: int, churn: int) -> list[dict]:
+        blocks = [{"type": "text", "text": f"stable-{i}"} for i in range(stable)]
+        blocks += [{"type": "text", "text": f"t{turn}-churn-{i}"} for i in range(churn)]
+        return [
+            {"role": "user", "content": "kickoff"},
+            {"role": "user", "content": [*blocks, suffix]},
+        ]
+
+    captured: dict[str, dict] = {}
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.mode = "token"
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            captured["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 3,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        breakpoints = []
+        for turn, churn in enumerate([3, 5], start=1):
+            response = client.post(
+                "/v1/messages",
+                headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 128,
+                    "system": "SYS",
+                    "messages": grown(turn, churn),
+                },
+            )
+            assert response.status_code == 200
+            body = captured["body"]
+            breakpoints.append(_bp_index_of_last_message(body))
+            # Exactly one message-level breakpoint survives, on every turn.
+            assert (
+                sum(
+                    1
+                    for m in body["messages"]
+                    if isinstance(m.get("content"), list)
+                    for b in m["content"]
+                    if isinstance(b, dict) and "cache_control" in b
+                )
+                == 1
+            )
+
+    cold, warm = breakpoints
+    assert cold == stable + 3, "cold turn has no previous turn to compare — newest block"
+    assert warm == stable - 1, (
+        f"warm turn must anchor to the end of the static prefix, got {warm} — "
+        "the handler is not passing previous_forwarded_messages"
+    )

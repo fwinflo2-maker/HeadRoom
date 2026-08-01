@@ -656,12 +656,22 @@ class TestConversationLineageResolution:
         assert store.active_sessions == 2
 
     @staticmethod
-    def _in_place_growth(stable: int, churn: int, tail: str) -> list[dict]:
+    def _in_place_growth(
+        stable: int, churn: int, tail: str, suffix: str = "end of transcript"
+    ) -> list[dict]:
         """The sub-call shape: a transcript packed into ONE block-style message
-        whose leading blocks are stable and whose tail is rewritten each turn.
-        This history grows at BLOCK granularity, not message granularity."""
+        whose leading blocks are stable, whose middle churns, and which keeps a
+        fixed instruction pinned at the very end. This history grows at BLOCK
+        granularity, not message granularity.
+
+        The pinned suffix mirrors the captured production shape, where the final
+        blocks are byte-identical turn over turn while the blocks before them are
+        rewritten. ``suffix`` is what distinguishes sibling conversations that
+        pack the same parent transcript.
+        """
         blocks = [{"type": "text", "text": f"stable {i} " + "x" * 200} for i in range(stable)]
         blocks += [{"type": "text", "text": f"{tail} churn {i}"} for i in range(churn)]
+        blocks += [{"type": "text", "text": suffix}]
         return [{"role": "user", "content": "kickoff"}, {"role": "user", "content": blocks}]
 
     def test_in_place_message_growth_keeps_its_lineage(self, store):
@@ -718,6 +728,76 @@ class TestConversationLineageResolution:
         )
         shrunk = self._in_place_growth(20, 2, "t1")
         assert store.resolve_tracker(sid, "anthropic", messages=shrunk) is not tracker
+
+    def test_shared_preamble_does_not_merge_parallel_subagents(self, store):
+        """Parallel subagents of the same type open with the same injected
+        boilerplate and then diverge. Sharing a preamble is not a conversation
+        identity — they must keep separate trackers, or they thrash one."""
+        sid = "shared-fallback-id"
+        preamble = {"type": "text", "text": "<system-reminder>shared boilerplate</system-reminder>"}
+
+        def spawn(name: str) -> list[dict]:
+            return [
+                {"role": "user", "content": [preamble, {"type": "text", "text": f"task {name}"}]}
+            ]
+
+        a = store.resolve_tracker(sid, "anthropic", messages=spawn("a"))
+        b = store.resolve_tracker(sid, "anthropic", messages=spawn("b"))
+        assert a is not b
+        assert store.active_sessions == 2
+
+    def test_boilerplate_on_both_ends_is_not_enough_to_share_a_lineage(self, store):
+        """Injected boilerplate can bracket a message on BOTH sides — a preamble
+        in front and a reminder pinned at the end. Two conversations then agree
+        on their first blocks and their last block while differing in the only
+        part that is theirs, so a proportional test alone ("most of the recorded
+        blocks survived") would merge them. A few shared blocks is not identity.
+        """
+        sid = "shared-fallback-id"
+        head = [{"type": "text", "text": f"boilerplate {i}"} for i in range(2)]
+        pinned = {"type": "text", "text": "<system-reminder>stay on task</system-reminder>"}
+
+        def spawn(name: str) -> list[dict]:
+            content = [*head, {"type": "text", "text": f"task {name}"}, pinned]
+            return [{"role": "user", "content": content}]
+
+        a = store.resolve_tracker(sid, "anthropic", messages=spawn("a"))
+        b = store.resolve_tracker(sid, "anthropic", messages=spawn("b"))
+        assert a is not b
+        assert store.active_sessions == 2
+
+    def test_sibling_sub_calls_over_one_transcript_do_not_ping_pong(self, store):
+        """Two sub-call streams can pack the SAME parent transcript and differ
+        only in the instruction appended after it. Their leading blocks match
+        almost entirely, so without a tail check they would trade one tracker
+        back and forth on every turn — forever, since neither ever gains a
+        message to tell them apart."""
+        sid = "shared-fallback-id"
+        seen: dict[str, PrefixCacheTracker] = {}
+        for turn, churn in enumerate([2, 4, 7], start=1):
+            for stream in ("summarize", "title"):
+                history = self._in_place_growth(
+                    30, churn, f"t{turn}", suffix=f"instruction: {stream}"
+                )
+                tracker = store.resolve_tracker(sid, "anthropic", messages=history)
+                seen.setdefault(stream, tracker)
+                assert tracker is seen[stream], f"[{stream}] turn {turn} switched trackers"
+                tracker.update_from_response(
+                    cache_read_tokens=1000,
+                    cache_write_tokens=500,
+                    messages=history,
+                    original_messages=history,
+                )
+        assert seen["summarize"] is not seen["title"]
+
+    def test_added_message_plus_rewritten_older_one_is_not_in_place_growth(self, store):
+        """Growing in place means the message COUNT held still. A history that
+        gained a message AND rewrote an earlier one was rewritten, not grown."""
+        sid = "shared"
+        base = self._in_place_growth(30, 4, "t1")
+        tracker = store.resolve_tracker(sid, "anthropic", messages=base)
+        grown_and_rewritten = [*self._in_place_growth(30, 9, "t2"), {"role": "assistant", "c": 1}]
+        assert store.resolve_tracker(sid, "anthropic", messages=grown_and_rewritten) is not tracker
 
     def test_strict_prefix_match_wins_over_in_place_growth(self, store):
         """An exact continuation must never be displaced by a looser one."""

@@ -922,6 +922,13 @@ def _lineage_snapshot(obj: Any) -> Any:
     return obj
 
 
+# Absolute floor on the stable leading run before a message counts as having
+# grown in place. A shared boilerplate preamble runs to a few blocks, while the
+# shapes this exists for keep runs in the hundreds, so this separates "same
+# conversation, extended" from "two conversations that open the same way".
+_MIN_CONTINUATION_RUN_BLOCKS = 8
+
+
 def _is_message_continuation(recorded: Any, incoming: Any) -> bool:
     """Return True iff ``incoming`` is ``recorded`` grown in place.
 
@@ -932,11 +939,22 @@ def _is_message_continuation(recorded: Any, incoming: Any) -> bool:
     not equal to the recorded one, so the whole-message prefix test rejects it.
 
     "Grown in place" is deliberately narrow, because a false match makes two
-    concurrent conversations share one tracker (the thrash lineages exist to
-    prevent): same role, block-style content that did not shrink, and a leading
-    run of byte-stable blocks covering MOST of the recorded version. Templated
-    fan-outs that diverge in their newest message share few or no leading blocks
-    and are still split apart.
+    concurrent conversations share one tracker — the thrash lineages exist to
+    prevent. All of the following must hold:
+
+    * same role, block-style content on both sides, and no blocks lost;
+    * a leading run of byte-stable blocks that is both substantial in absolute
+      terms and MOST of the recorded version — injected boilerplate can bracket a
+      message on both sides, so a few shared blocks is not a conversation
+      identity;
+    * an unchanged FINAL block. Conversations that pack the same parent
+      transcript differ in the instruction they append after it, so the tail is
+      what distinguishes siblings from a continuation of one stream. The shapes
+      this exists for keep a fixed suffix pinned at the end while the blocks
+      before it churn.
+
+    Anything that fails these keeps its own lineage, which is the pre-existing
+    behaviour and merely forgoes the cache win.
     """
     if not (isinstance(recorded, dict) and isinstance(incoming, dict)):
         return False
@@ -948,21 +966,30 @@ def _is_message_continuation(recorded: Any, incoming: Any) -> bool:
         return False
     if not old or len(new) < len(old):
         return False
+    if old[-1] != new[-1]:
+        return False
     run = _stable_leading_block_run(new, old)
-    return run * 2 >= len(old)
+    return run >= _MIN_CONTINUATION_RUN_BLOCKS and run * 2 >= len(old)
 
 
 def _chain_matches(chain: Any, snap: Any, strict: bool) -> bool:
     """Does ``snap`` continue the conversation recorded as ``chain``?
 
-    ``strict`` requires every recorded message to re-compare equal. Otherwise the
-    recorded messages before the last must still match exactly and the last one
-    only has to have grown in place (see :func:`_is_message_continuation`).
+    ``strict`` requires every recorded message to re-compare equal, and matches a
+    chain that the history merely extends with further messages.
+
+    The loose pass is narrower, not just weaker: the message COUNT must be
+    unchanged, every message before the last must still match exactly, and only
+    the last one may differ, by having grown in place (see
+    :func:`_is_message_continuation`). A history that both gained messages and
+    rewrote an older one did not grow in place, and starts a fresh lineage.
     """
     if len(chain) > len(snap):
         return False
     if strict:
         return bool(snap[: len(chain)] == chain)
+    if len(snap) != len(chain):
+        return False
     head = len(chain) - 1
     return bool(snap[:head] == chain[:head]) and _is_message_continuation(chain[head], snap[head])
 

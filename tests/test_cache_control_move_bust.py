@@ -243,13 +243,18 @@ def _blocks(*texts):
     return [{"type": "text", "text": t} for t in texts]
 
 
-def _grown(stable: int, churn: int, tail: str):
-    """One block-style message: `stable` unchanging blocks, then a varying tail."""
+def _grown(stable: int, churn: int, tail: str, suffix: str = "end-of-transcript"):
+    """One block-style message shaped like the captured production sub-call:
+    `stable` unchanging blocks, a churning middle, and a fixed instruction
+    pinned at the very end (the real shape's final blocks are byte-identical
+    turn over turn while the blocks before them are rewritten).
+    """
     return {
         "role": "user",
         "content": _blocks(
             *[f"stable-{i}" for i in range(stable)],
             *[f"{tail}-churn-{i}" for i in range(churn)],
+            suffix,
         ),
     }
 
@@ -291,7 +296,7 @@ def test_breakpoint_anchors_to_static_prefix_when_message_grows_in_place():
     ]
     turns = _drive_turns(shapes)
 
-    assert turns[0][1] == 42, "cold turn has nothing to compare — newest block"
+    assert turns[0][1] == 43, "cold turn has nothing to compare — newest block"
     for forwarded, bp in turns[1:]:
         blocks = forwarded[-1]["content"]
         assert bp == 39, f"breakpoint must sit at the end of the static prefix, got {bp}"

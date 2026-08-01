@@ -16,6 +16,7 @@ from unittest.mock import patch
 import pytest
 import uvicorn
 import websockets
+from starlette.websockets import WebSocket
 
 from headroom.providers.codex.live import (
     CODEX_LIVE_ROUTE_PATHS,
@@ -373,14 +374,34 @@ async def test_live_handler_propagates_close_metadata_and_cleans_tasks(monkeypat
     assert no_auth_connect["headers"] == {}
     assert "Codex Live has no Authorization header or OPENAI_API_KEY" in caplog.text
 
-    class _QueuedClient(_Client):
+    class _QueuedClient(WebSocket):
         def __init__(self, messages: list[dict[str, Any]]) -> None:
-            super().__init__(messages[0])
-            self.messages = iter(messages)
+            scope = {
+                "type": "websocket",
+                "path": "/v1/live",
+                "raw_path": b"/v1/live",
+                "scheme": "ws",
+                "query_string": b"",
+                "headers": [],
+                "client": ("127.0.0.1", 1234),
+                "server": ("127.0.0.1", 8788),
+                "subprotocols": [],
+            }
+            super().__init__(scope, self._receive_asgi, self._send_asgi)
+            self._messages = iter([{"type": "websocket.connect"}, *messages])
+            self.sent: list[dict[str, Any]] = []
+
+        async def _receive_asgi(self) -> dict[str, Any]:
+            return {"type": "websocket.connect"}
+
+        async def _send_asgi(self, message: dict[str, Any]) -> None:
+            self.sent.append(message)
 
         async def receive(self) -> dict[str, Any]:
+            # Starlette rejects unknown connected-state messages before the
+            # handler can reach its defensive branch, so inject it at this seam.
             try:
-                return next(self.messages)
+                return next(self._messages)
             except StopIteration:
                 return {"type": "websocket.disconnect", "code": 1000, "reason": "done"}
 

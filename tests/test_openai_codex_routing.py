@@ -642,6 +642,7 @@ def test_openai_responses_memory_continuation_is_zdr_safe(store, include, monkey
         )
     )
     assert first_body["include"] == expected_include
+    assert continuation_body["include"] == expected_include
     assert first_body["previous_response_id"] == "resp-inherited"
     assert ("store" in first_body) is (store is not None)
     if store is not None:

@@ -1687,6 +1687,7 @@ async def test_ws_memory_enabled_non_memory_response_streams_completion():
     assert forwarded_initial["tools"]
     assert forwarded_initial["include"] == ["reasoning.encrypted_content"]
     assert client_ws.sent_text == upstream_events
+    assert len(upstream.sent) == 1
 
 
 @pytest.mark.asyncio
@@ -1722,11 +1723,56 @@ async def test_ws_memory_continuation_handles_invalid_item_arguments_and_unavail
 
     assert len(upstream.sent) == 2
     continuation = json.loads(upstream.sent[1])["response"]
+    assert continuation["input"] == [
+        {"role": "user", "content": "hi"},
+        function_call,
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": '{"error": "backend not ready"}',
+        },
+    ]
     assert continuation["input"][-1] == {
         "type": "function_call_output",
         "call_id": "call-1",
         "output": '{"error": "backend not ready"}',
     }
+
+
+@pytest.mark.asyncio
+async def test_ws_memory_continuation_normalizes_malformed_arguments():
+    function_call = {
+        "type": "function_call",
+        "id": "fc-1",
+        "call_id": "call-1",
+        "name": "memory_search",
+        "arguments": "{malformed",
+    }
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.output_item.done", "item": "invalid"}),
+        json.dumps({"type": "response.output_item.added", "item": function_call}),
+        json.dumps({"type": "response.output_item.done", "item": function_call}),
+        json.dumps({"type": "response.completed", "response": {"id": "r-1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    client_ws.headers["x-headroom-user-id"] = "user-1"
+    handler = _DummyOpenAIHandler()
+    handler.memory_handler = _MemoryWsHandler()
+    executed: list[tuple[str, dict, str, str]] = []
+
+    async def _execute_memory_tool(name, args, user_id, provider):
+        executed.append((name, args, user_id, provider))
+        return '{"memories": []}'
+
+    handler.memory_handler._execute_memory_tool = _execute_memory_tool
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert executed == [("memory_search", {}, "user-1", "openai")]
 
 
 @pytest.mark.asyncio

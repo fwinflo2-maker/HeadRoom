@@ -711,6 +711,105 @@ class TestConversationLineageResolution:
         ]
         assert classify_append_only_prefix(renamed, first) is None
 
+    def test_append_only_classifier_rejects_short_empty_and_non_dict_histories(self):
+        from headroom.cache.prefix_tracker import (
+            _classify_append_only_canonical,
+            classify_append_only_prefix,
+        )
+
+        history = [{"role": "user", "content": "hello"}]
+
+        assert classify_append_only_prefix([], history) is None
+        assert classify_append_only_prefix(history, []) is None
+        assert classify_append_only_prefix(history, ["not a message"]) is None
+        assert _classify_append_only_canonical([], history) is None
+
+    def test_second_changed_message_rejects_the_append_only_classification(self):
+        from headroom.cache.prefix_tracker import classify_append_only_prefix
+
+        previous = [
+            {"role": "user", "content": [{"type": "text", "text": "A"}]},
+            {"role": "assistant", "content": "old"},
+        ]
+        current = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "A"},
+                    {"type": "text", "text": "B"},
+                ],
+            },
+            {"role": "assistant", "content": "new"},
+        ]
+
+        assert classify_append_only_prefix(current, previous) is None
+
+    def test_dropped_current_prefix_message_refuses_raw_indexing(self):
+        from headroom.cache.prefix_tracker import classify_append_only_prefix
+
+        previous = [{"role": "user", "content": [{"type": "text", "text": "A"}]}]
+        current = [{"cachePoint": {"type": "default"}}]
+
+        assert classify_append_only_prefix(current, previous) is None
+
+    def test_overlay_falls_back_when_frontier_is_outside_optimized_output(self):
+        from headroom.cache.prefix_tracker import overlay_cached_prefix
+
+        previous_original = [
+            {"role": "user", "content": [{"type": "text", "text": "A"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "old"}]},
+        ]
+        previous_forwarded = [
+            {"role": "user", "content": [{"type": "text", "text": "A_compressed"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "old_compressed"}]},
+        ]
+        current = [
+            previous_original[0],
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "old"},
+                    {"type": "text", "text": "appended"},
+                ],
+            },
+        ]
+
+        assert overlay_cached_prefix(
+            [previous_forwarded[0]], current, previous_original, previous_forwarded
+        ) == [previous_forwarded[0]]
+
+    def test_overlay_falls_back_when_forwarded_message_count_differs(self):
+        from headroom.cache.prefix_tracker import overlay_cached_prefix
+
+        original = [{"role": "user", "content": [{"type": "text", "text": "A"}]}]
+        forwarded = [
+            original[0],
+            {"role": "assistant", "content": [{"type": "text", "text": "extra"}]},
+        ]
+
+        assert overlay_cached_prefix(original, original, original, forwarded) == original
+
+    def test_overlay_logs_and_replays_prefix_before_a_divergent_tail(self):
+        from headroom.cache.prefix_tracker import overlay_cached_prefix
+
+        previous_original = [
+            {"role": "user", "content": [{"type": "text", "text": "A"}]},
+            {"role": "assistant", "content": "old"},
+        ]
+        previous_forwarded = [
+            {"role": "user", "content": [{"type": "text", "text": "A_compressed"}]},
+            {"role": "assistant", "content": "old_compressed"},
+        ]
+        current = [
+            previous_original[0],
+            {"role": "assistant", "content": "new"},
+        ]
+
+        assert overlay_cached_prefix(current, current, previous_original, previous_forwarded) == [
+            previous_forwarded[0],
+            current[1],
+        ]
+
     @pytest.mark.parametrize(
         "requote",
         [

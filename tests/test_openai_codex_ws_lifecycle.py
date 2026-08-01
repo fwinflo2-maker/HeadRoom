@@ -70,6 +70,47 @@ class _DummyMetrics:
         self.codex_ws_frames.append(dict(kwargs))
 
 
+class _MemoryWsHandler:
+    def __init__(self) -> None:
+        self.config = SimpleNamespace(
+            inject_context=False,
+            inject_tools=True,
+            project_root_override="",
+        )
+        self._backend = False
+
+    def compute_memory_tool_definitions(self, provider: str) -> list[dict]:
+        assert provider == "openai"
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "memory_search",
+                    "description": "Search memory.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+    async def _ensure_initialized(self) -> None:
+        self._backend = True
+
+    async def _execute_memory_tool(
+        self,
+        name: str,
+        args: dict,
+        user_id: str,
+        provider: str,
+    ) -> str:
+        assert (name, args, user_id, provider) == (
+            "memory_search",
+            {},
+            user_id,
+            "openai",
+        )
+        return '{"memories": []}'
+
+
 class _DummyOpenAIHandler(OpenAIHandlerMixin):
     OPENAI_API_URL = "https://api.openai.com"
 
@@ -1467,3 +1508,55 @@ async def test_ws_recognized_client_with_real_path_is_not_restamped():
     # the caller already self-identifies via its User-Agent.
     assert "x-client" not in {k.lower() for k in client_ws.headers}
     assert handler.ws_sessions.active_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_ws_memory_continuation_replays_history_without_previous_response_id():
+    function_call = {
+        "type": "function_call",
+        "id": "fc-1",
+        "call_id": "call-1",
+        "name": "memory_search",
+        "arguments": "{}",
+    }
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.output_item.added", "item": function_call}),
+        json.dumps({"type": "response.output_item.done", "item": function_call}),
+        json.dumps({"type": "response.completed", "response": {"id": "r-1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(
+        frames=[
+            json.dumps(
+                {
+                    "type": "response.create",
+                    "response": {
+                        "model": "gpt-5.4",
+                        "input": "remember this",
+                    },
+                }
+            )
+        ],
+        hold_after_initial=True,
+    )
+    client_ws.headers["x-headroom-user-id"] = "user-1"
+    handler = _DummyOpenAIHandler()
+    handler.memory_handler = _MemoryWsHandler()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert len(upstream.sent) >= 2
+    continuation = json.loads(upstream.sent[1])
+    assert "previous_response_id" not in continuation["response"]
+    assert continuation["response"]["input"] == [
+        {"role": "user", "content": "remember this"},
+        function_call,
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": '{"memories": []}',
+        },
+    ]

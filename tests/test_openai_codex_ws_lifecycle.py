@@ -1511,7 +1511,19 @@ async def test_ws_recognized_client_with_real_path_is_not_restamped():
 
 
 @pytest.mark.asyncio
-async def test_ws_memory_continuation_replays_history_without_previous_response_id():
+@pytest.mark.parametrize(
+    "include",
+    [
+        pytest.param(None, id="omitted"),
+        pytest.param(["response.output_text.done"], id="missing-marker"),
+        pytest.param(
+            ["response.output_text.done", "reasoning.encrypted_content"],
+            id="existing-marker",
+        ),
+        pytest.param("not-a-list", id="non-list"),
+    ],
+)
+async def test_ws_memory_continuation_replays_history_without_previous_response_id(include):
     function_call = {
         "type": "function_call",
         "id": "fc-1",
@@ -1542,6 +1554,18 @@ async def test_ws_memory_continuation_replays_history_without_previous_response_
         ],
         hold_after_initial=True,
     )
+    if include is not None:
+        client_ws._frames[0] = json.dumps(
+            {
+                "type": "response.create",
+                "response": {
+                    "model": "gpt-5.4",
+                    "input": "remember this",
+                    "store": True,
+                    "include": include,
+                },
+            }
+        )
     client_ws.headers["x-headroom-user-id"] = "user-1"
     handler = _DummyOpenAIHandler()
     handler.memory_handler = _MemoryWsHandler()
@@ -1550,10 +1574,25 @@ async def test_ws_memory_continuation_replays_history_without_previous_response_
         await handler.handle_openai_responses_ws(client_ws)
 
     assert len(upstream.sent) >= 2
+    expected_include = (
+        ["reasoning.encrypted_content"]
+        if include is None
+        else (
+            include
+            if not isinstance(include, list)
+            else (
+                include
+                if "reasoning.encrypted_content" in include
+                else [*include, "reasoning.encrypted_content"]
+            )
+        )
+    )
+    assert json.loads(upstream.sent[0])["response"]["include"] == expected_include
     continuation = json.loads(upstream.sent[1])
     assert "previous_response_id" not in continuation["response"]
     assert continuation["response"]["model"] == "gpt-5.4"
     assert continuation["response"]["store"] is True
+    assert continuation["response"]["include"] == expected_include
     assert continuation["response"]["tools"]
     assert continuation["response"]["instructions"]
     assert continuation["response"]["input"] == [
@@ -1565,6 +1604,129 @@ async def test_ws_memory_continuation_replays_history_without_previous_response_
             "output": '{"memories": []}',
         },
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "initial_frame",
+    [
+        pytest.param("not-json", id="initial-non-json"),
+        pytest.param(
+            json.dumps({"type": "response.create", "response": []}),
+            id="initial-non-mapping-response",
+        ),
+    ],
+)
+async def test_ws_memory_frame_shape_guards_fail_open(initial_frame):
+    later_frames = [
+        json.dumps(
+            {
+                "type": "response.create",
+                "response": {"model": "gpt-5.4", "input": []},
+            }
+        ),
+        json.dumps({"type": "response.create", "response": "invalid"}),
+    ]
+    frames = [initial_frame, *later_frames]
+    upstream = _FakeUpstream([], hold_after_events=True)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(frames=frames, hold_after_initial=True)
+    client_ws.headers["x-headroom-user-id"] = "user-1"
+    handler = _DummyOpenAIHandler()
+    handler.memory_handler = _MemoryWsHandler()
+
+    async def _trigger_disconnect() -> None:
+        await asyncio.sleep(0.05)
+        client_ws.trigger_disconnect()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        trigger_task = asyncio.create_task(_trigger_disconnect())
+        try:
+            await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=2.0)
+        finally:
+            trigger_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await trigger_task
+
+    assert upstream.sent[0] == initial_frame
+    forwarded_valid = json.loads(upstream.sent[1])["response"]
+    assert forwarded_valid["model"] == "gpt-5.4"
+    assert forwarded_valid["input"] == []
+    assert forwarded_valid["tools"]
+    assert forwarded_valid["include"] == ["reasoning.encrypted_content"]
+    assert upstream.sent[2] == later_frames[1]
+
+
+@pytest.mark.asyncio
+async def test_ws_memory_enabled_non_memory_response_streams_completion():
+    message_item = {
+        "type": "message",
+        "id": "message-1",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "hello"}],
+    }
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.output_item.added", "item": message_item}),
+        json.dumps({"type": "response.output_item.done", "item": message_item}),
+        json.dumps({"type": "response.completed", "response": {"id": "r-1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    client_ws.headers["x-headroom-user-id"] = "user-1"
+    handler = _DummyOpenAIHandler()
+    handler.memory_handler = _MemoryWsHandler()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    forwarded_initial = json.loads(upstream.sent[0])["response"]
+    assert forwarded_initial["model"] == "gpt-5.4"
+    assert forwarded_initial["input"] == "hi"
+    assert forwarded_initial["tools"]
+    assert forwarded_initial["include"] == ["reasoning.encrypted_content"]
+    assert client_ws.sent_text == upstream_events
+
+
+@pytest.mark.asyncio
+async def test_ws_memory_continuation_handles_invalid_item_arguments_and_unavailable_backend():
+    function_call = {
+        "type": "function_call",
+        "id": "fc-1",
+        "call_id": "call-1",
+        "name": "memory_search",
+        "arguments": "{malformed",
+    }
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.output_item.done", "item": "invalid"}),
+        json.dumps({"type": "response.output_item.added", "item": function_call}),
+        json.dumps({"type": "response.output_item.done", "item": function_call}),
+        json.dumps({"type": "response.completed", "response": {"id": "r-1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    client_ws.headers["x-headroom-user-id"] = "user-1"
+    handler = _DummyOpenAIHandler()
+    handler.memory_handler = _MemoryWsHandler()
+
+    async def _leave_backend_unavailable():
+        return None
+
+    handler.memory_handler._ensure_initialized = _leave_backend_unavailable
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert len(upstream.sent) == 2
+    continuation = json.loads(upstream.sent[1])["response"]
+    assert continuation["input"][-1] == {
+        "type": "function_call_output",
+        "call_id": "call-1",
+        "output": '{"error": "backend not ready"}',
+    }
 
 
 @pytest.mark.asyncio

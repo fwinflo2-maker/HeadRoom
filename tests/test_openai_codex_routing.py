@@ -139,6 +139,7 @@ def test_openai_responses_unit_cache_key_includes_target_ratio() -> None:
 
 
 def test_responses_stateless_output_items_drop_unencrypted_reasoning() -> None:
+    assert _responses_stateless_output_items(None) == []
     assert _responses_stateless_output_items(
         [
             {"type": "reasoning", "id": "rs-unusable", "summary": []},
@@ -577,7 +578,15 @@ def test_handle_openai_responses_api_auth_store_false_skips_memory_tools(monkeyp
 @pytest.mark.parametrize("store", [pytest.param(None, id="omitted"), True])
 @pytest.mark.parametrize(
     "include",
-    [pytest.param(None, id="omitted"), ["response.output_text.done"]],
+    [
+        pytest.param(None, id="omitted"),
+        pytest.param(["response.output_text.done"], id="missing-marker"),
+        pytest.param(
+            ["response.output_text.done", "reasoning.encrypted_content"],
+            id="existing-marker",
+        ),
+        pytest.param("not-a-list", id="non-list"),
+    ],
 )
 def test_openai_responses_memory_continuation_is_zdr_safe(store, include, monkeypatch):
     body = {
@@ -622,7 +631,15 @@ def test_openai_responses_memory_continuation_is_zdr_safe(store, include, monkey
     expected_include = (
         ["reasoning.encrypted_content"]
         if include is None
-        else [*include, "reasoning.encrypted_content"]
+        else (
+            include
+            if not isinstance(include, list)
+            else (
+                include
+                if "reasoning.encrypted_content" in include
+                else [*include, "reasoning.encrypted_content"]
+            )
+        )
     )
     assert first_body["include"] == expected_include
     assert first_body["previous_response_id"] == "resp-inherited"

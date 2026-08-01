@@ -252,7 +252,9 @@ class ContextTracker:
                 empty-keyed test contexts to avoid accidental crossover.
 
         Returns:
-            List of expansion recommendations, sorted by relevance.
+            List of expansion recommendations, sorted by relevance. Only
+            contexts with tool provenance (``tool_name`` set) are eligible;
+            compressed instruction/system text is never proactively expanded.
         """
         if not self.config.enabled or not self.config.proactive_expansion:
             return []
@@ -293,6 +295,22 @@ class ContextTracker:
                 and context.session_id is not None
                 and context.session_id != session_id
             ):
+                continue
+
+            # Tool-provenance filter. Proactive expansion exists to restore
+            # *tool ground truth* the compressor summarized away. Entries with
+            # no tool provenance are compressed instruction/system text (agent
+            # rules, injected reminders): the model already holds them in
+            # compressed form together with a retrieval marker, so re-injecting
+            # the full original buys nothing and costs the whole original.
+            #
+            # It is also strictly loss-making. Expansion *appends* the original
+            # while the compressed copy stays in the prefix, so the request
+            # carries both. On instruction text — which compresses poorly
+            # (~18% observed) — that lands well above the uncompressed
+            # baseline for the same content, and the append is replayed to the
+            # provider on every later turn of the conversation.
+            if context.tool_name is None:
                 continue
 
             # Check age

@@ -1535,6 +1535,7 @@ async def test_ws_memory_continuation_replays_history_without_previous_response_
                     "response": {
                         "model": "gpt-5.4",
                         "input": "remember this",
+                        "store": True,
                     },
                 }
             )
@@ -1551,6 +1552,10 @@ async def test_ws_memory_continuation_replays_history_without_previous_response_
     assert len(upstream.sent) >= 2
     continuation = json.loads(upstream.sent[1])
     assert "previous_response_id" not in continuation["response"]
+    assert continuation["response"]["model"] == "gpt-5.4"
+    assert continuation["response"]["store"] is True
+    assert continuation["response"]["tools"]
+    assert continuation["response"]["instructions"]
     assert continuation["response"]["input"] == [
         {"role": "user", "content": "remember this"},
         function_call,
@@ -1560,3 +1565,135 @@ async def test_ws_memory_continuation_replays_history_without_previous_response_
             "output": '{"memories": []}',
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_ws_memory_tools_respect_explicit_store_false():
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.completed", "response": {"id": "r-1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(
+        frames=[
+            json.dumps(
+                {
+                    "type": "response.create",
+                    "response": {
+                        "model": "gpt-5.4",
+                        "input": "do not use memory",
+                        "store": False,
+                    },
+                }
+            )
+        ],
+        hold_after_initial=True,
+    )
+    client_ws.headers["x-headroom-user-id"] = "user-1"
+    handler = _DummyOpenAIHandler()
+    handler.memory_handler = _MemoryWsHandler()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert len(upstream.sent) == 1
+    initial = json.loads(upstream.sent[0])["response"]
+    assert initial["store"] is False
+    assert "tools" not in initial
+
+
+@pytest.mark.asyncio
+async def test_ws_memory_continuation_handles_reasoning_first_and_repeated_calls():
+    function_call_one = {
+        "type": "function_call",
+        "id": "fc-1",
+        "call_id": "call-1",
+        "name": "memory_search",
+        "arguments": "{}",
+    }
+    function_call_two = {
+        "type": "function_call",
+        "id": "fc-2",
+        "call_id": "call-2",
+        "name": "memory_search",
+        "arguments": "{}",
+    }
+    reasoning_without_encryption = {
+        "type": "reasoning",
+        "id": "reasoning-1",
+        "summary": [],
+    }
+    reasoning_with_encryption = {
+        "type": "reasoning",
+        "id": "reasoning-2",
+        "summary": [],
+        "encrypted_content": "encrypted-2",
+    }
+    message_item = {
+        "type": "message",
+        "id": "message-2",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "searching"}],
+    }
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.output_item.added", "item": reasoning_without_encryption}),
+        json.dumps({"type": "response.output_item.done", "item": reasoning_without_encryption}),
+        json.dumps({"type": "response.output_item.added", "item": function_call_one}),
+        json.dumps({"type": "response.output_item.done", "item": function_call_one}),
+        json.dumps({"type": "response.completed", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.created", "response": {"id": "r-2"}}),
+        json.dumps({"type": "response.output_item.added", "item": reasoning_with_encryption}),
+        json.dumps({"type": "response.output_item.done", "item": reasoning_with_encryption}),
+        json.dumps({"type": "response.output_item.added", "item": message_item}),
+        json.dumps({"type": "response.output_item.done", "item": message_item}),
+        json.dumps({"type": "response.output_item.added", "item": function_call_two}),
+        json.dumps({"type": "response.output_item.done", "item": function_call_two}),
+        json.dumps({"type": "response.completed", "response": {"id": "r-2"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(
+        frames=[
+            json.dumps(
+                {
+                    "type": "response.create",
+                    "response": {"model": "gpt-5.4", "input": "remember this"},
+                }
+            )
+        ],
+        hold_after_initial=True,
+    )
+    client_ws.headers["x-headroom-user-id"] = "user-1"
+    handler = _DummyOpenAIHandler()
+    handler.memory_handler = _MemoryWsHandler()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert len(upstream.sent) == 3
+    first_continuation = json.loads(upstream.sent[1])["response"]["input"]
+    assert reasoning_without_encryption not in first_continuation
+    assert function_call_one in first_continuation
+    assert {
+        "type": "function_call_output",
+        "call_id": "call-1",
+        "output": '{"memories": []}',
+    } in first_continuation
+
+    second_continuation = json.loads(upstream.sent[2])["response"]["input"]
+    assert function_call_one in second_continuation
+    assert {
+        "type": "function_call_output",
+        "call_id": "call-1",
+        "output": '{"memories": []}',
+    } in second_continuation
+    assert reasoning_with_encryption in second_continuation
+    assert message_item in second_continuation
+    assert function_call_two in second_continuation
+    assert {
+        "type": "function_call_output",
+        "call_id": "call-2",
+        "output": '{"memories": []}',
+    } in second_continuation

@@ -575,17 +575,35 @@ def test_handle_openai_responses_api_auth_store_false_skips_memory_tools(monkeyp
 
 
 @pytest.mark.parametrize("store", [pytest.param(None, id="omitted"), True])
-def test_openai_responses_memory_continuation_is_zdr_safe(store, monkeypatch):
+@pytest.mark.parametrize(
+    "include",
+    [pytest.param(None, id="omitted"), ["response.output_text.done"]],
+)
+def test_openai_responses_memory_continuation_is_zdr_safe(store, include, monkeypatch):
     body = {
         "model": "gpt-5.4",
+        "previous_response_id": "resp-inherited",
         "input": [
             {
                 "type": "message",
                 "role": "user",
                 "content": [{"type": "input_text", "text": "hello"}],
-            }
+            },
+            {
+                "type": "reasoning",
+                "id": "prior-reasoning",
+                "summary": [],
+                "encrypted_content": "prior-encrypted",
+            },
+            {
+                "type": "reasoning",
+                "id": "prior-unencrypted-reasoning",
+                "summary": [],
+            },
         ],
     }
+    if include is not None:
+        body["include"] = include
     if store is not None:
         body["store"] = store
     request = _build_request(
@@ -601,7 +619,13 @@ def test_openai_responses_memory_continuation_is_zdr_safe(store, monkeypatch):
     assert response.status_code == 200
     assert len(handler.requests) == 2
     first_body, continuation_body = handler.requests
-    assert first_body["include"] == ["reasoning.encrypted_content"]
+    expected_include = (
+        ["reasoning.encrypted_content"]
+        if include is None
+        else [*include, "reasoning.encrypted_content"]
+    )
+    assert first_body["include"] == expected_include
+    assert first_body["previous_response_id"] == "resp-inherited"
     assert ("store" in first_body) is (store is not None)
     if store is not None:
         assert first_body["store"] is True
@@ -609,6 +633,7 @@ def test_openai_responses_memory_continuation_is_zdr_safe(store, monkeypatch):
         assert "store" not in first_body
     assert continuation_body["input"] == [
         body["input"][0],
+        body["input"][1],
         {
             "type": "reasoning",
             "id": "reasoning-1",

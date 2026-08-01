@@ -41,6 +41,30 @@ def test_qualified_ccr_retrieval_message_is_preserved(tool_name: str) -> None:
     assert result.metrics[0].skip_reason == "tool_excluded"
 
 
+def test_incomplete_tool_calls_do_not_hide_later_qualified_name() -> None:
+    messages = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"id": None, "name": "incomplete", "args": {}},
+                {"id": "ignored", "name": "", "args": {}},
+                {
+                    "id": "call_1",
+                    "name": "mcp__Headroom__headroom_retrieve",
+                    "args": {},
+                },
+            ],
+        ),
+        ToolMessage(content=_large_output(), tool_call_id="call_1"),
+    ]
+    original = messages[1].content
+
+    result = compress_tool_messages(messages)
+
+    assert result.messages[1].content == original
+    assert result.metrics[0].skip_reason == "tool_excluded"
+
+
 def test_near_match_ccr_tool_name_is_not_excluded() -> None:
     messages = _messages("mcp__Headroom__headroom_retrieve_extra")
     original = messages[1].content

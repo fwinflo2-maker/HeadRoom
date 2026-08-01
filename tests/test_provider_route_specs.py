@@ -139,7 +139,9 @@ def test_gemini_model_routes_all_follow_the_tagged_upstream() -> None:
 
 
 def test_non_gemini_handler_routes_do_not_opt_into_the_custom_base() -> None:
-    for spec in (*ANTHROPIC_HANDLER_ROUTES, *OPENAI_HANDLER_ROUTES, *CLOUDCODE_HANDLER_ROUTES):
+    for spec in PROVIDER_HANDLER_ROUTES:
+        if spec in GEMINI_HANDLER_ROUTES:
+            continue
         assert not spec.supports_custom_base_url, spec.path
 
 

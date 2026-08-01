@@ -930,12 +930,19 @@ def classify_append_only_prefix(
     previous = _lineage_snapshot(_canonicalize_for_prefix_compare(previous_messages))
     # Callers slice raw message lists by raw counts and index them by the
     # frontier's message index, so the canonical projection has to stay
-    # positionally 1:1 with its input. It does not when a whole message projects
-    # to ``{}`` and the list comprehension in
+    # positionally 1:1 with its input over the region they address. It does not
+    # when a whole message projects to ``{}`` and the list comprehension in
     # ``_canonicalize_for_prefix_compare`` drops it, which happens when every key
     # on that message is non-semantic. Refuse rather than hand back an index into
     # a list the caller does not have.
-    if len(current) != len(current_messages) or len(previous) != len(previous_messages):
+    #
+    # Only the compared prefix matters. A dropped message past it cannot shift
+    # any index the callers use, and the delta they take is the raw tail, so
+    # refusing there would give up a sound replay for nothing.
+    prefix_len = len(previous_messages)
+    if len(previous) != prefix_len:
+        return None
+    if len(_canonicalize_for_prefix_compare(current_messages[:prefix_len])) != prefix_len:
         return None
     return _classify_append_only_canonical(current, previous)
 

@@ -1433,6 +1433,31 @@ def test_a_message_that_canonicalizes_away_refuses_the_whole_classification() ->
     assert overlay_cached_prefix(current, current, previous_original, previous_forwarded) == current
 
 
+def test_a_dropped_message_past_the_compared_prefix_still_replays() -> None:
+    """The refusal is bounded to the region the callers index.
+
+    A message that canonicalizes away in the appended tail cannot shift the
+    prefix count or the frontier index, and the delta is taken from the raw
+    list, so giving up the replay there would cost a cache hit for nothing.
+    """
+    from headroom.cache.prefix_tracker import extract_cache_stable_delta
+
+    previous_original = [{"role": "user", "content": [{"type": "text", "text": "A"}]}]
+    previous_forwarded = [{"role": "user", "content": [{"type": "text", "text": "A_compressed"}]}]
+    current = [
+        {"role": "user", "content": [{"type": "text", "text": "A"}]},
+        {"cachePoint": {"type": "default"}},
+        {"role": "assistant", "content": [{"type": "text", "text": "B"}]},
+    ]
+
+    result = extract_cache_stable_delta(current, previous_original, previous_forwarded)
+
+    assert result is not None
+    prefix, delta = result
+    assert prefix == previous_forwarded
+    assert delta == current[1:]
+
+
 def test_growth_on_a_directive_only_message_is_not_a_clean_prefix_match() -> None:
     """A message whose blocks all canonicalize away still grew.
 

@@ -7722,8 +7722,9 @@ class OpenAIHandlerMixin:
                                     "type": "response.create",
                                     "response": continuation_response,
                                 }
+                                continuation_raw = _strip_codex_lite_metadata(json.dumps(cont))
                                 await upstream.send(
-                                    _normalize_ws_response_create_for_upstream(json.dumps(cont))
+                                    _normalize_ws_response_create_for_upstream(continuation_raw)
                                 )
                                 logger.info(
                                     f"[{request_id}] WS Memory: Sent continuation "

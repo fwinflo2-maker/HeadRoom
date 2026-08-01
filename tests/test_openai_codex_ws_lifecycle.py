@@ -1867,7 +1867,14 @@ async def test_ws_memory_continuation_handles_reasoning_first_and_repeated_calls
             json.dumps(
                 {
                     "type": "response.create",
-                    "response": {"model": "gpt-5.4", "input": "remember this"},
+                    "response": {
+                        "model": "gpt-5.4",
+                        "input": "remember this",
+                        "client_metadata": {
+                            "ws_request_header_x_openai_internal_codex_responses_lite": "true",
+                            "keep": "yes",
+                        },
+                    },
                 }
             )
         ],
@@ -1889,6 +1896,7 @@ async def test_ws_memory_continuation_handles_reasoning_first_and_repeated_calls
         "call_id": "call-1",
         "output": '{"memories": []}',
     } in first_continuation
+    assert json.loads(upstream.sent[1])["response"]["client_metadata"] == {"keep": "yes"}
 
     second_continuation = json.loads(upstream.sent[2])["response"]["input"]
     assert function_call_one in second_continuation

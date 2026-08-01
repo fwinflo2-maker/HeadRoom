@@ -10,6 +10,8 @@ These tests pin the resolution contract:
 - header present  → its value wins
 - header absent   → configured ``OPENAI_API_URL`` fallback
 - header empty or whitespace-only → fallback (no blanking)
+- Grok CLI wire signals → ``api.x.ai`` even when process default is OpenAI
+- chat/responses call sites must re-run the full resolver after custom-base shadowing
 """
 
 from __future__ import annotations
@@ -142,3 +144,59 @@ def test_non_grok_clients_keep_process_openai_default() -> None:
     )
 
     assert proxy._resolve_openai_upstream(request) == "https://api.openai.com"
+
+
+def test_chat_call_site_must_not_use_custom_only_or_process_default_for_grok() -> None:
+    """Regression: mid-handler custom-base shadowing must not discard Grok→xAI.
+
+    Production ``handle_openai_chat`` / ``handle_openai_responses`` rebind a local
+    ``upstream_base_url`` to custom-header-only for path rewrite/telemetry, then
+    build the final outbound URL. Using ``custom_only or OPENAI_API_URL`` there
+    sends Grok session tokens to api.openai.com on a shared Claude/Codex proxy
+    (401). The shipped call sites must call ``_resolve_openai_upstream`` again.
+    """
+    from headroom.proxy.handlers.openai import _resolve_openai_upstream_base
+
+    process_default = "https://api.openai.com"
+    proxy = _stub_proxy(process_default)
+    request = _FakeRequest(
+        {
+            "authorization": "Bearer redacted",
+            "x-xai-token-auth": "xai-grok-cli",
+            "user-agent": "grok-shell/0.2.117 (macos; aarch64)",
+        }
+    )
+
+    # Mid-handler shadowing (production chat ~2810 / responses ~4901).
+    custom_only = _resolve_openai_upstream_base(request.headers)
+    assert custom_only is None  # Grok cannot stamp x-headroom-base-url
+
+    # Broken call-site formula that caused the shared-proxy 401.
+    broken_final_base = custom_only or process_default
+    assert broken_final_base == process_default
+
+    # Correct call-site formula (production chat ~4020 / responses ~4910).
+    fixed_final_base = proxy._resolve_openai_upstream(request)
+    assert fixed_final_base == "https://api.x.ai"
+    assert fixed_final_base != broken_final_base
+
+
+def test_chat_call_site_custom_base_still_wins_when_shadowed_var_is_set() -> None:
+    """When a custom base is present, mid-handler shadowing and full resolve agree."""
+    from headroom.proxy.handlers.openai import _resolve_openai_upstream_base
+
+    process_default = "https://api.openai.com"
+    proxy = _stub_proxy(process_default)
+    request = _FakeRequest(
+        {
+            "x-headroom-base-url": "https://gateway.example",
+            "x-xai-token-auth": "xai-grok-cli",
+            "user-agent": "grok-shell/0.2.117",
+        }
+    )
+
+    custom_only = _resolve_openai_upstream_base(request.headers)
+    assert custom_only == "https://gateway.example"
+    # Both the shadowed var and the full resolver must honor the custom base.
+    assert (custom_only or process_default) == "https://gateway.example"
+    assert proxy._resolve_openai_upstream(request) == "https://gateway.example"

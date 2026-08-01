@@ -34,7 +34,8 @@ def is_grok_cli_request(headers: Mapping[str, str]) -> bool:
     Grok cannot stamp ``x-headroom-base-url`` (no custom attribution headers),
     so shared-proxy routing must recognize the CLI from wire signals instead.
     Detection is intentionally narrow: only the official token-auth marker and
-    known Grok UA prefixes — never model-id heuristics.
+    known Grok UA markers (substring match, same style as client UA maps) —
+    never model-id heuristics.
     """
     token_auth = _header_value(headers, _XAI_TOKEN_AUTH_HEADER)
     if token_auth is not None and token_auth.strip().lower() == _XAI_TOKEN_AUTH_VALUE:

@@ -1401,6 +1401,38 @@ def test_same_message_append_with_changed_role_is_not_append_only() -> None:
     assert overlay_cached_prefix(current, current, previous, forwarded) == current
 
 
+def test_a_message_that_canonicalizes_away_refuses_the_whole_classification() -> None:
+    """The projection has to stay positionally 1:1 with the raw list.
+
+    A message whose keys are all non-semantic projects to ``{}`` and the
+    canonicalizer drops it, so the canonical index no longer addresses the raw
+    list. Callers slice raw lists by raw counts, so handing them a classification
+    derived from the shorter projection drops whole messages.
+    """
+    from headroom.cache.prefix_tracker import (
+        classify_append_only_prefix,
+        extract_cache_stable_delta,
+        overlay_cached_prefix,
+    )
+
+    previous_original = [
+        {"cachePoint": {"type": "default"}},
+        {"role": "user", "content": [{"type": "text", "text": "A"}]},
+    ]
+    previous_forwarded = [
+        {"cachePoint": {"type": "default"}},
+        {"role": "user", "content": [{"type": "text", "text": "A_compressed"}]},
+    ]
+    current = [
+        {"role": "user", "content": [{"type": "text", "text": "A"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "B"}]},
+    ]
+
+    assert classify_append_only_prefix(current, previous_original) is None
+    assert extract_cache_stable_delta(current, previous_original, previous_forwarded) is None
+    assert overlay_cached_prefix(current, current, previous_original, previous_forwarded) == current
+
+
 def test_growth_on_a_directive_only_message_is_not_a_clean_prefix_match() -> None:
     """A message whose blocks all canonicalize away still grew.
 
@@ -1472,6 +1504,35 @@ def test_overlay_split_uses_raw_blocks_not_the_canonical_frontier() -> None:
     blocks = out[0]["content"]
     assert {"type": "text", "text": "B"} in blocks
     assert sum(1 for block in blocks if "cachePoint" in block) == 1
+
+
+def test_overlay_merge_replays_the_forwarded_blocks_and_appends_the_tail() -> None:
+    """Observe the merge output, not just that nothing was corrupted.
+
+    Without this the sibling guards would still pass if the merge branch stopped
+    firing altogether, since not merging also leaves the input intact.
+    """
+    from headroom.cache.prefix_tracker import overlay_cached_prefix
+
+    previous_original = [
+        {"role": "user", "content": [{"type": "text", "text": "A"}]},
+    ]
+    previous_forwarded = [
+        {"role": "user", "content": [{"type": "text", "text": "A_compressed"}]},
+    ]
+    current = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "A"}, {"type": "text", "text": "B"}],
+        }
+    ]
+
+    out = overlay_cached_prefix(current, current, previous_original, previous_forwarded)
+
+    assert out[0]["content"] == [
+        {"type": "text", "text": "A_compressed"},
+        {"type": "text", "text": "B"},
+    ]
 
 
 def test_overlay_bails_when_forwarded_block_count_differs_from_original() -> None:

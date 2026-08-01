@@ -15,8 +15,9 @@ PROXY_ENV_KEY = "GROK_MODELS_BASE_URL"
 # process-wide OPENAI target is still api.openai.com (Claude/Codex-started).
 _XAI_TOKEN_AUTH_HEADER = "x-xai-token-auth"
 _XAI_TOKEN_AUTH_VALUE = "xai-grok-cli"
-# UA markers from current (grok-pager/grok-shell) and older (grok/) clients.
-_GROK_UA_MARKERS = ("grok-pager/", "grok-shell/", "grok/")
+# UA product tokens emitted by Grok CLI 0.2.x. Matched against whitespace-split
+# tokens so unrelated clients ("litellm-grok/1.0") cannot collide.
+_GROK_UA_PREFIXES = ("grok-pager/", "grok-shell/")
 
 
 def _header_value(headers: Mapping[str, str], name: str) -> str | None:
@@ -34,7 +35,7 @@ def is_grok_cli_request(headers: Mapping[str, str]) -> bool:
     Grok cannot stamp ``x-headroom-base-url`` (no custom attribution headers),
     so shared-proxy routing must recognize the CLI from wire signals instead.
     Detection is intentionally narrow: only the official token-auth marker and
-    known Grok UA markers (substring match, same style as client UA maps) —
+    known Grok UA product tokens (prefix match on whitespace-split tokens) —
     never model-id heuristics.
     """
     token_auth = _header_value(headers, _XAI_TOKEN_AUTH_HEADER)
@@ -44,8 +45,7 @@ def is_grok_cli_request(headers: Mapping[str, str]) -> bool:
     user_agent = _header_value(headers, "user-agent")
     if not user_agent:
         return False
-    ua = user_agent.lower()
-    return any(marker in ua for marker in _GROK_UA_MARKERS)
+    return any(token.startswith(_GROK_UA_PREFIXES) for token in user_agent.lower().split())
 
 
 def proxy_base_url(port: int) -> str:

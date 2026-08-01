@@ -7,6 +7,7 @@ from typing import Any, cast
 
 from headroom.providers.codex import resolve_codex_routing
 from headroom.providers.codex.endpoints import CHATGPT_BACKEND_API_URL
+from headroom.providers.codex.runtime import DEFAULT_API_URL as DEFAULT_OPENAI_API_URL
 from headroom.providers.grok.runtime import DEFAULT_API_URL as XAI_API_URL
 from headroom.providers.grok.runtime import is_grok_cli_request
 from headroom.providers.vertex import vertex_target_for_location as _vertex_target_for_location
@@ -31,16 +32,33 @@ def vertex_target_for_location(proxy: Any, location: str) -> str:
     return _vertex_target_for_location(api_target(proxy, "vertex"), location)
 
 
+def route_grok_to_xai(headers: Mapping[str, str], openai_target: str) -> bool:
+    """Return True when Grok CLI traffic should be redirected to ``api.x.ai``.
+
+    Grok CLI cannot set ``x-headroom-base-url``, so a shared proxy started for
+    Claude/Codex has to recognize it from wire signals or it forwards xAI
+    session tokens to ``api.openai.com``.
+
+    Only applies while the OpenAI target is still the default. An operator who
+    pointed the proxy at a gateway (LiteLLM, Azure, self-hosted vLLM) chose it
+    for every OpenAI-compatible client; a client User-Agent must not silently
+    bypass that, nor carry the gateway's ``OPENAI_TARGET_API_HEADERS`` to xAI.
+    """
+    if not is_grok_cli_request(headers):
+        return False
+    return openai_target.rstrip("/") == DEFAULT_OPENAI_API_URL
+
+
 def openai_compatible_base_url(proxy: Any, headers: Mapping[str, str]) -> str:
     """Resolve upstream for OpenAI-compatible metadata/passthrough traffic.
 
-    Official Grok CLI cannot set ``x-headroom-base-url``; when its wire
-    signals are present, prefer ``api.x.ai`` over the process OpenAI default
-    so ``GET /v1/models`` and catch-all passthrough succeed on a shared proxy.
+    Routes official Grok CLI to ``api.x.ai`` so ``GET /v1/models`` and catch-all
+    passthrough succeed on a shared proxy whose OpenAI target is the default.
     """
-    if is_grok_cli_request(headers):
+    target = api_target(proxy, "openai")
+    if route_grok_to_xai(headers, target):
         return XAI_API_URL
-    return api_target(proxy, "openai")
+    return target
 
 
 def select_passthrough_base_url(proxy: Any, headers: Mapping[str, str]) -> str:

@@ -62,7 +62,7 @@ from headroom.providers.codex.runtime import (
 )
 from headroom.providers.copilot import model_prefers_responses_api
 from headroom.providers.grok.runtime import DEFAULT_API_URL as XAI_API_URL
-from headroom.providers.grok.runtime import is_grok_cli_request
+from headroom.providers.proxy_targets import route_grok_to_xai
 from headroom.proxy.auth_mode import (
     classify_auth_mode,
     classify_client,
@@ -1453,15 +1453,17 @@ class OpenAIHandlerMixin:
         not just the generic passthrough route that already honors it.
 
         When the header is absent, official Grok CLI requests (identified by
-        ``x-xai-token-auth`` / Grok UA markers) route to ``api.x.ai`` so a
+        ``x-xai-token-auth`` / Grok UA tokens) route to ``api.x.ai`` so a
         shared proxy started for Claude/Codex does not forward Grok session
-        tokens to ``api.openai.com``. Otherwise falls back to the configured
-        ``OPENAI_API_URL`` (``OPENAI_TARGET_API_URL``).
+        tokens to ``api.openai.com`` — but only while ``OPENAI_API_URL`` is
+        still the default, so a configured gateway is never bypassed.
+        Otherwise falls back to the configured ``OPENAI_API_URL``
+        (``OPENAI_TARGET_API_URL``).
         """
         custom = _resolve_openai_upstream_base(request.headers)
         if custom is not None:
             return custom
-        if is_grok_cli_request(request.headers):
+        if route_grok_to_xai(request.headers, self.OPENAI_API_URL):
             return XAI_API_URL
         return self.OPENAI_API_URL
 
@@ -2807,19 +2809,19 @@ class OpenAIHandlerMixin:
             stripped_count=_pre_strip_count_chat,
             request_id=request_id,
         )
-        upstream_base_url = _resolve_openai_upstream_base(request.headers)
+        custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
         handler_path = (
             _resolve_openai_handler_path(
                 request.headers,
                 handler_path=_OPENAI_CHAT_COMPLETIONS_PATH,
             )
-            if upstream_base_url is not None
+            if custom_upstream_base_url is not None
             else "/v1/chat/completions"
         )
         _, custom_chat_provider = _custom_base_passthrough_telemetry(
             request.method,
             handler_path,
-            upstream_base_url or "",
+            custom_upstream_base_url or "",
         )
         openai_chat_outcome_provider = custom_chat_provider or "openai"
 
@@ -4011,11 +4013,10 @@ class OpenAIHandlerMixin:
                     },
                 )
 
-        # Direct OpenAI API (no backend configured).
-        # Re-resolve via the full chain (custom base → Grok CLI → process
-        # default). The local ``upstream_base_url`` above is custom-header only
-        # (for path rewriting); using it alone would skip Grok→xAI routing on a
-        # shared proxy whose OPENAI_API_URL is still api.openai.com.
+        # Direct OpenAI API (no backend configured). Re-resolve via the full
+        # chain (custom base → Grok CLI → process default): the local
+        # ``custom_upstream_base_url`` above is custom-header only, and using it
+        # alone would skip Grok→xAI routing on a shared proxy.
         url = build_copilot_upstream_url(
             self._resolve_openai_upstream(request),
             handler_path,

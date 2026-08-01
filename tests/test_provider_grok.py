@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from headroom.providers.grok import (
-    DEFAULT_API_URL,
     PROXY_ENV_KEY,
     build_launch_env,
     is_grok_cli_request,
@@ -29,14 +28,13 @@ def test_is_grok_cli_request_matches_known_user_agents() -> None:
         is True
     )
     assert is_grok_cli_request({"user-agent": "grok-shell/0.2.112"}) is True
-    assert is_grok_cli_request({"user-agent": "grok/0.1.0"}) is True
-    # Non-Grok OpenAI-compatible clients must not match.
+    # Non-Grok OpenAI-compatible clients must not match, including wrappers
+    # whose name merely contains "grok" — they carry OpenAI credentials.
     assert is_grok_cli_request({"user-agent": "codex-tui/0.146.0"}) is False
+    assert is_grok_cli_request({"user-agent": "litellm-grok/1.0"}) is False
+    assert is_grok_cli_request({"user-agent": "my-grok-shell/1.0"}) is False
+    assert is_grok_cli_request({"user-agent": "grok/0.1.0"}) is False
     assert is_grok_cli_request({}) is False
-
-
-def test_default_api_url_is_xai() -> None:
-    assert DEFAULT_API_URL == "https://api.x.ai"
 
 
 def test_grok_build_launch_env_sets_models_base_url() -> None:

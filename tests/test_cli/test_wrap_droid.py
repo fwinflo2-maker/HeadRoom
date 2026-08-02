@@ -73,10 +73,10 @@ def test_wrap_droid_missing_binary_exits_with_install_hint(runner: CliRunner) ->
         result = runner.invoke(main, ["wrap", "droid"])
 
     assert result.exit_code == 1
-    # Full literal URL, not a bare hostname fragment: CodeQL's
-    # incomplete-url-substring-sanitization query flags a bare domain
-    # substring check as a potential hostname-validation anti-pattern even
-    # in test assertions that are not actually validating anything.
+    # Asserting on captured CLI stdout, not making a security/trust decision
+    # about an untrusted URL, so CodeQL's incomplete-url-substring-sanitization
+    # heuristic (meant for redirect/hostname allowlist checks) does not apply.
+    # codeql[py/incomplete-url-substring-sanitization]
     assert "https://docs.factory.ai" in result.output
 
 
@@ -266,6 +266,10 @@ def test_proxy_cli_banner_shows_factory_route_when_configured(runner: CliRunner)
         )
     assert result.exit_code == 0, result.output
     assert "/api/llm/a/v1/messages" in result.output
+    # Asserting on captured CLI stdout, not a security/trust decision about
+    # an untrusted URL; see the identical suppression above for why this is
+    # a false positive for CodeQL's incomplete-url-substring-sanitization query.
+    # codeql[py/incomplete-url-substring-sanitization]
     assert "https://api.factory.ai" in result.output
     assert "Factory Droid" in result.output
 

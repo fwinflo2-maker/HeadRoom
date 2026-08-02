@@ -73,7 +73,11 @@ def test_wrap_droid_missing_binary_exits_with_install_hint(runner: CliRunner) ->
         result = runner.invoke(main, ["wrap", "droid"])
 
     assert result.exit_code == 1
-    assert "docs.factory.ai" in result.output
+    # Full literal URL, not a bare hostname fragment: CodeQL's
+    # incomplete-url-substring-sanitization query flags a bare domain
+    # substring check as a potential hostname-validation anti-pattern even
+    # in test assertions that are not actually validating anything.
+    assert "https://docs.factory.ai" in result.output
 
 
 def test_wrap_droid_points_child_at_proxy_and_forwards_default_upstream(
@@ -248,3 +252,26 @@ def test_start_proxy_forwards_factory_api_url_to_subprocess(tmp_path: Path) -> N
     idx = captured["cmd"].index("--factory-api-url")
     assert captured["cmd"][idx + 1] == "https://api.factory.ai"
     assert captured["env"]["FACTORY_TARGET_API_URL"] == "https://api.factory.ai"
+
+
+def test_proxy_cli_banner_shows_factory_route_when_configured(runner: CliRunner) -> None:
+    """`headroom proxy --factory-api-url ...` prints the Factory Droid route
+    line in its startup banner so users can visually confirm it is active.
+    """
+    with patch("headroom.proxy.server.run_server", lambda config, **kwargs: None):
+        result = runner.invoke(
+            main,
+            ["proxy", "--factory-api-url", "https://api.factory.ai"],
+            catch_exceptions=False,
+        )
+    assert result.exit_code == 0, result.output
+    assert "/api/llm/a/v1/messages" in result.output
+    assert "https://api.factory.ai" in result.output
+    assert "Factory Droid" in result.output
+
+
+def test_proxy_cli_banner_omits_factory_route_by_default(runner: CliRunner) -> None:
+    with patch("headroom.proxy.server.run_server", lambda config, **kwargs: None):
+        result = runner.invoke(main, ["proxy"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert "Factory Droid" not in result.output

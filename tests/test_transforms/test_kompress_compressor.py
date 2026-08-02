@@ -685,6 +685,71 @@ class TestPytorchWeightLoading:
             raise kmod.LocalEntryNotFoundError("not cached")
 
         monkeypatch.setattr(kmod, "hf_hub_download_local_first", fake_download)
+        monkeypatch.setattr(kmod, "hf_entry_known_absent", lambda *a, **k: False)
 
         with pytest.raises(kmod.KompressModelNotCached):
             kmod._load_pytorch_weights(SimpleNamespace(), "some/repo", allow_download=False)
+
+    def test_cache_only_defers_instead_of_using_stale_plain_checkpoint(self, monkeypatch) -> None:
+        """Regression test: if merged.pt is not cached yet and we have no
+        confirmation it is genuinely absent upstream, a stale model.safetensors
+        left over from a previous (pre-fix) run must NOT be used as a silent
+        fallback - that would reintroduce the original bug for exactly the
+        upgrade scenario that motivated this fix. It must defer instead.
+        """
+        import pytest
+
+        pytest.importorskip("torch")
+        import headroom.transforms.kompress_compressor as kmod
+
+        plain_download_calls: list[str] = []
+
+        def fake_download(model_id, filename, *, allow_network=True, **kwargs):  # noqa: ANN001
+            if filename == "merged.pt":
+                raise kmod.LocalEntryNotFoundError("merged.pt not cached yet")
+            plain_download_calls.append(filename)
+            return "/fake/cached/model.safetensors"
+
+        monkeypatch.setattr(kmod, "hf_hub_download_local_first", fake_download)
+        # Nothing has ever confirmed merged.pt is absent from this repo -
+        # simulates a v2-style repo mid-upgrade, not a v1-style repo.
+        monkeypatch.setattr(kmod, "hf_entry_known_absent", lambda *a, **k: False)
+
+        with pytest.raises(kmod.KompressModelNotCached):
+            kmod._load_pytorch_weights(
+                SimpleNamespace(), "chopratejas/kompress-v2-base", allow_download=False
+            )
+
+        assert plain_download_calls == [], (
+            "must not fall back to model.safetensors without confirming merged.pt is absent"
+        )
+
+    def test_cache_only_uses_plain_checkpoint_when_merged_pt_confirmed_absent(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        import pytest
+
+        torch = pytest.importorskip("torch")
+        safetensors_torch = pytest.importorskip("safetensors.torch")
+        import headroom.transforms.kompress_compressor as kmod
+
+        model = self._make_model(torch)
+        weights_path = tmp_path / "model.safetensors"
+        safetensors_torch.save_file(dict(model.state_dict()), str(weights_path))
+
+        fresh_model = self._make_model(torch)
+
+        def fake_download(model_id, filename, *, allow_network=True, **kwargs):  # noqa: ANN001
+            if filename == "merged.pt":
+                raise kmod.LocalEntryNotFoundError("merged.pt not cached")
+            return str(weights_path)
+
+        monkeypatch.setattr(kmod, "hf_hub_download_local_first", fake_download)
+        # A prior real network lookup already confirmed this repo has no
+        # merged.pt at all (the v1-style case), so the plain fallback is safe.
+        monkeypatch.setattr(kmod, "hf_entry_known_absent", lambda *a, **k: True)
+
+        kmod._load_pytorch_weights(fresh_model, "chopratejas/kompress-base", allow_download=False)
+
+        for name, param in model.state_dict().items():
+            assert torch.equal(param, fresh_model.state_dict()[name])

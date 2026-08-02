@@ -29,6 +29,7 @@ from ..config import TransformResult
 from ..onnx_runtime import (
     ONNX_CPU_ARENA_ENV,
     create_cpu_session_options,
+    hf_entry_known_absent,
     hf_hub_download_local_first,
     trim_process_heap,
 )
@@ -782,11 +783,21 @@ def _load_pytorch_weights(model: Any, model_id: str, *, allow_download: bool) ->
     ``encoder.base_model.model...``) and does not map onto this module tree at
     all, so it is only used as a fallback for repos that never shipped a
     merged checkpoint (e.g. the original non-LoRA kompress-base).
+
+    In cache-only mode (``allow_download=False``) a ``merged.pt`` cache miss is
+    ambiguous: it could mean the repo has no merged checkpoint (safe to use the
+    plain fallback), or it could mean the repo has one but it just is not
+    downloaded yet (in which case a *stale* cached ``model.safetensors`` from a
+    prior run must not be used, since for a PEFT repo it is the wrong format).
+    ``hf_entry_known_absent`` disambiguates without a network call, using
+    HuggingFace Hub's own cache of confirmed-404 lookups.
     """
     try:
         ckpt_path = hf_hub_download_local_first(model_id, "merged.pt", allow_network=allow_download)
     except _NOT_CACHED_ERRORS as exc:
         if not allow_download:
+            if not hf_entry_known_absent(model_id, "merged.pt"):
+                raise KompressModelNotCached(model_id) from exc
             try:
                 weights_path = hf_hub_download_local_first(
                     model_id, "model.safetensors", allow_network=False

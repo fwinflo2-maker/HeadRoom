@@ -271,8 +271,8 @@ class TransformPipeline:
         )
         # perf review F5: skip the inline telemetry-only re-parse on the proxy's
         # critical path. Defaults False so SDK/library callers (and `simulate`)
-        # keep identical inline behavior; the proxy passes True via
-        # `proxy_pipeline_kwargs` and re-parses off-path instead (anthropic.py).
+        # keep identical inline behavior; the proxy passes True explicitly at
+        # covered handler call sites and re-parses off-path instead (anthropic.py).
         defer_waste_signals = bool(kwargs.pop("defer_waste_signals", False))
         tokenizer = self._get_tokenizer(model)
         provider_name = self._provider_name()

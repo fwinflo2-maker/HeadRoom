@@ -51,4 +51,3 @@ Auggie's tenant wire is Augment-proprietary (the inference call `POST /chat-stre
 - Proxy dashboards bucket the inference traffic under the `augment` provider. (The real model id and token counts live in Auggie's proprietary response and are not yet parsed, so a v1 session shows the `augment` provider with a generic passthrough model label.)
 - If the target port already runs a Headroom proxy that is NOT in Auggie mode (for example a shared `headroom wrap claude` on the default `8787`), `wrap auggie` cannot serve Auggie's `/chat-stream` from it and stops with an error. Run Auggie on a dedicated port instead, e.g. `headroom wrap auggie --port 8790`.
 - Nothing durable is written (only the launched process's environment is set), so there is no `headroom unwrap auggie`: ending the session fully undoes the redirect. Your on-disk `~/.augment/session.json` is never modified.
-</content>

@@ -100,6 +100,13 @@ def test_load_session_missing_fields_raises_valueerror(tmp_path: Path) -> None:
         load_session(p)
 
 
+def test_load_session_non_object_json_raises_valueerror(tmp_path: Path) -> None:
+    p = tmp_path / "session.json"
+    p.write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
+    with pytest.raises(ValueError, match="not a JSON object"):
+        load_session(p)
+
+
 # ---------------------------------------------------------------------------
 # CLI wiring
 # ---------------------------------------------------------------------------
@@ -119,6 +126,18 @@ def test_wrap_auggie_missing_session_errors_friendly(runner: CliRunner, tmp_path
     result = runner.invoke(main, ["wrap", "auggie", "--session-file", str(tmp_path / "nope.json")])
     assert result.exit_code != 0
     assert "auggie login" in result.output
+
+
+def test_wrap_auggie_malformed_session_errors_friendly(runner: CliRunner, tmp_path: Path) -> None:
+    """A session file missing tenantURL/accessToken surfaces load_session's
+    ValueError as a friendly ClickException through the full CLI, not just
+    from the lower-level load_session() call.
+    """
+    p = tmp_path / "session.json"
+    p.write_text(json.dumps({"accessToken": _TOKEN}), encoding="utf-8")  # no tenantURL
+    result = runner.invoke(main, ["wrap", "auggie", "--session-file", str(p)])
+    assert result.exit_code != 0
+    assert "tenantURL" in result.output
 
 
 def test_wrap_auggie_points_child_at_proxy_and_forwards_default_upstream(
@@ -279,3 +298,34 @@ def test_wrap_auggie_reuse_guard_allows_matching_tenant(runner: CliRunner, tmp_p
     assert captured["augment_api_url"] == "https://xlb.api.augmentcode.com"
     # Matching tenant -> reuse the existing proxy on the requested port (no fallback).
     assert captured["port"] == 8787
+
+
+def test_start_proxy_forwards_augment_api_url_to_subprocess(tmp_path: Path) -> None:
+    """_start_proxy must pass --augment-api-url through to the actual proxy
+    subprocess command when augment_api_url is set.
+    """
+    import headroom.cli.wrap as wrap_module
+
+    captured: dict[str, object] = {}
+
+    class _FakeProcess:
+        returncode = None
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _FakeProcess()
+
+    with (
+        patch("headroom.cli.wrap.subprocess.Popen", side_effect=fake_popen),
+        patch("headroom.cli.wrap._check_proxy", return_value=True),
+        patch("headroom.cli.wrap._get_log_path", return_value=tmp_path / "proxy.log"),
+        patch("headroom.cli.wrap._get_proxy_stdio_log_path", return_value=tmp_path / "stdio.log"),
+    ):
+        wrap_module._start_proxy(8899, augment_api_url="https://xlb.api.augmentcode.com")
+
+    assert "--augment-api-url" in captured["cmd"]
+    idx = captured["cmd"].index("--augment-api-url")
+    assert captured["cmd"][idx + 1] == "https://xlb.api.augmentcode.com"

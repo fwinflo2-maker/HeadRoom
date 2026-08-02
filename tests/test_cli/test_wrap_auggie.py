@@ -272,6 +272,32 @@ def test_wrap_auggie_falls_back_to_free_port_when_non_augment_proxy(
     assert json.loads(env["AUGMENT_SESSION_AUTH"])["tenantURL"] == "http://127.0.0.1:8790"
 
 
+def test_wrap_auggie_tenant_mismatch_with_no_free_port_keeps_requested_port(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """Tenant mismatch, but _find_available_port returns the SAME port back
+    (no actually-different port found nearby): no fallback message is printed
+    and the requested port is kept, rather than silently reusing the other
+    tenant's proxy.
+    """
+    session = _write_session(tmp_path)
+    captured: dict[str, object] = {}
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="auggie"),
+        patch("headroom.cli.wrap._check_proxy", return_value=True),
+        patch(
+            "headroom.cli.wrap._query_proxy_config",
+            return_value={"augment_api_url": "https://eu.api.augmentcode.com"},
+        ),
+        patch("headroom.cli.wrap._find_available_port", return_value=8787),
+        patch("headroom.cli.wrap._launch_tool", side_effect=lambda **kw: captured.update(kw)),
+    ):
+        result = runner.invoke(main, ["wrap", "auggie", "--session-file", str(session)])
+    assert result.exit_code == 0, result.output
+    assert captured["port"] == 8787
+    assert "using port" not in result.output
+
+
 def test_wrap_auggie_rejects_retired_context_tool_flag(runner: CliRunner, tmp_path: Path) -> None:
     session = _write_session(tmp_path)
     with patch("headroom.cli.wrap.shutil.which", return_value="auggie"):
@@ -352,6 +378,35 @@ def test_start_proxy_forwards_augment_api_url_to_subprocess(tmp_path: Path) -> N
     assert "--augment-api-url" in captured["cmd"]
     idx = captured["cmd"].index("--augment-api-url")
     assert captured["cmd"][idx + 1] == "https://xlb.api.augmentcode.com"
+
+
+def test_start_proxy_omits_augment_api_url_flag_when_not_set(tmp_path: Path) -> None:
+    """_start_proxy must not pass --augment-api-url when augment_api_url is
+    not set, so other wrappers that never pass it are unaffected.
+    """
+    import headroom.cli.wrap as wrap_module
+
+    captured: dict[str, object] = {}
+
+    class _FakeProcess:
+        returncode = None
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _FakeProcess()
+
+    with (
+        patch("headroom.cli.wrap.subprocess.Popen", side_effect=fake_popen),
+        patch("headroom.cli.wrap._check_proxy", return_value=True),
+        patch("headroom.cli.wrap._get_log_path", return_value=tmp_path / "proxy.log"),
+        patch("headroom.cli.wrap._get_proxy_stdio_log_path", return_value=tmp_path / "stdio.log"),
+    ):
+        wrap_module._start_proxy(8899)
+
+    assert "--augment-api-url" not in captured["cmd"]
 
 
 def test_launch_tool_rewrites_env_display_after_port_fallback(

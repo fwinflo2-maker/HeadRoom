@@ -120,10 +120,10 @@ def test_wrap_auggie_missing_binary_exits_with_install_hint(
     with patch("headroom.cli.wrap.shutil.which", return_value=None):
         result = runner.invoke(main, ["wrap", "auggie", "--session-file", str(session)])
     assert result.exit_code == 1
-    # Full literal URL, not a bare hostname fragment: CodeQL's
-    # incomplete-url-substring-sanitization query flags a bare domain
-    # substring check as a potential hostname-validation anti-pattern even
-    # in test assertions that are not actually validating anything.
+    # Asserting on captured CLI stdout, not making a security/trust decision
+    # about an untrusted URL, so CodeQL's incomplete-url-substring-sanitization
+    # heuristic (meant for redirect/hostname allowlist checks) does not apply.
+    # codeql[py/incomplete-url-substring-sanitization]
     assert "https://docs.augmentcode.com/cli" in result.output
 
 
@@ -244,6 +244,10 @@ def test_wrap_auggie_prepare_only_reports_wiring(runner: CliRunner, tmp_path: Pa
         )
     assert result.exit_code == 0, result.output
     assert "AUGMENT_API_URL=http://127.0.0.1:8787" in result.output
+    # Asserting on captured CLI stdout, not a security/trust decision about
+    # an untrusted URL; see the identical suppression above for why this is
+    # a false positive for CodeQL's incomplete-url-substring-sanitization query.
+    # codeql[py/incomplete-url-substring-sanitization]
     assert "upstream=https://xlb.api.augmentcode.com" in result.output
 
 

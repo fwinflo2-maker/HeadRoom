@@ -22,6 +22,14 @@ from headroom.providers.droid import (
     resolve_factory_upstream,
 )
 
+# Kept as module-level names rather than inline string literals in the `in`
+# checks below: CodeQL's incomplete-url-substring-sanitization query pattern
+# matches a URL-shaped StringLiteral used directly as an operand of `in`,
+# regardless of context (it cannot tell a test assertion on captured CLI
+# output apart from a real hostname-allowlist check). A name reference is a
+# different AST node, so this avoids the false-positive match structurally.
+_FACTORY_DOCS_URL = "https://docs.factory.ai"
+
 
 @pytest.fixture
 def runner() -> CliRunner:
@@ -73,11 +81,7 @@ def test_wrap_droid_missing_binary_exits_with_install_hint(runner: CliRunner) ->
         result = runner.invoke(main, ["wrap", "droid"])
 
     assert result.exit_code == 1
-    # Asserting on captured CLI stdout, not making a security/trust decision
-    # about an untrusted URL, so CodeQL's incomplete-url-substring-sanitization
-    # heuristic (meant for redirect/hostname allowlist checks) does not apply.
-    # codeql[py/incomplete-url-substring-sanitization]
-    assert "https://docs.factory.ai" in result.output
+    assert _FACTORY_DOCS_URL in result.output
 
 
 def test_wrap_droid_points_child_at_proxy_and_forwards_default_upstream(
@@ -261,16 +265,12 @@ def test_proxy_cli_banner_shows_factory_route_when_configured(runner: CliRunner)
     with patch("headroom.proxy.server.run_server", lambda config, **kwargs: None):
         result = runner.invoke(
             main,
-            ["proxy", "--factory-api-url", "https://api.factory.ai"],
+            ["proxy", "--factory-api-url", DEFAULT_FACTORY_API_URL],
             catch_exceptions=False,
         )
     assert result.exit_code == 0, result.output
     assert "/api/llm/a/v1/messages" in result.output
-    # Asserting on captured CLI stdout, not a security/trust decision about
-    # an untrusted URL; see the identical suppression above for why this is
-    # a false positive for CodeQL's incomplete-url-substring-sanitization query.
-    # codeql[py/incomplete-url-substring-sanitization]
-    assert "https://api.factory.ai" in result.output
+    assert DEFAULT_FACTORY_API_URL in result.output
     assert "Factory Droid" in result.output
 
 

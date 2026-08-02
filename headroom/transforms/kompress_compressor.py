@@ -22,6 +22,7 @@ import os
 import re
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -39,6 +40,21 @@ logger = logging.getLogger(__name__)
 
 # Default HuggingFace model ID
 HF_MODEL_ID = "chopratejas/kompress-v2-base"
+_MERGED_PYTORCH_CHECKPOINT = "merged.pt"
+_LEGACY_PYTORCH_CHECKPOINT = "model.safetensors"
+_MERGED_STATE_DICT_TARGETS = (
+    ("encoder_state_dict", "encoder"),
+    ("token_head_state_dict", "token_head"),
+    ("span_conv_state_dict", "span_conv"),
+)
+
+
+def _canonical_kompress_model_id(model_id: str) -> str:
+    """Canonicalize known model IDs so artifact selection and pinning agree."""
+    if model_id.casefold() == HF_MODEL_ID.casefold():
+        return HF_MODEL_ID
+    return model_id
+
 
 # Tokens matching this pattern are always kept regardless of model score.
 # Numbers, ALLCAPS identifiers, dotted paths, unix paths, file extensions,
@@ -507,9 +523,18 @@ def _get_model_class() -> type:
     class HeadroomCompressorModel(nn.Module):
         """Dual-head ModernBERT: token classification + span importance CNN."""
 
-        def __init__(self, model_name: str = "answerdotai/ModernBERT-base"):
+        def __init__(
+            self,
+            model_name: str = "answerdotai/ModernBERT-base",
+            *,
+            local_files_only: bool = False,
+        ):
             super().__init__()
-            self.encoder = AutoModel.from_pretrained(model_name, attn_implementation="eager")
+            self.encoder = AutoModel.from_pretrained(
+                model_name,
+                attn_implementation="eager",
+                local_files_only=local_files_only,
+            )
             hidden_size = self.encoder.config.hidden_size  # 768
 
             # Head 1: Token keep/discard
@@ -561,6 +586,58 @@ def _get_model_class() -> type:
 
 
 # ── Model Loading ─────────────────────────────────────────────────────
+
+
+def _load_state_dict_exact(
+    module: Any,
+    state_dict: Mapping[str, Any],
+    *,
+    label: str,
+    source: str,
+) -> None:
+    """Load a state dict and fail loudly when it does not match the module."""
+    missing, unexpected = module.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"{source}: {label} state_dict mismatch "
+            f"(missing={list(missing)[:5]}, unexpected={list(unexpected)[:5]})"
+        )
+
+
+def _load_merged_pytorch_checkpoint(
+    model: Any,
+    checkpoint: Any,
+    *,
+    source: str,
+) -> None:
+    """Load the structured, LoRA-merged Kompress v2 checkpoint."""
+    if not isinstance(checkpoint, Mapping):
+        raise RuntimeError(f"{source}: expected a mapping, got {type(checkpoint).__name__}")
+
+    missing_sections = [
+        checkpoint_key
+        for checkpoint_key, _module_name in _MERGED_STATE_DICT_TARGETS
+        if checkpoint_key not in checkpoint
+    ]
+    if missing_sections:
+        raise RuntimeError(
+            f"{source}: missing checkpoint sections {missing_sections}; "
+            f"found {sorted(str(key) for key in checkpoint)}"
+        )
+
+    for checkpoint_key, module_name in _MERGED_STATE_DICT_TARGETS:
+        state_dict = checkpoint[checkpoint_key]
+        if not isinstance(state_dict, Mapping):
+            raise RuntimeError(
+                f"{source}: '{checkpoint_key}' must be a state_dict mapping, "
+                f"got {type(state_dict).__name__}"
+            )
+        _load_state_dict_exact(
+            getattr(model, module_name),
+            state_dict,
+            label=module_name,
+            source=source,
+        )
 
 
 class _OnnxModel:
@@ -664,6 +741,7 @@ def _load_kompress_onnx(
     the local cache only; a cache miss raises :class:`KompressModelNotCached`
     instead of hitting the network.
     """
+    model_id = _canonical_kompress_model_id(model_id)
     with _kompress_lock:
         if model_id in _kompress_cache:
             return _kompress_cache[model_id]
@@ -726,21 +804,30 @@ def _load_kompress_pytorch(
 ) -> tuple[Any, Any, str]:
     """Download PyTorch model from HuggingFace and load with torch.
 
+    The default Kompress v2 repository uses ``merged.pt`` because its
+    ``model.safetensors`` contains an unmerged PEFT/LoRA module tree that does
+    not match :class:`HeadroomCompressorModel`. Custom model repositories retain
+    the legacy full-model ``model.safetensors`` contract.
+
     When ``allow_download`` is ``False`` weights and tokenizer are loaded from
     the local cache only; a cache miss raises :class:`KompressModelNotCached`.
     """
     import torch
     from transformers import AutoTokenizer
 
+    model_id = _canonical_kompress_model_id(model_id)
     with _kompress_lock:
         if model_id in _kompress_cache:
             return _kompress_cache[model_id]
 
         logger.info("Downloading Kompress PyTorch model from %s ...", model_id)
 
+        checkpoint_filename = (
+            _MERGED_PYTORCH_CHECKPOINT if model_id == HF_MODEL_ID else _LEGACY_PYTORCH_CHECKPOINT
+        )
         try:
             weights_path = hf_hub_download_local_first(
-                model_id, "model.safetensors", allow_network=allow_download
+                model_id, checkpoint_filename, allow_network=allow_download
             )
         except _NOT_CACHED_ERRORS as exc:
             if not allow_download:
@@ -748,12 +835,30 @@ def _load_kompress_pytorch(
             raise
 
         HeadroomCompressorModel = _get_model_class()
-        model = HeadroomCompressorModel()
+        try:
+            model = HeadroomCompressorModel(local_files_only=not allow_download)
+        except _NOT_CACHED_ERRORS as exc:
+            if not allow_download:
+                raise KompressModelNotCached("answerdotai/ModernBERT-base") from exc
+            raise
 
-        from safetensors.torch import load_file
+        checkpoint_source = f"{model_id}/{checkpoint_filename}"
+        if checkpoint_filename == _MERGED_PYTORCH_CHECKPOINT:
+            checkpoint = torch.load(weights_path, map_location="cpu", weights_only=True)
+            _load_merged_pytorch_checkpoint(model, checkpoint, source=checkpoint_source)
+        else:
+            from safetensors.torch import load_file
 
-        state_dict = load_file(weights_path)
-        model.load_state_dict(state_dict, strict=False)
+            state_dict = load_file(weights_path)
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            if missing or unexpected:
+                logger.warning(
+                    "%s: legacy custom-model state_dict mismatch "
+                    "(missing=%s, unexpected=%s); continuing with partial load",
+                    checkpoint_source,
+                    list(missing)[:5],
+                    list(unexpected)[:5],
+                )
 
         if device == "auto":
             if torch.cuda.is_available():
@@ -821,6 +926,7 @@ def _load_kompress(
 
     Models are cached by model_id — multiple models can coexist.
     """
+    model_id = _canonical_kompress_model_id(model_id)
     if model_id in _kompress_cache:
         return _kompress_cache[model_id]
 
@@ -879,6 +985,8 @@ def unload_kompress_model(model_id: str | None = None) -> bool:
     Args:
         model_id: Specific model to unload. If None, unloads all cached models.
     """
+    if model_id is not None:
+        model_id = _canonical_kompress_model_id(model_id)
     with _kompress_lock:
         if model_id is not None:
             if model_id in _kompress_cache:
@@ -936,6 +1044,7 @@ def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto"
     completes the deep path activates on subsequent requests without ever
     blocking one on the network.
     """
+    model_id = _canonical_kompress_model_id(model_id)
     if model_id in _kompress_cache:
         return
     with _download_threads_lock:
@@ -971,6 +1080,7 @@ def warm_kompress_model(
     Returns ``True`` if the model is loaded and ready, ``False`` if Kompress is
     unavailable or the load failed.
     """
+    model_id = _canonical_kompress_model_id(model_id)
     if not is_kompress_available():
         return False
     try:
@@ -1006,6 +1116,9 @@ class KompressConfig:
     model_id: str = HF_MODEL_ID
     chunk_words: int = 350
     score_threshold: float = 0.5
+
+    def __post_init__(self) -> None:
+        self.model_id = _canonical_kompress_model_id(self.model_id)
 
 
 @dataclass

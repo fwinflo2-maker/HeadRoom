@@ -65,32 +65,17 @@ def _build_core(model_id: str):
     import torch
     from huggingface_hub import hf_hub_download
 
-    from headroom.transforms.kompress_compressor import _get_model_class
+    from headroom.transforms.kompress_compressor import (
+        _get_model_class,
+        _load_merged_pytorch_checkpoint,
+    )
 
     ckpt_path = hf_hub_download(model_id, "merged.pt")
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    for key in ("encoder_state_dict", "token_head_state_dict", "span_conv_state_dict"):
-        if key not in ckpt:
-            raise RuntimeError(
-                f"merged.pt missing '{key}'. Found: {sorted(ckpt)}. "
-                "This script targets the v2 'merged' checkpoint format."
-            )
-
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     core = _get_model_class()(model_name=BASE_MODEL)
 
-    def _strict_load(module, sd, label: str) -> None:
-        missing, unexpected = module.load_state_dict(sd, strict=False)
-        if missing or unexpected:
-            raise RuntimeError(
-                f"{label}: state_dict mismatch (missing={list(missing)[:5]}, "
-                f"unexpected={list(unexpected)[:5]}). Architecture drifted from the checkpoint."
-            )
-        logger.info("  %s loaded (%d tensors, exact match)", label, len(sd))
-
     logger.info("Loading merged.pt (checkpoint_kind=%s)", ckpt.get("checkpoint_kind"))
-    _strict_load(core.encoder, ckpt["encoder_state_dict"], "encoder")
-    _strict_load(core.token_head, ckpt["token_head_state_dict"], "token_head")
-    _strict_load(core.span_conv, ckpt["span_conv_state_dict"], "span_conv")
+    _load_merged_pytorch_checkpoint(core, ckpt, source=f"{model_id}/merged.pt")
 
     core.eval()
     return core

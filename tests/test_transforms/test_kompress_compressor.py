@@ -9,8 +9,11 @@ Covers:
 """
 
 import logging
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 # ── Import safety (the whole point of the fix) ─────────────────────────
 
@@ -192,6 +195,238 @@ class TestKompressBackendSelection:
         assert options.inter_op_num_threads == 1
         assert options.enable_cpu_mem_arena is False
         assert options.enable_mem_pattern is False
+
+
+class _FakeStateDictModule:
+    def __init__(
+        self,
+        *,
+        missing: list[str] | None = None,
+        unexpected: list[str] | None = None,
+    ) -> None:
+        self.missing = missing or []
+        self.unexpected = unexpected or []
+        self.loaded: list[object] = []
+
+    def load_state_dict(self, state_dict, *, strict=False):
+        assert strict is False
+        self.loaded.append(state_dict)
+        return self.missing, self.unexpected
+
+
+class _FakeKompressModel:
+    def __init__(self) -> None:
+        self.encoder = _FakeStateDictModule()
+        self.token_head = _FakeStateDictModule()
+        self.span_conv = _FakeStateDictModule()
+        self.full_model = _FakeStateDictModule()
+        self.device = None
+        self.eval_called = False
+
+    def load_state_dict(self, state_dict, *, strict=False):
+        return self.full_model.load_state_dict(state_dict, strict=strict)
+
+    def to(self, device):
+        self.device = device
+        return self
+
+    def eval(self):
+        self.eval_called = True
+        return self
+
+
+class TestKompressPyTorchCheckpointLoading:
+    @pytest.mark.parametrize(
+        "requested_model_id",
+        [
+            "chopratejas/kompress-v2-base",
+            "Chopratejas/Kompress-V2-Base",
+        ],
+    )
+    def test_default_v2_model_loads_merged_checkpoint(
+        self,
+        monkeypatch,
+        requested_model_id,
+    ) -> None:
+        import headroom.transforms.kompress_compressor as kmod
+
+        downloads: list[tuple[str, str, bool]] = []
+        load_calls: list[tuple[str, str, bool]] = []
+        model_class_calls: list[bool] = []
+        checkpoint = {
+            "encoder_state_dict": {"encoder.weight": object()},
+            "token_head_state_dict": {"token_head.weight": object()},
+            "span_conv_state_dict": {"span_conv.weight": object()},
+            "checkpoint_kind": "merged",
+        }
+        model = _FakeKompressModel()
+
+        fake_torch = ModuleType("torch")
+        fake_torch.cuda = SimpleNamespace(is_available=lambda: False)
+        fake_torch.backends = SimpleNamespace(mps=SimpleNamespace(is_available=lambda: False))
+
+        def fake_torch_load(path, *, map_location, weights_only):
+            load_calls.append((path, map_location, weights_only))
+            return checkpoint
+
+        fake_torch.load = fake_torch_load
+
+        class FakeAutoTokenizer:
+            @staticmethod
+            def from_pretrained(model_name, *, local_files_only):
+                return ("tokenizer", model_name, local_files_only)
+
+        fake_transformers = ModuleType("transformers")
+        fake_transformers.AutoTokenizer = FakeAutoTokenizer
+
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+        monkeypatch.setattr(kmod, "_kompress_cache", {})
+
+        def fake_model_class(*, local_files_only=False):
+            model_class_calls.append(local_files_only)
+            return model
+
+        monkeypatch.setattr(kmod, "_get_model_class", lambda: fake_model_class)
+        monkeypatch.setattr(
+            kmod,
+            "hf_hub_download_local_first",
+            lambda repo_id, filename, *, allow_network: (
+                downloads.append((repo_id, filename, allow_network)) or "/cache/merged.pt"
+            ),
+        )
+
+        loaded_model, tokenizer, backend = kmod._load_kompress_pytorch(
+            requested_model_id,
+            allow_download=False,
+        )
+
+        assert downloads == [(kmod.HF_MODEL_ID, "merged.pt", False)]
+        assert model_class_calls == [True]
+        assert load_calls == [("/cache/merged.pt", "cpu", True)]
+        assert model.encoder.loaded == [checkpoint["encoder_state_dict"]]
+        assert model.token_head.loaded == [checkpoint["token_head_state_dict"]]
+        assert model.span_conv.loaded == [checkpoint["span_conv_state_dict"]]
+        assert model.device == "cpu"
+        assert model.eval_called is True
+        assert loaded_model is model
+        assert tokenizer == ("tokenizer", "answerdotai/ModernBERT-base", True)
+        assert backend == "pytorch"
+
+    def test_cache_only_load_does_not_download_base_model(self, monkeypatch) -> None:
+        import headroom.transforms.kompress_compressor as kmod
+
+        fake_torch = ModuleType("torch")
+        fake_transformers = ModuleType("transformers")
+        fake_transformers.AutoTokenizer = object()
+        constructor_calls: list[bool] = []
+
+        def unavailable_model_class(*, local_files_only=False):
+            constructor_calls.append(local_files_only)
+            raise OSError("ModernBERT is not cached")
+
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+        monkeypatch.setattr(kmod, "_kompress_cache", {})
+        monkeypatch.setattr(kmod, "_get_model_class", lambda: unavailable_model_class)
+        monkeypatch.setattr(
+            kmod,
+            "hf_hub_download_local_first",
+            lambda repo_id, filename, *, allow_network: "/cache/merged.pt",
+        )
+
+        with pytest.raises(kmod.KompressModelNotCached, match="ModernBERT-base"):
+            kmod._load_kompress_pytorch(kmod.HF_MODEL_ID, allow_download=False)
+
+        assert constructor_calls == [True]
+
+    def test_custom_model_keeps_legacy_safetensors_contract(
+        self,
+        monkeypatch,
+        caplog,
+    ) -> None:
+        import headroom.transforms.kompress_compressor as kmod
+
+        downloads: list[tuple[str, str, bool]] = []
+        state_dict = {"legacy.weight": object()}
+        model = _FakeKompressModel()
+        model.full_model = _FakeStateDictModule(missing=["optional.weight"])
+
+        fake_torch = ModuleType("torch")
+        fake_torch.cuda = SimpleNamespace(is_available=lambda: False)
+        fake_torch.backends = SimpleNamespace(mps=SimpleNamespace(is_available=lambda: False))
+
+        class FakeAutoTokenizer:
+            @staticmethod
+            def from_pretrained(model_name, *, local_files_only):
+                return ("tokenizer", model_name, local_files_only)
+
+        fake_transformers = ModuleType("transformers")
+        fake_transformers.AutoTokenizer = FakeAutoTokenizer
+        fake_safetensors = ModuleType("safetensors")
+        fake_safetensors.__path__ = []
+        fake_safetensors_torch = ModuleType("safetensors.torch")
+        fake_safetensors_torch.load_file = lambda path: state_dict
+
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+        monkeypatch.setitem(sys.modules, "safetensors", fake_safetensors)
+        monkeypatch.setitem(sys.modules, "safetensors.torch", fake_safetensors_torch)
+        monkeypatch.setattr(kmod, "_kompress_cache", {})
+        monkeypatch.setattr(
+            kmod,
+            "_get_model_class",
+            lambda: lambda **_kwargs: model,
+        )
+        monkeypatch.setattr(
+            kmod,
+            "hf_hub_download_local_first",
+            lambda repo_id, filename, *, allow_network: (
+                downloads.append((repo_id, filename, allow_network)) or "/cache/model.safetensors"
+            ),
+        )
+
+        with caplog.at_level(logging.WARNING, logger=kmod.logger.name):
+            loaded_model, _tokenizer, backend = kmod._load_kompress_pytorch(
+                "org/custom-kompress",
+                allow_download=False,
+            )
+
+        assert downloads == [("org/custom-kompress", "model.safetensors", False)]
+        assert model.full_model.loaded == [state_dict]
+        assert loaded_model is model
+        assert backend == "pytorch"
+        assert "continuing with partial load" in caplog.text
+
+    def test_merged_checkpoint_requires_all_sections(self) -> None:
+        import headroom.transforms.kompress_compressor as kmod
+
+        with pytest.raises(RuntimeError, match="span_conv_state_dict"):
+            kmod._load_merged_pytorch_checkpoint(
+                _FakeKompressModel(),
+                {
+                    "encoder_state_dict": {},
+                    "token_head_state_dict": {},
+                },
+                source="org/model/merged.pt",
+            )
+
+    def test_merged_checkpoint_rejects_state_dict_mismatch(self) -> None:
+        import headroom.transforms.kompress_compressor as kmod
+
+        model = _FakeKompressModel()
+        model.encoder = _FakeStateDictModule(missing=["encoder.layer.0.weight"])
+
+        with pytest.raises(RuntimeError, match="encoder state_dict mismatch"):
+            kmod._load_merged_pytorch_checkpoint(
+                model,
+                {
+                    "encoder_state_dict": {},
+                    "token_head_state_dict": {},
+                    "span_conv_state_dict": {},
+                },
+                source="org/model/merged.pt",
+            )
 
 
 # ── KompressResult ──────────────────────────────────────────────────────

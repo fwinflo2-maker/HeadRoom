@@ -215,3 +215,36 @@ def test_wrap_droid_reuses_matching_factory_proxy(runner: CliRunner) -> None:
         result = runner.invoke(main, ["wrap", "droid"])
     assert result.exit_code == 0, result.output
     assert captured["port"] == 8787
+
+
+def test_start_proxy_forwards_factory_api_url_to_subprocess(tmp_path: Path) -> None:
+    """_start_proxy must pass --factory-api-url and FACTORY_TARGET_API_URL through
+    to the actual proxy subprocess command/env when factory_api_url is set.
+    """
+    import headroom.cli.wrap as wrap_module
+
+    captured: dict[str, object] = {}
+
+    class _FakeProcess:
+        returncode = None
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env")
+        return _FakeProcess()
+
+    with (
+        patch("headroom.cli.wrap.subprocess.Popen", side_effect=fake_popen),
+        patch("headroom.cli.wrap._check_proxy", return_value=True),
+        patch("headroom.cli.wrap._get_log_path", return_value=tmp_path / "proxy.log"),
+        patch("headroom.cli.wrap._get_proxy_stdio_log_path", return_value=tmp_path / "stdio.log"),
+    ):
+        wrap_module._start_proxy(8899, factory_api_url="https://api.factory.ai")
+
+    assert "--factory-api-url" in captured["cmd"]
+    idx = captured["cmd"].index("--factory-api-url")
+    assert captured["cmd"][idx + 1] == "https://api.factory.ai"
+    assert captured["env"]["FACTORY_TARGET_API_URL"] == "https://api.factory.ai"

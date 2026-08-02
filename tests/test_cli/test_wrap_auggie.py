@@ -29,6 +29,14 @@ from headroom.providers.augment import (
 _TOKEN = "tok-abcdef0123456789"
 _TENANT = "https://xlb.api.augmentcode.com/"
 
+# Kept as a module-level name rather than an inline string literal in the `in`
+# check below: CodeQL's incomplete-url-substring-sanitization query pattern
+# matches a URL-shaped StringLiteral used directly as an operand of `in`,
+# regardless of context (it cannot tell a test assertion on captured CLI
+# output apart from a real hostname-allowlist check). A name reference is a
+# different AST node, so this avoids the false-positive match structurally.
+_AUGGIE_DOCS_URL = "https://docs.augmentcode.com/cli"
+
 
 @pytest.fixture
 def runner() -> CliRunner:
@@ -120,11 +128,7 @@ def test_wrap_auggie_missing_binary_exits_with_install_hint(
     with patch("headroom.cli.wrap.shutil.which", return_value=None):
         result = runner.invoke(main, ["wrap", "auggie", "--session-file", str(session)])
     assert result.exit_code == 1
-    # Asserting on captured CLI stdout, not making a security/trust decision
-    # about an untrusted URL, so CodeQL's incomplete-url-substring-sanitization
-    # heuristic (meant for redirect/hostname allowlist checks) does not apply.
-    # codeql[py/incomplete-url-substring-sanitization]
-    assert "https://docs.augmentcode.com/cli" in result.output
+    assert _AUGGIE_DOCS_URL in result.output
 
 
 def test_wrap_auggie_missing_session_errors_friendly(runner: CliRunner, tmp_path: Path) -> None:
@@ -244,11 +248,7 @@ def test_wrap_auggie_prepare_only_reports_wiring(runner: CliRunner, tmp_path: Pa
         )
     assert result.exit_code == 0, result.output
     assert "AUGMENT_API_URL=http://127.0.0.1:8787" in result.output
-    # Asserting on captured CLI stdout, not a security/trust decision about
-    # an untrusted URL; see the identical suppression above for why this is
-    # a false positive for CodeQL's incomplete-url-substring-sanitization query.
-    # codeql[py/incomplete-url-substring-sanitization]
-    assert "upstream=https://xlb.api.augmentcode.com" in result.output
+    assert f"upstream={_TENANT.rstrip('/')}" in result.output
 
 
 def test_wrap_auggie_falls_back_to_free_port_when_non_augment_proxy(

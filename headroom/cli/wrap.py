@@ -4536,10 +4536,19 @@ def _launch_tool(
         port_holder[0] = actual_port
         _push_runtime_env(actual_port, no_proxy)
 
-        # If port fell back, update env URLs to point at the actual port
+        # If port fell back, update env URLs to point at the actual port.
+        # The displayed lines must be rewritten too: they are built before the
+        # port is known, so leaving them stale makes the banner contradict
+        # itself ("Proxy ready on ...:8851" next to
+        # "COPILOT_PROVIDER_BASE_URL=...:8850"). The env was already correct, but
+        # a banner that misreports the port reads as a routing failure and sends
+        # people debugging a bug that isn't there.
         if actual_port != port:
+            _stale = f"127.0.0.1:{port}"
+            _fresh = f"127.0.0.1:{actual_port}"
             for k, v in dict(env).items():
-                env[k] = v.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
+                env[k] = v.replace(_stale, _fresh)
+            env_vars_display = [line.replace(_stale, _fresh) for line in env_vars_display]
 
         if configure_launch is not None:
             args, env, env_vars_display = configure_launch(actual_port, args, env, env_vars_display)

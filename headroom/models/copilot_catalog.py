@@ -446,6 +446,28 @@ def resolve_model_id(
     by_name = [c for c in chat_cards if c.display_name and _norm(c.display_name) == target]
     if len(by_name) == 1:
         return by_name[0].id
+
+    # Version separators get confused constantly: agents write
+    # ``claude-sonnet-4-6`` for ``claude-sonnet-4.6`` (observed live in
+    # proxy.log). Compare with '.' and '-' collapsed to a single token so the
+    # two spellings meet, but only accept a UNIQUE match -- if flattening makes
+    # a name ambiguous, leave it alone rather than pick one.
+    def _flatten(value: str) -> str:
+        return value.replace(".", "").replace("-", "").replace("_", "")
+
+    flat_target = _flatten(target)
+    if flat_target:
+        by_flat = [c for c in chat_cards if _flatten(c.id) == flat_target]
+        if len(by_flat) == 1:
+            return by_flat[0].id
+        if not by_flat:
+            by_flat_name = [
+                c
+                for c in chat_cards
+                if c.display_name and _flatten(_norm(c.display_name)) == flat_target
+            ]
+            if len(by_flat_name) == 1:
+                return by_flat_name[0].id
     return None
 
 

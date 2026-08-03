@@ -445,3 +445,56 @@ def test_launcher_wire_api_survives_an_unreachable_models_endpoint(
         )
         == "completions"
     )
+
+
+# ---------------------------------------------------------------------------
+# Agent-hallucinated model names (observed live in proxy.log)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("typed", "expected"),
+    [
+        # Version separator confusion: agents write '-' where the id has '.'.
+        ("claude-sonnet-4-6", "claude-sonnet-4.6"),
+        ("claude-opus-4-8", "claude-opus-4.8"),
+        ("gpt-5-5", "gpt-5.5"),
+    ],
+)
+def test_version_separator_confusion_resolves(
+    cards: dict[str, ModelCard], typed: str, expected: str
+) -> None:
+    """`claude-sonnet-4-6` reached the proxy live; the real id is `claude-sonnet-4.6`."""
+    assert resolve_model_id(typed, cards) == expected
+
+
+@pytest.mark.parametrize(
+    "retired",
+    [
+        # All of these were reached for by orchestrating agents in proxy.log and
+        # none exist in the account's live catalog. They must NOT be "corrected"
+        # into something plausible -- a wrong model silently answering is worse
+        # than a clear upstream 400.
+        "claude-3.5-sonnet",
+        "gemini-2.5-pro",
+        "glm-5.2",
+        "gpt-5.2",
+        "o1-experimental",
+    ],
+)
+def test_retired_or_foreign_models_are_not_invented(
+    cards: dict[str, ModelCard], retired: str
+) -> None:
+    assert resolve_model_id(retired, cards) is None
+
+
+def test_static_table_no_longer_lists_retired_models() -> None:
+    """The hardcoded fallback set must not legitimize models GitHub retired.
+
+    Keeping `gemini-2.5-pro` / `gpt-5.2` / `o1-experimental` in it made a
+    hallucinated name look recognized, so it was confidently forwarded and 400'd.
+    """
+    from headroom.proxy.handlers.openai import _KNOWN_COPILOT_MODEL_IDS
+
+    for retired in ("gemini-2.5-pro", "gpt-5.2", "o1-experimental"):
+        assert retired not in _KNOWN_COPILOT_MODEL_IDS

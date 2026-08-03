@@ -3548,40 +3548,49 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         return "missing"
 
     def _build_recent_request_payload(limit: int = RECENT_REQUEST_LOG_WINDOW) -> dict[str, Any]:
-        recent_request_logs = proxy.logger.get_recent(limit) if proxy.logger else []
+        log_full_messages = bool(proxy and proxy.config.log_full_messages)
+        if proxy and proxy.logger:
+            if log_full_messages:
+                recent_request_logs = proxy.logger.get_recent_with_messages(limit)
+            else:
+                recent_request_logs = proxy.logger.get_recent(limit)
+        else:
+            recent_request_logs = []
         dashboard_recent_requests = []
         for log in reversed(recent_request_logs):
             token_accounting_status = _recent_request_token_accounting_status(log)
-            dashboard_recent_requests.append(
-                {
-                    "request_id": log.get("request_id"),
-                    "timestamp": log.get("timestamp"),
-                    "provider": resolve_display_provider(
-                        log.get("provider"),
-                        openai_api_url=proxy.config.openai_api_url,
-                        provider_name=proxy.config.provider_name,
-                    ),
-                    "model": log.get("model"),
-                    "input_tokens_original": _recent_request_optional_number(
-                        log, "input_tokens_original"
-                    ),
-                    "input_tokens_optimized": _recent_request_optional_number(
-                        log, "input_tokens_optimized"
-                    ),
-                    "output_tokens": _recent_request_optional_number(log, "output_tokens"),
-                    "tokens_saved": _recent_request_optional_number(log, "tokens_saved"),
-                    "savings_percent": _recent_request_optional_number(log, "savings_percent"),
-                    "optimization_latency_ms": _recent_request_optional_number(
-                        log, "optimization_latency_ms"
-                    ),
-                    "total_latency_ms": _recent_request_optional_number(log, "total_latency_ms"),
-                    "has_exact_tokens": token_accounting_status == "complete",
-                    "token_accounting_status": token_accounting_status,
-                    "transforms_applied": log.get("transforms_applied", []),
-                    "waste_signals": log.get("waste_signals"),
-                    "tool_schema_saved_tokens": _tool_schema_saved_from_tags(log.get("tags")),
-                }
-            )
+            entry: dict[str, Any] = {
+                "request_id": log.get("request_id"),
+                "timestamp": log.get("timestamp"),
+                "provider": resolve_display_provider(
+                    log.get("provider"),
+                    openai_api_url=proxy.config.openai_api_url,
+                    provider_name=proxy.config.provider_name,
+                ),
+                "model": log.get("model"),
+                "input_tokens_original": _recent_request_optional_number(
+                    log, "input_tokens_original"
+                ),
+                "input_tokens_optimized": _recent_request_optional_number(
+                    log, "input_tokens_optimized"
+                ),
+                "output_tokens": _recent_request_optional_number(log, "output_tokens"),
+                "tokens_saved": _recent_request_optional_number(log, "tokens_saved"),
+                "savings_percent": _recent_request_optional_number(log, "savings_percent"),
+                "optimization_latency_ms": _recent_request_optional_number(
+                    log, "optimization_latency_ms"
+                ),
+                "total_latency_ms": _recent_request_optional_number(log, "total_latency_ms"),
+                "has_exact_tokens": token_accounting_status == "complete",
+                "token_accounting_status": token_accounting_status,
+                "transforms_applied": log.get("transforms_applied", []),
+                "waste_signals": log.get("waste_signals"),
+                "tool_schema_saved_tokens": _tool_schema_saved_from_tags(log.get("tags")),
+            }
+            if log_full_messages:
+                entry["request_messages"] = log.get("request_messages")
+                entry["compressed_messages"] = log.get("compressed_messages")
+            dashboard_recent_requests.append(entry)
         dashboard_recent_requests = dashboard_recent_requests[:25]
         return {
             "request_logs": recent_request_logs[-10:],

@@ -1967,10 +1967,7 @@ def _decompress_gzip_capped(data: bytes) -> bytes:
         if not remaining:
             break
         if not remaining.startswith(b"\x1f\x8b"):
-            raise ValueError(
-                f"unexpected trailing data after gzip stream "
-                f"({len(remaining)} bytes)"
-            )
+            raise ValueError(f"unexpected trailing data after gzip stream ({len(remaining)} bytes)")
     return bytes(out)
 
 

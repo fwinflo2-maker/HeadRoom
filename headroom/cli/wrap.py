@@ -30,7 +30,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -3501,6 +3501,22 @@ def _copilot_default_wire_api_for_model(model: str | None) -> str:
     return _copilot_default_wire_api_for_model_impl(model)
 
 
+def _build_copilot_native_launch_env(
+    *, port: int, environ: dict[str, str], project: str | None
+) -> tuple[dict[str, str], list[str]]:
+    """Launch env for native (non-BYOK) Copilot routing through the proxy."""
+    from headroom.providers.copilot.wrap import build_native_launch_env
+
+    return build_native_launch_env(port=port, environ=environ, project=project)
+
+
+def _native_api_url_supported(*, environ: Mapping[str, str] | None = None) -> bool | None:
+    """Whether the installed Copilot CLI honours ``COPILOT_API_URL`` (None=unknown)."""
+    from headroom.providers.copilot.wrap import native_api_url_supported
+
+    return native_api_url_supported(environ=environ)
+
+
 def _resolve_copilot_wire_api_for_model(
     model: str | None, *, api_url: str | None, token: str | None
 ) -> str:
@@ -4136,6 +4152,7 @@ def _launch_tool(
     anyllm_provider: str | None = None,
     region: str | None = None,
     openai_api_url: str | None = None,
+    anthropic_api_url: str | None = None,
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
@@ -4172,6 +4189,7 @@ def _launch_tool(
             anyllm_provider=anyllm_provider,
             region=region,
             openai_api_url=openai_api_url,
+            anthropic_api_url=anthropic_api_url,
             copilot_api_token=copilot_api_token,
             copilot_refresh_oauth_token=copilot_refresh_oauth_token,
             copilot_api_token_expires_at=copilot_api_token_expires_at,
@@ -5075,6 +5093,16 @@ def _require_copilot_subscription_resolution() -> CopilotSubscriptionTokenResolu
 )
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
 @click.option(
+    "--native",
+    is_flag=True,
+    help=(
+        "Experimental: route Copilot's own GitHub-authenticated API through Headroom "
+        "instead of using the BYOK provider override. Keeps Copilot's native model "
+        "routing, so the /model picker stays populated and the MAIN agent's model can "
+        "be switched in-session. Implies --subscription; no --model required."
+    ),
+)
+@click.option(
     "--no-model-list",
     is_flag=True,
     help=(
@@ -5094,6 +5122,7 @@ def copilot(
     wire_api: str | None,
     subscription: bool,
     memory: bool,
+    native: bool,
     no_model_list: bool,
     verbose: bool,
     copilot_args: tuple[str, ...],
@@ -5139,6 +5168,25 @@ def copilot(
             )
         effective_backend = running_backend or effective_backend
 
+    # --native replaces the BYOK interposition rather than layering on it, so it
+    # implies subscription-style resolution (Copilot's hosted API, the user's own
+    # GitHub auth) and is incompatible with a BYOK provider type or a translated
+    # backend. Validated up front so a bad combination fails clearly instead of
+    # producing a session that silently bypasses Headroom.
+    if native:
+        subscription = True
+        if provider_type == "anthropic":
+            raise click.ClickException(
+                "--native routes Copilot's own API through Headroom and does not use the "
+                "BYOK provider override; do not combine it with --provider-type anthropic."
+            )
+        if wire_api is not None:
+            raise click.ClickException(
+                "--wire-api pins one BYOK wire API for the whole session, which is exactly "
+                "what --native avoids: the wire is chosen per request from the model. "
+                "Drop --wire-api."
+            )
+
     effective_provider_type = _resolve_copilot_provider_type(effective_backend, provider_type)
     if subscription:
         if effective_backend not in (None, "", "anthropic"):
@@ -5166,6 +5214,10 @@ def copilot(
     copilot_api_token_expires_at: float | None = None
     client_bearer: str | None = None
     subscription_resolution: CopilotSubscriptionTokenResolution | None = None
+    # Only set in --native mode: the native CLI sends Claude traffic on the
+    # Anthropic wire, so the proxy's Anthropic upstream must point at the Copilot
+    # host too. Left None for BYOK so that path is byte-identical to before.
+    copilot_native_anthropic_url: str | None = None
     if _should_use_copilot_oauth(
         backend=effective_backend,
         provider_type=provider_type,
@@ -5184,110 +5236,155 @@ def copilot(
                 "GITHUB_COPILOT_TOKEN / GITHUB_COPILOT_GITHUB_TOKEN."
             )
 
-        selected_model = _copilot_model_from_args(copilot_args, env)
-
-        # ``--model auto`` is a Copilot-internal routing token that the BYOK
-        # API rejects with ``400 The requested model is not supported``.  In
-        # subscription/OAuth mode we route to the real Copilot hosted API, so
-        # Copilot's own native auto-selection works fine — we just need to
-        # strip the ``--model auto`` flag before launch so Copilot doesn't
-        # forward it to the provider endpoint.
-        if _is_auto_model(selected_model):
-            copilot_args = _strip_auto_model_args(copilot_args)
-            selected_model = None
-            click.echo(
-                "  Note: '--model auto' is not forwarded to the Copilot API "
-                "(it would cause a 400). Removed it; Copilot will use its own "
-                "automatic model selection."
+        if native:
+            openai_api_url = (
+                subscription_resolution.api_url
+                if subscription_resolution is not None
+                else resolve_copilot_api_url(client_bearer)
             )
-
-        # The wire API is pinned for the whole session, so guessing it from the
-        # model name can make a valid main model unusable: mai-code-1-flash-picker
-        # is /responses-only but does not match gpt-5*/o1*/o3*, so the heuristic
-        # pinned "completions" and every turn 400'd. Ask the upstream which
-        # endpoints actually serve this model; falls back to the heuristic on any
-        # failure, so launch never depends on discovery succeeding.
-        effective_wire_api = wire_api or (
-            _resolve_copilot_wire_api_for_model(
-                selected_model,
-                api_url=(
-                    subscription_resolution.api_url if subscription_resolution is not None else None
-                ),
-                token=client_bearer,
+            env, env_vars_display = _build_copilot_native_launch_env(
+                port=port,
+                environ=env,
+                project=_project_name_from_cwd(),
             )
-            if subscription
-            else "completions"
-        )
-        env["COPILOT_PROVIDER_TYPE"] = "openai"
-        # Per-project savings: the Copilot CLI cannot send custom headers, so
-        # the project rides as a /p/<name> base-URL prefix the proxy strips.
-        env["COPILOT_PROVIDER_BASE_URL"] = _with_project_prefix(
-            f"http://127.0.0.1:{port}/v1", _project_name_from_cwd()
-        )
-        env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
-        env["COPILOT_PROVIDER_BEARER_TOKEN"] = client_bearer
-        env["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] = "false"
-        env.pop("COPILOT_PROVIDER_API_KEY", None)
-        # Hand the exact token we resolved (and, for --subscription, validated
-        # against GitHub) to the proxy explicitly via copilot_proxy_token below.
-        # The proxy pins it as GITHUB_COPILOT_API_TOKEN, so upstream auth is
-        # deterministic instead of the proxy re-running unvalidated discovery
-        # (read_cached_oauth_token returns the *first* candidate, which may not
-        # be the one the wrapper approved → environment-dependent 401s). Passing
-        # it as a launch argument — rather than mutating this process's global
-        # os.environ — keeps the token off shared state and out of unrelated
-        # code paths.
-        copilot_proxy_token = client_bearer
-        if subscription_resolution is not None:
-            copilot_refresh_oauth_token = subscription_resolution.refresh_oauth_token
-            copilot_api_token_expires_at = subscription_resolution.api_token_expires_at
-        env_vars_display = [
-            "COPILOT_PROVIDER_TYPE=openai",
-            f"COPILOT_PROVIDER_BASE_URL={env['COPILOT_PROVIDER_BASE_URL']}",
-            f"COPILOT_PROVIDER_WIRE_API={effective_wire_api}",
-            (
-                "COPILOT_AUTH_MODE=github-subscription-experimental"
-                if subscription
-                else "COPILOT_AUTH_MODE=github-oauth"
-            ),
-        ]
-        # Non-subscription OAuth keeps upstream's generic-host policy from
-        # #610. Subscription mode can use the endpoint returned by the Copilot
-        # token exchange, which is how Business accounts advertise their API
-        # host without requiring users to configure it manually.
-        openai_api_url = (
-            subscription_resolution.api_url
-            if subscription_resolution is not None
-            else resolve_copilot_api_url(client_bearer)
-        )
-        env["GITHUB_COPILOT_API_URL"] = openai_api_url
-        env["OPENAI_TARGET_API_URL"] = openai_api_url
-        env_vars_display.append(f"COPILOT_PROVIDER_API_URL={openai_api_url}")
+            # The native CLI drives BOTH wires off this one base URL: Claude models
+            # over /v1/messages (the Anthropic shape) and OpenAI models over
+            # /responses or /chat/completions. So both of the proxy's upstreams have
+            # to resolve to the Copilot host, or /v1/messages lands on
+            # api.anthropic.com and returns 401.
+            env["GITHUB_COPILOT_API_URL"] = openai_api_url
+            env["OPENAI_TARGET_API_URL"] = openai_api_url
+            env["ANTHROPIC_TARGET_API_URL"] = openai_api_url
+            copilot_native_anthropic_url = openai_api_url
+            copilot_proxy_token = client_bearer
+            if subscription_resolution is not None:
+                copilot_refresh_oauth_token = subscription_resolution.refresh_oauth_token
+                copilot_api_token_expires_at = subscription_resolution.api_token_expires_at
+            env_vars_display.append(f"COPILOT_UPSTREAM={openai_api_url}")
 
-        # Restore model-choice parity with native Copilot. BYOK tells the CLI
-        # about exactly one model, so an agent asked to "use a different model"
-        # has nothing authoritative to consult and invents or scrapes names
-        # (observed live: claude-fable-5, claude-opus-4.8-fast, grok-4.5 —
-        # none of them Copilot models). Writing the real list into the
-        # instruction file gives it the same knowledge native Copilot has.
-        # Skipped with --no-model-list, and removed by `unwrap copilot`.
-        if not no_model_list:
-            # Best-effort, never fatal. origin/main never wrote this file, so a
-            # crash here would be a pure regression: `.github` existing as a file
-            # raises FileExistsError from mkdir, and a read-only target raises
-            # PermissionError from the atomic os.replace. Model guidance is a
-            # convenience -- it must never stop a session from launching.
-            try:
-                _inject_copilot_models_instructions(
-                    Path.cwd() / ".github" / "copilot-instructions.md",
-                    _live_copilot_model_ids(openai_api_url, client_bearer),
-                    verbose=verbose,
+            support = _native_api_url_supported(environ=os.environ)
+            if support is False:
+                raise click.ClickException(
+                    "This Copilot CLI build does not appear to honour COPILOT_API_URL, so "
+                    "--native would let the CLI bypass Headroom entirely (you would lose "
+                    "compression without any error). Re-run without --native to use BYOK mode."
                 )
-            except OSError as exc:
+            if support is None and verbose:
                 click.echo(
-                    f"  Note: could not write the available-models list ({exc}). "
-                    "Continuing; run `headroom models` to see what is available."
+                    "  Note: could not verify COPILOT_API_URL support in the installed CLI "
+                    "(it is undocumented). Proceeding; check the dashboard shows traffic."
                 )
+            click.echo(
+                "  Native mode: Copilot keeps its own model routing, so /model switches "
+                "the main agent in-session and --model is optional."
+            )
+        else:
+            selected_model = _copilot_model_from_args(copilot_args, env)
+
+            # ``--model auto`` is a Copilot-internal routing token that the BYOK
+            # API rejects with ``400 The requested model is not supported``.  In
+            # subscription/OAuth mode we route to the real Copilot hosted API, so
+            # Copilot's own native auto-selection works fine — we just need to
+            # strip the ``--model auto`` flag before launch so Copilot doesn't
+            # forward it to the provider endpoint.
+            if _is_auto_model(selected_model):
+                copilot_args = _strip_auto_model_args(copilot_args)
+                selected_model = None
+                click.echo(
+                    "  Note: '--model auto' is not forwarded to the Copilot API "
+                    "(it would cause a 400). Removed it; Copilot will use its own "
+                    "automatic model selection."
+                )
+
+            # The wire API is pinned for the whole session, so guessing it from the
+            # model name can make a valid main model unusable: mai-code-1-flash-picker
+            # is /responses-only but does not match gpt-5*/o1*/o3*, so the heuristic
+            # pinned "completions" and every turn 400'd. Ask the upstream which
+            # endpoints actually serve this model; falls back to the heuristic on any
+            # failure, so launch never depends on discovery succeeding.
+            effective_wire_api = wire_api or (
+                _resolve_copilot_wire_api_for_model(
+                    selected_model,
+                    api_url=(
+                        subscription_resolution.api_url
+                        if subscription_resolution is not None
+                        else None
+                    ),
+                    token=client_bearer,
+                )
+                if subscription
+                else "completions"
+            )
+            env["COPILOT_PROVIDER_TYPE"] = "openai"
+            # Per-project savings: the Copilot CLI cannot send custom headers, so
+            # the project rides as a /p/<name> base-URL prefix the proxy strips.
+            env["COPILOT_PROVIDER_BASE_URL"] = _with_project_prefix(
+                f"http://127.0.0.1:{port}/v1", _project_name_from_cwd()
+            )
+            env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
+            env["COPILOT_PROVIDER_BEARER_TOKEN"] = client_bearer
+            env["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] = "false"
+            env.pop("COPILOT_PROVIDER_API_KEY", None)
+            # Hand the exact token we resolved (and, for --subscription, validated
+            # against GitHub) to the proxy explicitly via copilot_proxy_token below.
+            # The proxy pins it as GITHUB_COPILOT_API_TOKEN, so upstream auth is
+            # deterministic instead of the proxy re-running unvalidated discovery
+            # (read_cached_oauth_token returns the *first* candidate, which may not
+            # be the one the wrapper approved → environment-dependent 401s). Passing
+            # it as a launch argument — rather than mutating this process's global
+            # os.environ — keeps the token off shared state and out of unrelated
+            # code paths.
+            copilot_proxy_token = client_bearer
+            if subscription_resolution is not None:
+                copilot_refresh_oauth_token = subscription_resolution.refresh_oauth_token
+                copilot_api_token_expires_at = subscription_resolution.api_token_expires_at
+            env_vars_display = [
+                "COPILOT_PROVIDER_TYPE=openai",
+                f"COPILOT_PROVIDER_BASE_URL={env['COPILOT_PROVIDER_BASE_URL']}",
+                f"COPILOT_PROVIDER_WIRE_API={effective_wire_api}",
+                (
+                    "COPILOT_AUTH_MODE=github-subscription-experimental"
+                    if subscription
+                    else "COPILOT_AUTH_MODE=github-oauth"
+                ),
+            ]
+            # Non-subscription OAuth keeps upstream's generic-host policy from
+            # #610. Subscription mode can use the endpoint returned by the Copilot
+            # token exchange, which is how Business accounts advertise their API
+            # host without requiring users to configure it manually.
+            openai_api_url = (
+                subscription_resolution.api_url
+                if subscription_resolution is not None
+                else resolve_copilot_api_url(client_bearer)
+            )
+            env["GITHUB_COPILOT_API_URL"] = openai_api_url
+            env["OPENAI_TARGET_API_URL"] = openai_api_url
+            env_vars_display.append(f"COPILOT_PROVIDER_API_URL={openai_api_url}")
+
+            # Restore model-choice parity with native Copilot. BYOK tells the CLI
+            # about exactly one model, so an agent asked to "use a different model"
+            # has nothing authoritative to consult and invents or scrapes names
+            # (observed live: claude-fable-5, claude-opus-4.8-fast, grok-4.5 —
+            # none of them Copilot models). Writing the real list into the
+            # instruction file gives it the same knowledge native Copilot has.
+            # Skipped with --no-model-list, and removed by `unwrap copilot`.
+            if not no_model_list:
+                # Best-effort, never fatal. origin/main never wrote this file, so a
+                # crash here would be a pure regression: `.github` existing as a file
+                # raises FileExistsError from mkdir, and a read-only target raises
+                # PermissionError from the atomic os.replace. Model guidance is a
+                # convenience -- it must never stop a session from launching.
+                try:
+                    _inject_copilot_models_instructions(
+                        Path.cwd() / ".github" / "copilot-instructions.md",
+                        _live_copilot_model_ids(openai_api_url, client_bearer),
+                        verbose=verbose,
+                    )
+                except OSError as exc:
+                    click.echo(
+                        f"  Note: could not write the available-models list ({exc}). "
+                        "Continuing; run `headroom models` to see what is available."
+                    )
     else:
         env, env_vars_display = _build_copilot_launch_env(
             port=port,
@@ -5347,6 +5444,9 @@ def copilot(
         anyllm_provider=anyllm_provider,
         region=region,
         openai_api_url=openai_api_url,
+        # None outside --native, so the BYOK path keeps the proxy's default
+        # Anthropic upstream untouched.
+        anthropic_api_url=copilot_native_anthropic_url,
         copilot_api_token=copilot_proxy_token,
         copilot_refresh_oauth_token=copilot_refresh_oauth_token,
         copilot_api_token_expires_at=copilot_api_token_expires_at,

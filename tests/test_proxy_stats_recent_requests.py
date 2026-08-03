@@ -20,6 +20,16 @@ class FakeRequestLogger:
         self._logs = value
 
     def get_recent(self, limit: int) -> list[dict[str, object]]:
+        return [
+            {
+                k: v
+                for k, v in entry.items()
+                if k not in ("request_messages", "compressed_messages", "response_content")
+            }
+            for entry in self._logs[-limit:]
+        ]
+
+    def get_recent_with_messages(self, limit: int) -> list[dict[str, object]]:
         return self._logs[-limit:]
 
 
@@ -231,3 +241,85 @@ def test_stats_preserves_default_smart_crusher_compaction_state() -> None:
 
     assert response.status_code == 200
     assert response.json()["config"]["smart_crusher_with_compaction"] is None
+
+
+def test_stats_recent_requests_includes_message_snapshots_when_logging_enabled() -> None:
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            log_full_messages=True,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            http2=False,
+        )
+    )
+    logger = FakeRequestLogger()
+    app.state.proxy.logger = logger
+    logger.logs = [
+        FakeLogEntry(
+            {
+                "timestamp": "2026-06-11T10:00:00Z",
+                "provider": "anthropic",
+                "model": "claude-sonnet",
+                "input_tokens_original": 100,
+                "input_tokens_optimized": 60,
+                "tokens_saved": 40,
+                "savings_percent": 40.0,
+                "request_messages": [{"role": "user", "content": "original prompt"}],
+                "compressed_messages": [{"role": "user", "content": "compressed prompt"}],
+            }
+        )
+    ]
+
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+        payload = client.get("/stats?cached=1").json()
+
+    recent = payload["recent_requests"][0]
+    assert recent["request_messages"] == [{"role": "user", "content": "original prompt"}]
+    assert recent["compressed_messages"] == [{"role": "user", "content": "compressed prompt"}]
+
+
+def test_stats_recent_requests_omits_message_snapshots_when_logging_disabled() -> None:
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            log_full_messages=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            http2=False,
+        )
+    )
+    logger = FakeRequestLogger()
+    app.state.proxy.logger = logger
+    logger.logs = [
+        FakeLogEntry(
+            {
+                "timestamp": "2026-06-11T10:00:00Z",
+                "provider": "anthropic",
+                "model": "claude-sonnet",
+                "input_tokens_original": 100,
+                "input_tokens_optimized": 60,
+                "tokens_saved": 40,
+                "savings_percent": 40.0,
+                "request_messages": [{"role": "user", "content": "original prompt"}],
+                "compressed_messages": [{"role": "user", "content": "compressed prompt"}],
+            }
+        )
+    ]
+
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+        payload = client.get("/stats?cached=1").json()
+
+    recent = payload["recent_requests"][0]
+    assert "request_messages" not in recent
+    assert "compressed_messages" not in recent

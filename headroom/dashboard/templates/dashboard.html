@@ -75,6 +75,10 @@
         .diff-before { background: var(--diff-before-body); }
         .diff-after-header { background: var(--diff-after-header); }
         .diff-after { background: var(--diff-after-body); }
+        .diff-origin-header { background: var(--diff-before-header); }
+        .diff-origin { background: var(--diff-before-body); }
+        .diff-compressed-header { background: var(--diff-after-header); }
+        .diff-compressed { background: var(--diff-after-body); }
         .ttl-bucket-gradient-card { background: var(--ttl-card-bg); }
 
         /* Light mode: invert the gray text scale (dark bg grays → light bg grays) */
@@ -944,6 +948,35 @@
                                                         </div>
                                                     </div>
                                                 </template>
+                                                <!-- Origin vs compressed prompt text -->
+                                                <div class="mt-4">
+                                                    <div class="text-xs text-gray-500 uppercase tracking-wide mb-2">Prompt Text</div>
+                                                    <template x-if="log_full_messages && hasRequestTextContent(req)">
+                                                        <div class="grid grid-cols-1 lg:grid-cols-2 gap-3">
+                                                            <div class="rounded border border-red-900/30 overflow-hidden flex flex-col max-h-52">
+                                                                <div class="diff-origin-header px-2 py-1 border-b border-red-900/30 shrink-0">
+                                                                    <span class="text-[10px] text-red-400 uppercase tracking-wide font-semibold">Origin Text</span>
+                                                                </div>
+                                                                <pre class="diff-origin p-2 font-mono text-[11px] text-gray-300 overflow-auto flex-1 whitespace-pre-wrap m-0"
+                                                                     x-text="requestOriginPreview(req)"></pre>
+                                                            </div>
+                                                            <div class="rounded border border-emerald-900/30 overflow-hidden flex flex-col max-h-52">
+                                                                <div class="diff-compressed-header px-2 py-1 border-b border-emerald-900/30 shrink-0">
+                                                                    <span class="text-[10px] text-emerald-400 uppercase tracking-wide font-semibold">Compressed Text</span>
+                                                                    <span class="text-[9px] text-emerald-500/70 normal-case ml-1">sent to LLM</span>
+                                                                </div>
+                                                                <pre class="diff-compressed p-2 font-mono text-[11px] text-gray-300 overflow-auto flex-1 whitespace-pre-wrap m-0"
+                                                                     x-text="requestCompressedPreview(req)"></pre>
+                                                            </div>
+                                                        </div>
+                                                    </template>
+                                                    <template x-if="log_full_messages && !hasRequestTextContent(req)">
+                                                        <p class="text-xs text-gray-500 italic">No message content captured for this request.</p>
+                                                    </template>
+                                                    <template x-if="!log_full_messages">
+                                                        <p class="text-xs text-gray-500 italic">Enable HEADROOM_LOG_MESSAGES=true to see origin vs compressed text.</p>
+                                                    </template>
+                                                </div>
                                             </div>
                                         </template>
                                     </div>
@@ -2009,12 +2042,77 @@
                     container.innerHTML = html;
                 },
 
+                extractMessageText(content) {
+                    if (content == null) return '';
+                    if (typeof content === 'string') return content;
+                    if (Array.isArray(content)) {
+                        const parts = [];
+                        for (const block of content) {
+                            if (typeof block === 'string') {
+                                parts.push(block);
+                            } else if (block && typeof block === 'object') {
+                                if (typeof block.text === 'string') {
+                                    parts.push(block.text);
+                                } else if (typeof block.content === 'string' || Array.isArray(block.content)) {
+                                    parts.push(this.extractMessageText(block.content));
+                                } else {
+                                    parts.push(JSON.stringify(block));
+                                }
+                            } else {
+                                parts.push(String(block));
+                            }
+                        }
+                        return parts.join('\n');
+                    }
+                    return String(content);
+                },
+
+                flattenMessages(messages) {
+                    if (!messages || !messages.length) return '';
+                    const multi = messages.length > 1;
+                    return messages.map(m => {
+                        const role = (m && m.role) ? m.role : '?';
+                        const text = this.extractMessageText(m ? m.content : null);
+                        return multi ? `[${role}] ${text}` : text;
+                    }).join('\n\n');
+                },
+
+                truncateDisplayText(text, limit = 2000) {
+                    if (!text) return '';
+                    return text.substring(0, limit) + (text.length > limit ? '\n\n[truncated]' : '');
+                },
+
+                hasRequestTextContent(req) {
+                    const originText = this.flattenMessages(req?.request_messages || []);
+                    const compressed = req?.compressed_messages;
+                    return originText.length > 0
+                        || (Array.isArray(compressed) && compressed.length > 0);
+                },
+
+                requestOriginPreview(req) {
+                    return this.truncateDisplayText(this.flattenMessages(req?.request_messages || []));
+                },
+
+                requestCompressedPreview(req) {
+                    const originText = this.flattenMessages(req?.request_messages || []);
+                    const compressedRaw = req?.compressed_messages;
+                    const hasCompressedSnapshot = Array.isArray(compressedRaw) && compressedRaw.length > 0;
+                    if (!hasCompressedSnapshot) {
+                        if (originText.length > 0) {
+                            return 'No compressed snapshot — same as origin\n\n'
+                                + this.truncateDisplayText(originText);
+                        }
+                        return '';
+                    }
+                    return this.truncateDisplayText(this.flattenMessages(compressedRaw));
+                },
+
                 renderTransformationCard(t, idx) {
                     const msgs = (t.request_messages || []).map(m => m.content || '').join('');
                     const response = t.response_content || '';
                     const hasMessages = msgs.length > 0 || response.length > 0;
-                    const before = msgs.substring(0, 2000) + (msgs.length > 2000 ? '\n\n[truncated]' : '');
-                    const after = response.substring(0, 2000) + (response.length > 2000 ? '\n\n[truncated]' : '');
+                    const before = this.truncateDisplayText(msgs);
+                    const after = this.truncateDisplayText(response);
 
                     const time = t.timestamp ? new Date(t.timestamp).toLocaleTimeString() : '--:--:--';
                     const model = (t.model || 'unknown').replace(/^(anthropic\.|openai\.)/, '').substring(0, 25);

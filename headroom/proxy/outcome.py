@@ -85,6 +85,21 @@ def consume_pending_ccr_continuation_usage() -> tuple[int, int, int, int] | None
     return value
 
 
+def clear_pending_outcome_side_channels() -> None:
+    """Drop both pending side-channel values in the CALLER's context.
+
+    ``emit_request_outcome`` consumes them itself, but production reaches it
+    through ``asyncio.shield`` (``HeadroomProxy._record_request_outcome``), which
+    runs the funnel in a child task holding a *copy* of the caller's context —
+    so the funnel's ``set(None)`` never reaches the caller. Any call site that
+    shields must clear here afterwards; otherwise a second outcome emitted from
+    the same context (a batch item, a re-driven turn) books the same continuation
+    usage and proactive drawback a second time.
+    """
+    _pending_proactive_retrieval.set(None)
+    _pending_ccr_continuation_usage.set(None)
+
+
 @dataclass(frozen=True)
 class RequestOutcome:
     """Immutable, value-equal snapshot of a completed request.
@@ -391,8 +406,6 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     and is awaitable-compatible. We could lift this to a typing.Protocol
     if/when another contract surface emerges, but YAGNI.
     """
-    import dataclasses
-
     from headroom.copilot_auth import consume_request_routed_to_copilot
     from headroom.proxy.cost import _summarize_transforms
     from headroom.proxy.models import RequestLog
@@ -417,7 +430,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     _pending_proactive = consume_pending_proactive_retrieval()
 
     # Consume (read + clear) the dropped CCR continuation rounds' usage for this
-    # request. Folded into the billed totals only in the success section below —
+    # request. Folded into the cost view only in the success section below —
     # a >=500 short-circuit must never book continuation tokens that, by the
     # account-after-success rule in handle_response, were never billed.
     _pending_continuation = consume_pending_ccr_continuation_usage()
@@ -440,24 +453,28 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         if _proactive_rec is not None:
             _proactive_rec(*_pending_proactive)
 
-    # Fold the dropped continuation rounds' real billed usage into the cost-
-    # relevant token totals. handle_response returns only the final round, so
-    # without this the intermediate rounds' usage never reaches cost_with_headroom
-    # (it sat in the /stats ccr_overhead side-channel but was deliberately
-    # excluded from the total). Each bucket lands in the field cost_with_headroom
-    # prices: uncached input at list, cache_read at the discounted rate,
-    # cache_write at the premium rate, and output into the budget/metrics total
-    # (cost_with_headroom itself is input-only). Client-facing response.usage is
-    # unchanged; only the internal billed totals move.
-    if _pending_continuation is not None:
-        _ct_uin, _ct_cr, _ct_cw, _ct_out = _pending_continuation
-        outcome = dataclasses.replace(
-            outcome,
-            output_tokens=outcome.output_tokens + _ct_out,
-            uncached_input_tokens=outcome.uncached_input_tokens + _ct_uin,
-            cache_read_tokens=outcome.cache_read_tokens + _ct_cr,
-            cache_write_tokens=outcome.cache_write_tokens + _ct_cw,
-        )
+    # The dropped continuation rounds were really billed, so they belong in the
+    # cost view — and ONLY there, which is why they are added at the
+    # ``cost_tracker.record_tokens`` call below instead of onto ``outcome``:
+    #
+    # * ``metrics.record_request`` forwards ``cache_read_tokens`` to
+    #   SavingsTracker, which credits it as cache *savings*
+    #   (``_estimate_cache_savings_usd`` -> ``lifetime.cache_savings_usd`` ->
+    #   ``SavingsSnapshot.total_savings``). Folding there would let CCR retrieval
+    #   overhead RAISE the reported savings.
+    # * the output-shaper estimator below reads ``outcome.output_tokens`` as the
+    #   observed completion length of *this* turn; continuation output would bias
+    #   the per-arm counterfactual.
+    # * the RequestLog row and the PERF line describe the one round the client
+    #   received, so they stay on the final round's numbers.
+    #
+    # ``cost_tracker.record_tokens`` is where the billed input breakdown lands
+    # (``_api_{uncached,cache_read,cache_write}_by_model`` -> the per-category
+    # pricing behind ``cost_with_headroom_usd``) and where ``_costs`` is appended
+    # for budget enforcement, so the fold reaches both of the surfaces that are
+    # meant to reflect real spend. ``/stats`` ``cost.ccr_overhead`` keeps the
+    # token-level attribution view.
+    _ct_uin, _ct_cr, _ct_cw, _ct_out = _pending_continuation or (0, 0, 0, 0)
 
     # Output-shaping savings ledger (counterfactual estimator). The shaper
     # tags each request's (arm, stratum) onto ``transforms_applied``; feed the
@@ -513,19 +530,23 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         tool_search_saved=tool_search_saved,
     )
 
-    # 2. Cost tracker (optional).
+    # 2. Cost tracker (optional). The dropped CCR continuation rounds are folded
+    #    in here — see the comment above the ``_ct_*`` unpack. The 5m/1h split is
+    #    left alone: the provider does not report a TTL for a continuation round,
+    #    so only the cache-write total moves and the TTL attribution view stays
+    #    honest about what it actually observed.
     cost_tracker = getattr(handler, "cost_tracker", None)
     if cost_tracker is not None:
         cost_tracker.record_tokens(
             outcome.model,
             outcome.tokens_saved,
             outcome.optimized_tokens,
-            cache_read_tokens=outcome.cache_read_tokens,
-            cache_write_tokens=outcome.cache_write_tokens,
+            cache_read_tokens=outcome.cache_read_tokens + _ct_cr,
+            cache_write_tokens=outcome.cache_write_tokens + _ct_cw,
             cache_write_5m_tokens=outcome.cache_write_5m_tokens,
             cache_write_1h_tokens=outcome.cache_write_1h_tokens,
-            uncached_tokens=outcome.uncached_input_tokens,
-            output_tokens=outcome.output_tokens,
+            uncached_tokens=outcome.uncached_input_tokens + _ct_uin,
+            output_tokens=outcome.output_tokens + _ct_out,
         )
 
     # 3. Per-request log (optional). The ``client`` outcome field is

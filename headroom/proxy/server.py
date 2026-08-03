@@ -1940,7 +1940,10 @@ class HeadroomProxy(
         See ``docs/superpowers/specs/P0-proxy-pipeline-audit.md`` for the
         divergence catalog this funnel collapses.
         """
-        from headroom.proxy.outcome import emit_request_outcome
+        from headroom.proxy.outcome import (
+            clear_pending_outcome_side_channels,
+            emit_request_outcome,
+        )
 
         # Shielded because four call sites are `finally:` blocks inside streaming
         # async generators (streaming.py:1611, :1859, :2069, openai.py:8614). A
@@ -1953,7 +1956,14 @@ class HeadroomProxy(
         # The shield does not swallow the cancellation — the await below still
         # raises CancelledError, so generator teardown propagates exactly as
         # before. It only keeps the bookkeeping from being torn in half.
-        await asyncio.shield(emit_request_outcome(self, outcome))
+        try:
+            await asyncio.shield(emit_request_outcome(self, outcome))
+        finally:
+            # The shielded funnel runs in a child task, which holds a COPY of this
+            # context: its consume_* cleared the copy, not ours. Clear here as well,
+            # or a second outcome emitted from this same context would re-book the
+            # same CCR continuation usage / proactive drawback.
+            clear_pending_outcome_side_channels()
 
     async def _next_request_id(self) -> str:
         """Generate unique request ID."""

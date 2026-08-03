@@ -671,15 +671,18 @@ def build_session_summary(
     summary["compression"]["net_tokens_saved"] = net_tokens_saved
 
     # Attribution view only. The dropped CCR continuation rounds' usage is now
-    # folded into the billed totals at the outcome funnel
-    # (set_pending_ccr_continuation_usage -> uncached_input_tokens /
-    # cache_read_tokens / cache_write_tokens, which cost_with_headroom prices, and
-    # output_tokens for the budget/metrics total). So the dropped rounds ARE
-    # inside cost_with_headroom (their input side). This block surfaces them
-    # again purely as a breakdown; do NOT add ccr_overhead into a second cost
+    # folded into the cost view at the outcome funnel
+    # (set_pending_ccr_continuation_usage -> the cost_tracker.record_tokens
+    # cache_read / cache_write / uncached args that cost_with_headroom prices,
+    # plus output_tokens for the budget). So the dropped rounds ARE inside
+    # cost_with_headroom (their input side). This block surfaces them again
+    # purely as a token breakdown; do NOT add ccr_overhead into a second cost
     # total, that double-counts. (The earlier "already inside cost_with_headroom"
     # claim was inaccurate: handle_response returns only the final round, so
     # without the funnel fold the dropped rounds were never costed at all.)
+    # Note the funnel deliberately leaves metrics / SavingsTracker / RequestLog
+    # on the final round's numbers — continuation cache reads must not be
+    # credited as cache savings.
     summary["cost"]["retrieval_cost_usd"] = round(
         estimate_cost_usd(primary_model, tokens_retrieved + overhead_tokens), 6
     )

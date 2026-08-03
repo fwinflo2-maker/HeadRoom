@@ -5255,12 +5255,22 @@ class OpenAIHandlerMixin:
                             # outcome carries the initial round's usage (captured
                             # above, before CCR): it under-counts the final round
                             # and, combined with the continuation-cost fold,
-                            # double-books the initial round. Absent fields
-                            # default to 0 so a partial final payload cannot
-                            # leave the stale initial usage in place.
+                            # double-books the initial round. A partial final
+                            # payload must not leave the stale initial usage in
+                            # place either, so absent fields are re-derived, not
+                            # kept: output/cached fall to 0, and the input side
+                            # keeps the same ``original_tokens`` floor the
+                            # pre-CCR capture above used — dropping to 0 there
+                            # would price this round's input at nothing, since
+                            # the folded continuation tokens keep
+                            # ``record_tokens``' "no breakdown -> use
+                            # tokens_sent" fallback from firing.
                             _final_usage = resp_json.get("usage") or {}
                             if isinstance(_final_usage, dict):
-                                total_input_tokens = _usage_int(_final_usage.get("input_tokens"))
+                                total_input_tokens = _usage_int(
+                                    _final_usage.get("input_tokens"),
+                                    original_tokens,
+                                )
                                 output_tokens = _usage_int(_final_usage.get("output_tokens"))
                                 _final_details = _final_usage.get("input_tokens_details") or {}
                                 if isinstance(_final_details, dict):

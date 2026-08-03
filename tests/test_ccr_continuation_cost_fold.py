@@ -7,8 +7,16 @@ continuation round, so the dropped rounds' real billed usage sat in /stats
 "ATTRIBUTION ONLY" comment's premise that it was "already inside
 cost_with_headroom" did not hold). The fix publishes the per-call dropped-round
 usage, cache-split into (uncached_input, cache_read, cache_write, output), via a
-ContextVar mirroring the proactive-expansion pattern; the outcome funnel folds
-each bucket into the field `cost_with_headroom` prices.
+ContextVar mirroring the proactive-expansion pattern; the outcome funnel adds
+each bucket to the matching `cost_tracker.record_tokens` argument.
+
+The fold is deliberately cost-only. `metrics.record_request` forwards
+`cache_read_tokens` to SavingsTracker, which credits it as cache *savings*, so
+folding there would let retrieval overhead RAISE the reported savings; the
+output-shaper estimator reads `outcome.output_tokens` as this turn's completion
+length; and the RequestLog row / PERF line describe the single round the client
+received. Those surfaces stay on the final round — see the tests below that pin
+each one.
 
 All usage numbers below are SYNTHETIC fixture inputs chosen for arithmetic
 clarity; assertions are on structural invariants (sums of dropped rounds,
@@ -17,11 +25,12 @@ cache-bucket placement), NOT on any production billing figure or percentage.
 Context note: set/call/consume must run inside ONE asyncio.run. A ContextVar
 set inside handle_response only propagates to callers in the SAME task/context
 (the production flow: handle_response and emit_request_outcome run in the same
-request coroutine). Note that production emit runs via asyncio.shield, which
-copies context; the consume therefore clears the copy, not the parent. That is
-benign while each request task emits at most one success outcome and is the same
-risk class as the proactive-expansion pattern. The batch path (multiple
-handle_response calls, one emit) is a known follow-up, not covered here.
+request coroutine). Production emit runs via asyncio.shield, which copies the
+context, so the funnel's consume clears the copy rather than the caller's value —
+`clear_pending_outcome_side_channels()` in `_record_request_outcome` is what
+prevents a second outcome from the same context re-booking the same rounds. The
+batch path (multiple handle_response calls, one emit) is a known follow-up: the
+publish overwrites rather than sums, so earlier items go uncounted.
 """
 
 from __future__ import annotations
@@ -32,6 +41,7 @@ from headroom.ccr.response_handler import CCRResponseHandler, CCRToolResult
 from headroom.ccr.tool_injection import CCR_TOOL_NAME
 from headroom.proxy.outcome import (
     RequestOutcome,
+    clear_pending_outcome_side_channels,
     consume_pending_ccr_continuation_usage,
     emit_request_outcome,
     set_pending_ccr_continuation_usage,
@@ -234,45 +244,143 @@ class _Metrics:
         self.requested.append(kwargs)
 
 
+class _CostTracker:
+    def __init__(self):
+        self.recorded = []
+
+    def record_tokens(self, model, tokens_saved, tokens_sent, **kwargs):
+        self.recorded.append({"model": model, "tokens_sent": tokens_sent, **kwargs})
+
+
 class _Handler:
     def __init__(self):
         self.metrics = _Metrics()
+        self.cost_tracker = _CostTracker()
 
 
-def test_emit_request_outcome_folds_continuation_usage_into_billed_tokens():
-    """The funnel adds each published bucket to the matching cost field."""
+BASE_OUT, BASE_UIN, BASE_CR, BASE_CW = 800, 110_000, 30_000, 3_000
+CT_UIN, CT_CR, CT_CW, CT_OUT = 205_000, 80_000, 11_000, 1_100  # dropped rounds (synthetic)
+
+
+def _outcome(request_id="req-ccr-fold", **overrides):
+    fields = {
+        "request_id": request_id,
+        "provider": "anthropic",
+        "model": "m",
+        "status_code": 200,
+        "original_tokens": BASE_UIN,
+        "optimized_tokens": BASE_UIN,
+        "output_tokens": BASE_OUT,
+        "tokens_saved": 0,
+        "attempted_input_tokens": BASE_UIN,
+        "uncached_input_tokens": BASE_UIN,
+        "cache_read_tokens": BASE_CR,
+        "cache_write_tokens": BASE_CW,
+    }
+    fields.update(overrides)
+    return RequestOutcome(**fields)
+
+
+def test_emit_request_outcome_folds_continuation_usage_into_cost_view():
+    """The funnel adds each published bucket to the matching cost_tracker arg."""
     handler = _Handler()
-    base_out, base_uin, base_cr, base_cw = 800, 110_000, 30_000, 3_000
-    ct_uin, ct_cr, ct_cw, ct_out = 205_000, 80_000, 11_000, 1_100  # dropped rounds (synthetic)
-
-    outcome = RequestOutcome(
-        request_id="req-ccr-fold",
-        provider="anthropic",
-        model="m",
-        status_code=200,
-        original_tokens=base_uin,
-        optimized_tokens=base_uin,
-        output_tokens=base_out,
-        tokens_saved=0,
-        attempted_input_tokens=base_uin,
-        uncached_input_tokens=base_uin,
-        cache_read_tokens=base_cr,
-        cache_write_tokens=base_cw,
-    )
 
     async def main():
-        set_pending_ccr_continuation_usage((ct_uin, ct_cr, ct_cw, ct_out))
-        await emit_request_outcome(handler, outcome)
+        set_pending_ccr_continuation_usage((CT_UIN, CT_CR, CT_CW, CT_OUT))
+        await emit_request_outcome(handler, _outcome())
         return consume_pending_ccr_continuation_usage()
 
     leftover = asyncio.run(main())
 
-    rec = handler.metrics.requested[0]
-    assert rec["output_tokens"] == base_out + ct_out
-    assert rec["uncached_input_tokens"] == base_uin + ct_uin
-    assert rec["cache_read_tokens"] == base_cr + ct_cr
-    assert rec["cache_write_tokens"] == base_cw + ct_cw
+    rec = handler.cost_tracker.recorded[0]
+    assert rec["uncached_tokens"] == BASE_UIN + CT_UIN
+    assert rec["cache_read_tokens"] == BASE_CR + CT_CR
+    assert rec["cache_write_tokens"] == BASE_CW + CT_CW
+    assert rec["output_tokens"] == BASE_OUT + CT_OUT
+    # tokens_sent is Headroom's own forwarded-bytes count, never a billed total.
+    assert rec["tokens_sent"] == BASE_UIN
+    # The TTL split is not invented for continuation rounds.
+    assert rec["cache_write_5m_tokens"] == 0
+    assert rec["cache_write_1h_tokens"] == 0
     assert leftover is None
+
+
+def test_continuation_usage_does_not_inflate_the_savings_surface():
+    """metrics.record_request feeds SavingsTracker, which credits cache_read as
+    savings — CCR overhead must not raise the reported savings, so the fold stays
+    off this call."""
+    handler = _Handler()
+
+    async def main():
+        set_pending_ccr_continuation_usage((CT_UIN, CT_CR, CT_CW, CT_OUT))
+        await emit_request_outcome(handler, _outcome())
+
+    asyncio.run(main())
+
+    rec = handler.metrics.requested[0]
+    assert rec["cache_read_tokens"] == BASE_CR
+    assert rec["cache_write_tokens"] == BASE_CW
+    assert rec["uncached_input_tokens"] == BASE_UIN
+    assert rec["output_tokens"] == BASE_OUT
+    assert rec["input_tokens"] == BASE_UIN
+
+
+def test_continuation_output_does_not_bias_output_shaper_estimator():
+    """The shaper's counterfactual reads this turn's completion length; dropped
+    continuation rounds are a different request's output."""
+    from headroom.proxy import output_savings
+
+    seen = []
+
+    class _Recorder:
+        def record_from_labels(self, labels, output_tokens):
+            seen.append(output_tokens)
+
+        def estimate_request_savings(self, labels, output_tokens):
+            return 0
+
+    original = output_savings.get_recorder
+    output_savings.get_recorder = lambda: _Recorder()
+    try:
+
+        async def main():
+            set_pending_ccr_continuation_usage((CT_UIN, CT_CR, CT_CW, CT_OUT))
+            await emit_request_outcome(
+                _Handler(),
+                _outcome(transforms_applied=("output_shaper:arm=terse",)),
+            )
+
+        asyncio.run(main())
+    finally:
+        output_savings.get_recorder = original
+
+    assert seen == [BASE_OUT]
+
+
+def test_shielded_emit_does_not_leave_continuation_pending_for_the_next_outcome():
+    """asyncio.shield copies the context, so the funnel's consume clears the copy.
+    clear_pending_outcome_side_channels() is what keeps a second outcome from the
+    same context from re-booking the same continuation rounds."""
+    handler = _Handler()
+
+    async def emit(outcome):
+        # Mirrors HeadroomProxy._record_request_outcome.
+        try:
+            await asyncio.shield(emit_request_outcome(handler, outcome))
+        finally:
+            clear_pending_outcome_side_channels()
+
+    async def main():
+        set_pending_ccr_continuation_usage((CT_UIN, CT_CR, CT_CW, CT_OUT))
+        await emit(_outcome("turn-1"))
+        await emit(_outcome("turn-2"))
+
+    asyncio.run(main())
+
+    first, second = handler.cost_tracker.recorded
+    assert first["uncached_tokens"] == BASE_UIN + CT_UIN
+    assert second["uncached_tokens"] == BASE_UIN  # not booked twice
+    assert second["cache_read_tokens"] == BASE_CR
 
 
 def test_emit_request_outcome_5xx_does_not_fold_continuation():
@@ -304,8 +412,9 @@ def test_emit_request_outcome_5xx_does_not_fold_continuation():
 
 
 def test_end_to_end_handle_then_emit_folds_dropped_rounds(monkeypatch):
-    """Full wiring in one task: handle_response publishes, emit consumes and
-    folds, so record_request sees final-round + dropped-round tokens."""
+    """Full wiring in one task: handle_response publishes, emit consumes and folds
+    into the cost view only — cost_tracker sees final + dropped rounds while the
+    metrics/savings surface stays on the final round."""
     ccr = CCRResponseHandler()
     monkeypatch.setattr(
         ccr,
@@ -360,14 +469,21 @@ def test_end_to_end_handle_then_emit_folds_dropped_rounds(monkeypatch):
             cache_write_tokens=U2["cache_creation_input_tokens"],
         )
         await emit_request_outcome(handler, outcome)
-        return handler.metrics.requested[0]
+        return handler.cost_tracker.recorded[0], handler.metrics.requested[0]
 
-    rec = asyncio.run(main())
-    # final (U2) + dropped (U1) per bucket.
-    assert rec["uncached_input_tokens"] == U1["input_tokens"] + U2["input_tokens"]
-    assert rec["cache_read_tokens"] == U1["cache_read_input_tokens"] + U2["cache_read_input_tokens"]
+    cost_rec, metrics_rec = asyncio.run(main())
+    # Cost view: final (U2) + dropped (U1) per bucket.
+    assert cost_rec["uncached_tokens"] == U1["input_tokens"] + U2["input_tokens"]
     assert (
-        rec["cache_write_tokens"]
+        cost_rec["cache_read_tokens"]
+        == U1["cache_read_input_tokens"] + U2["cache_read_input_tokens"]
+    )
+    assert (
+        cost_rec["cache_write_tokens"]
         == U1["cache_creation_input_tokens"] + U2["cache_creation_input_tokens"]
     )
-    assert rec["output_tokens"] == U1["output_tokens"] + U2["output_tokens"]
+    assert cost_rec["output_tokens"] == U1["output_tokens"] + U2["output_tokens"]
+    # Savings / metrics view: final round only.
+    assert metrics_rec["uncached_input_tokens"] == U2["input_tokens"]
+    assert metrics_rec["cache_read_tokens"] == U2["cache_read_input_tokens"]
+    assert metrics_rec["output_tokens"] == U2["output_tokens"]

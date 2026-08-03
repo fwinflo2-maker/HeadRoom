@@ -108,7 +108,16 @@ def test_pricing_lookup_candidates_vertex_versioned_models() -> None:
 def test_vertex_versioned_model_resolves_to_known_key() -> None:
     # Simulate LiteLLM knowing the bare model name (not the versioned one)
     known = {"claude-haiku-4-5", "anthropic/claude-sonnet-4-6"}
-    assert resolve_litellm_model_name("claude-haiku-4-5@20251001", known.__contains__) == "claude-haiku-4-5"
-    assert resolve_litellm_model_name("claude-sonnet-4-6", known.__contains__) == "anthropic/claude-sonnet-4-6"
+    assert (
+        resolve_litellm_model_name("claude-haiku-4-5@20251001", known.__contains__)
+        == "claude-haiku-4-5"
+    )
+    assert (
+        resolve_litellm_model_name("claude-sonnet-4-6", known.__contains__)
+        == "anthropic/claude-sonnet-4-6"
+    )
     # Unknown versioned model falls back to original
-    assert resolve_litellm_model_name("claude-unknown@20251001", lambda _: False) == "claude-unknown@20251001"
+    assert (
+        resolve_litellm_model_name("claude-unknown@20251001", lambda _: False)
+        == "claude-unknown@20251001"
+    )

@@ -3140,14 +3140,6 @@ def _proxy_anthropic_upstream_mismatch(
 ) -> bool:
     """True when a running proxy's Anthropic upstream differs from what we want.
 
-    Deliberately compares even when ``requested`` is ``None`` (meaning "the
-    default upstream"), which is what makes it useful: ``wrap copilot --native``
-    repoints the Anthropic upstream at the Copilot host, and a later ``wrap
-    claude`` on the same port passes ``None``. Without this check the reuse logic
-    saw no mismatch and Claude Code's ``/v1/messages`` traffic would be forwarded
-    to Copilot under the wrong credential -- silently, since the proxy looked
-    healthy.
-
     ``anthropic_api_url`` defaults to ``None`` on the proxy, so "not reported"
     means "using the default upstream" -- which is why a plain ``wrap claude``
     reusing a plain proxy still matches and is not needlessly restarted.
@@ -3156,6 +3148,38 @@ def _proxy_anthropic_upstream_mismatch(
     if running is None:
         return False
     return running != _normalize_proxy_api_url(requested) if requested else True
+
+
+def _proxy_upstream_conflicts(
+    health_payload: dict[str, object],
+    *,
+    anthropic: str | None = None,
+    openai: str | None = None,
+) -> list[str]:
+    """Names of upstreams where a running proxy disagrees with this launch.
+
+    Compared **unconditionally**, including when the caller wants the default
+    (``None``). That asymmetry was the actual bug: the pre-existing
+    ``openai_api_url`` check only ran ``if openai_api_url:``, so a caller wanting
+    the default never compared against a proxy pinned to something else. Both
+    directions matter --  after a Copilot session, ``wrap claude`` (Anthropic) or
+    ``wrap codex`` (OpenAI) could otherwise silently ride the Copilot upstream
+    with a substituted credential.
+
+    An empty list means the proxy is safe to share.
+    """
+    config = health_payload.get("config") if isinstance(health_payload, dict) else None
+    if not isinstance(config, dict):
+        # No config to compare: leave the existing reuse logic in charge rather
+        # than forcing a dedicated proxy on every launch.
+        return []
+    conflicts: list[str] = []
+    for name, requested in (("anthropic", anthropic), ("openai", openai)):
+        running = _normalize_proxy_api_url(config.get(f"{name}_api_url"))
+        wanted = _normalize_proxy_api_url(requested)
+        if running != wanted:
+            conflicts.append(f"{name}={running or 'default'}")
+    return conflicts
 
 
 def _normalize_proxy_api_url(url: object) -> str | None:
@@ -3647,6 +3671,30 @@ def _ensure_proxy(
         isolated_copilot_subscription_proxy = copilot_subscription_seed_requested and (
             manifest is not None or helpers._check_proxy(port)
         )
+        # A proxy pinned to different upstreams cannot be shared, and adding the
+        # mismatch to `missing` does NOT achieve that: a non-empty `missing` only
+        # logs "stale; starting a fresh proxy instead" and then falls through to a
+        # second reuse check that recomputes `missing` without it, so the proxy is
+        # handed over anyway (verified by driving _ensure_proxy directly). The
+        # consequence is severe and silent: after `wrap copilot --native`, a
+        # `wrap claude` on the same port would send Claude Code's /v1/messages to
+        # api.githubcopilot.com, and since sk-ant-* bearers are not forwardable,
+        # apply_copilot_api_auth strips the user's Anthropic credential and
+        # substitutes the Copilot token. So the conflict is resolved here, before
+        # any reuse path runs, by taking a dedicated port instead.
+        if not isolated_copilot_subscription_proxy and helpers._check_proxy(port):
+            conflicts = _proxy_upstream_conflicts(
+                helpers._query_proxy_health(port) or {},
+                anthropic=anthropic_api_url,
+                openai=openai_api_url,
+            )
+            if conflicts:
+                isolated_copilot_subscription_proxy = True
+                click.echo(
+                    f"  Proxy on port {port} is pinned to a different upstream "
+                    f"({', '.join(conflicts)}); starting a dedicated proxy for this "
+                    "session rather than sharing it."
+                )
         if isolated_copilot_subscription_proxy:
             click.echo(
                 "  Copilot subscription seeds are session-specific; "
@@ -5217,6 +5265,17 @@ def copilot(
                 "what --native avoids: the wire is chosen per request from the model. "
                 "Drop --wire-api."
             )
+        if no_proxy:
+            # Native mode needs BOTH proxy upstreams pointed at the Copilot host,
+            # and those are start-time parameters -- there is no runtime path to
+            # repoint a proxy that is already running. With --no-proxy the
+            # overrides are silently discarded and every request 401s against the
+            # wrong vendor, so fail loudly instead.
+            raise click.ClickException(
+                "--native cannot be combined with --no-proxy: it needs to start a proxy "
+                "whose Anthropic and OpenAI upstreams both point at the Copilot host, and "
+                "an already-running proxy cannot be repointed at runtime."
+            )
 
     effective_provider_type = _resolve_copilot_provider_type(effective_backend, provider_type)
     if subscription:
@@ -5293,14 +5352,24 @@ def copilot(
                 copilot_api_token_expires_at = subscription_resolution.api_token_expires_at
             env_vars_display.append(f"COPILOT_UPSTREAM={openai_api_url}")
 
+            # Warn rather than refuse. The probe inspects the shipped bundle for an
+            # undocumented variable, so a false negative is possible (a needle
+            # split across a read boundary did exactly that) -- and refusing to
+            # launch a CLI that actually works is a worse outcome than proceeding
+            # with a clear warning. The genuine risk it guards is silent: if the
+            # variable really is gone, the CLI talks straight to GitHub and
+            # Headroom simply never sees the traffic, so the warning says how to
+            # confirm.
             support = _native_api_url_supported(environ=os.environ)
             if support is False:
-                raise click.ClickException(
-                    "This Copilot CLI build does not appear to honour COPILOT_API_URL, so "
-                    "--native would let the CLI bypass Headroom entirely (you would lose "
-                    "compression without any error). Re-run without --native to use BYOK mode."
+                click.echo(
+                    "  Warning: this Copilot CLI build does not appear to honour "
+                    "COPILOT_API_URL. If that is right, the CLI will bypass Headroom "
+                    "entirely and you will silently get no compression. Check the "
+                    f"dashboard at http://127.0.0.1:{port}/dashboard shows traffic; if "
+                    "it does not, re-run without --native to use BYOK mode."
                 )
-            if support is None and verbose:
+            elif support is None and verbose:
                 click.echo(
                     "  Note: could not verify COPILOT_API_URL support in the installed CLI "
                     "(it is undocumented). Proceeding; check the dashboard shows traffic."

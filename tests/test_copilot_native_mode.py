@@ -66,18 +66,30 @@ def test_native_support_probe_is_tri_state(tmp_path, monkeypatch: pytest.MonkeyP
     (proceed with a note) and "bundle found, variable absent" (refuse) have to be
     different answers.
     """
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "nothing-here"))
-    assert native_api_url_supported(environ={"LOCALAPPDATA": str(tmp_path / "none")}) is None
+    empty = {"LOCALAPPDATA": str(tmp_path / "none")}
+    # `home` is passed explicitly so a dev box with the CLI at the XDG location
+    # cannot make this machine-dependent.
+    assert native_api_url_supported(environ=empty, home=str(tmp_path / "none")) is None
 
     pkg = tmp_path / "copilot" / "pkg" / "win32-x64" / "1.0.0"
     pkg.mkdir(parents=True)
     (pkg / "app.js").write_text("var x = 1;  // no override support\n", encoding="utf-8")
-    assert native_api_url_supported(environ={"LOCALAPPDATA": str(tmp_path)}) is False
+    assert (
+        native_api_url_supported(
+            environ={"LOCALAPPDATA": str(tmp_path)}, home=str(tmp_path / "none")
+        )
+        is False
+    )
 
     (pkg / "app.js").write_text(
         "function qc(){return process.env.COPILOT_API_URL?1:2}\n", encoding="utf-8"
     )
-    assert native_api_url_supported(environ={"LOCALAPPDATA": str(tmp_path)}) is True
+    assert (
+        native_api_url_supported(
+            environ={"LOCALAPPDATA": str(tmp_path)}, home=str(tmp_path / "none")
+        )
+        is True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -183,11 +195,19 @@ def test_byok_launch_leaves_the_anthropic_upstream_alone(monkeypatch: pytest.Mon
     assert COPILOT_NATIVE_API_URL_ENV not in env
 
 
-def test_native_requires_no_model(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`--model` is mandatory under BYOK and pointless in native mode."""
-    result, _captured = _invoke_copilot(monkeypatch, ["--native", "--port", "8890"])
+def test_native_implies_subscription_so_no_model_is_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--model` is mandatory under BYOK and optional in native mode.
+
+    The "requires a model" note is gated on `not subscription`, so this really
+    pins `native => subscription`; it fails if that coupling is removed. Also
+    asserts the mode actually engaged, which the original did not.
+    """
+    result, captured = _invoke_copilot(monkeypatch, ["--native", "--port", "8890"])
     assert result.exit_code == 0, result.output
     assert "requires a model" not in result.output
+    assert COPILOT_NATIVE_API_URL_ENV in captured["env"]
 
 
 def test_native_rejects_wire_api(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -207,12 +227,15 @@ def test_native_rejects_anthropic_provider_type(monkeypatch: pytest.MonkeyPatch)
     assert "provider-type anthropic" in result.output
 
 
-def test_native_refuses_when_cli_lacks_support(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Refusing beats silently bypassing Headroom and losing compression.
+def test_native_warns_when_cli_lacks_support(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Warn loudly, but do not refuse.
 
-    If a future CLI drops ``COPILOT_API_URL`` the failure is invisible: the CLI
-    would talk straight to GitHub, the session would work, and Headroom would
-    simply never see the traffic. A hard error is the only honest outcome.
+    If a future CLI drops ``COPILOT_API_URL`` the failure is invisible — the CLI
+    talks straight to GitHub and Headroom never sees the traffic — so silence is
+    not acceptable. But the probe reads an undocumented needle out of a shipped
+    bundle and *has* produced false negatives (a needle split across a read
+    boundary), and refusing to launch a CLI that actually works is the worse
+    outcome. So: warn, name how to confirm, and proceed.
     """
     import shutil
 
@@ -235,18 +258,36 @@ def test_native_refuses_when_cli_lacks_support(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(wrap_mod, "_native_api_url_supported", lambda **_k: False)
 
     result = CliRunner().invoke(main, ["wrap", "copilot", "--native", "--port", "8890"])
-    assert result.exit_code != 0, result.output
+    assert result.exit_code == 0, result.output
     assert "COPILOT_API_URL" in result.output
+    assert "silently get no compression" in result.output
     assert "without --native" in result.output
 
 
-def test_native_skips_the_model_list_injection(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    """Native mode has a real picker, so the instruction-file workaround is not needed."""
-    import os
+def test_native_skips_the_model_list_injection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Native mode has a real picker, so the instruction-file workaround is not needed.
 
-    monkeypatch.chdir(tmp_path)
-    _result, _captured = _invoke_copilot(monkeypatch, ["--native", "--port", "8890"])
-    assert not os.path.exists(tmp_path / ".github" / "copilot-instructions.md")
+    Spies on the injector rather than checking for the file: the earlier version
+    stubbed the model list to `[]`, and the injector early-returns on empty, so the
+    file was absent on the BYOK path too and the test could not fail.
+    """
+    from headroom.cli import wrap as wrap_mod
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        wrap_mod,
+        "_inject_copilot_models_instructions",
+        lambda *a, **k: calls.append(a) or True,
+    )
+    monkeypatch.setattr(wrap_mod, "_live_copilot_model_ids", lambda *_a, **_k: ["gpt-5.4"])
+
+    _r, _c = _invoke_copilot(monkeypatch, ["--native", "--port", "8890"])
+    assert calls == [], "native mode should not write the model list"
+
+    _r2, _c2 = _invoke_copilot(
+        monkeypatch, ["--subscription", "--port", "8890", "--", "--model", "gpt-5.4"]
+    )
+    assert len(calls) == 1, "BYOK mode must still write it (proves the spy works)"
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +295,7 @@ def test_native_skips_the_model_list_injection(monkeypatch: pytest.MonkeyPatch, 
 # ---------------------------------------------------------------------------
 
 
-def test_native_proxy_is_not_reused_for_claude() -> None:
+def test_anthropic_upstream_mismatch_predicate() -> None:
     """Native mode repoints the Anthropic upstream at the Copilot host.
 
     If `wrap claude` reused that proxy, Claude Code's /v1/messages traffic would
@@ -285,3 +326,66 @@ def test_native_proxy_is_reusable_for_the_same_native_upstream() -> None:
         _proxy_anthropic_upstream_mismatch(native_proxy, "https://api.githubcopilot.com") is False
     )
     assert _proxy_anthropic_upstream_mismatch(native_proxy, "https://api.anthropic.com") is True
+
+
+def test_native_rejects_no_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Native needs both upstreams repointed, which is start-time only.
+
+    With --no-proxy the overrides are silently discarded and every request 401s
+    against the wrong vendor, so this must fail loudly.
+    """
+    result, _captured = _invoke_copilot(monkeypatch, ["--native", "--no-proxy", "--port", "8890"])
+    assert result.exit_code != 0
+    assert "--no-proxy" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Probe correctness — a false negative used to hard-refuse a working CLI
+# ---------------------------------------------------------------------------
+
+
+def test_probe_finds_a_needle_split_across_a_read_boundary(tmp_path) -> None:
+    """Reads are chunked; the needle must not be missed by straddling a boundary."""
+    pkg = tmp_path / "copilot" / "pkg" / "win32-x64" / "1.0.77"
+    pkg.mkdir(parents=True)
+    (pkg / "app.js").write_text(
+        "x" * ((1 << 20) - 8) + COPILOT_NATIVE_API_URL_ENV + "y" * 40, encoding="utf-8"
+    )
+    assert (
+        native_api_url_supported(
+            environ={"LOCALAPPDATA": str(tmp_path)}, home=str(tmp_path / "none")
+        )
+        is True
+    )
+
+
+def test_probe_answers_from_the_newest_bundle_only(tmp_path) -> None:
+    """An old bundle must not vouch for a newer one that dropped the variable.
+
+    That is the dangerous direction: it would approve a CLI that silently
+    bypasses Headroom, which is exactly what the probe exists to catch.
+    """
+    root = tmp_path / "copilot" / "pkg" / "win32-x64"
+    (root / "1.0.39").mkdir(parents=True)
+    (root / "1.0.39" / "app.js").write_text(
+        f"var a = process.env.{COPILOT_NATIVE_API_URL_ENV};", encoding="utf-8"
+    )
+    (root / "1.0.78").mkdir(parents=True)
+    (root / "1.0.78" / "app.js").write_text("var a = 1; // variable removed", encoding="utf-8")
+    assert (
+        native_api_url_supported(
+            environ={"LOCALAPPDATA": str(tmp_path)}, home=str(tmp_path / "none")
+        )
+        is False
+    ), "an older bundle vouched for a newer one that dropped the variable"
+
+
+def test_probe_returns_unknown_for_an_empty_root(tmp_path) -> None:
+    """Docstring promises None when no bundle could be located."""
+    (tmp_path / "copilot" / "pkg").mkdir(parents=True)
+    assert (
+        native_api_url_supported(
+            environ={"LOCALAPPDATA": str(tmp_path)}, home=str(tmp_path / "none")
+        )
+        is None
+    )

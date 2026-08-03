@@ -234,7 +234,9 @@ COPILOT_NATIVE_PASSTHROUGH_PATHS: tuple[str, ...] = (
 )
 
 
-def native_api_url_supported(*, environ: Mapping[str, str] | None = None) -> bool | None:
+def native_api_url_supported(
+    *, environ: Mapping[str, str] | None = None, home: str | None = None
+) -> bool | None:
     """Best-effort check that the installed CLI honours ``COPILOT_API_URL``.
 
     Returns ``True`` when the shipped application bundle references the variable,
@@ -249,28 +251,57 @@ def native_api_url_supported(*, environ: Mapping[str, str] | None = None) -> boo
     report that reads zero.
     """
     env = environ if environ is not None else os.environ
-    local = env.get("LOCALAPPDATA") or env.get("HOME") or os.path.expanduser("~")
+    resolved_home = home if home is not None else os.path.expanduser("~")
+    local = env.get("LOCALAPPDATA") or env.get("HOME") or resolved_home
     roots = [
         os.path.join(local, "copilot", "pkg"),
-        os.path.join(os.path.expanduser("~"), ".local", "share", "copilot", "pkg"),
+        os.path.join(resolved_home, ".local", "share", "copilot", "pkg"),
     ]
+
+    # Answer from the NEWEST bundle only. ORing over every installed version is
+    # unsafe in the direction that matters: an old bundle that still has the
+    # variable would vouch for a new one that dropped it, which is precisely the
+    # silent-bypass case this probe exists to catch.
+    bundles: list[tuple[tuple[int, ...], str]] = []
     for root in roots:
         if not os.path.isdir(root):
             continue
         for dirpath, _dirnames, filenames in os.walk(root):
-            if "app.js" not in filenames:
-                continue
-            try:
-                with open(
-                    os.path.join(dirpath, "app.js"), encoding="utf-8", errors="replace"
-                ) as fh:
-                    while chunk := fh.read(1 << 20):
-                        if COPILOT_NATIVE_API_URL_ENV in chunk:
-                            return True
-            except OSError:
-                continue
+            if "app.js" in filenames:
+                bundles.append((_version_key(dirpath), os.path.join(dirpath, "app.js")))
+    if not bundles:
+        return None  # nothing to inspect: unknown, not unsupported
+
+    bundles.sort()
+    read_any = False
+    for _key, path in reversed(bundles):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                read_any = True
+                # Overlap successive reads so the needle cannot be missed by
+                # landing across a chunk boundary (it silently returned False for
+                # a supported CLI, which then hard-refused the launch).
+                carry = ""
+                overlap = len(COPILOT_NATIVE_API_URL_ENV) - 1
+                while chunk := fh.read(1 << 20):
+                    if COPILOT_NATIVE_API_URL_ENV in carry + chunk:
+                        return True
+                    carry = chunk[-overlap:] if overlap else ""
+        except OSError:
+            continue
+        # The newest readable bundle is authoritative; do not let older ones vote.
         return False
-    return None
+    return False if read_any else None
+
+
+def _version_key(path: str) -> tuple[int, ...]:
+    """Sortable version tuple from a bundle directory name (``.../1.0.77``)."""
+    name = os.path.basename(path.rstrip(os.sep))
+    parts: list[int] = []
+    for piece in name.split("."):
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts) or (0,)
 
 
 def provider_key_source(provider_type: str) -> str:

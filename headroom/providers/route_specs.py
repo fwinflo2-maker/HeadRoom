@@ -105,6 +105,13 @@ ANTHROPIC_BATCH_ROUTES: tuple[ProviderHandlerRoute, ...] = (
 
 OPENAI_HANDLER_ROUTES: tuple[ProviderHandlerRoute, ...] = (
     ProviderHandlerRoute("POST", "/v1/chat/completions", "handle_openai_chat"),
+    # Unprefixed form used by the GitHub Copilot CLI's *native* API surface
+    # (`wrap copilot --native`), which drives `<base>/chat/completions` directly.
+    # Previously this only matched the generic passthrough route, so native
+    # OpenAI-family traffic was forwarded without compression. The handler derives
+    # its upstream path from the resolved base URL rather than request.url.path, so
+    # serving both forms is safe.
+    ProviderHandlerRoute("POST", "/chat/completions", "handle_openai_chat"),
 )
 
 

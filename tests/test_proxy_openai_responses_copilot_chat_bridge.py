@@ -362,3 +362,49 @@ def test_bridge_fails_closed_when_response_translation_raises(
 
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "copilot_responses_bridge_error"
+
+
+# ---------------------------------------------------------------------------
+# x-headroom-bypass must mean "forward my bytes untouched"
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("header", "value"),
+    [("x-headroom-bypass", "true"), ("x-headroom-mode", "passthrough")],
+)
+def test_bypass_skips_routing_and_body_rewriting(
+    monkeypatch: pytest.MonkeyPatch, header: str, value: str
+) -> None:
+    """Bypass previously only gated model normalization, not the bridge.
+
+    Model-name normalization was correctly skipped under bypass, but planning and
+    the Responses->Chat body rewrite were not — so a bypassed request was routed
+    to a *different endpoint* with a *completely rewritten body*, which breaks the
+    same contract far more severely. origin/main always sent /v1/responses
+    verbatim here.
+    """
+    client, captured = _build_bridge_client(monkeypatch, chat_response_json=_chat_completion_json())
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "claude-sonnet-4.6",  # chat-only: would normally be bridged
+            "input": "hello",
+            "instructions": "be brief",
+            "stream": False,
+        },
+        headers={header: value, "x-headroom-base-url": _COPILOT_BASE},
+    )
+    assert response.status_code in (200, 502), response.text
+    # Routed to the Responses wire, not downgraded to /chat/completions.
+    # (build_copilot_upstream_url normalizes the /v1 prefix for Copilot hosts,
+    # so assert on the endpoint rather than the full path.)
+    url = str(captured["url"])
+    assert url.endswith("/responses"), url
+    assert "/chat/completions" not in url, url
+    # Body still Responses-shaped: no `messages` array was synthesized.
+    body = captured["body"]
+    assert isinstance(body, dict)
+    assert "messages" not in body
+    assert body.get("input") == "hello"
+    assert body.get("instructions") == "be brief"

@@ -1730,29 +1730,77 @@ def _live_copilot_model_ids(api_url: str | None, token: str | None) -> list[str]
     )
 
 
+def _find_marked_block(existing: str) -> tuple[int, int] | None:
+    """Locate a well-formed available-models block, or ``None``.
+
+    Anchor on the end marker and take the **last** start marker before it. A
+    written block is always a contiguous ``START ... END`` with no nested START,
+    so that pair is necessarily ours.
+
+    Both naive alternatives lose user data, and both were reproduced:
+
+    * ``existing.index(END)`` with no offset matches the *first* end marker
+      regardless of where the start is. A user with the start marker in their own
+      prose (documenting this feature, say) lost every byte between their marker
+      and the real block's end -- silently, while the CLI reported a successful
+      refresh.
+    * Searching END *forward from the first* START is not enough either: when the
+      user's stray START precedes our block, the span still swallows everything
+      between their marker and our block's end. That is why this anchors on END
+      and scans backwards.
+
+    A reversed pair (END before any START) yields no match, so callers append a
+    fresh block rather than splicing a range they cannot trust -- previously that
+    case produced ``end < start`` and duplicated user text on every launch.
+    """
+    end = existing.find(_COPILOT_MODELS_MARKER_END)
+    if end < 0:
+        return None
+    start = existing.rfind(_COPILOT_MODELS_MARKER, 0, end)
+    if start < 0:
+        return None
+    return start, end + len(_COPILOT_MODELS_MARKER_END)
+
+
+def _write_preserving_line_endings(file_path: Path, original: str, updated: str) -> None:
+    """Write ``updated``, keeping the file's existing dominant line ending.
+
+    ``_read_text`` normalizes CRLF to LF and ``_write_text`` writes newlines
+    verbatim, which is harmless for the JSON configs that helper was built for
+    but not for a *source-controlled* file: rewriting one marked region would
+    convert every line ending in the file and show up as a whole-file diff on a
+    CRLF checkout. Restore whatever the file already used.
+    """
+    if "\r\n" in original:
+        updated = updated.replace("\r\n", "\n").replace("\n", "\r\n")
+    _write_text(file_path, updated)
+
+
 def _inject_copilot_models_instructions(
     file_path: Path, model_ids: list[str], verbose: bool = False
 ) -> bool:
     """Write/refresh the available-models block in Copilot's instruction file.
 
-    Rewrites in place when the marker is already present, so the list follows
-    the live catalog instead of going stale on the first launch that wrote it.
-    Only the marked region is touched; everything the user wrote is preserved.
+    Rewrites in place when a well-formed marker pair is present, so the list
+    follows the live catalog instead of going stale on the first launch that
+    wrote it. Only the marked region is touched; everything the user wrote is
+    preserved, including their line endings.
     """
     if not model_ids:
         return False
     block = _copilot_models_instructions_block(model_ids)
     if file_path.exists():
+        raw = file_path.read_bytes().decode("utf-8", errors="replace")
         existing = _read_text(file_path)
-        if _COPILOT_MODELS_MARKER in existing and _COPILOT_MODELS_MARKER_END in existing:
-            start = existing.index(_COPILOT_MODELS_MARKER)
-            end = existing.index(_COPILOT_MODELS_MARKER_END) + len(_COPILOT_MODELS_MARKER_END)
+        span = _find_marked_block(existing)
+        if span is not None:
+            start, end = span
             updated = existing[:start] + block.rstrip("\n") + existing[end:]
             if updated == existing:
                 if verbose:
                     click.echo(f"  Available-models list already current in {file_path.name}")
                 return True
-            _write_text(file_path, updated)
+            _write_preserving_line_endings(file_path, raw, updated)
             click.echo(
                 f"  Refreshed available-models list in {file_path} ({len(model_ids)} models)"
             )
@@ -1769,12 +1817,14 @@ def _remove_copilot_models_instructions(file_path: Path) -> bool:
     """Strip the available-models block, leaving the user's content intact."""
     if not file_path.exists():
         return False
+    raw = file_path.read_bytes().decode("utf-8", errors="replace")
     existing = _read_text(file_path)
-    if _COPILOT_MODELS_MARKER not in existing or _COPILOT_MODELS_MARKER_END not in existing:
+    span = _find_marked_block(existing)
+    if span is None:
         return False
-    start = existing.index(_COPILOT_MODELS_MARKER)
-    end = existing.index(_COPILOT_MODELS_MARKER_END) + len(_COPILOT_MODELS_MARKER_END)
-    _write_text(file_path, (existing[:start].rstrip("\n") + "\n" + existing[end:].lstrip("\n")))
+    start, end = span
+    updated = existing[:start].rstrip("\n") + "\n" + existing[end:].lstrip("\n")
+    _write_preserving_line_endings(file_path, raw, updated)
     return True
 
 
@@ -5222,11 +5272,22 @@ def copilot(
         # instruction file gives it the same knowledge native Copilot has.
         # Skipped with --no-model-list, and removed by `unwrap copilot`.
         if not no_model_list:
-            _inject_copilot_models_instructions(
-                Path.cwd() / ".github" / "copilot-instructions.md",
-                _live_copilot_model_ids(openai_api_url, client_bearer),
-                verbose=verbose,
-            )
+            # Best-effort, never fatal. origin/main never wrote this file, so a
+            # crash here would be a pure regression: `.github` existing as a file
+            # raises FileExistsError from mkdir, and a read-only target raises
+            # PermissionError from the atomic os.replace. Model guidance is a
+            # convenience -- it must never stop a session from launching.
+            try:
+                _inject_copilot_models_instructions(
+                    Path.cwd() / ".github" / "copilot-instructions.md",
+                    _live_copilot_model_ids(openai_api_url, client_bearer),
+                    verbose=verbose,
+                )
+            except OSError as exc:
+                click.echo(
+                    f"  Note: could not write the available-models list ({exc}). "
+                    "Continuing; run `headroom models` to see what is available."
+                )
     else:
         env, env_vars_display = _build_copilot_launch_env(
             port=port,

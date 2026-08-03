@@ -1278,6 +1278,19 @@ def _apply_plan_reasoning_effort(chat_kwargs: dict[str, Any], plan: Any) -> None
             chat_kwargs["max_completion_tokens"] = max_output
 
 
+def _inbound_reasoning_effort(body: dict[str, Any]) -> str | None:
+    """The client's requested ``reasoning.effort``, when it sent a string one."""
+    reasoning = body.get("reasoning")
+    effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+    return effort if isinstance(effort, str) else None
+
+
+def _inbound_max_output_tokens(body: dict[str, Any]) -> int | None:
+    """The client's requested ``max_output_tokens``, when it sent an int one."""
+    value = body.get("max_output_tokens")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def _coerce_reasoning_effort(chat_kwargs: dict[str, Any]) -> None:
     """Flatten litellm's ``reasoning_effort`` to the string the wire expects.
 
@@ -1737,9 +1750,10 @@ class OpenAIHandlerMixin:
         if catalog is None:
             return None
         try:
-            return catalog._entries.get(self._copilot_catalog_key(request), None) and dict(
-                catalog._entries[self._copilot_catalog_key(request)].cards
-            )
+            # Goes through `cards()` rather than reading `_entries`: that accessor
+            # is where the staleness bound lives, and bypassing it let name
+            # normalization run off an arbitrarily old catalog.
+            return catalog.cards(self._copilot_catalog_key(request))
         except Exception:  # noqa: BLE001
             return None
 
@@ -1750,13 +1764,35 @@ class OpenAIHandlerMixin:
         rejects an unknown ``Copilot-Integration-Id`` outright, and Enterprise
         tenants sit on their own host -- so a catalog fetched under one identity
         does not describe traffic sent under another.
+
+        The fingerprint must track the credential the fetch will *actually* use.
+        ``apply_copilot_api_auth`` forwards the client's own bearer when it is
+        forwardable and only otherwise falls back to the proxy's env token, so
+        keying purely on the env var collapsed to a process-lifetime constant and
+        let two clients with different Copilot tokens share one entry -- exactly
+        the sharing this key exists to prevent. Mirror that decision here.
         """
-        from headroom.copilot_auth import token_fingerprint
+        from headroom.copilot_auth import (
+            _is_forwardable_copilot_bearer_token,
+            _is_managed_copilot_seeded_bearer,
+            token_fingerprint,
+        )
         from headroom.models.copilot_catalog import CopilotModelCatalog
 
         base_url = self._resolved_openai_upstream_base(request)
         integration_id = os.environ.get("GITHUB_COPILOT_INTEGRATION_ID", "vscode-chat")
-        token = os.environ.get("GITHUB_COPILOT_API_TOKEN", "")
+        token = ""
+        inbound = request.headers.get("authorization") or ""
+        scheme, _, raw = inbound.partition(" ")
+        if scheme.lower() == "bearer" and raw:
+            try:
+                if _is_forwardable_copilot_bearer_token(
+                    raw
+                ) and not _is_managed_copilot_seeded_bearer(raw):
+                    token = raw
+            except Exception:  # noqa: BLE001 — fall back to the env token
+                token = ""
+        token = token or os.environ.get("GITHUB_COPILOT_API_TOKEN", "")
         try:
             fingerprint = token_fingerprint(token) if token else ""
         except Exception:  # noqa: BLE001
@@ -1775,8 +1811,8 @@ class OpenAIHandlerMixin:
         model: Any,
         base_url: str,
         body: dict[str, Any],
-    ) -> str:
-        """Choose the upstream path for a ``/v1/responses`` request.
+    ) -> Any:
+        """Return the ``TransportPlan`` for a ``/v1/responses`` request.
 
         Prefers the catalog's published ``supported_endpoints`` and falls back
         to the legacy name heuristic whenever the catalog cannot answer -- which
@@ -1789,36 +1825,55 @@ class OpenAIHandlerMixin:
         real model: ``mai-code-1-flash-picker`` is served only on ``/responses``
         but does not match ``gpt-5*/o1*/o3*``, so name-based routing downgrades
         it to ``/chat/completions`` and turns a working request into a 400.
+
+        **Returns the plan rather than stashing it on ``self``.** An earlier
+        version assigned ``self._last_transport_plan`` and had the caller read it
+        back, but ``self`` is the process-wide proxy and this coroutine suspends
+        on the catalog fetch. On the exception path the attribute was left
+        holding whichever plan another in-flight request had stored, so a
+        request could be bridged using a *different model's* capability
+        decisions -- reinstating exactly the ``reasoning_effort`` 400 that
+        #f3771695 removed, nondeterministically, under the concurrent subagent
+        fan-out this feature exists to serve. Per-request state must travel with
+        the request.
         """
         from headroom.proxy.transport_planner import plan_transport
 
         heuristic = _resolve_openai_responses_handler_path(base_url, model)
-        self._last_transport_plan = None
+
+        def _heuristic_plan() -> Any:
+            # Build a real plan for the fallback too, so the returned plan and
+            # the returned path can never disagree. `card=None` on a bridged
+            # route yields drop_fields=("reasoning_effort",) -- the pre-existing,
+            # always-safe behaviour.
+            return plan_transport(
+                inbound_path=_OPENAI_RESPONSES_PATH,
+                card=None,
+                heuristic_prefers_responses=(heuristic == _OPENAI_RESPONSES_PATH),
+                reasoning_effort=_inbound_reasoning_effort(body),
+                requested_max_output_tokens=_inbound_max_output_tokens(body),
+            )
+
         if not isinstance(model, str) or not model or not is_copilot_api_url(base_url):
-            return heuristic
+            return _heuristic_plan()
         try:
             cards = await self._ensure_copilot_catalog(request, headers)
             card = (cards or {}).get(model)
             if card is not None and not card.is_chat_model:
                 card = None
-            reasoning = body.get("reasoning")
-            effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
             plan = plan_transport(
                 inbound_path=_OPENAI_RESPONSES_PATH,
                 card=card,
                 heuristic_prefers_responses=(heuristic == _OPENAI_RESPONSES_PATH),
-                reasoning_effort=effort if isinstance(effort, str) else None,
-                requested_max_output_tokens=body.get("max_output_tokens")
-                if isinstance(body.get("max_output_tokens"), int)
-                else None,
+                reasoning_effort=_inbound_reasoning_effort(body),
+                requested_max_output_tokens=_inbound_max_output_tokens(body),
             )
         except Exception:  # noqa: BLE001 — routing must never regress to an error
             logger.debug("transport planning failed; using name heuristic", exc_info=True)
-            return heuristic
-        self._last_transport_plan = plan
+            return _heuristic_plan()
         if plan.upstream_path != heuristic:
             logger.info("transport plan: %s", plan.reason)
-        return plan.upstream_path
+        return plan
 
     async def _ensure_copilot_catalog(self, request: Request, headers: dict[str, str]) -> Any:
         """Populate the catalog for this credential if not already fresh.
@@ -1841,30 +1896,53 @@ class OpenAIHandlerMixin:
             catalog = CopilotModelCatalog()
             self._copilot_catalog = catalog
         key = self._copilot_catalog_key(request)
-        if catalog.is_fresh(key):
-            return dict(catalog._entries[key].cards)
+        cached = catalog.cards(key)
+        if cached is not None and (catalog.is_fresh(key) or catalog.refresh_suppressed(key)):
+            return cached
         if self.http_client is None:
             return None
-        # `/models` needs the same auth and the same Copilot-Integration-Id as
-        # the traffic it describes -- the endpoint 400s on an unknown integration
-        # id, and entitlements differ per token. Reusing the request path's own
-        # auth helper is what keeps the catalog describing *this* credential
-        # rather than some other lane's.
-        catalog_headers = {
-            k: v
-            for k, v in headers.items()
-            if k.lower()
-            not in ("content-length", "content-type", "host", "accept-encoding", "content-encoding")
-        }
-        catalog_headers = await apply_copilot_api_auth(catalog_headers, url=f"{base_url}/models")
-        cards = await fetch_cards(self.http_client, base_url=base_url, headers=catalog_headers)
-        if cards:
-            catalog.put(key, cards)
-            return cards
-        # Cache the empty result too, so an unreachable /models is retried on
-        # the TTL rather than on every request in a subagent fan-out.
-        catalog.put(key, {})
-        return None
+
+        # Single-flight per credential. Without this, an N-way subagent fan-out
+        # on a cold cache issues N parallel `/models` GETs and every one of those
+        # requests waits out the fetch timeout before it can route -- a latency
+        # cliff that did not exist before, since routing used to be pure string
+        # matching. One fetch serves the whole wave.
+        lock = catalog.fetch_lock(key)
+        async with lock:
+            cached = catalog.cards(key)
+            if cached is not None and (catalog.is_fresh(key) or catalog.refresh_suppressed(key)):
+                return cached
+            # `/models` needs the same auth and the same Copilot-Integration-Id as
+            # the traffic it describes -- the endpoint 400s on an unknown integration
+            # id, and entitlements differ per token. Reusing the request path's own
+            # auth helper is what keeps the catalog describing *this* credential
+            # rather than some other lane's.
+            catalog_headers = {
+                k: v
+                for k, v in headers.items()
+                if k.lower()
+                not in (
+                    "content-length",
+                    "content-type",
+                    "host",
+                    "accept-encoding",
+                    "content-encoding",
+                )
+            }
+            catalog_headers = await apply_copilot_api_auth(
+                catalog_headers, url=f"{base_url}/models"
+            )
+            cards = await fetch_cards(self.http_client, base_url=base_url, headers=catalog_headers)
+            if cards:
+                catalog.put(key, cards)
+                return cards
+            # A failed fetch must NOT overwrite a good catalog with {}: that would
+            # destroy working routing for a full TTL over one transient blip, and
+            # silently revert models like mai-code-1-flash-picker to the heuristic
+            # that 400s them. Record the failure under a short backoff instead and
+            # keep serving what we already had, up to the staleness bound.
+            catalog.note_fetch_failure(key)
+            return catalog.cards(key)
 
     OPENAI_RESPONSES_ROUTER_MIN_BYTES = 512
     OPENAI_RESPONSES_OUTPUT_TYPES = _RESPONSES_OUTPUT_ITEM_TYPES
@@ -5452,14 +5530,23 @@ class OpenAIHandlerMixin:
         else:
             custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
             resolved_upstream_base_url = custom_upstream_base_url or self.OPENAI_API_URL
-            handler_path_suffix = await self._plan_responses_upstream_path(
-                request,
-                headers,
-                model=model,
-                base_url=resolved_upstream_base_url,
-                body=body,
-            )
-            transport_plan = self._last_transport_plan
+            if _bypass:
+                # An explicit bypass means "forward my bytes untouched", and the
+                # model-normalization gate above already honours that. Rerouting
+                # the request to a different endpoint AND rewriting the body into
+                # a different API shape would break the same promise far more
+                # severely, so planning is skipped entirely: this reproduces
+                # origin/main's behaviour of always sending /v1/responses verbatim.
+                handler_path_suffix = _OPENAI_RESPONSES_PATH
+            else:
+                transport_plan = await self._plan_responses_upstream_path(
+                    request,
+                    headers,
+                    model=model,
+                    base_url=resolved_upstream_base_url,
+                    body=body,
+                )
+                handler_path_suffix = transport_plan.upstream_path
             is_copilot_chat_bridge = handler_path_suffix == _OPENAI_CHAT_COMPLETIONS_PATH
             handler_path = (
                 _resolve_openai_handler_path(request.headers, handler_path=handler_path_suffix)

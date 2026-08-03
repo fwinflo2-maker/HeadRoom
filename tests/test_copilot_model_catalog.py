@@ -351,8 +351,8 @@ def test_catalog_is_keyed_per_credential(cards: dict[str, ModelCard]) -> None:
     )
     assert key_a != key_b
     catalog.put(key_a, cards)
-    assert catalog.get(key_a, "claude-opus-4.6") is not None
-    assert catalog.get(key_b, "claude-opus-4.6") is None
+    assert (catalog.cards(key_a) or {}).get("claude-opus-4.6") is not None
+    assert (catalog.cards(key_b) or {}).get("claude-opus-4.6") is None
 
 
 def test_indefinitely_stale_entries_are_dropped(cards: dict[str, ModelCard]) -> None:
@@ -364,8 +364,8 @@ def test_indefinitely_stale_entries_are_dropped(cards: dict[str, ModelCard]) -> 
         token_fingerprint="aaaa",
     )
     catalog.put(key, cards, now=0.0)
-    assert catalog.get(key, "claude-opus-4.6", now=100.0) is not None
-    assert catalog.get(key, "claude-opus-4.6", now=90_000.0) is None
+    assert (catalog.cards(key, now=100.0) or {}).get("claude-opus-4.6") is not None
+    assert catalog.cards(key, now=90_000.0) is None
 
 
 def test_invalidate_forces_a_refetch(cards: dict[str, ModelCard]) -> None:
@@ -377,7 +377,7 @@ def test_invalidate_forces_a_refetch(cards: dict[str, ModelCard]) -> None:
     )
     catalog.put(key, cards)
     catalog.invalidate(key)
-    assert catalog.get(key, "claude-opus-4.6") is None
+    assert catalog.cards(key) is None
 
 
 # ---------------------------------------------------------------------------

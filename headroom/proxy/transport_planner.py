@@ -60,15 +60,10 @@ class TransportPlan:
 
     upstream_path: str
     request_bridge: str | None = None
-    response_bridge: str | None = None
     drop_fields: tuple[str, ...] = ()
     clamp: dict[str, Any] = field(default_factory=dict)
     reason: str = ""
     catalog_backed: bool = False
-
-    @property
-    def bridged(self) -> bool:
-        return self.request_bridge is not None
 
     @property
     def executable(self) -> bool:
@@ -187,14 +182,11 @@ def _finish(
     catalog_backed: bool,
 ) -> TransportPlan:
     request_bridge: str | None = None
-    response_bridge: str | None = None
     if target != inbound_path:
         if inbound_path == RESPONSES_PATH and target == CHAT_COMPLETIONS_PATH:
             request_bridge = BRIDGE_RESPONSES_TO_CHAT
-            response_bridge = BRIDGE_RESPONSES_TO_CHAT
         elif inbound_path == CHAT_COMPLETIONS_PATH and target == RESPONSES_PATH:
             request_bridge = BRIDGE_CHAT_TO_RESPONSES
-            response_bridge = BRIDGE_CHAT_TO_RESPONSES
 
     clamp: dict[str, Any] = {}
     drop: list[str] = []
@@ -229,7 +221,6 @@ def _finish(
     plan = TransportPlan(
         upstream_path=target,
         request_bridge=request_bridge,
-        response_bridge=response_bridge,
         drop_fields=tuple(drop),
         clamp=clamp,
         reason=reason,
@@ -250,7 +241,6 @@ def _finish(
         return TransportPlan(
             upstream_path=inbound_path,
             request_bridge=None,
-            response_bridge=None,
             drop_fields=tuple(drop),
             clamp=clamp,
             reason=f"{reason}; bridge {plan.request_bridge} not implemented, forwarded unchanged",

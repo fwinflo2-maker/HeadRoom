@@ -49,12 +49,12 @@ never make a request fail that would otherwise have succeeded.
 
 from __future__ import annotations
 
-import json
+import asyncio
 import logging
 import os
 import time
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -315,7 +315,6 @@ def parse_models_payload(payload: Any) -> dict[str, ModelCard]:
 class _CatalogEntry:
     cards: dict[str, ModelCard]
     fetched_at: float
-    missing: dict[str, float] = field(default_factory=dict)
 
     def age(self, now: float) -> float:
         return max(0.0, now - self.fetched_at)
@@ -332,6 +331,8 @@ class CopilotModelCatalog:
     def __init__(self, *, ttl_seconds: float | None = None) -> None:
         self._ttl = ttl_seconds if ttl_seconds is not None else catalog_ttl_seconds()
         self._entries: dict[tuple[str, str, str], _CatalogEntry] = {}
+        self._failed_at: dict[tuple[str, str, str], float] = {}
+        self._locks: dict[tuple[str, str, str], asyncio.Lock] = {}
 
     @staticmethod
     def cache_key(
@@ -346,6 +347,8 @@ class CopilotModelCatalog:
         self._entries[key] = _CatalogEntry(
             cards=dict(cards), fetched_at=now if now is not None else time.time()
         )
+        # A successful fetch clears any backoff from an earlier failure.
+        self._failed_at.pop(key, None)
 
     def is_fresh(self, key: tuple[str, str, str], *, now: float | None = None) -> bool:
         entry = self._entries.get(key)
@@ -353,15 +356,19 @@ class CopilotModelCatalog:
             return False
         return entry.age(now if now is not None else time.time()) < self._ttl
 
-    def get(
-        self, key: tuple[str, str, str], model_id: str, *, now: float | None = None
-    ) -> ModelCard | None:
-        """Return the card for ``model_id``, or ``None`` when unknown.
+    def cards(
+        self, key: tuple[str, str, str], *, now: float | None = None
+    ) -> dict[str, ModelCard] | None:
+        """All cards for ``key``, or ``None`` when there is nothing usable.
 
-        ``None`` is also returned for an entry past :data:`_MAX_STALE_SECONDS`:
-        an indefinitely stale endpoint list is worse than no information,
-        because it routes confidently to a wire that may no longer serve the
-        model, whereas ``None`` restores the caller's heuristic.
+        The single accessor the request path should use, because it is where the
+        staleness bound is enforced. Reading ``_entries`` directly bypassed that
+        guard, so name normalization could run off an arbitrarily old catalog.
+
+        An entry past :data:`_MAX_STALE_SECONDS` is dropped and reported as
+        absent: an indefinitely stale endpoint list is worse than no information,
+        since it routes confidently to a wire that may no longer serve the model,
+        whereas ``None`` restores the caller's heuristic.
         """
         entry = self._entries.get(key)
         if entry is None:
@@ -369,50 +376,44 @@ class CopilotModelCatalog:
         if entry.age(now if now is not None else time.time()) > _MAX_STALE_SECONDS:
             self._entries.pop(key, None)
             return None
-        card = entry.cards.get(model_id)
-        if card is None or not card.is_chat_model:
-            return None
-        return card
+        return dict(entry.cards) if entry.cards else None
 
-    def note_missing(
-        self, key: tuple[str, str, str], model_id: str, *, now: float | None = None
-    ) -> None:
-        """Remember that ``model_id`` was absent, to damp refresh storms."""
-        entry = self._entries.get(key)
-        if entry is not None:
-            entry.missing[model_id] = now if now is not None else time.time()
+    def note_fetch_failure(self, key: tuple[str, str, str], *, now: float | None = None) -> None:
+        """Record that a refresh failed, without discarding what we already had.
 
-    def recently_missing(
-        self, key: tuple[str, str, str], model_id: str, *, now: float | None = None
-    ) -> bool:
-        entry = self._entries.get(key)
-        if entry is None:
+        Overwriting a good catalog with an empty one on a transient ``/models``
+        blip would silently revert routing to the name heuristic for a whole TTL
+        -- and that heuristic is wrong in the unsafe direction for
+        ``/responses``-only models. Instead the previous cards stay live (up to
+        the staleness bound) and refetching is suppressed only briefly, so a real
+        outage does not turn into a per-request retry storm.
+        """
+        self._failed_at[key] = now if now is not None else time.time()
+
+    def refresh_suppressed(self, key: tuple[str, str, str], *, now: float | None = None) -> bool:
+        """True while a recent fetch failure should stop us retrying."""
+        failed = self._failed_at.get(key)
+        if failed is None:
             return False
-        seen = entry.missing.get(model_id)
-        if seen is None:
-            return False
-        return (now if now is not None else time.time()) - seen < _NEGATIVE_TTL_SECONDS
+        return (now if now is not None else time.time()) - failed < _NEGATIVE_TTL_SECONDS
+
+    def fetch_lock(self, key: tuple[str, str, str]) -> asyncio.Lock:
+        """Per-credential lock so one refresh serves a concurrent wave."""
+        lock = self._locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[key] = lock
+        return lock
 
     def invalidate(self, key: tuple[str, str, str]) -> None:
         """Drop an entry so the next lookup refetches.
 
-        Called when the upstream contradicts the catalog (for example
-        ``unsupported_api_for_model``), which is the only reliable signal that a
-        cached endpoint list has gone stale before its TTL.
+        Called when the upstream contradicts the catalog (``unsupported_api_for_model``
+        / ``model_not_supported``), which is the only reliable signal that a
+        cached endpoint list went stale before its TTL expired.
         """
         self._entries.pop(key, None)
-
-    def selectable_cards(self, key: tuple[str, str, str]) -> tuple[ModelCard, ...]:
-        """Chat models this credential may pick, for discovery surfaces."""
-        entry = self._entries.get(key)
-        if entry is None:
-            return ()
-        return tuple(
-            sorted(
-                (c for c in entry.cards.values() if c.is_chat_model and c.selectable),
-                key=lambda c: (c.vendor.lower(), c.id),
-            )
-        )
+        self._failed_at.pop(key, None)
 
 
 def resolve_model_id(
@@ -517,13 +518,3 @@ async def fetch_cards(
     if cards:
         logger.info("copilot model catalog: loaded %d models from %s", len(cards), url)
     return cards
-
-
-def load_seed_cards(payload: Any) -> dict[str, ModelCard]:
-    """Parse a bundled/on-disk snapshot with the same rules as a live payload."""
-    try:
-        if isinstance(payload, (str, bytes)):
-            payload = json.loads(payload)
-    except (TypeError, ValueError):
-        return {}
-    return parse_models_payload(payload)

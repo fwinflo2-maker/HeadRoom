@@ -3135,6 +3135,29 @@ def _proxy_active_session_count(payload: dict[str, Any] | None) -> int:
     return max(counts, default=0)
 
 
+def _proxy_anthropic_upstream_mismatch(
+    running_config: dict[str, object], requested: str | None
+) -> bool:
+    """True when a running proxy's Anthropic upstream differs from what we want.
+
+    Deliberately compares even when ``requested`` is ``None`` (meaning "the
+    default upstream"), which is what makes it useful: ``wrap copilot --native``
+    repoints the Anthropic upstream at the Copilot host, and a later ``wrap
+    claude`` on the same port passes ``None``. Without this check the reuse logic
+    saw no mismatch and Claude Code's ``/v1/messages`` traffic would be forwarded
+    to Copilot under the wrong credential -- silently, since the proxy looked
+    healthy.
+
+    ``anthropic_api_url`` defaults to ``None`` on the proxy, so "not reported"
+    means "using the default upstream" -- which is why a plain ``wrap claude``
+    reusing a plain proxy still matches and is not needlessly restarted.
+    """
+    running = _normalize_proxy_api_url(running_config.get("anthropic_api_url"))
+    if running is None:
+        return False
+    return running != _normalize_proxy_api_url(requested) if requested else True
+
+
 def _normalize_proxy_api_url(url: object) -> str | None:
     """Normalize configured upstream URLs for running-proxy comparisons."""
     if not isinstance(url, str):
@@ -3683,6 +3706,14 @@ def _ensure_proxy(
                         requested_openai_url = _normalize_proxy_api_url(openai_api_url)
                         if running_openai_url != requested_openai_url:
                             missing.append("openai-api-url")
+                    # Compared even when the caller wants the DEFAULT upstream
+                    # (anthropic_api_url is None), unlike the openai check above.
+                    # `wrap copilot --native` points the Anthropic upstream at the
+                    # Copilot host, so reusing that proxy for `wrap claude` would
+                    # silently send Claude Code's /v1/messages traffic to Copilot
+                    # with the wrong credential. A mismatch must force a restart.
+                    if _proxy_anthropic_upstream_mismatch(running_config, anthropic_api_url):
+                        missing.append("anthropic-api-url")
                     if not missing:
                         click.echo(f"  Proxy already running on port {port}")
                         click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")

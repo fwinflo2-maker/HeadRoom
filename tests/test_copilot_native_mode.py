@@ -247,3 +247,41 @@ def test_native_skips_the_model_list_injection(monkeypatch: pytest.MonkeyPatch, 
     monkeypatch.chdir(tmp_path)
     _result, _captured = _invoke_copilot(monkeypatch, ["--native", "--port", "8890"])
     assert not os.path.exists(tmp_path / ".github" / "copilot-instructions.md")
+
+
+# ---------------------------------------------------------------------------
+# Cross-contamination: a native proxy must never be reused by `wrap claude`
+# ---------------------------------------------------------------------------
+
+
+def test_native_proxy_is_not_reused_for_claude() -> None:
+    """Native mode repoints the Anthropic upstream at the Copilot host.
+
+    If `wrap claude` reused that proxy, Claude Code's /v1/messages traffic would
+    be forwarded to Copilot under the wrong credential — silently, because the
+    proxy looks healthy. The reuse check must treat that as a mismatch.
+    """
+    from headroom.cli.wrap import _proxy_anthropic_upstream_mismatch
+
+    native_proxy = {"anthropic_api_url": "https://api.githubcopilot.com"}
+    # wrap claude asks for the DEFAULT upstream (None) -> must be a mismatch.
+    assert _proxy_anthropic_upstream_mismatch(native_proxy, None) is True
+
+
+def test_plain_proxy_is_still_reusable_for_claude() -> None:
+    """Guard against over-correcting: normal reuse must not start restarting."""
+    from headroom.cli.wrap import _proxy_anthropic_upstream_mismatch
+
+    plain_proxy = {"anthropic_api_url": None}
+    assert _proxy_anthropic_upstream_mismatch(plain_proxy, None) is False
+    assert _proxy_anthropic_upstream_mismatch({}, None) is False
+
+
+def test_native_proxy_is_reusable_for_the_same_native_upstream() -> None:
+    from headroom.cli.wrap import _proxy_anthropic_upstream_mismatch
+
+    native_proxy = {"anthropic_api_url": "https://api.githubcopilot.com"}
+    assert (
+        _proxy_anthropic_upstream_mismatch(native_proxy, "https://api.githubcopilot.com") is False
+    )
+    assert _proxy_anthropic_upstream_mismatch(native_proxy, "https://api.anthropic.com") is True

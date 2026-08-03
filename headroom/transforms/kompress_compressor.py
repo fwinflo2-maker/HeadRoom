@@ -29,6 +29,7 @@ from ..config import TransformResult
 from ..onnx_runtime import (
     ONNX_CPU_ARENA_ENV,
     create_cpu_session_options,
+    hf_entry_known_absent,
     hf_hub_download_local_first,
     trim_process_heap,
 )
@@ -96,11 +97,12 @@ KOMPRESS_ONNX_INTER_THREADS_ENV = "HEADROOM_KOMPRESS_ONNX_INTER_THREADS"
 KOMPRESS_COREML_CACHE_DIR_ENV = "HEADROOM_KOMPRESS_COREML_CACHE_DIR"
 KOMPRESS_MAX_CONCURRENT_ENV = "HEADROOM_KOMPRESS_MAX_CONCURRENT"
 KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_ENV = "HEADROOM_KOMPRESS_EXECUTION_TIMEOUT_MS"
-KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_DEFAULT = 25
+KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_DEFAULT = 3000
 KOMPRESS_BATCH_SIZE_ENV = "HEADROOM_KOMPRESS_BATCH_SIZE"
 KOMPRESS_ACQUIRE_TIMEOUT_ENV = "HEADROOM_KOMPRESS_ACQUIRE_TIMEOUT_SECONDS"
 KOMPRESS_TIME_BUDGET_ENV = "HEADROOM_KOMPRESS_TIME_BUDGET_SECONDS"
 KOMPRESS_CANARY_THRESHOLD_ENV = "HEADROOM_KOMPRESS_CANARY_SECONDS"
+KOMPRESS_REQUEST_DEADLINE_ENV = "HEADROOM_COMPRESSION_DEADLINE_MS"
 
 # Both defaults sit well under the proxy's 30s compression-stage timeout so a
 # slow model gives up (passthrough) before the request is abandoned. A thread
@@ -173,6 +175,13 @@ def _execution_wait_budget_seconds() -> float:
         )
         return 0.0
     return parsed / 1000.0
+
+
+def _request_deadline_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get(KOMPRESS_REQUEST_DEADLINE_ENV, "20000")) / 1000.0)
+    except ValueError:
+        return 20.0
 
 
 def _acquire_execution_slot(
@@ -713,6 +722,104 @@ def _load_modernbert_tokenizer(auto_tokenizer: Any, *, allow_download: bool) -> 
         raise
 
 
+# Sub-state-dict keys inside a merged v2-style checkpoint (see
+# scripts/export_kompress_v2_onnx.py, which this mirrors).
+_MERGED_CHECKPOINT_KEYS = ("encoder_state_dict", "token_head_state_dict", "span_conv_state_dict")
+
+
+def _load_merged_state_dict(model: Any, ckpt_path: str, model_id: str) -> None:
+    """Load a merged v2-style checkpoint (LoRA already folded into the encoder).
+
+    The checkpoint is a dict of per-submodule state-dicts
+    (``encoder_state_dict`` / ``token_head_state_dict`` / ``span_conv_state_dict``)
+    rather than a single flat state-dict, so each piece is loaded into its
+    matching submodule directly instead of via a single ``load_state_dict``
+    call on the whole model.
+    """
+    import torch
+
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    missing_sections = [k for k in _MERGED_CHECKPOINT_KEYS if k not in ckpt]
+    if missing_sections:
+        raise RuntimeError(
+            f"merged.pt for {model_id} is missing {missing_sections}; found keys: "
+            f"{sorted(ckpt)}. This checkpoint format is not what the loader expects."
+        )
+
+    for section, submodule in (
+        ("encoder_state_dict", model.encoder),
+        ("token_head_state_dict", model.token_head),
+        ("span_conv_state_dict", model.span_conv),
+    ):
+        missing, unexpected = submodule.load_state_dict(ckpt[section], strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"{model_id} {section}: state_dict mismatch against {type(submodule).__name__} "
+                f"(missing={list(missing)[:5]}, unexpected={list(unexpected)[:5]}). "
+                "The checkpoint no longer matches HeadroomCompressorModel's architecture."
+            )
+
+
+def _load_plain_state_dict(model: Any, weights_path: str, model_id: str) -> None:
+    """Load a plain, already-merged full state-dict (the pre-v2 / non-PEFT format)."""
+    from safetensors.torch import load_file
+
+    state_dict = load_file(weights_path)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"{model_id} model.safetensors: state_dict mismatch against "
+            f"HeadroomCompressorModel (missing={list(missing)[:5]}, "
+            f"unexpected={list(unexpected)[:5]}). Refusing to run with unloaded weights."
+        )
+
+
+def _load_pytorch_weights(model: Any, model_id: str, *, allow_download: bool) -> None:
+    """Load PyTorch weights into ``model``, preferring the merged v2 checkpoint.
+
+    ``merged.pt`` (when the repo ships one) holds LoRA-merged sub-state-dicts
+    keyed by submodule name. In a PEFT-trained repo, ``model.safetensors`` is
+    the *unmerged* adapter checkpoint (encoder keys prefixed
+    ``encoder.base_model.model...``) and does not map onto this module tree at
+    all, so it is only used as a fallback for repos that never shipped a
+    merged checkpoint (e.g. the original non-LoRA kompress-base).
+
+    In cache-only mode (``allow_download=False``) a ``merged.pt`` cache miss is
+    ambiguous: it could mean the repo has no merged checkpoint (safe to use the
+    plain fallback), or it could mean the repo has one but it just is not
+    downloaded yet (in which case a *stale* cached ``model.safetensors`` from a
+    prior run must not be used, since for a PEFT repo it is the wrong format).
+    ``hf_entry_known_absent`` disambiguates without a network call, using
+    HuggingFace Hub's own cache of confirmed-404 lookups.
+    """
+    try:
+        ckpt_path = hf_hub_download_local_first(model_id, "merged.pt", allow_network=allow_download)
+    except _NOT_CACHED_ERRORS as exc:
+        if not allow_download:
+            if not hf_entry_known_absent(model_id, "merged.pt"):
+                raise KompressModelNotCached(model_id) from exc
+            try:
+                weights_path = hf_hub_download_local_first(
+                    model_id, "model.safetensors", allow_network=False
+                )
+            except _NOT_CACHED_ERRORS:
+                raise KompressModelNotCached(model_id) from exc
+            _load_plain_state_dict(model, weights_path, model_id)
+            return
+        if isinstance(exc, EntryNotFoundError):
+            # merged.pt genuinely does not exist in this repo (confirmed by a
+            # real network lookup, not just a cache miss) - fall back to the
+            # plain format instead of treating it as a download failure.
+            weights_path = hf_hub_download_local_first(
+                model_id, "model.safetensors", allow_network=allow_download
+            )
+            _load_plain_state_dict(model, weights_path, model_id)
+            return
+        raise
+    else:
+        _load_merged_state_dict(model, ckpt_path, model_id)
+
+
 def _load_kompress_pytorch(
     model_id: str, device: str = "auto", *, allow_download: bool = True
 ) -> tuple[Any, Any, str]:
@@ -730,22 +837,10 @@ def _load_kompress_pytorch(
 
         logger.info("Downloading Kompress PyTorch model from %s ...", model_id)
 
-        try:
-            weights_path = hf_hub_download_local_first(
-                model_id, "model.safetensors", allow_network=allow_download
-            )
-        except _NOT_CACHED_ERRORS as exc:
-            if not allow_download:
-                raise KompressModelNotCached(model_id) from exc
-            raise
-
         HeadroomCompressorModel = _get_model_class()
         model = HeadroomCompressorModel()
 
-        from safetensors.torch import load_file
-
-        state_dict = load_file(weights_path)
-        model.load_state_dict(state_dict, strict=False)
+        _load_pytorch_weights(model, model_id, allow_download=allow_download)
 
         if device == "auto":
             if torch.cuda.is_available():
@@ -1199,6 +1294,7 @@ class KompressCompressor(Transform):
         *,
         allow_download: bool = True,
         ccr_original: str | None = None,
+        _deadline_started_at: float | None = None,
     ) -> KompressResult:
         """Compress content using Kompress model.
 
@@ -1223,6 +1319,7 @@ class KompressCompressor(Transform):
         Returns:
             KompressResult with compressed text.
         """
+        t_deadline = time.perf_counter() if _deadline_started_at is None else _deadline_started_at
         words = content.split()
         n_words = len(words)
 
@@ -1238,13 +1335,7 @@ class KompressCompressor(Transform):
         # Cached per instance: operator config, read once -- not per compress() call.
         deadline_s = getattr(self, "_deadline_s", None)
         if deadline_s is None:
-            try:
-                deadline_s = max(
-                    0.0,
-                    float(os.environ.get("HEADROOM_COMPRESSION_DEADLINE_MS", "20000")) / 1000.0,
-                )
-            except ValueError:
-                deadline_s = 20.0
+            deadline_s = _request_deadline_seconds()
             self._deadline_s = deadline_s
 
         try:
@@ -1263,6 +1354,7 @@ class KompressCompressor(Transform):
                     target_ratio=[target_ratio],
                     batch_size=_batch_size(),
                     ccr_originals=[ccr_original],
+                    _deadline_started_at=t_deadline,
                 )
                 if batch_result:
                     return batch_result[0]
@@ -1271,7 +1363,6 @@ class KompressCompressor(Transform):
             kept_ids: set[int] = set()
             inference_ms = 0.0
             chunk_count = 0
-            t_deadline = time.perf_counter()
 
             acquire_timeout = _acquire_timeout_seconds()
             budget = _time_budget_seconds()
@@ -1327,12 +1418,29 @@ class KompressCompressor(Transform):
                     input_ids = input_ids.to(device)
                     attention_mask = attention_mask.to(device)
 
+                request_remaining: float | None = None
+                if deadline_s:
+                    request_remaining = deadline_s - (time.perf_counter() - t_deadline)
+                    if request_remaining <= 0:
+                        kept_ids.update(range(chunk_start, n_words))
+                        logger.warning(
+                            "Kompress hit %.1fs deadline before acquire after %d/%d words "
+                            "(%d chunks done); kept remainder verbatim to free the request "
+                            "thread (#1171)",
+                            deadline_s,
+                            chunk_start,
+                            n_words,
+                            chunk_count,
+                        )
+                        break
+
                 acquire_bounds = [
                     bound
                     for bound in (
                         _execution_wait_budget_seconds(),
                         acquire_timeout,
                         remaining,
+                        request_remaining,
                     )
                     if bound is not None
                 ]
@@ -1431,8 +1539,14 @@ class KompressCompressor(Transform):
                 cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens)
                 if cache_key:
                     result.cache_key = cache_key
+                    # Report the source line span so a reader can tell content was
+                    # compressed away rather than absent — "items" counts words, which
+                    # does not map to lines and reads as evidence of absence (#2586).
+                    source_lines = ccr_source.count("\n") + 1
+                    line_word = "line" if source_lines == 1 else "lines"
                     result.compressed += (
-                        f"\n[{n_words} items compressed to {compressed_count}."
+                        f"\n[{n_words} items compressed to {compressed_count}"
+                        f" (from {source_lines} source {line_word})."
                         f" Retrieve more: hash={cache_key}]"
                     )
 
@@ -1471,6 +1585,7 @@ class KompressCompressor(Transform):
         batch_size: int = 32,
         *,
         ccr_originals: list[str | None] | None = None,
+        _deadline_started_at: float | None = None,
     ) -> list[KompressResult]:
         """Compress multiple texts. Uses batched inference on GPU, sequential on CPU.
 
@@ -1531,6 +1646,7 @@ class KompressCompressor(Transform):
         n = len(contents)
         if n == 0:
             return []
+        t_deadline = time.perf_counter() if _deadline_started_at is None else _deadline_started_at
 
         # Normalize target_ratio to a per-text list
         if isinstance(target_ratio, list):
@@ -1572,6 +1688,7 @@ class KompressCompressor(Transform):
                     question=question,
                     target_ratio=r,
                     ccr_original=ccr_source,
+                    _deadline_started_at=t_deadline,
                 )
                 for content, r, ccr_source in zip(contents, ratios, ccr_sources, strict=True)
             ]
@@ -1608,6 +1725,10 @@ class KompressCompressor(Transform):
         device_type = _model_device_type(model, backend)
         kept_ids_per_text: dict[int, set[int]] = {i: set() for i in range(n) if results[i] is None}
         inference_ms = 0.0
+        deadline_s = getattr(self, "_deadline_s", None)
+        if deadline_s is None:
+            deadline_s = _request_deadline_seconds()
+            self._deadline_s = deadline_s
 
         acquire_timeout = _acquire_timeout_seconds()
         budget = _time_budget_seconds()
@@ -1637,6 +1758,9 @@ class KompressCompressor(Transform):
                 if remaining <= 0:
                     _bail_remaining("time budget exhausted", batch_start)
                     break
+            if deadline_s and (deadline_s - (time.perf_counter() - t_deadline)) <= 0:
+                _bail_remaining("request deadline exhausted", batch_start)
+                break
 
             batch = chunk_queue[batch_start : batch_start + batch_size]
             batch_word_lists = [c[2] for c in batch]
@@ -1660,6 +1784,13 @@ class KompressCompressor(Transform):
                     input_ids = input_ids.to(device)
                     attention_mask = attention_mask.to(device)
 
+                request_remaining: float | None = None
+                if deadline_s:
+                    request_remaining = deadline_s - (time.perf_counter() - t_deadline)
+                    if request_remaining <= 0:
+                        _bail_remaining("request deadline exhausted", batch_start)
+                        break
+
                 # Single forward pass for all chunks in this batch.
                 acquire_bounds = [
                     bound
@@ -1667,6 +1798,7 @@ class KompressCompressor(Transform):
                         _execution_wait_budget_seconds(),
                         acquire_timeout,
                         remaining,
+                        request_remaining,
                     )
                     if bound is not None
                 ]
@@ -1770,8 +1902,14 @@ class KompressCompressor(Transform):
                 cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens)
                 if cache_key:
                     result.cache_key = cache_key
+                    # Report the source line span so a reader can tell content was
+                    # compressed away rather than absent — "items" counts words, which
+                    # does not map to lines and reads as evidence of absence (#2586).
+                    source_lines = ccr_source.count("\n") + 1
+                    line_word = "line" if source_lines == 1 else "lines"
                     result.compressed += (
-                        f"\n[{n_words} items compressed to {compressed_count}."
+                        f"\n[{n_words} items compressed to {compressed_count}"
+                        f" (from {source_lines} source {line_word})."
                         f" Retrieve more: hash={cache_key}]"
                     )
 

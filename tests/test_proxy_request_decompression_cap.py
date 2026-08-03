@@ -156,13 +156,20 @@ def test_brotli_not_installed_raises(monkeypatch):
         _read(b"ignored", "br")
 
 
-def test_gzip_multi_member_rejected():
-    # zlib stops at the first gzip member; anything after it must not be
-    # silently dropped (gzip.decompress() used to decompress all members).
-    m1 = gzip.compress(b"first member " * 100)
-    m2 = gzip.compress(b"second member " * 100)
-    with pytest.raises(ValueError, match="trailing data"):
-        _read(m1 + m2, "gzip")
+def test_gzip_multi_member_round_trips():
+    # gzip.decompress() handled multi-member files; the incremental path
+    # must decompress every member against the same cap.
+    m1 = b"first member " * 100
+    m2 = b"second member " * 100
+    assert _read(gzip.compress(m1) + gzip.compress(m2), "gzip") == m1 + m2
+
+
+def test_gzip_multi_member_cumulative_cap(monkeypatch):
+    # The cap applies to the whole payload, not per member.
+    monkeypatch.setattr("headroom.proxy.helpers.MAX_DECOMPRESSED_BODY_BYTES", 4096)
+    member = gzip.compress(b"A" * 2048)  # 2048 B decompressed each
+    with pytest.raises(RequestBodyTooLarge):
+        _read(member + member + member, "gzip")
 
 
 def test_gzip_trailing_garbage_rejected():

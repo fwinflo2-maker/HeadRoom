@@ -1916,7 +1916,9 @@ def _enforce_decompression_cap(size: int, label: str) -> None:
         )
 
 
-def _decompress_capped(decompressor: Any, data: bytes, *, label: str) -> bytes:
+def _decompress_capped(
+    decompressor: Any, data: bytes, *, label: str, out: bytearray | None = None
+) -> bytes:
     """Incrementally decompress *data* (zlib ``decompressobj``) under a hard cap.
 
     ``zlib.decompressobj.decompress(data, max_length)`` returns at most
@@ -1924,9 +1926,10 @@ def _decompress_capped(decompressor: Any, data: bytes, *, label: str) -> bytes:
     ``unconsumed_tail``, so feeding in bounded slices and checking the
     running total keeps peak memory under ``MAX_DECOMPRESSED_BODY_BYTES``.
     A decompression bomb becomes a clean :class:`RequestBodyTooLarge`
-    instead of an OOM kill.
+    instead of an OOM kill. Pass *out* to accumulate across calls (used
+    for multi-member gzip) so the cap applies to the whole payload.
     """
-    out = bytearray()
+    out = out if out is not None else bytearray()
     remaining = data
     while remaining and not decompressor.eof:
         chunk = decompressor.decompress(remaining, 64 * 1024)
@@ -1940,6 +1943,34 @@ def _decompress_capped(decompressor: Any, data: bytes, *, label: str) -> bytes:
     # there is no buffered output left to flush here.)
     if not decompressor.eof:
         raise ValueError(f"truncated {label} stream")
+    return bytes(out)
+
+
+def _decompress_gzip_capped(data: bytes) -> bytes:
+    """Decompress *data*, including multi-member gzip, under the hard cap.
+
+    zlib's gzip mode stops at the end of the first member and parks the
+    remainder on ``unused_data``, whereas ``gzip.decompress()`` used to
+    decompress every member. Loop the members against one shared running
+    total so the cap applies to the whole payload, and reject trailing
+    bytes that are not another gzip member (old behavior raised
+    ``BadGzipFile`` on garbage).
+    """
+    import zlib
+
+    out = bytearray()
+    remaining = data
+    while True:
+        decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+        _decompress_capped(decompressor, remaining, label="gzip", out=out)
+        remaining = decompressor.unused_data
+        if not remaining:
+            break
+        if not remaining.startswith(b"\x1f\x8b"):
+            raise ValueError(
+                f"unexpected trailing data after gzip stream "
+                f"({len(remaining)} bytes)"
+            )
     return bytes(out)
 
 
@@ -2014,18 +2045,7 @@ async def _read_request_body_bytes(request: Request) -> bytes:
             # zlib's gzip mode (wbits=31) gives us a bounded incremental API;
             # gzip.decompress() has no output cap and would materialize a
             # decompression bomb in full before we could reject it.
-            decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
-            raw = _decompress_capped(decompressor, raw, label="gzip")
-            if decompressor.unused_data:
-                # zlib stops at the end of the first gzip member and ignores
-                # whatever follows. gzip.decompress() used to handle
-                # multi-member files and reject trailing garbage; reject
-                # loudly here instead of silently forwarding a truncated
-                # body that differs from what the client sent.
-                raise ValueError(
-                    f"unexpected trailing data after gzip stream "
-                    f"({len(decompressor.unused_data)} bytes)"
-                )
+            raw = _decompress_gzip_capped(raw)
         except RequestBodyTooLarge:
             raise
         except Exception as exc:

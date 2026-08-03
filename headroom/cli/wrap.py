@@ -3855,6 +3855,15 @@ def _copilot_default_wire_api_for_model(model: str | None) -> str:
     return _copilot_default_wire_api_for_model_impl(model)
 
 
+def _resolve_copilot_wire_api_for_model(
+    model: str | None, *, api_url: str | None, token: str | None
+) -> str:
+    """Wire API for ``model``, from its published endpoints when discoverable."""
+    from headroom.providers.copilot.wrap import resolve_wire_api_for_model
+
+    return resolve_wire_api_for_model(model, api_url=api_url, token=token)
+
+
 def _should_use_copilot_oauth(
     *,
     backend: str | None,
@@ -5586,8 +5595,22 @@ def copilot(
                 "automatic model selection."
             )
 
+        # The wire API is pinned for the whole session, so guessing it from the
+        # model name can make a valid main model unusable: mai-code-1-flash-picker
+        # is /responses-only but does not match gpt-5*/o1*/o3*, so the heuristic
+        # pinned "completions" and every turn 400'd. Ask the upstream which
+        # endpoints actually serve this model; falls back to the heuristic on any
+        # failure, so launch never depends on discovery succeeding.
         effective_wire_api = wire_api or (
-            _copilot_default_wire_api_for_model(selected_model) if subscription else "completions"
+            _resolve_copilot_wire_api_for_model(
+                selected_model,
+                api_url=(
+                    subscription_resolution.api_url if subscription_resolution is not None else None
+                ),
+                token=client_bearer,
+            )
+            if subscription
+            else "completions"
         )
         env["COPILOT_PROVIDER_TYPE"] = "openai"
         # Per-project savings: the Copilot CLI cannot send custom headers, so

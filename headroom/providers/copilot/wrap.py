@@ -147,8 +147,65 @@ def copilot_model_from_args(
 
 
 def default_wire_api_for_model(model: str | None) -> str:
-    """Choose the Copilot OpenAI-compatible wire API for a model."""
+    """Choose the Copilot OpenAI-compatible wire API for a model, by name."""
     return "responses" if model_prefers_responses_api(model) else "completions"
+
+
+def resolve_wire_api_for_model(
+    model: str | None,
+    *,
+    api_url: str | None = None,
+    token: str | None = None,
+    timeout: float = 4.0,
+) -> str:
+    """Pick the wire API from the model's published endpoints when possible.
+
+    The launcher pins ``COPILOT_PROVIDER_WIRE_API`` for the whole session, so
+    guessing it from the model name can make a perfectly valid main model
+    unusable. ``mai-code-1-flash-picker`` is served **only** on ``/responses``
+    but does not match ``gpt-5*/o1*/o3*``, so the name heuristic pins the
+    session to ``completions`` and every turn fails with
+    ``400 model "mai-code-1-flash-picker" is not accessible via the
+    /chat/completions endpoint`` -- reproduced end-to-end through the real
+    Copilot CLI.
+
+    Asking the upstream which endpoints serve the model removes the guess. This
+    runs once at launch, is bounded by ``timeout``, and falls back to
+    :func:`default_wire_api_for_model` on any failure, so a slow or unreachable
+    ``/models`` only costs a few seconds and never blocks a launch.
+    """
+    fallback = default_wire_api_for_model(model)
+    if not model or not api_url or not token:
+        return fallback
+
+    try:
+        import httpx
+
+        from headroom.copilot_auth import _copilot_chat_header_defaults
+        from headroom.models.copilot_catalog import catalog_enabled, parse_models_payload
+
+        if not catalog_enabled():
+            return fallback
+
+        headers = {"Authorization": f"Bearer {token}", **_copilot_chat_header_defaults()}
+        response = httpx.get(f"{api_url.rstrip('/')}/models", headers=headers, timeout=timeout)
+        if response.status_code != 200:
+            return fallback
+        card = parse_models_payload(response.json()).get(model)
+    except Exception:  # noqa: BLE001 — launch must never fail on discovery
+        return fallback
+
+    if card is None or not card.constrains_endpoints():
+        return fallback
+    # Prefer the model's native wire so the main model never rides the buffered
+    # bridge for every turn; only fall back when it publishes neither.
+    if "/responses" in card.endpoints and "/chat/completions" not in card.endpoints:
+        return "responses"
+    if "/chat/completions" in card.endpoints and "/responses" not in card.endpoints:
+        return "completions"
+    if "/responses" in card.endpoints or "/chat/completions" in card.endpoints:
+        return fallback if fallback in ("responses", "completions") else "completions"
+    return fallback
 
 
 def provider_key_source(provider_type: str) -> str:

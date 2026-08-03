@@ -378,3 +378,70 @@ def test_invalidate_forces_a_refetch(cards: dict[str, ModelCard]) -> None:
     catalog.put(key, cards)
     catalog.invalidate(key)
     assert catalog.get(key, "claude-opus-4.6") is None
+
+
+# ---------------------------------------------------------------------------
+# Launcher wire-API selection
+# ---------------------------------------------------------------------------
+
+
+def test_launcher_wire_api_falls_back_without_credentials() -> None:
+    """No token or url => keep the name heuristic; launch must not depend on it."""
+    from headroom.providers.copilot.wrap import resolve_wire_api_for_model
+
+    assert resolve_wire_api_for_model("gpt-5.4", api_url=None, token=None) == "responses"
+    assert resolve_wire_api_for_model("claude-opus-4.8", api_url=None, token=None) == "completions"
+    assert resolve_wire_api_for_model(None, api_url=None, token=None) == "completions"
+
+
+def test_launcher_wire_api_uses_published_endpoints(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The defect this closes, at the launcher rather than the proxy.
+
+    ``mai-code-1-flash-picker`` is /responses-only but does not match
+    ``gpt-5*``, so the name heuristic pinned the session to ``completions`` and
+    every turn failed with ``400 ... not accessible via the /chat/completions
+    endpoint`` -- reproduced through the real Copilot CLI before this fix.
+    """
+    import httpx
+
+    from headroom.providers.copilot import wrap as copilot_wrap
+
+    payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    monkeypatch.setattr(
+        httpx, "get", lambda *a, **k: httpx.Response(200, json=payload), raising=True
+    )
+
+    resolve = copilot_wrap.resolve_wire_api_for_model
+    # /responses-only, and the name heuristic gets it wrong.
+    assert copilot_wrap.default_wire_api_for_model("mai-code-1-flash-picker") == "completions"
+    assert resolve(
+        "mai-code-1-flash-picker", api_url="https://api.githubcopilot.com", token="t"
+    ) == ("responses")
+    # chat-only models must not be pushed onto /responses.
+    assert resolve("claude-opus-4.8", api_url="https://api.githubcopilot.com", token="t") == (
+        "completions"
+    )
+    assert resolve(
+        "gemini-3.1-pro-preview", api_url="https://api.githubcopilot.com", token="t"
+    ) == ("completions")
+    # A model with no published endpoints keeps the heuristic.
+    assert resolve("gpt-4o", api_url="https://api.githubcopilot.com", token="t") == "completions"
+
+
+def test_launcher_wire_api_survives_an_unreachable_models_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    from headroom.providers.copilot import wrap as copilot_wrap
+
+    def _boom(*a: object, **k: object) -> None:
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr(httpx, "get", _boom, raising=True)
+    assert (
+        copilot_wrap.resolve_wire_api_for_model(
+            "mai-code-1-flash-picker", api_url="https://api.githubcopilot.com", token="t"
+        )
+        == "completions"
+    )

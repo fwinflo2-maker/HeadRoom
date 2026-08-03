@@ -205,6 +205,21 @@ class ModelCard:
         return best
 
 
+def _as_str(value: Any, *, default: str = "") -> str:
+    """Coerce an untrusted JSON value to a definite ``str``.
+
+    The upstream payload is not schema-validated, so a field can be missing, or
+    an unexpected type. Narrowing here keeps every ``ModelCard`` field concrete
+    rather than pushing ``Any`` through the routing decisions downstream.
+    """
+    return value if isinstance(value, str) else default
+
+
+def _as_opt_str(value: Any) -> str | None:
+    """Coerce to ``str`` or ``None`` for genuinely optional fields."""
+    return value if isinstance(value, str) else None
+
+
 def _as_int(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         return None
@@ -261,14 +276,10 @@ def parse_model_card(entry: Any) -> ModelCard | None:
 
     return ModelCard(
         id=model_id,
-        display_name=entry.get("name") if isinstance(entry.get("name"), str) else "",
-        vendor=entry.get("vendor") if isinstance(entry.get("vendor"), str) else "",
-        tier=(
-            entry.get("model_picker_category")
-            if isinstance(entry.get("model_picker_category"), str)
-            else None
-        ),
-        kind=capabilities.get("type") if isinstance(capabilities.get("type"), str) else "chat",
+        display_name=_as_str(entry.get("name")),
+        vendor=_as_str(entry.get("vendor")),
+        tier=_as_opt_str(entry.get("model_picker_category")),
+        kind=_as_str(capabilities.get("type"), default="chat"),
         endpoints=endpoints,
         reasoning_efforts=efforts,
         context_window=_as_int(limits.get("max_context_window_tokens")),
@@ -422,7 +433,9 @@ def resolve_model_id(
     """
     if not raw_model or not raw_model.strip():
         return None
-    card_list = list(cards.values()) if isinstance(cards, Mapping) else list(cards)
+    # Annotated explicitly: narrowing on the unparameterised `Mapping` ABC loses
+    # the value type, which would leak `Any` out of every `return card.id` below.
+    card_list: list[ModelCard] = list(cards.values()) if isinstance(cards, Mapping) else list(cards)
     chat_cards = [c for c in card_list if c.is_chat_model]
 
     for card in chat_cards:

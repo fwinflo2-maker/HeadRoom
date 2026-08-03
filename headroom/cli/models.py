@@ -154,8 +154,8 @@ def _anthropic_rows() -> tuple[list[_Row], str | None]:
         rows.append(
             _Row(
                 id=model_id,
-                name=entry.get("display_name")
-                if isinstance(entry.get("display_name"), str)
+                name=display_name
+                if isinstance(display_name := entry.get("display_name"), str)
                 else "",
                 vendor="Anthropic",
                 tier=None,

@@ -1775,6 +1775,133 @@ def _inject_serena_instructions(file_path: Path, verbose: bool = False) -> bool:
     return True
 
 
+_COPILOT_MODELS_MARKER = "<!-- headroom:available-models -->"
+_COPILOT_MODELS_MARKER_END = "<!-- /headroom:available-models -->"
+
+
+def _copilot_models_instructions_block(model_lines: list[str]) -> str:
+    """Build the marker-guarded available-models block for Copilot instructions.
+
+    Why this is needed: ``wrap copilot`` uses the CLI's BYOK provider override
+    (its only interposition hook), and BYOK is single-model -- it replaces
+    Copilot's own model routing, so the CLI knows about exactly the one model it
+    was launched with. Native Copilot knows the full set and picks correctly;
+    under BYOK the agent has nothing to consult, so when asked to "use a
+    different model" it invents names from training memory or scrapes them out
+    of repo files. Observed live: an agent listed ``claude-fable-5``,
+    ``claude-opus-4.8-fast`` and ``grok-4.5`` as available -- none are Copilot
+    models -- mixed in with real ones, which is exactly the "sometimes right,
+    sometimes deprecated" behaviour users report.
+
+    Giving the agent the real list restores parity with native Copilot. The
+    ``headroom models`` pointer matters as much as the list: the block is
+    written at launch, so the command is what keeps the answer current if
+    GitHub's catalog shifts mid-session.
+    """
+    listing = "\n".join(f"- `{line}`" for line in model_lines)
+    return f"""\
+{_COPILOT_MODELS_MARKER}
+# Available AI models (Headroom)
+
+This session runs through Headroom, which uses Copilot's BYOK transport. That
+transport is single-model, so the model picker shows only the launch model and
+**your own knowledge of model names is not a reliable guide** — names from
+training data are frequently retired or belong to another product.
+
+**The models below are the ones this account can actually use.** Use these IDs
+verbatim when choosing a model for a subagent or when asked to use a different
+model or vendor. Do not invent, guess, or abbreviate them, and do not scrape
+model names out of repository files.
+
+{listing}
+
+To re-check the current list at any time (authoritative, live):
+
+```
+headroom models            # all available models
+headroom models --json     # machine-readable
+```
+
+If a model you want is not listed, it is not available on this account — say so
+rather than substituting a similar-sounding name.
+{_COPILOT_MODELS_MARKER_END}
+"""
+
+
+def _live_copilot_model_ids(api_url: str | None, token: str | None) -> list[str]:
+    """Selectable Copilot chat model IDs, live. Empty list on any failure."""
+    if not api_url or not token:
+        return []
+    try:
+        import httpx
+
+        from headroom.copilot_auth import _copilot_chat_header_defaults
+        from headroom.models.copilot_catalog import parse_models_payload
+
+        response = httpx.get(
+            f"{api_url.rstrip('/')}/models",
+            headers={"Authorization": f"Bearer {token}", **_copilot_chat_header_defaults()},
+            timeout=8,
+        )
+        if response.status_code != 200:
+            return []
+        cards = parse_models_payload(response.json())
+    except Exception:  # noqa: BLE001 — guidance is best-effort, never fatal
+        return []
+    return sorted(
+        (c.id for c in cards.values() if c.is_chat_model and c.selectable),
+        key=lambda mid: (mid.split("-")[0], mid),
+    )
+
+
+def _inject_copilot_models_instructions(
+    file_path: Path, model_ids: list[str], verbose: bool = False
+) -> bool:
+    """Write/refresh the available-models block in Copilot's instruction file.
+
+    Rewrites in place when the marker is already present, so the list follows
+    the live catalog instead of going stale on the first launch that wrote it.
+    Only the marked region is touched; everything the user wrote is preserved.
+    """
+    if not model_ids:
+        return False
+    block = _copilot_models_instructions_block(model_ids)
+    if file_path.exists():
+        existing = _read_text(file_path)
+        if _COPILOT_MODELS_MARKER in existing and _COPILOT_MODELS_MARKER_END in existing:
+            start = existing.index(_COPILOT_MODELS_MARKER)
+            end = existing.index(_COPILOT_MODELS_MARKER_END) + len(_COPILOT_MODELS_MARKER_END)
+            updated = existing[:start] + block.rstrip("\n") + existing[end:]
+            if updated == existing:
+                if verbose:
+                    click.echo(f"  Available-models list already current in {file_path.name}")
+                return True
+            _write_text(file_path, updated)
+            click.echo(
+                f"  Refreshed available-models list in {file_path} ({len(model_ids)} models)"
+            )
+            return True
+        _append_text(file_path, "\n\n" + block)
+    else:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_text(file_path, block)
+    click.echo(f"  Available-models list injected into {file_path} ({len(model_ids)} models)")
+    return True
+
+
+def _remove_copilot_models_instructions(file_path: Path) -> bool:
+    """Strip the available-models block, leaving the user's content intact."""
+    if not file_path.exists():
+        return False
+    existing = _read_text(file_path)
+    if _COPILOT_MODELS_MARKER not in existing or _COPILOT_MODELS_MARKER_END not in existing:
+        return False
+    start = existing.index(_COPILOT_MODELS_MARKER)
+    end = existing.index(_COPILOT_MODELS_MARKER_END) + len(_COPILOT_MODELS_MARKER_END)
+    _write_text(file_path, (existing[:start].rstrip("\n") + "\n" + existing[end:].lstrip("\n")))
+    return True
+
+
 def _detect_repo_languages(root: Path) -> list[str]:
     """Detect the Serena languages present under *root* by file extension.
 
@@ -5473,6 +5600,14 @@ def _require_copilot_subscription_resolution() -> CopilotSubscriptionTokenResolu
     ),
 )
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--no-model-list",
+    is_flag=True,
+    help=(
+        "Skip writing the available-models list into .github/copilot-instructions.md "
+        "(the list is what stops agents inventing unavailable model names under BYOK)"
+    ),
+)
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.argument("copilot_args", nargs=-1, type=click.UNPROCESSED)
 def copilot(
@@ -5486,6 +5621,7 @@ def copilot(
     wire_api: str | None,
     subscription: bool,
     memory: bool,
+    no_model_list: bool,
     verbose: bool,
     copilot_args: tuple[str, ...],
 ) -> None:
@@ -5666,6 +5802,20 @@ def copilot(
         env["GITHUB_COPILOT_API_URL"] = openai_api_url
         env["OPENAI_TARGET_API_URL"] = openai_api_url
         env_vars_display.append(f"COPILOT_PROVIDER_API_URL={openai_api_url}")
+
+        # Restore model-choice parity with native Copilot. BYOK tells the CLI
+        # about exactly one model, so an agent asked to "use a different model"
+        # has nothing authoritative to consult and invents or scrapes names
+        # (observed live: claude-fable-5, claude-opus-4.8-fast, grok-4.5 —
+        # none of them Copilot models). Writing the real list into the
+        # instruction file gives it the same knowledge native Copilot has.
+        # Skipped with --no-model-list, and removed by `unwrap copilot`.
+        if not no_model_list:
+            _inject_copilot_models_instructions(
+                Path.cwd() / ".github" / "copilot-instructions.md",
+                _live_copilot_model_ids(openai_api_url, client_bearer),
+                verbose=verbose,
+            )
     else:
         env, env_vars_display = _build_copilot_launch_env(
             port=port,
@@ -5748,6 +5898,8 @@ def unwrap_copilot(port: int, no_stop_proxy: bool) -> None:
         click.echo("  Removed Headroom rtk instructions from Copilot.")
     else:
         click.echo("  No Headroom rtk instructions found for Copilot.")
+    if _remove_copilot_models_instructions(instructions):
+        click.echo("  Removed Headroom available-models list from Copilot instructions.")
 
     if not no_stop_proxy:
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)

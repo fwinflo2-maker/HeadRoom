@@ -1933,14 +1933,13 @@ def _decompress_capped(decompressor: Any, data: bytes, *, label: str) -> bytes:
         out.extend(chunk)
         _enforce_decompression_cap(len(out), label)
         remaining = decompressor.unconsumed_tail
-    # Drain output still buffered inside the decompressor. flush() also
-    # surfaces truncated-stream errors, matching the old one-shot calls.
-    while True:
-        chunk = decompressor.flush(64 * 1024)
-        if not chunk:
-            break
-        out.extend(chunk)
-        _enforce_decompression_cap(len(out), label)
+    # Input exhausted without the stream end marker: truncated. The old
+    # one-shot calls (gzip.decompress / zlib.decompress) raised on this;
+    # keep that behavior so the generic handler turns it into a 400.
+    # (The main loop always drains pending output via unconsumed_tail, so
+    # there is no buffered output left to flush here.)
+    if not decompressor.eof:
+        raise ValueError(f"truncated {label} stream")
     return bytes(out)
 
 
@@ -2017,6 +2016,16 @@ async def _read_request_body_bytes(request: Request) -> bytes:
             # decompression bomb in full before we could reject it.
             decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
             raw = _decompress_capped(decompressor, raw, label="gzip")
+            if decompressor.unused_data:
+                # zlib stops at the end of the first gzip member and ignores
+                # whatever follows. gzip.decompress() used to handle
+                # multi-member files and reject trailing garbage; reject
+                # loudly here instead of silently forwarding a truncated
+                # body that differs from what the client sent.
+                raise ValueError(
+                    f"unexpected trailing data after gzip stream "
+                    f"({len(decompressor.unused_data)} bytes)"
+                )
         except RequestBodyTooLarge:
             raise
         except Exception as exc:

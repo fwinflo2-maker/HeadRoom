@@ -13,6 +13,7 @@ DoS. Every format is now fed incrementally against
 import asyncio
 import gzip
 import json
+import sys
 import zlib
 
 import pytest
@@ -129,6 +130,59 @@ def test_payload_at_cap_is_accepted(monkeypatch):
 def test_corrupt_gzip_still_raises_value_error():
     with pytest.raises(ValueError):
         _read(b"this is not a gzip stream at all", "gzip")
+
+
+def test_corrupt_deflate_still_raises_value_error():
+    with pytest.raises(ValueError):
+        _read(b"this is not a deflate stream at all", "deflate")
+
+
+def test_corrupt_zstd_still_raises_value_error():
+    zstandard = pytest.importorskip("zstandard")
+    del zstandard  # bytes only; the ImportError path is covered separately
+    with pytest.raises(ValueError):
+        _read(b"this is not a zstd frame at all", "zstd")
+
+
+def test_zstd_not_installed_raises(monkeypatch):
+    monkeypatch.setitem(sys.modules, "zstandard", None)
+    with pytest.raises(ValueError, match="not installed"):
+        _read(b"ignored", "zstd")
+
+
+def test_brotli_not_installed_raises(monkeypatch):
+    monkeypatch.setitem(sys.modules, "brotli", None)
+    with pytest.raises(ValueError, match="not installed"):
+        _read(b"ignored", "br")
+
+
+def test_gzip_multi_member_rejected():
+    # zlib stops at the first gzip member; anything after it must not be
+    # silently dropped (gzip.decompress() used to decompress all members).
+    m1 = gzip.compress(b"first member " * 100)
+    m2 = gzip.compress(b"second member " * 100)
+    with pytest.raises(ValueError, match="trailing data"):
+        _read(m1 + m2, "gzip")
+
+
+def test_gzip_trailing_garbage_rejected():
+    with pytest.raises(ValueError, match="trailing data"):
+        _read(gzip.compress(b"ok") + b"NOTGZIP", "gzip")
+
+
+def test_truncated_gzip_still_raises_value_error():
+    # Header + partial body, no end marker: the old one-shot call raised
+    # BadGzipFile; the incremental path must raise too.
+    truncated = gzip.compress(_PAYLOAD)[:32]
+    with pytest.raises(ValueError):
+        _read(truncated, "gzip")
+
+
+def test_gzip_payload_across_slice_boundary_round_trips():
+    # Exactly 64 KiB + a few bytes: exercises the multi-iteration path where
+    # the final output is emitted after the cap-sized slice.
+    payload = b"x" * (64 * 1024 + 7)
+    assert _read(gzip.compress(payload), "gzip") == payload
 
 
 def test_truncated_brotli_still_raises_value_error():

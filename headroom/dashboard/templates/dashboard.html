@@ -77,15 +77,62 @@
         .diff-after { background: var(--diff-after-body); }
         .ttl-bucket-gradient-card { background: var(--ttl-card-bg); }
 
-        /* Light mode: invert the gray text scale (dark bg grays → light bg grays) */
+        /* Accessibility: high-contrast theme overrides
+           These fix WCAG AA failures in both light and dark modes. They live
+           here (after Tailwind CDN) so they override the generated utilities. */
+
+        /* Light mode: readable grays on white/light-gray surfaces. */
         html:not(.dark) body { color: #1f2937; }
+        html:not(.dark) .text-gray-100 { color: #111827; }
         html:not(.dark) .text-gray-200 { color: #1f2937; }
         html:not(.dark) .text-gray-300 { color: #374151; }
-        html:not(.dark) .text-gray-400 { color: #6b7280; }
-        html:not(.dark) .text-gray-500 { color: #9ca3af; }
-        html:not(.dark) .text-gray-600 { color: #6b7280; }
+        html:not(.dark) .text-gray-400 { color: #4b5563; }
+        html:not(.dark) .text-gray-500 { color: #4b5563; }
+        html:not(.dark) .text-gray-600 { color: #374151; }
         html:not(.dark) .hover\:text-gray-200:hover { color: #111827; }
         html:not(.dark) .hover\:text-white:hover { color: #111827; }
+
+        /* Light mode: darken bright accent text so it survives on white surfaces. */
+        html:not(.dark) .text-accent { color: #155e75; }
+        html:not(.dark) .text-cyan-50,
+        html:not(.dark) .text-cyan-100 { color: #164e63; }
+        html:not(.dark) .text-cyan-200\/80,
+        html:not(.dark) .text-cyan-300,
+        html:not(.dark) .text-cyan-300\/70,
+        html:not(.dark) .text-cyan-300\/75,
+        html:not(.dark) .text-cyan-400,
+        html:not(.dark) .text-cyan-400\/70,
+        html:not(.dark) .text-cyan-500\/60 { color: #155e75; }
+        html:not(.dark) .text-amber-50 { color: #78350f; }
+        html:not(.dark) .text-amber-300\/75,
+        html:not(.dark) .text-amber-300\/90,
+        html:not(.dark) .text-amber-400,
+        html:not(.dark) .text-amber-400\/70,
+        html:not(.dark) .text-amber-500,
+        html:not(.dark) .text-amber-500\/80 { color: #92400e; }
+        html:not(.dark) .text-emerald-50 { color: #064e3b; }
+        html:not(.dark) .text-emerald-300\/75,
+        html:not(.dark) .text-emerald-300\/90,
+        html:not(.dark) .text-emerald-400 { color: #065f46; }
+        html:not(.dark) .text-red-50 { color: #7f1d1d; }
+        html:not(.dark) .text-red-300\/75,
+        html:not(.dark) .text-red-300\/90,
+        html:not(.dark) .text-red-400,
+        html:not(.dark) .text-red-500,
+        html:not(.dark) .text-red-500\/80 { color: #991b1b; }
+        html:not(.dark) .text-violet-50 { color: #4c1d95; }
+        html:not(.dark) .text-violet-300\/75,
+        html:not(.dark) .text-violet-300\/90,
+        html:not(.dark) .text-violet-400 { color: #5b21b6; }
+        html:not(.dark) .text-yellow-400 { color: #854d0e; }
+        html:not(.dark) .text-orange-400 { color: #9a3412; }
+        html:not(.dark) .text-blue-400 { color: #1e40af; }
+        html:not(.dark) .text-sky-400 { color: #075985; }
+        html:not(.dark) .text-purple-400 { color: #6b21a8; }
+        html:not(.dark) .text-pink-400 { color: #9d1745; }
+        html:not(.dark) .text-rose-400 { color: #9f1239; }
+        html:not(.dark) .text-teal-400 { color: #115e59; }
+
         /* Light mode overrides for dark-specific utility classes */
         html:not(.dark) .bg-black\/20 { background-color: rgba(0,0,0,0.04); }
         html:not(.dark) .bg-black\/30 { background-color: rgba(0,0,0,0.06); }
@@ -93,12 +140,28 @@
         html:not(.dark) .ring-white\/5 { --tw-ring-color: rgba(0,0,0,0.08); }
         html:not(.dark) .border-red-900\/30 { border-color: rgba(239,68,68,0.25); }
         html:not(.dark) .border-emerald-900\/30 { border-color: rgba(16,185,129,0.25); }
-        /* Light mode: TTL card color adjustments */
-        html:not(.dark) .text-cyan-50 { color: #164e63; }
-        html:not(.dark) .text-violet-50 { color: #4c1d95; }
-        html:not(.dark) .text-cyan-200\/80 { color: #0e7490; }
-        html:not(.dark) .text-cyan-300\/75 { color: #0891b2; }
-        html:not(.dark) .text-violet-300\/75 { color: #7c3aed; }
+
+        /* Dark mode: lift muted gray text above WCAG AA on dark surfaces. */
+        .dark .text-gray-500,
+        .dark .text-gray-600,
+        .dark .text-gray-700 { color: #9ca3af; }
+
+        /* Dark mode: remove low-opacity tints that drop below AA on dark cards. */
+        .dark .text-cyan-500\/60 { color: #22d3ee; }
+        .dark .text-red-500\/80 { color: #f87171; }
+
+        /* Focus indicators for keyboard navigation. */
+        :is(button, a, input, select, textarea, [role="tab"]):focus-visible {
+            outline: 2px solid #22d3ee;
+            outline-offset: 2px;
+        }
+
+        /* Respect reduced-motion preferences. */
+        @media (prefers-reduced-motion: reduce) {
+            html { scroll-behavior: auto; }
+            .pulse-live { animation: none; }
+        }
+
         /* Light mode: fix hardcoded dark card backgrounds */
         .bg-card-alt { background: var(--card-alt-bg); }
         .hover-bg-surface:hover { background: var(--color-surface); }

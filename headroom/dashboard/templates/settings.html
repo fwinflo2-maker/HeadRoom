@@ -26,6 +26,23 @@
         .field-help { color: var(--muted); }
         input, select { background: var(--surface); border: 1px solid var(--border); }
         input:disabled, select:disabled { opacity: .55; cursor: not-allowed; }
+
+        /* Accessibility overrides for settings */
+        html:not(.dark) .text-accent { color: #155e75; }
+        html:not(.dark) .text-amber-500,
+        html:not(.dark) .text-amber-500\/80 { color: #92400e; }
+        html:not(.dark) .text-red-500,
+        html:not(.dark) .text-red-500\/80 { color: #991b1b; }
+        .dark .text-red-500\/80 { color: #f87171; }
+
+        :is(button, a, input, select, textarea, [role="tab"]):focus-visible {
+            outline: 2px solid #22d3ee;
+            outline-offset: 2px;
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            html { scroll-behavior: auto; }
+        }
     </style>
 </head>
 <body class="text-gray-800 dark:text-gray-100 min-h-screen" x-data="settingsPage()" x-init="init()">

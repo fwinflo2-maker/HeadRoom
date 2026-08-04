@@ -191,3 +191,102 @@ def test_launch_survives_github_existing_as_a_file(tmp_path: Path) -> None:
         _inject_copilot_models_instructions(target, ["gpt-5.4"])
     # The launch path must swallow exactly this, so assert it is an OSError
     # subclass (what the call site catches) rather than something broader.
+
+
+# ---------------------------------------------------------------------------
+# Ownership must be established by CONTENT, not position
+# ---------------------------------------------------------------------------
+
+_START = "<!-- headroom:available-models -->"
+_END = "<!-- /headroom:available-models -->"
+_KEEP = "DO NOT DELETE MY RULE"
+_USER_PAIR = f"{_START}\n{_KEEP}\n{_END}\n"
+
+
+def _real_block() -> str:
+    from headroom.cli.wrap import _copilot_models_instructions_block
+
+    return _copilot_models_instructions_block(["old-model"])
+
+
+def _refresh_then_unwrap(path: Path) -> tuple[str, str]:
+    """Two refreshes then a removal — the full lifecycle a user actually hits."""
+    _inject_copilot_models_instructions(path, ["gpt-5.4"])
+    _inject_copilot_models_instructions(path, ["gpt-5.5"])
+    after = path.read_text(encoding="utf-8")
+    _remove_copilot_models_instructions(path)
+    return after, path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("label", "content"),
+    [
+        # The reviewer's repro: a COMPLETE user pair above the generated block.
+        # Position-based ownership (first END + nearest preceding START) selected
+        # the *user's* pair and deleted it while reporting a successful refresh.
+        ("complete user pair before", f"# Rules\n\n{_USER_PAIR}\n{{real}}"),
+        ("complete user pair after", f"# Rules\n\n{{real}}\n{_USER_PAIR}"),
+        ("user pairs on both sides", f"{_USER_PAIR}\n{{real}}\n{_USER_PAIR}"),
+        # A stray START widens any forward-paired span; the generated block then
+        # sits *inside* it, so even a content check on the span still passed.
+        ("stray START only", f"# Rules\n\n{_START}\n{_KEEP}\n\n## section\n"),
+        ("stray END only", f"# Rules\n\n{_KEEP}\n{_END}\n"),
+        ("reversed markers", f"{_END}\n{_KEEP}\n{_START}\n"),
+        ("user quotes our block verbatim", f"# Rules\n{_KEEP}\n\n{{real}}\n{{real}}"),
+    ],
+)
+def test_user_content_survives_refresh_and_unwrap(tmp_path: Path, label: str, content: str) -> None:
+    p = tmp_path / "copilot-instructions.md"
+    p.write_text(content.replace("{real}", _real_block()), encoding="utf-8")
+    after, final = _refresh_then_unwrap(p)
+    assert _KEEP in after, f"{label}: user content destroyed by refresh"
+    assert _KEEP in final, f"{label}: user content destroyed by unwrap"
+
+
+def test_lone_user_pair_with_no_generated_block_is_never_touched(tmp_path: Path) -> None:
+    """Nothing of ours is present, so neither refresh nor unwrap may edit the pair."""
+    p = tmp_path / "copilot-instructions.md"
+    p.write_text(f"# Rules\n\n{_USER_PAIR}", encoding="utf-8")
+    assert _remove_copilot_models_instructions(p) is False
+    assert _KEEP in p.read_text(encoding="utf-8")
+    after, final = _refresh_then_unwrap(p)
+    assert _KEEP in after
+    assert _KEEP in final
+
+
+def test_ambiguous_duplicate_generated_blocks_refuse_to_mutate(tmp_path: Path) -> None:
+    """Two blocks that both look generated: there is no safe way to pick one."""
+    from headroom.cli.wrap import _marked_block_is_ambiguous
+
+    p = tmp_path / "copilot-instructions.md"
+    body = f"# Rules\n{_KEEP}\n\n{_real_block()}\n{_real_block()}"
+    p.write_text(body, encoding="utf-8")
+    assert _marked_block_is_ambiguous(body.replace("\r\n", "\n")) is True
+    assert _inject_copilot_models_instructions(p, ["gpt-5.4"]) is False
+    assert p.read_text(encoding="utf-8") == body, "file was mutated while ambiguous"
+
+
+def test_invalid_utf8_fails_closed(tmp_path: Path) -> None:
+    """`errors="replace"` + whole-file rewrite would substitute U+FFFD everywhere."""
+    p = tmp_path / "copilot-instructions.md"
+    p.write_bytes(b"# Rules\n\xff\xfe raw bytes " + _KEEP.encode() + b"\n")
+    before = p.read_bytes()
+    assert _inject_copilot_models_instructions(p, ["gpt-5.4"]) is False
+    assert p.read_bytes() == before
+    assert _remove_copilot_models_instructions(p) is False
+    assert p.read_bytes() == before
+
+
+def test_normal_lifecycle_still_works(tmp_path: Path) -> None:
+    """Guard against over-correcting into never updating anything."""
+    p = tmp_path / "copilot-instructions.md"
+    p.write_text("# Mine\nkeep me\n", encoding="utf-8")
+    _inject_copilot_models_instructions(p, ["gpt-5.4"])
+    assert "gpt-5.4" in p.read_text(encoding="utf-8")
+    _inject_copilot_models_instructions(p, ["gpt-5.5"])
+    text = p.read_text(encoding="utf-8")
+    assert "gpt-5.5" in text and "gpt-5.4" not in text
+    assert text.count(_START) == 1, "refresh duplicated the block"
+    _remove_copilot_models_instructions(p)
+    final = p.read_text(encoding="utf-8")
+    assert "keep me" in final and _START not in final

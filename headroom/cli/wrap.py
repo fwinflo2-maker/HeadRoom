@@ -1730,36 +1730,90 @@ def _live_copilot_model_ids(api_url: str | None, token: str | None) -> list[str]
     )
 
 
-def _find_marked_block(existing: str) -> tuple[int, int] | None:
-    """Locate a well-formed available-models block, or ``None``.
+#: A line every generated block contains. Position-independent ownership proof:
+#: marker text alone cannot identify our block, because a user may legitimately
+#: quote the markers -- including a complete pair -- in their own prose.
+_COPILOT_MODELS_BLOCK_SIGNATURE = "# Available AI models (Headroom)"
 
-    Anchor on the end marker and take the **last** start marker before it. A
-    written block is always a contiguous ``START ... END`` with no nested START,
-    so that pair is necessarily ours.
 
-    Both naive alternatives lose user data, and both were reproduced:
+def _marked_block_spans(existing: str) -> list[tuple[int, int]]:
+    """Every complete ``START ... END`` pair, tightest-first, in file order.
 
-    * ``existing.index(END)`` with no offset matches the *first* end marker
-      regardless of where the start is. A user with the start marker in their own
-      prose (documenting this feature, say) lost every byte between their marker
-      and the real block's end -- silently, while the CLI reported a successful
-      refresh.
-    * Searching END *forward from the first* START is not enough either: when the
-      user's stray START precedes our block, the span still swallows everything
-      between their marker and our block's end. That is why this anchors on END
-      and scans backwards.
-
-    A reversed pair (END before any START) yields no match, so callers append a
-    fresh block rather than splicing a range they cannot trust -- previously that
-    case produced ``end < start`` and duplicated user text on every launch.
+    Iterates **END markers** and pairs each with the *nearest preceding* START.
+    Pairing the other way round (first START, then the next END) produces a span
+    that swallows everything between an unpaired stray START and a later real
+    block -- and because the real block then sits inside that span, an ownership
+    check on its contents still passes, so the user's text is deleted anyway.
+    Taking the nearest START yields the narrowest defensible pair instead.
     """
-    end = existing.find(_COPILOT_MODELS_MARKER_END)
-    if end < 0:
+    spans: list[tuple[int, int]] = []
+    search_from = 0
+    while True:
+        end = existing.find(_COPILOT_MODELS_MARKER_END, search_from)
+        if end < 0:
+            return spans
+        end_stop = end + len(_COPILOT_MODELS_MARKER_END)
+        start = existing.rfind(_COPILOT_MODELS_MARKER, search_from, end)
+        if start >= 0:
+            spans.append((start, end_stop))
+        search_from = end_stop
+
+
+def _find_marked_block(existing: str) -> tuple[int, int] | None:
+    """Locate **our** generated block, or ``None`` when ownership is not certain.
+
+    Position-based heuristics cannot establish ownership here, and every one tried
+    so far destroyed user content in a reproducible case:
+
+    * ``index(END)`` with no offset matched the first END anywhere in the file.
+    * Searching END forward from the first START still swallowed user text when a
+      stray START preceded our block.
+    * Anchoring on the first END and taking the last START before it -- the
+      previous attempt -- picks the *user's* pair when they document a **complete**
+      pair above our block, which is exactly as plausible as a stray marker.
+
+    So ownership is established by content, not position: a candidate must carry
+    :data:`_COPILOT_MODELS_BLOCK_SIGNATURE`, a line only the generator writes.
+    Returns ``None`` unless exactly one candidate qualifies -- zero means "no
+    block of ours, append a fresh one", and more than one means genuinely
+    ambiguous, where refusing to touch the file is the only safe answer.
+    """
+    owned = [
+        (start, end)
+        for start, end in _marked_block_spans(existing)
+        if _COPILOT_MODELS_BLOCK_SIGNATURE in existing[start:end]
+    ]
+    return owned[0] if len(owned) == 1 else None
+
+
+def _marked_block_is_ambiguous(existing: str) -> bool:
+    """True when more than one candidate block claims to be ours.
+
+    Callers must not mutate in this state: there is no way to tell which pair the
+    generator owns, and guessing risks deleting the user's own content.
+    """
+    return (
+        sum(
+            1
+            for start, end in _marked_block_spans(existing)
+            if _COPILOT_MODELS_BLOCK_SIGNATURE in existing[start:end]
+        )
+        > 1
+    )
+
+
+def _read_instruction_file(file_path: Path) -> str | None:
+    """Raw text of an instruction file, or ``None`` when it is not safe to rewrite.
+
+    Fails closed on invalid UTF-8. Decoding with ``errors="replace"`` and then
+    writing the result back would substitute U+FFFD for every undecodable byte
+    across the *whole* file -- silent corruption of content this function only
+    means to read.
+    """
+    try:
+        return file_path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
         return None
-    start = existing.rfind(_COPILOT_MODELS_MARKER, 0, end)
-    if start < 0:
-        return None
-    return start, end + len(_COPILOT_MODELS_MARKER_END)
 
 
 def _write_preserving_line_endings(file_path: Path, original: str, updated: str) -> None:
@@ -1790,8 +1844,21 @@ def _inject_copilot_models_instructions(
         return False
     block = _copilot_models_instructions_block(model_ids)
     if file_path.exists():
-        raw = file_path.read_bytes().decode("utf-8", errors="replace")
-        existing = _read_text(file_path)
+        raw = _read_instruction_file(file_path)
+        if raw is None:
+            click.echo(
+                f"  Note: {file_path} is not valid UTF-8; leaving it untouched rather "
+                "than risk rewriting it. Run `headroom models` to see available models."
+            )
+            return False
+        existing = raw.replace("\r\n", "\n")
+        if _marked_block_is_ambiguous(existing):
+            click.echo(
+                f"  Note: {file_path} contains more than one Headroom available-models "
+                "block, so which one is generated is ambiguous. Leaving the file "
+                "untouched; remove the duplicate to re-enable automatic updates."
+            )
+            return False
         span = _find_marked_block(existing)
         if span is not None:
             start, end = span
@@ -1814,11 +1881,24 @@ def _inject_copilot_models_instructions(
 
 
 def _remove_copilot_models_instructions(file_path: Path) -> bool:
-    """Strip the available-models block, leaving the user's content intact."""
+    """Strip **our** generated block, leaving everything the user wrote intact.
+
+    Removes a block only when ownership is unambiguous, on the same rules as the
+    injector. A user's own quoted marker pair -- even a complete one -- is never
+    deleted, and an ambiguous file is left alone.
+    """
     if not file_path.exists():
         return False
-    raw = file_path.read_bytes().decode("utf-8", errors="replace")
-    existing = _read_text(file_path)
+    raw = _read_instruction_file(file_path)
+    if raw is None:
+        return False
+    existing = raw.replace("\r\n", "\n")
+    if _marked_block_is_ambiguous(existing):
+        click.echo(
+            f"  Note: {file_path} contains more than one Headroom available-models "
+            "block; leaving it untouched rather than guessing which to remove."
+        )
+        return False
     span = _find_marked_block(existing)
     if span is None:
         return False

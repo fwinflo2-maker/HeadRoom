@@ -863,44 +863,58 @@
                 </div>
 
                 <!-- Recent Requests Table (with expandable rows) -->
-                <div class="bg-surface rounded-lg border border-border overflow-hidden mb-6">
-                    <div class="px-4 py-3 border-b border-border flex justify-between items-center">
-                        <span class="text-sm font-medium text-gray-300">Recent Requests</span>
-                        <span class="text-xs text-gray-500">Last 25 &mdash; click row to expand</span>
+                <div class="bg-surface rounded-lg border border-border overflow-hidden mb-6" data-testid="recent-requests-table">
+                    <div class="px-4 py-3 border-b border-border flex flex-col gap-2 sm:flex-row sm:justify-between sm:items-center">
+                        <div>
+                            <span class="text-sm font-medium text-gray-300">Recent Requests</span>
+                            <span class="text-xs text-gray-500 ml-2">Last 25 &mdash; click row to expand</span>
+                        </div>
+                        <p class="text-xs text-gray-400 font-mono tabular-nums" data-testid="token-summary-line"
+                           x-text="tokenSummaryLine"></p>
                     </div>
                     <div class="overflow-x-auto">
                         <div>
-                            <!-- Header -->
+                            <!-- Header: Question | Input | Headroom compress | Output | Saving -->
                             <div class="grid text-xs text-gray-500 uppercase tracking-wide border-b border-border"
-                                 style="grid-template-columns: 2rem 12fr 22fr 15fr 12fr 10fr 14fr">
+                                 style="grid-template-columns: 2rem minmax(12rem, 2.4fr) minmax(5.5rem, 0.85fr) minmax(6.5rem, 0.95fr) minmax(5.5rem, 0.85fr) minmax(6.5rem, 0.95fr)">
                                 <div class="px-2 py-3"></div>
-                                <div class="px-4 py-3 font-medium">Time</div>
-                                <div class="px-4 py-3 font-medium">Model</div>
-                                <div class="px-4 py-3 font-medium text-right">Input</div>
-                                <div class="px-4 py-3 font-medium text-right">Output</div>
-                                <div class="px-4 py-3 font-medium text-right">Saved</div>
-                                <div class="px-4 py-3 font-medium text-right">Latency</div>
+                                <div class="px-4 py-3 font-medium">Question</div>
+                                <div class="px-4 py-3 font-medium text-right">Input Token</div>
+                                <div class="px-4 py-3 font-medium text-right">Headroom Compress</div>
+                                <div class="px-4 py-3 font-medium text-right">Output Token</div>
+                                <div class="px-4 py-3 font-medium text-right">Saving</div>
                             </div>
                             <!-- Data rows -->
                             <div class="divide-y divide-border">
                                 <template x-for="req in (stats.recent_requests || [])" :key="req.request_id">
                                     <div>
                                         <div class="cursor-pointer" @click="toggleExpanded(req.request_id)">
-                                            <div class="grid hover:bg-border/30 transition-colors"
-                                                 style="grid-template-columns: 2rem 12fr 22fr 15fr 12fr 10fr 14fr">
+                                            <div class="grid hover:bg-border/30 transition-colors items-center"
+                                                 style="grid-template-columns: 2rem minmax(12rem, 2.4fr) minmax(5.5rem, 0.85fr) minmax(6.5rem, 0.95fr) minmax(5.5rem, 0.85fr) minmax(6.5rem, 0.95fr)">
                                                 <div class="px-2 py-3 text-gray-500 flex items-center justify-center">
                                                     <span x-text="expandedRows[req.request_id] ? '-' : '+'"></span>
                                                 </div>
-                                                <div class="px-4 py-3 font-mono text-gray-400 truncate" x-text="formatTime(req.timestamp)"></div>
                                                 <div class="px-4 py-3 min-w-0">
-                                                    <span class="px-2 py-0.5 bg-border rounded text-xs truncate" x-text="truncateModel(req.model)"></span>
+                                                    <div class="text-sm text-gray-200 truncate" :title="requestQuestionPreview(req)"
+                                                         x-text="requestQuestionPreview(req)"></div>
+                                                    <div class="mt-0.5 flex items-center gap-2 text-[11px] text-gray-500">
+                                                        <span class="font-mono truncate" x-text="formatTime(req.timestamp)"></span>
+                                                        <span class="px-1.5 py-0.5 bg-border rounded text-[10px] truncate max-w-[10rem]"
+                                                              x-text="truncateModel(req.model)"></span>
+                                                    </div>
                                                 </div>
-                                                <div class="px-4 py-3 text-right font-mono tabular-nums" x-text="formatNumber(req.input_tokens_optimized)"></div>
-                                                <div class="px-4 py-3 text-right font-mono tabular-nums" x-text="formatNumber(req.output_tokens || 0)"></div>
+                                                <div class="px-4 py-3 text-right font-mono tabular-nums text-gray-300"
+                                                     x-text="formatNumber(req.input_tokens_original || 0)"></div>
+                                                <div class="px-4 py-3 text-right font-mono tabular-nums text-cyan-300"
+                                                     x-text="formatNumber(req.input_tokens_optimized || 0)"></div>
+                                                <div class="px-4 py-3 text-right font-mono tabular-nums"
+                                                     x-text="formatNumber(req.output_tokens || 0)"></div>
                                                 <div class="px-4 py-3 text-right">
-                                                    <span class="text-accent font-mono tabular-nums" x-text="req.savings_percent.toFixed(0) + '%'"></span>
+                                                    <div class="text-accent font-mono tabular-nums"
+                                                         x-text="formatNumber(req.tokens_saved || 0)"></div>
+                                                    <div class="text-[11px] text-gray-500 font-mono tabular-nums"
+                                                         x-text="(req.savings_percent || 0).toFixed(0) + '%'"></div>
                                                 </div>
-                                                <div class="px-4 py-3 text-right font-mono tabular-nums text-gray-400" x-text="(req.total_latency_ms || 0).toFixed(0) + 'ms'"></div>
                                             </div>
                                         </div>
                                         <!-- Expanded detail row -->
@@ -2089,6 +2103,28 @@
                         || (Array.isArray(compressed) && compressed.length > 0);
                 },
 
+                requestQuestionPreview(req) {
+                    const messages = req?.request_messages || [];
+                    if (Array.isArray(messages) && messages.length > 0) {
+                        for (let i = messages.length - 1; i >= 0; i--) {
+                            const msg = messages[i];
+                            if (!msg || (msg.role && msg.role !== 'user')) continue;
+                            const text = this.extractMessageText(msg.content).replace(/\s+/g, ' ').trim();
+                            if (text) {
+                                return text.length > 96 ? text.slice(0, 96) + '…' : text;
+                            }
+                        }
+                        const fallback = this.flattenMessages(messages).replace(/\s+/g, ' ').trim();
+                        if (fallback) {
+                            return fallback.length > 96 ? fallback.slice(0, 96) + '…' : fallback;
+                        }
+                    }
+                    if (!this.log_full_messages) {
+                        return 'Enable HEADROOM_LOG_MESSAGES=true';
+                    }
+                    return this.truncateModel(req?.model || 'request');
+                },
+
                 requestOriginPreview(req) {
                     return this.truncateDisplayText(this.flattenMessages(req?.request_messages || []));
                 },
@@ -2105,6 +2141,18 @@
                         return '';
                     }
                     return this.truncateDisplayText(this.flattenMessages(compressedRaw));
+                },
+
+                get tokenSummaryLine() {
+                    const tokens = this.stats?.tokens || {};
+                    const compressed = tokens.input || 0;
+                    const saved = tokens.proxy_compression_saved ?? tokens.saved ?? 0;
+                    const original = tokens.proxy_total_before_compression
+                        || (compressed + saved)
+                        || 0;
+                    const output = tokens.output || 0;
+                    const pct = original > 0 ? (saved / original * 100) : 0;
+                    return `Input ${this.formatNumber(original)} → Headroom ${this.formatNumber(compressed)} · Output ${this.formatNumber(output)} · Saved ${this.formatNumber(saved)} (${pct.toFixed(0)}%)`;
                 },
 
                 renderTransformationCard(t, idx) {

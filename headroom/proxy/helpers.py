@@ -1900,8 +1900,13 @@ def apply_session_sticky_ccr_tool(
 class RequestBodyTooLarge(ValueError):
     """A compressed request body expanded beyond the decompression cap.
 
-    Subclasses ``ValueError`` so existing callers that translate
-    decompression failures into a client error (400) keep working. The
+    Subclasses ``ValueError`` so the exception always degrades to a client
+    error even if a caller forgets to handle it explicitly. Handlers that
+    read request bodies MUST translate this into
+    :func:`get_body_too_large_status` (default 413) — never a 400, and
+    never a fail-open forward: a size-policy rejection is a client error
+    distinct from malformed JSON, and the whole point of the cap is that
+    the expanded body must never be materialized or forwarded. The
     pristine message matters: it names the limit instead of the wrapped
     decompressor error.
     """
@@ -1992,23 +1997,6 @@ def _decompress_zstd_capped(zstandard: Any, data: bytes) -> bytes:
         reader.close()
 
 
-def _decompress_brotli_capped(brotli: Any, data: bytes) -> bytes:
-    """Decompress a brotli stream incrementally, capped on output.
-
-    ``brotli.decompress`` has no output cap and ``Decompressor.process``
-    materializes everything it can from the given input, so feed the input
-    in bounded slices and enforce the cap on the running total.
-    """
-    decompressor = brotli.Decompressor()
-    out = bytearray()
-    for i in range(0, len(data), 64 * 1024):
-        out.extend(decompressor.process(data[i : i + 64 * 1024]))
-        _enforce_decompression_cap(len(out), "br")
-    if not decompressor.is_finished():
-        raise ValueError("Failed to decompress br request body: truncated or corrupt stream")
-    return bytes(out)
-
-
 async def _read_request_body_bytes(request: Request) -> bytes:
     """Read and (if needed) decompress the request body, returning raw UTF-8 bytes.
 
@@ -2058,18 +2046,22 @@ async def _read_request_body_bytes(request: Request) -> bytes:
         except Exception as exc:
             raise ValueError(f"Failed to decompress deflate request body: {exc}") from exc
     elif encoding == "br":
-        try:
-            import brotli
-        except ImportError:
-            raise ValueError(
-                "Request body is brotli-compressed but the 'brotli' package is not installed."
-            ) from None
-        try:
-            raw = _decompress_brotli_capped(brotli, raw)
-        except RequestBodyTooLarge:
-            raise
-        except Exception as exc:
-            raise ValueError(f"Failed to decompress brotli request body: {exc}") from exc
+        # Brotli request bodies are rejected outright. The Python brotli
+        # bindings (brotli 1.2.0 and brotlicffi) expose no output-bounded
+        # streaming API: ``Decompressor.process(input_slice)`` returns ALL
+        # output produced from that slice before returning, so a highly
+        # compressible stream smaller than any feed slice can expand well
+        # past ``MAX_DECOMPRESSED_BODY_BYTES`` inside a single call — the
+        # exact allocation the cap exists to prevent. Rejecting the
+        # encoding (rather than decompressing) is the only way the
+        # process-wide decompression-bomb boundary holds for br; clients
+        # that send compressed request bodies can use gzip, deflate, or
+        # zstd, which all have bounded streaming APIs.
+        raise ValueError(
+            "Request body is brotli-compressed, but brotli request bodies are not "
+            "accepted: the Python brotli API cannot bound decompressed output "
+            "(decompression-bomb risk). Use Content-Encoding: gzip, deflate, or zstd."
+        )
     elif encoding and encoding != "identity":
         raise ValueError(f"Unsupported Content-Encoding: {encoding}")
 

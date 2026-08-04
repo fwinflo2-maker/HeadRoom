@@ -1,13 +1,19 @@
 """Decompression of compressed request bodies must be bounded.
 
 ``_read_request_body_bytes`` (headroom/proxy/helpers.py) expands
-zstd/gzip/deflate/br request bodies before forwarding. The expansion used
+zstd/gzip/deflate request bodies before forwarding. The expansion used
 to be unbounded (``gzip.decompress`` / ``zlib.decompress`` /
 ``brotli.decompress`` / ``stream_reader().read()``), so a tiny compressed
 body could balloon into an unbounded in-memory buffer — a decompression-bomb
-DoS. Every format is now fed incrementally against
+DoS. Every supported format is now fed incrementally against
 ``MAX_DECOMPRESSED_BODY_BYTES`` and raises ``RequestBodyTooLarge`` (a
 ``ValueError``) when the cap is exceeded.
+
+Brotli (``br``) request bodies are rejected outright: the Python brotli
+bindings expose no output-bounded streaming API, so a highly compressible
+stream smaller than any feed slice can expand past the cap inside a single
+``Decompressor.process()`` call — the exact allocation the cap exists to
+prevent. Rejecting the encoding keeps the process-wide boundary intact.
 """
 
 import asyncio
@@ -69,10 +75,14 @@ def test_zstd_round_trip():
     assert _read(raw, "zstd") == _PAYLOAD
 
 
-def test_brotli_round_trip():
+def test_brotli_round_trip_rejected():
+    # br is rejected outright: the Python brotli bindings have no
+    # output-bounded streaming API, so even a valid small stream could
+    # expand past the cap inside a single Decompressor.process() call.
     brotli = pytest.importorskip("brotli")
     raw = brotli.compress(_PAYLOAD)
-    assert _read(raw, "br") == _PAYLOAD
+    with pytest.raises(ValueError, match="brotli"):
+        _read(raw, "br")
 
 
 # ---------------------------------------------------------------------------
@@ -110,10 +120,24 @@ def test_zstd_bomb_rejected(monkeypatch):
         )
 
 
-def test_brotli_bomb_rejected(monkeypatch):
+def test_brotli_peak_input_never_reaches_decompressor(monkeypatch):
+    """Regression: peak-producing br input cannot cross the cap boundary.
+
+    Before this PR the brotli path fed 64 KiB input slices to
+    ``Decompressor.process()``, which returns ALL output produced from a
+    slice before the cap check runs — a highly compressible sub-64 KiB
+    stream could materialize far beyond the cap in one call. Brotli is now
+    rejected before any decompression happens, so the boundary holds by
+    construction: the bomb is refused as an unsupported encoding
+    (ValueError), never decompressed, and never surfaces as
+    RequestBodyTooLarge (which would imply a decompressor ran).
+    """
     brotli = pytest.importorskip("brotli")
-    with pytest.raises(RequestBodyTooLarge):
-        _read(_bomb_under_cap(monkeypatch, brotli.compress), "br")
+    monkeypatch.setattr("headroom.proxy.helpers.MAX_DECOMPRESSED_BODY_BYTES", 4096)
+    bomb = brotli.compress(b"A" * (1024 * 1024))
+    assert len(bomb) < 4096  # sanity: the input itself is tiny
+    with pytest.raises(ValueError, match="brotli"):
+        _read(bomb, "br")
 
 
 def test_payload_at_cap_is_accepted(monkeypatch):
@@ -150,9 +174,13 @@ def test_zstd_not_installed_raises(monkeypatch):
         _read(b"ignored", "zstd")
 
 
-def test_brotli_not_installed_raises(monkeypatch):
+def test_brotli_rejected_regardless_of_install(monkeypatch):
+    # The br rejection is unconditional: the encoding is refused before any
+    # brotli import, so whether the package is installed or not changes
+    # nothing (and a missing package can no longer silently allow a bomb
+    # through as "not installed").
     monkeypatch.setitem(sys.modules, "brotli", None)
-    with pytest.raises(ValueError, match="not installed"):
+    with pytest.raises(ValueError, match="brotli"):
         _read(b"ignored", "br")
 
 
@@ -193,9 +221,12 @@ def test_gzip_payload_across_slice_boundary_round_trips():
 
 
 def test_truncated_brotli_still_raises_value_error():
+    # br is rejected before any decompression, so even a truncated stream is
+    # refused with the same encoding rejection (still a client-error
+    # ValueError, matching the pre-PR contract).
     brotli = pytest.importorskip("brotli")
     truncated = brotli.compress(_PAYLOAD)[:16]
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="brotli"):
         _read(truncated, "br")
 
 

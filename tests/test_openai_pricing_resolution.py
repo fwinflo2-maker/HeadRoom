@@ -54,7 +54,11 @@ def test_pricing_prefers_the_most_specific_prefix(
 ) -> None:
     got_in, got_out = OpenAIProvider()._get_pricing(model)
 
-    assert (got_in, got_out) == (want_in, want_out)
+    # Tolerance, not equality: these rates may come from LiteLLM's per-token
+    # figures, and the x1e6 conversion is not exact in binary floating point
+    # ($0.4/1M arrives as 0.39999999999999997). Money compared to the cent.
+    assert got_in == pytest.approx(want_in, abs=0.001)
+    assert got_out == pytest.approx(want_out, abs=0.001)
 
 
 def test_nano_is_not_priced_as_legacy_gpt4() -> None:

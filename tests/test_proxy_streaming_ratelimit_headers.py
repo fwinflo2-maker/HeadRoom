@@ -293,6 +293,8 @@ class TestStreamingRatelimitHeaderForwarding:
         proxy.http_client.send = AsyncMock(return_value=mock_response)
         fake_logger = MagicMock()
         monkeypatch.setattr(streaming_module, "logger", fake_logger)
+        prefix_tracker = MagicMock()
+        prefix_tracker.classify_cache_miss.return_value.is_miss = False
 
         result = await proxy._stream_response(
             url="https://api.anthropic.com/v1/messages",
@@ -312,6 +314,7 @@ class TestStreamingRatelimitHeaderForwarding:
             transforms_applied=[],
             tags={},
             optimization_latency=0.0,
+            prefix_tracker=prefix_tracker,
         )
 
         assert result.status_code == 503
@@ -329,6 +332,8 @@ class TestStreamingRatelimitHeaderForwarding:
         proxy.metrics.record_failed.assert_awaited_once()
         proxy.metrics.record_request.assert_not_awaited()
         proxy.cost_tracker.record_tokens.assert_not_called()
+        prefix_tracker.classify_cache_miss.assert_not_called()
+        prefix_tracker.update_from_response.assert_not_called()
         mock_response.aclose.assert_awaited_once()
 
     @pytest.mark.asyncio

@@ -1870,11 +1870,18 @@ def _read_instruction_file(file_path: Path) -> str | None:
     writing the result back would substitute U+FFFD for every undecodable byte
     across the *whole* file -- silent corruption of content this function only
     means to read.
+
+    A NUL byte also fails closed. UTF-16LE-encoded ASCII is *valid* UTF-8 (the
+    interleaved NULs decode as U+0000), so the decode guard alone admits such a
+    file and the rewrite leaves it undecodable in its own encoding. Real markdown
+    never contains NUL -- git itself treats a NUL-bearing file as binary -- so
+    rejecting it costs nothing and also covers UTF-16BE and UTF-32.
     """
     try:
-        return file_path.read_bytes().decode("utf-8")
+        text = file_path.read_bytes().decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return None
+    return None if "\x00" in text else text
 
 
 def _write_preserving_line_endings(file_path: Path, original: str, updated: str) -> None:
@@ -3324,38 +3331,6 @@ def _proxy_anthropic_upstream_mismatch(
     return running != _normalize_proxy_api_url(requested) if requested else True
 
 
-def _proxy_upstream_conflicts(
-    health_payload: dict[str, object],
-    *,
-    anthropic: str | None = None,
-    openai: str | None = None,
-) -> list[str]:
-    """Names of upstreams where a running proxy disagrees with this launch.
-
-    Compared **unconditionally**, including when the caller wants the default
-    (``None``). That asymmetry was the actual bug: the pre-existing
-    ``openai_api_url`` check only ran ``if openai_api_url:``, so a caller wanting
-    the default never compared against a proxy pinned to something else. Both
-    directions matter --  after a Copilot session, ``wrap claude`` (Anthropic) or
-    ``wrap codex`` (OpenAI) could otherwise silently ride the Copilot upstream
-    with a substituted credential.
-
-    An empty list means the proxy is safe to share.
-    """
-    config = health_payload.get("config") if isinstance(health_payload, dict) else None
-    if not isinstance(config, dict):
-        # No config to compare: leave the existing reuse logic in charge rather
-        # than forcing a dedicated proxy on every launch.
-        return []
-    conflicts: list[str] = []
-    for name, requested in (("anthropic", anthropic), ("openai", openai)):
-        running = _normalize_proxy_api_url(config.get(f"{name}_api_url"))
-        wanted = _normalize_proxy_api_url(requested)
-        if running != wanted:
-            conflicts.append(f"{name}={running or 'default'}")
-    return conflicts
-
-
 def _normalize_proxy_api_url(url: object) -> str | None:
     """Normalize configured upstream URLs for running-proxy comparisons."""
     if not isinstance(url, str):
@@ -3845,30 +3820,6 @@ def _ensure_proxy(
         isolated_copilot_subscription_proxy = copilot_subscription_seed_requested and (
             manifest is not None or helpers._check_proxy(port)
         )
-        # A proxy pinned to different upstreams cannot be shared, and adding the
-        # mismatch to `missing` does NOT achieve that: a non-empty `missing` only
-        # logs "stale; starting a fresh proxy instead" and then falls through to a
-        # second reuse check that recomputes `missing` without it, so the proxy is
-        # handed over anyway (verified by driving _ensure_proxy directly). The
-        # consequence is severe and silent: after `wrap copilot --native`, a
-        # `wrap claude` on the same port would send Claude Code's /v1/messages to
-        # api.githubcopilot.com, and since sk-ant-* bearers are not forwardable,
-        # apply_copilot_api_auth strips the user's Anthropic credential and
-        # substitutes the Copilot token. So the conflict is resolved here, before
-        # any reuse path runs, by taking a dedicated port instead.
-        if not isolated_copilot_subscription_proxy and helpers._check_proxy(port):
-            conflicts = _proxy_upstream_conflicts(
-                helpers._query_proxy_health(port) or {},
-                anthropic=anthropic_api_url,
-                openai=openai_api_url,
-            )
-            if conflicts:
-                isolated_copilot_subscription_proxy = True
-                click.echo(
-                    f"  Proxy on port {port} is pinned to a different upstream "
-                    f"({', '.join(conflicts)}); starting a dedicated proxy for this "
-                    "session rather than sharing it."
-                )
         if isolated_copilot_subscription_proxy:
             click.echo(
                 "  Copilot subscription seeds are session-specific; "
@@ -4088,13 +4039,24 @@ def _ensure_proxy(
                     and running_config.get("savings_profile") != expected_savings_profile
                 ):
                     missing.append("savings-profile")
-                if openai_api_url:
-                    running_openai_url = _normalize_proxy_api_url(
-                        running_config.get("openai_api_url")
-                    )
-                    requested_openai_url = _normalize_proxy_api_url(openai_api_url)
-                    if running_openai_url != requested_openai_url:
-                        missing.append("openai-api-url")
+                # Compared even when the caller wants the DEFAULT upstream
+                # (``*_api_url is None``). The old ``if openai_api_url:`` guard
+                # only fired when the caller pinned one, so a caller wanting the
+                # default never noticed a proxy pinned elsewhere -- and after
+                # `wrap copilot --native` (which points BOTH upstreams at the
+                # Copilot host) a later `wrap claude` silently reused it, sending
+                # Claude traffic to Copilot with the user's Anthropic credential
+                # replaced by the Copilot token. Landing this in ``missing``
+                # reuses the established kill-and-restart-on-the-same-port
+                # contract rather than inventing a second isolation mechanism.
+                for _label, _key, _requested in (
+                    ("openai-api-url", "openai_api_url", openai_api_url),
+                    ("anthropic-api-url", "anthropic_api_url", anthropic_api_url),
+                ):
+                    if _normalize_proxy_api_url(
+                        running_config.get(_key)
+                    ) != _normalize_proxy_api_url(_requested):
+                        missing.append(_label)
                 if vertex_api_url or clear_vertex_api_url:
                     running_vertex_url = _normalize_proxy_api_url(
                         running_config.get("vertex_api_url")
@@ -4107,11 +4069,30 @@ def _ensure_proxy(
                     flags_str = ", ".join(
                         f if f.startswith("--") else f"--{f.replace('_', '-')}" for f in missing
                     )
+                    # An upstream mismatch is NOT a missing feature: sharing that
+                    # proxy would send this session's traffic to a different
+                    # vendor. After `wrap copilot --native` (both upstreams pinned
+                    # at the Copilot host) a `wrap claude` reusing it has its
+                    # Anthropic credential stripped and the Copilot token
+                    # substituted, silently. So it can neither be reused as-is nor
+                    # be fixed by restarting a proxy other sessions are using:
+                    # this session takes its own proxy instead.
+                    upstream_conflict = [flag for flag in missing if flag.endswith("-api-url")]
                     other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
-                    if other_wrappers:
-                        # Another wrapper is attached to this proxy; restarting it
-                        # to add flags would drop their in-flight requests. Reuse
-                        # the running proxy as-is rather than disrupt them.
+                    if upstream_conflict and other_wrappers:
+                        click.echo(
+                            f"  Proxy on port {port} is pinned to a different upstream "
+                            f"({', '.join(upstream_conflict)}) and {len(other_wrappers)} "
+                            "other wrapper(s) are attached."
+                        )
+                        click.echo(
+                            "  Starting a dedicated proxy for this session rather than "
+                            "sharing it or disrupting them."
+                        )
+                        isolated_copilot_subscription_proxy = True
+                    elif other_wrappers:
+                        # A genuinely missing *feature* is safe to live without;
+                        # restarting would drop other sessions' in-flight requests.
                         click.echo(
                             f"  Proxy on port {port} is missing: {flags_str}, but "
                             f"{len(other_wrappers)} other wrapper(s) are attached."
@@ -4148,7 +4129,10 @@ def _ensure_proxy(
                             )
                             return None, port
 
-            if not needs_restart:
+            # `isolated_...` is also set when an upstream conflict was detected
+            # above, and it must veto reuse: returning here would hand this
+            # session a proxy pinned to another vendor's host.
+            if not needs_restart and not isolated_copilot_subscription_proxy:
                 click.echo(f"  Proxy already running on port {port}")
                 click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
                 return None, port

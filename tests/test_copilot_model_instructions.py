@@ -345,3 +345,21 @@ def test_invalid_utf8_fails_closed(tmp_path: Path) -> None:
     assert p.read_bytes() == before
     assert _remove_copilot_models_instructions(p) is False
     assert p.read_bytes() == before
+
+
+def test_utf16le_without_bom_fails_closed(tmp_path: Path) -> None:
+    """UTF-16LE ASCII is valid UTF-8, so the decode guard alone admits it.
+
+    The interleaved NUL bytes decode as U+0000, so a rewrite left the file
+    undecodable in its own encoding. A BOM-prefixed UTF-16 file already failed
+    closed (0xFF is invalid UTF-8); this covers the BOM-less case.
+    """
+    p = tmp_path / "copilot-instructions.md"
+    p.write_bytes("# Mine\nkeep me\n".encode("utf-16-le"))
+    before = p.read_bytes()
+    assert _inject_copilot_models_instructions(p, ["gpt-5.4"]) is False
+    assert p.read_bytes() == before
+    assert _remove_copilot_models_instructions(p) is False
+    assert p.read_bytes() == before
+    # Still readable in its own encoding.
+    assert p.read_bytes().decode("utf-16-le") == "# Mine\nkeep me\n"

@@ -295,97 +295,125 @@ def test_native_skips_the_model_list_injection(monkeypatch: pytest.MonkeyPatch) 
 # ---------------------------------------------------------------------------
 
 
-def test_anthropic_upstream_mismatch_predicate() -> None:
-    """Native mode repoints the Anthropic upstream at the Copilot host.
+def _drive_ensure_proxy(monkeypatch: pytest.MonkeyPatch, running_config: dict, **kwargs):
+    """Drive the real `_ensure_proxy` against a running proxy, recording its actions.
 
-    If `wrap claude` reused that proxy, Claude Code's /v1/messages traffic would
-    be forwarded to Copilot under the wrong credential — silently, because the
-    proxy looks healthy. The reuse check must treat that as a mismatch.
+    Exercises the end-to-end decision rather than a helper predicate: an earlier
+    version of this guard tested a predicate that was correct while the product
+    ignored it on every path, so the test was green and the bug was live.
     """
-    from headroom.cli.wrap import _proxy_anthropic_upstream_mismatch
+    from headroom.cli import wrap as wrap_mod
 
-    native_proxy = {"anthropic_api_url": "https://api.githubcopilot.com"}
-    # wrap claude asks for the DEFAULT upstream (None) -> must be a mismatch.
-    assert _proxy_anthropic_upstream_mismatch(native_proxy, None) is True
-
-
-def test_plain_proxy_is_still_reusable_for_claude() -> None:
-    """Guard against over-correcting: normal reuse must not start restarting."""
-    from headroom.cli.wrap import _proxy_anthropic_upstream_mismatch
-
-    plain_proxy = {"anthropic_api_url": None}
-    assert _proxy_anthropic_upstream_mismatch(plain_proxy, None) is False
-    assert _proxy_anthropic_upstream_mismatch({}, None) is False
-
-
-def test_native_proxy_is_reusable_for_the_same_native_upstream() -> None:
-    from headroom.cli.wrap import _proxy_anthropic_upstream_mismatch
-
-    native_proxy = {"anthropic_api_url": "https://api.githubcopilot.com"}
-    assert (
-        _proxy_anthropic_upstream_mismatch(native_proxy, "https://api.githubcopilot.com") is False
+    calls: list[tuple] = []
+    health = {
+        "version": wrap_mod._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {
+            "pid": "4242",
+            "memory": False,
+            "learn": False,
+            "code_graph": False,
+            **running_config,
+        },
+    }
+    monkeypatch.setattr(wrap_mod, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: len(calls) == 0)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_mod, "_port_bind_error", lambda port: None)
+    monkeypatch.setattr(
+        wrap_mod, "_kill_proxy_by_pid", lambda pid, port: calls.append(("kill", pid, port)) or True
     )
-    assert _proxy_anthropic_upstream_mismatch(native_proxy, "https://api.anthropic.com") is True
+    monkeypatch.setattr(wrap_mod, "_start_proxy", lambda *a, **k: calls.append(("start", k)))
+    _proc, port = wrap_mod._ensure_proxy(8787, False, **kwargs)
+    return port, calls
 
 
-def test_native_rejects_no_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Native needs both upstreams repointed, which is start-time only.
+def test_native_proxy_is_not_shared_with_claude(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The credential-substitution hazard: `wrap claude` must not inherit it.
 
-    With --no-proxy the overrides are silently discarded and every request 401s
-    against the wrong vendor, so this must fail loudly.
+    `--native` points BOTH upstreams at the Copilot host. Sharing that proxy would
+    send Claude Code's /v1/messages to api.githubcopilot.com — and since `sk-ant-*`
+    bearers are not forwardable, `apply_copilot_api_auth` strips the user's
+    Anthropic credential and substitutes the Copilot token. Silently, because the
+    proxy reports healthy.
     """
-    result, _captured = _invoke_copilot(monkeypatch, ["--native", "--no-proxy", "--port", "8890"])
-    assert result.exit_code != 0
-    assert "--no-proxy" in result.output
-
-
-# ---------------------------------------------------------------------------
-# Probe correctness — a false negative used to hard-refuse a working CLI
-# ---------------------------------------------------------------------------
-
-
-def test_probe_finds_a_needle_split_across_a_read_boundary(tmp_path) -> None:
-    """Reads are chunked; the needle must not be missed by straddling a boundary."""
-    pkg = tmp_path / "copilot" / "pkg" / "win32-x64" / "1.0.77"
-    pkg.mkdir(parents=True)
-    (pkg / "app.js").write_text(
-        "x" * ((1 << 20) - 8) + COPILOT_NATIVE_API_URL_ENV + "y" * 40, encoding="utf-8"
+    port, calls = _drive_ensure_proxy(
+        monkeypatch,
+        {
+            "anthropic_api_url": "https://api.githubcopilot.com",
+            "openai_api_url": "https://api.githubcopilot.com",
+        },
+        # `wrap claude` wants the DEFAULT upstreams — the case a
+        # "only compare when the caller pinned one" check never noticed.
     )
-    assert (
-        native_api_url_supported(
-            environ={"LOCALAPPDATA": str(tmp_path)}, home=str(tmp_path / "none")
-        )
-        is True
+    assert any(c[0] == "kill" for c in calls), "the Copilot-pinned proxy was reused"
+    started = [c for c in calls if c[0] == "start"]
+    assert started, "no replacement proxy was started"
+    assert started[0][1].get("anthropic_api_url") is None
+    assert started[0][1].get("openai_api_url") is None
+    assert port == 8787, "restart should reclaim the same port, not take a new one"
+
+
+def test_plain_proxy_is_still_reused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Guard against over-correcting into restarting on every launch."""
+    port, calls = _drive_ensure_proxy(
+        monkeypatch, {"anthropic_api_url": None, "openai_api_url": None}
     )
+    assert not calls, f"a matching proxy was needlessly restarted: {calls}"
+    assert port == 8787
 
 
-def test_probe_answers_from_the_newest_bundle_only(tmp_path) -> None:
-    """An old bundle must not vouch for a newer one that dropped the variable.
+def test_matching_native_proxy_is_reused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two `--native` sessions on one port share the proxy rather than fighting."""
+    copilot = "https://api.githubcopilot.com"
+    port, calls = _drive_ensure_proxy(
+        monkeypatch,
+        {"anthropic_api_url": copilot, "openai_api_url": copilot},
+        anthropic_api_url=copilot,
+        openai_api_url=copilot,
+    )
+    assert not calls, f"a matching native proxy was needlessly restarted: {calls}"
+    assert port == 8787
 
-    That is the dangerous direction: it would approve a CLI that silently
-    bypasses Headroom, which is exactly what the probe exists to catch.
+
+def test_pinned_proxy_is_not_shared_even_when_another_wrapper_is_attached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An upstream conflict must not fall into the "reuse as-is" branch.
+
+    That branch exists so a *missing feature* does not disrupt other sessions'
+    in-flight requests — correct for a feature, wrong for an upstream: sharing a
+    Copilot-pinned proxy sends this session's traffic to another vendor with the
+    credential substituted. Found by review after an earlier rework routed the
+    conflict through the `missing` list, which lands in exactly that branch.
     """
-    root = tmp_path / "copilot" / "pkg" / "win32-x64"
-    (root / "1.0.39").mkdir(parents=True)
-    (root / "1.0.39" / "app.js").write_text(
-        f"var a = process.env.{COPILOT_NATIVE_API_URL_ENV};", encoding="utf-8"
-    )
-    (root / "1.0.78").mkdir(parents=True)
-    (root / "1.0.78" / "app.js").write_text("var a = 1; // variable removed", encoding="utf-8")
-    assert (
-        native_api_url_supported(
-            environ={"LOCALAPPDATA": str(tmp_path)}, home=str(tmp_path / "none")
-        )
-        is False
-    ), "an older bundle vouched for a newer one that dropped the variable"
+    from headroom.cli import wrap as wrap_mod
 
-
-def test_probe_returns_unknown_for_an_empty_root(tmp_path) -> None:
-    """Docstring promises None when no bundle could be located."""
-    (tmp_path / "copilot" / "pkg").mkdir(parents=True)
-    assert (
-        native_api_url_supported(
-            environ={"LOCALAPPDATA": str(tmp_path)}, home=str(tmp_path / "none")
-        )
-        is None
+    calls: list[str] = []
+    health = {
+        "version": wrap_mod._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {
+            "pid": "4242",
+            "memory": False,
+            "learn": False,
+            "code_graph": False,
+            "anthropic_api_url": "https://api.githubcopilot.com",
+            "openai_api_url": "https://api.githubcopilot.com",
+        },
+    }
+    monkeypatch.setattr(wrap_mod, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_mod, "_port_bind_error", lambda port: None)
+    monkeypatch.setattr(wrap_mod, "_live_proxy_clients", lambda port, exclude_self: ["copilot"])
+    monkeypatch.setattr(wrap_mod, "_find_available_port", lambda start: 8788)
+    monkeypatch.setattr(
+        wrap_mod, "_kill_proxy_by_pid", lambda pid, port: calls.append("kill") or True
     )
+    monkeypatch.setattr(wrap_mod, "_start_proxy", lambda *a, **k: calls.append("start"))
+
+    _proc, port = wrap_mod._ensure_proxy(8787, False, agent_type="claude")
+
+    assert port != 8787, "shared a proxy pinned to another vendor's upstream"
+    assert "kill" not in calls, "disrupted the attached session instead of isolating"

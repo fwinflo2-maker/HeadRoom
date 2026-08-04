@@ -7591,28 +7591,6 @@ class OpenAIHandlerMixin:
                                         ):
                                             pending_fcs.append(item)
 
-                                if (
-                                    decided
-                                    and not suppress_response
-                                    and event_type
-                                    in {
-                                        "response.output_item.added",
-                                        "response.output_item.done",
-                                    }
-                                ):
-                                    item = event.get("item", {})
-                                    if (
-                                        isinstance(item, dict)
-                                        and item.get("type") == "function_call"
-                                        and item.get("name") in MEMORY_TOOL_NAMES
-                                    ):
-                                        suppress_response = True
-                                        event_buffer.clear()
-                                        logger.info(
-                                            f"[{request_id}] WS Memory: Detected "
-                                            f"{item.get('name')} after streamed output"
-                                        )
-
                                 if not decided:
                                     event_buffer.append(msg_str)
                                     if event_type == "response.output_item.added":

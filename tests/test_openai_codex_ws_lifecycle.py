@@ -1691,6 +1691,51 @@ async def test_ws_memory_enabled_non_memory_response_streams_completion():
 
 
 @pytest.mark.asyncio
+async def test_ws_late_memory_call_after_streamed_message_passes_through():
+    message_item = {
+        "type": "message",
+        "id": "message-1",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "searching"}],
+    }
+    function_call = {
+        "type": "function_call",
+        "id": "fc-1",
+        "call_id": "call-1",
+        "name": "memory_search",
+        "arguments": "{}",
+    }
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.output_item.added", "item": message_item}),
+        json.dumps({"type": "response.output_item.done", "item": message_item}),
+        json.dumps({"type": "response.output_item.added", "item": function_call}),
+        json.dumps({"type": "response.output_item.done", "item": function_call}),
+        json.dumps({"type": "response.completed", "response": {"id": "r-1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    client_ws.headers["x-headroom-user-id"] = "user-1"
+    handler = _DummyOpenAIHandler()
+    handler.memory_handler = _MemoryWsHandler()
+    executed: list[tuple[str, dict, str, str]] = []
+
+    async def _execute_memory_tool(name, args, user_id, provider):
+        executed.append((name, args, user_id, provider))
+        return '{"memories": []}'
+
+    handler.memory_handler._execute_memory_tool = _execute_memory_tool
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert client_ws.sent_text == upstream_events
+    assert len(upstream.sent) == 1
+    assert executed == []
+
+
+@pytest.mark.asyncio
 async def test_ws_memory_continuation_handles_invalid_item_arguments_and_unavailable_backend():
     function_call = {
         "type": "function_call",
@@ -1812,7 +1857,7 @@ async def test_ws_memory_tools_respect_explicit_store_false():
 
 
 @pytest.mark.asyncio
-async def test_ws_memory_continuation_handles_reasoning_first_and_repeated_calls():
+async def test_ws_memory_continuation_continues_pre_stream_and_passes_late_call():
     function_call_one = {
         "type": "function_call",
         "id": "fc-1",
@@ -1883,11 +1928,18 @@ async def test_ws_memory_continuation_handles_reasoning_first_and_repeated_calls
     client_ws.headers["x-headroom-user-id"] = "user-1"
     handler = _DummyOpenAIHandler()
     handler.memory_handler = _MemoryWsHandler()
+    executed: list[tuple[str, dict, str, str]] = []
+
+    async def _execute_memory_tool(name, args, user_id, provider):
+        executed.append((name, args, user_id, provider))
+        return '{"memories": []}'
+
+    handler.memory_handler._execute_memory_tool = _execute_memory_tool
 
     with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
         await handler.handle_openai_responses_ws(client_ws)
 
-    assert len(upstream.sent) == 3
+    assert len(upstream.sent) == 2
     first_continuation = json.loads(upstream.sent[1])["response"]["input"]
     assert reasoning_without_encryption not in first_continuation
     assert function_call_one in first_continuation
@@ -1898,18 +1950,22 @@ async def test_ws_memory_continuation_handles_reasoning_first_and_repeated_calls
     } in first_continuation
     assert json.loads(upstream.sent[1])["response"]["client_metadata"] == {"keep": "yes"}
 
-    second_continuation = json.loads(upstream.sent[2])["response"]["input"]
-    assert function_call_one in second_continuation
-    assert {
-        "type": "function_call_output",
-        "call_id": "call-1",
-        "output": '{"memories": []}',
-    } in second_continuation
-    assert reasoning_with_encryption in second_continuation
-    assert message_item in second_continuation
-    assert function_call_two in second_continuation
-    assert {
-        "type": "function_call_output",
-        "call_id": "call-2",
-        "output": '{"memories": []}',
-    } in second_continuation
+    second_response = [json.loads(frame) for frame in client_ws.sent_text]
+    assert [event["type"] for event in second_response] == [
+        "response.created",
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.completed",
+    ]
+    assert second_response[0]["response"]["id"] == "r-2"
+    assert second_response[2]["item"] == reasoning_with_encryption
+    assert second_response[3]["item"] == message_item
+    assert second_response[4]["item"] == message_item
+    assert second_response[5]["item"] == function_call_two
+    assert second_response[6]["item"] == function_call_two
+    assert second_response[7]["response"]["id"] == "r-2"
+    assert executed == [("memory_search", {}, "user-1", "openai")]

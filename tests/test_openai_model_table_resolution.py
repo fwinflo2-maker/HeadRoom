@@ -38,8 +38,8 @@ from headroom.providers.openai import (
         ("gpt-4.1-2025-04-14", 1_047_576),
         ("gpt-4-32k-0613", 32768),
         # Newer families that fell through to the unknown-model default.
-        ("gpt-5", 400_000),
-        ("gpt-5-mini", 400_000),
+        ("gpt-5", 272_000),
+        ("gpt-5-mini", 272_000),
         ("o4-mini", 200_000),
         # Must not regress.
         ("gpt-4", 8192),

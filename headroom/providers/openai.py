@@ -88,10 +88,12 @@ _CONTEXT_LIMITS: dict[str, int] = {
     "gpt-4.1": 1_047_576,
     "gpt-4.1-mini": 1_047_576,
     "gpt-4.1-nano": 1_047_576,
-    # GPT-5 series
-    "gpt-5": 400000,
-    "gpt-5-mini": 400000,
-    "gpt-5-nano": 400000,
+    # GPT-5 series. This table is an INPUT budget (get_context_limit returns
+    # litellm's max_input_tokens when available), so these are 272K input --
+    # not the 400K total window, which is 272K in + 128K out.
+    "gpt-5": 272000,
+    "gpt-5-mini": 272000,
+    "gpt-5-nano": 272000,
     # GPT-4 Turbo
     "gpt-4-turbo": 128000,
     "gpt-4-turbo-preview": 128000,

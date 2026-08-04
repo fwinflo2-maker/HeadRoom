@@ -42,7 +42,15 @@ def route_grok_to_xai(headers: Mapping[str, str], openai_target: str) -> bool:
     Only applies while the OpenAI target is still the default. An operator who
     pointed the proxy at a gateway (LiteLLM, Azure, self-hosted vLLM) chose it
     for every OpenAI-compatible client; a client User-Agent must not silently
-    bypass that, nor carry the gateway's ``OPENAI_TARGET_API_HEADERS`` to xAI.
+    bypass that.
+
+    This gate is URL policy only. It does not keep operator-configured
+    ``OPENAI_TARGET_API_HEADERS`` away from xAI — those extras are configured
+    independently of the target URL, so a default-URL proxy can still redirect
+    here. The direct OpenAI HTTP handlers enforce credential isolation
+    separately by suppressing configured extras when their OpenAI-compatible
+    upstream candidate is the xAI host. Configured backend transports retain
+    their existing header policy.
     """
     if not is_grok_cli_request(headers):
         return False

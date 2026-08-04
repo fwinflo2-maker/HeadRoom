@@ -254,6 +254,26 @@ def _append_request_query(url: str, query: str) -> str:
     return f"{url}{separator}{query}"
 
 
+def _xai_hostname(url: str) -> str | None:
+    """Return ``url``'s hostname with any fully-qualified trailing dot removed.
+
+    ``https://api.x.ai.`` resolves to the same host as ``https://api.x.ai`` but
+    ``urlparse`` reports a distinct hostname, so a client-supplied
+    ``x-headroom-base-url`` could otherwise slip past the comparison below.
+    """
+    hostname = urlparse(url).hostname
+    return hostname.rstrip(".") if hostname else hostname
+
+
+def _is_xai_upstream(upstream_base_url: str) -> bool:
+    """Return whether the selected upstream is the official xAI API host.
+
+    Compares the parsed hostname only: a path, scheme or port variation of
+    ``api.x.ai`` is still xAI and must not receive OpenAI-side credentials.
+    """
+    return _xai_hostname(upstream_base_url) == _xai_hostname(XAI_API_URL)
+
+
 def _normalize_origin(origin: str) -> str | None:
     parsed = urlparse(origin.strip())
     if not parsed.scheme or not parsed.hostname:
@@ -1466,6 +1486,20 @@ class OpenAIHandlerMixin:
         if route_grok_to_xai(request.headers, self.OPENAI_API_URL):
             return XAI_API_URL
         return self.OPENAI_API_URL
+
+    def _openai_extra_headers_for_upstream(self, upstream_base_url: str) -> dict[str, str] | None:
+        """Return configured OpenAI extras for a direct non-xAI upstream.
+
+        ``openai_extra_headers`` is operator-owned and scoped to the OpenAI
+        target (an API key for a gateway, a tenant header, ...). ``api.x.ai`` is
+        reached with the *client's* own xAI credential, so those extras must
+        never travel there — ``merge_extra_headers`` overrides same-named keys,
+        so a configured ``Authorization`` would both leak the operator's OpenAI
+        credential and clobber the client's ``Bearer xai-...``.
+        """
+        if _is_xai_upstream(upstream_base_url):
+            return None
+        return self.config.openai_extra_headers
 
     @staticmethod
     def _strict_previous_turn_frozen_count(
@@ -2803,7 +2837,15 @@ class OpenAIHandlerMixin:
 
         _pre_strip_count_chat = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
         headers = _strip_internal_headers(headers)
-        headers = merge_extra_headers(headers, self.config.openai_extra_headers)
+        # Configured backends own their destination and authentication, so they
+        # retain the existing extra-header policy. The direct path selects
+        # extras from the resolved OpenAI-compatible upstream.
+        headers = merge_extra_headers(
+            headers,
+            self.config.openai_extra_headers
+            if self.anthropic_backend is not None
+            else self._openai_extra_headers_for_upstream(upstream_base_url),
+        )
         log_outbound_headers(
             forwarder="openai_chat_completions",
             stripped_count=_pre_strip_count_chat,
@@ -4013,12 +4055,13 @@ class OpenAIHandlerMixin:
                     },
                 )
 
-        # Direct OpenAI API (no backend configured). Re-resolve via the full
-        # chain (custom base → Grok CLI → process default): the local
-        # ``custom_upstream_base_url`` above is custom-header only, and using it
-        # alone would skip Grok→xAI routing on a shared proxy.
+        # Direct OpenAI API (no backend configured). Reuse the upstream resolved
+        # once at request entry (custom base → Grok CLI → process default): the
+        # local ``custom_upstream_base_url`` above is custom-header only, and the
+        # same value already decided which extra headers were merged, so routing
+        # and header policy cannot drift apart.
         url = build_copilot_upstream_url(
-            self._resolve_openai_upstream(request),
+            upstream_base_url,
             handler_path,
         )
         url = _append_request_query(url, request.url.query)
@@ -4589,7 +4632,14 @@ class OpenAIHandlerMixin:
 
         _pre_strip_count_resp = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
         headers = _strip_internal_headers(headers)
-        headers = merge_extra_headers(headers, self.config.openai_extra_headers)
+        # Resolve the OpenAI-compatible candidate before merging operator
+        # extras. Mixed ChatGPT-auth + Grok-signal requests conservatively
+        # withhold extras based on the xAI candidate even though the higher-
+        # priority routing branch below still sends them to chatgpt.com.
+        openai_upstream_base_url = self._resolve_openai_upstream(request)
+        headers = merge_extra_headers(
+            headers, self._openai_extra_headers_for_upstream(openai_upstream_base_url)
+        )
         # Mirror the WS handler: never forward Codex's client-only lite header
         # upstream. OpenAI rejects newer Codex models when it leaks, and the HTTP
         # POST path (unlike the WS path) otherwise forwards request headers verbatim.
@@ -4905,10 +4955,11 @@ class OpenAIHandlerMixin:
                 if custom_upstream_base_url is not None
                 else "/v1/responses"
             )
-            # Full chain (custom base → Grok CLI → process default) so Grok
-            # Responses traffic on a shared proxy is not sent to api.openai.com.
+            # Reuse the OpenAI-compatible candidate resolved at request entry.
+            # In this non-ChatGPT branch it is also the actual upstream, keeping
+            # direct routing and header selection aligned.
             url = build_copilot_upstream_url(
-                self._resolve_openai_upstream(request),
+                openai_upstream_base_url,
                 handler_path,
             )
             url = _append_request_query(url, request.url.query)

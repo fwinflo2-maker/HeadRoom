@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import errno
+import hashlib
 import importlib.util
 import io
 import json
@@ -1730,10 +1731,57 @@ def _live_copilot_model_ids(api_url: str | None, token: str | None) -> list[str]
     )
 
 
-#: A line every generated block contains. Position-independent ownership proof:
-#: marker text alone cannot identify our block, because a user may legitimately
-#: quote the markers -- including a complete pair -- in their own prose.
-_COPILOT_MODELS_BLOCK_SIGNATURE = "# Available AI models (Headroom)"
+def _copilot_models_provenance_path(file_path: Path) -> Path:
+    """Sidecar recording the exact block Headroom last wrote to ``file_path``.
+
+    Kept in Headroom's own workspace, not in the user's file: **nothing inside the
+    instruction file can prove ownership.** Marker text cannot (a user may quote a
+    complete pair while documenting the feature), and neither can a signature line
+    inside the block -- a user quoting the block quotes its heading too. Both were
+    reproduced destroying real user content. Out-of-band provenance is the only
+    signal a user's prose cannot forge.
+    """
+    from headroom import paths
+
+    digest = hashlib.sha256(str(file_path.resolve()).encode("utf-8", "replace")).hexdigest()[:16]
+    return paths.workspace_dir() / "copilot_model_blocks" / f"{digest}.json"
+
+
+def _record_copilot_models_provenance(file_path: Path, block: str) -> None:
+    """Remember the exact bytes written, so a later launch can prove ownership."""
+    try:
+        record = _copilot_models_provenance_path(file_path)
+        record.parent.mkdir(parents=True, exist_ok=True)
+        _write_text(
+            record,
+            json.dumps(
+                {
+                    "path": str(file_path),
+                    "sha256": hashlib.sha256(block.encode("utf-8")).hexdigest(),
+                }
+            ),
+        )
+    except OSError:
+        # Provenance is an optimisation for *refreshing*. Losing it only means the
+        # next launch appends instead of replacing -- never that user text is cut.
+        pass
+
+
+def _copilot_models_provenance(file_path: Path) -> str | None:
+    """SHA-256 of the block Headroom last wrote here, or ``None``."""
+    try:
+        rec = json.loads(_read_text(_copilot_models_provenance_path(file_path)))
+    except (OSError, ValueError):
+        return None
+    sha = rec.get("sha256") if isinstance(rec, dict) else None
+    return sha if isinstance(sha, str) and sha else None
+
+
+def _clear_copilot_models_provenance(file_path: Path) -> None:
+    try:
+        _copilot_models_provenance_path(file_path).unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _marked_block_spans(existing: str) -> list[tuple[int, int]]:
@@ -1759,47 +1807,48 @@ def _marked_block_spans(existing: str) -> list[tuple[int, int]]:
         search_from = end_stop
 
 
-def _find_marked_block(existing: str) -> tuple[int, int] | None:
-    """Locate **our** generated block, or ``None`` when ownership is not certain.
+def _owned_marked_block_spans(existing: str, file_path: Path) -> list[tuple[int, int]]:
+    """Spans whose bytes Headroom can **prove** it wrote, by recorded digest.
 
-    Position-based heuristics cannot establish ownership here, and every one tried
-    so far destroyed user content in a reproducible case:
+    Every content-based rule tried before this destroyed real user text, because
+    each was forgeable by a user writing about the feature:
 
     * ``index(END)`` with no offset matched the first END anywhere in the file.
-    * Searching END forward from the first START still swallowed user text when a
-      stray START preceded our block.
-    * Anchoring on the first END and taking the last START before it -- the
-      previous attempt -- picks the *user's* pair when they document a **complete**
-      pair above our block, which is exactly as plausible as a stray marker.
+    * END forward from the first START swallowed text before a real block.
+    * First END + nearest preceding START selected a *complete* pair the user had
+      documented above ours.
+    * A signature line inside the span -- a user quoting the block quotes its
+      heading too, and prose merely *mentioning* both markers and the heading was
+      spliced away (``NEVER COMMIT SECRETS`` deleted in a two-line file).
 
-    So ownership is established by content, not position: a candidate must carry
-    :data:`_COPILOT_MODELS_BLOCK_SIGNATURE`, a line only the generator writes.
-    Returns ``None`` unless exactly one candidate qualifies -- zero means "no
-    block of ours, append a fresh one", and more than one means genuinely
-    ambiguous, where refusing to touch the file is the only safe answer.
+    So ownership is a byte-level identity check against an out-of-band record.
+    Anything we cannot prove we wrote is treated as the user's, and the caller
+    appends instead of splicing. Appending a visible duplicate is a recoverable
+    annoyance; cutting a span out of someone's instructions file is not.
     """
-    owned = [
+    expected = _copilot_models_provenance(file_path)
+    if expected is None:
+        return []
+    return [
         (start, end)
         for start, end in _marked_block_spans(existing)
-        if _COPILOT_MODELS_BLOCK_SIGNATURE in existing[start:end]
+        if hashlib.sha256(existing[start:end].encode("utf-8")).hexdigest() == expected
     ]
+
+
+def _find_marked_block(existing: str, file_path: Path) -> tuple[int, int] | None:
+    """The one span Headroom provably wrote, or ``None``.
+
+    ``None`` means "do not splice": either nothing here is ours (append), or more
+    than one span matches the recorded digest, which is genuinely ambiguous.
+    """
+    owned = _owned_marked_block_spans(existing, file_path)
     return owned[0] if len(owned) == 1 else None
 
 
-def _marked_block_is_ambiguous(existing: str) -> bool:
-    """True when more than one candidate block claims to be ours.
-
-    Callers must not mutate in this state: there is no way to tell which pair the
-    generator owns, and guessing risks deleting the user's own content.
-    """
-    return (
-        sum(
-            1
-            for start, end in _marked_block_spans(existing)
-            if _COPILOT_MODELS_BLOCK_SIGNATURE in existing[start:end]
-        )
-        > 1
-    )
+def _marked_block_is_ambiguous(existing: str, file_path: Path) -> bool:
+    """True when several spans match the recorded digest (identical duplicates)."""
+    return len(_owned_marked_block_spans(existing, file_path)) > 1
 
 
 def _read_instruction_file(file_path: Path) -> str | None:
@@ -1852,30 +1901,40 @@ def _inject_copilot_models_instructions(
             )
             return False
         existing = raw.replace("\r\n", "\n")
-        if _marked_block_is_ambiguous(existing):
+        if _marked_block_is_ambiguous(existing, file_path):
             click.echo(
-                f"  Note: {file_path} contains more than one Headroom available-models "
-                "block, so which one is generated is ambiguous. Leaving the file "
-                "untouched; remove the duplicate to re-enable automatic updates."
+                f"  Warning: {file_path} contains more than one copy of the Headroom "
+                "available-models block, so which to update is ambiguous. Leaving the "
+                "file untouched — delete the duplicate block, or pass --no-model-list "
+                "to stop managing it."
             )
             return False
-        span = _find_marked_block(existing)
+        span = _find_marked_block(existing, file_path)
         if span is not None:
             start, end = span
-            updated = existing[:start] + block.rstrip("\n") + existing[end:]
+            new_block = block.rstrip("\n")
+            updated = existing[:start] + new_block + existing[end:]
             if updated == existing:
                 if verbose:
                     click.echo(f"  Available-models list already current in {file_path.name}")
                 return True
             _write_preserving_line_endings(file_path, raw, updated)
+            _record_copilot_models_provenance(file_path, new_block)
             click.echo(
                 f"  Refreshed available-models list in {file_path} ({len(model_ids)} models)"
             )
             return True
-        _append_text(file_path, "\n\n" + block)
+        # Not provably ours: append rather than splice. A visible duplicate is
+        # recoverable; cutting a span out of the user's file is not.
+        appended = block.rstrip("\n")
+        _write_preserving_line_endings(
+            file_path, raw, existing.rstrip("\n") + "\n\n" + appended + "\n"
+        )
+        _record_copilot_models_provenance(file_path, appended)
     else:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         _write_text(file_path, block)
+        _record_copilot_models_provenance(file_path, block.rstrip("\n"))
     click.echo(f"  Available-models list injected into {file_path} ({len(model_ids)} models)")
     return True
 
@@ -1891,20 +1950,23 @@ def _remove_copilot_models_instructions(file_path: Path) -> bool:
         return False
     raw = _read_instruction_file(file_path)
     if raw is None:
-        return False
-    existing = raw.replace("\r\n", "\n")
-    if _marked_block_is_ambiguous(existing):
         click.echo(
-            f"  Note: {file_path} contains more than one Headroom available-models "
-            "block; leaving it untouched rather than guessing which to remove."
+            f"  Note: {file_path} could not be read as UTF-8; leaving it untouched. "
+            "Remove the Headroom available-models block by hand if you want it gone."
         )
         return False
-    span = _find_marked_block(existing)
-    if span is None:
+    existing = raw.replace("\r\n", "\n")
+    # Removal can act on every proven copy: each one is byte-identical to what we
+    # wrote, so deleting all of them cannot touch user text -- and leaving a
+    # duplicate behind would mean `unwrap` cannot undo its own durable setup.
+    owned = _owned_marked_block_spans(existing, file_path)
+    if not owned:
         return False
-    start, end = span
-    updated = existing[:start].rstrip("\n") + "\n" + existing[end:].lstrip("\n")
-    _write_preserving_line_endings(file_path, raw, updated)
+    updated = existing
+    for start, end in reversed(owned):
+        updated = updated[:start].rstrip("\n") + "\n\n" + updated[end:].lstrip("\n")
+    _write_preserving_line_endings(file_path, raw, updated.rstrip("\n") + "\n")
+    _clear_copilot_models_provenance(file_path)
     return True
 
 
@@ -5646,8 +5708,14 @@ def copilot(
 def unwrap_copilot(port: int, no_stop_proxy: bool) -> None:
     """Undo durable setup from ``headroom wrap copilot``."""
     instructions = Path.cwd() / ".github" / "copilot-instructions.md"
-    if _remove_copilot_models_instructions(instructions):
-        click.echo("  Removed Headroom available-models list from Copilot instructions.")
+    # Guarded: the write can raise (read-only file, replaced path) and an uncaught
+    # error here would abort `unwrap` before it stops the proxy — leaving the
+    # session's proxy running, which is the opposite of undoing the setup.
+    try:
+        if _remove_copilot_models_instructions(instructions):
+            click.echo("  Removed Headroom available-models list from Copilot instructions.")
+    except OSError as exc:
+        click.echo(f"  Note: could not update {instructions} ({exc}); continuing.")
 
     if not no_stop_proxy:
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)

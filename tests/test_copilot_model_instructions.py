@@ -219,28 +219,59 @@ def _refresh_then_unwrap(path: Path) -> tuple[str, str]:
 
 
 @pytest.mark.parametrize(
-    ("label", "content"),
+    ("label", "content", "keep"),
     [
-        # The reviewer's repro: a COMPLETE user pair above the generated block.
-        # Position-based ownership (first END + nearest preceding START) selected
-        # the *user's* pair and deleted it while reporting a successful refresh.
-        ("complete user pair before", f"# Rules\n\n{_USER_PAIR}\n{{real}}"),
-        ("complete user pair after", f"# Rules\n\n{{real}}\n{_USER_PAIR}"),
-        ("user pairs on both sides", f"{_USER_PAIR}\n{{real}}\n{_USER_PAIR}"),
-        # A stray START widens any forward-paired span; the generated block then
-        # sits *inside* it, so even a content check on the span still passed.
-        ("stray START only", f"# Rules\n\n{_START}\n{_KEEP}\n\n## section\n"),
-        ("stray END only", f"# Rules\n\n{_KEEP}\n{_END}\n"),
-        ("reversed markers", f"{_END}\n{_KEEP}\n{_START}\n"),
-        ("user quotes our block verbatim", f"# Rules\n{_KEEP}\n\n{{real}}\n{{real}}"),
+        # Ownership cannot be inferred from anything IN the file. Each shape below
+        # forges whatever the previous implementation trusted, and each destroyed
+        # real user content before provenance-based ownership landed.
+        #
+        # Prose merely *describing* the feature: markers inline, heading quoted.
+        (
+            "prose documenting the feature",
+            "# Team rules\n\nHeadroom keeps a `{S}` block here.\n"
+            "The heading is `# Available AI models (Headroom)`.\n\n"
+            "NEVER COMMIT SECRETS.\n\nIt closes with `{E}` -- do not edit.\n",
+            "NEVER COMMIT SECRETS",
+        ),
+        # The canonical way anyone documents a marker-guarded block.
+        (
+            "markers inside a fenced code block",
+            "# Docs\n\nHeadroom writes:\n\n```markdown\n{S}\n"
+            "# Available AI models (Headroom)\n- `gpt-4`\n{KEEP}\n{E}\n```\n\ntail\n",
+            None,
+        ),
+        # A signature test that is not line-anchored also matches "##".
+        (
+            "signature not line-anchored",
+            "# Rules\n\n{S}\n## Available AI models (Headroom)\n{KEEP}\n{E}\n",
+            None,
+        ),
+        (
+            "markers with trailing whitespace",
+            "# Rules\n\n{S}   \n## Available AI models (Headroom)\n{KEEP}\n{E}   \n",
+            None,
+        ),
+        # The reviewer's original repro: a COMPLETE user pair above ours.
+        ("complete user pair before", "# Rules\n\n{PAIR}\n{REAL}", None),
+        ("complete user pair after", "# Rules\n\n{REAL}\n{PAIR}", None),
+        ("user pairs on both sides", "{PAIR}\n{REAL}\n{PAIR}", None),
+        ("stray START only", "# Rules\n\n{S}\n{KEEP}\n\n## section\n", None),
+        ("stray END only", "# Rules\n\n{KEEP}\n{E}\n", None),
+        ("reversed markers", "{E}\n{KEEP}\n{S}\n", None),
+        ("user quotes our block verbatim", "# Rules\n{KEEP}\n\n{REAL}", None),
     ],
 )
-def test_user_content_survives_refresh_and_unwrap(tmp_path: Path, label: str, content: str) -> None:
+def test_user_content_survives_refresh_and_unwrap(
+    tmp_path: Path, label: str, content: str, keep: str | None
+) -> None:
+    """The user's line must survive BOTH a refresh and an unwrap, in every shape."""
+    sentinel = keep or _KEEP
+    body = content.format(S=_START, E=_END, KEEP=_KEEP, PAIR=_USER_PAIR, REAL=_real_block())
     p = tmp_path / "copilot-instructions.md"
-    p.write_text(content.replace("{real}", _real_block()), encoding="utf-8")
+    p.write_text(body, encoding="utf-8")
     after, final = _refresh_then_unwrap(p)
-    assert _KEEP in after, f"{label}: user content destroyed by refresh"
-    assert _KEEP in final, f"{label}: user content destroyed by unwrap"
+    assert sentinel in after, f"{label}: user content destroyed by refresh"
+    assert sentinel in final, f"{label}: user content destroyed by unwrap"
 
 
 def test_lone_user_pair_with_no_generated_block_is_never_touched(tmp_path: Path) -> None:
@@ -254,16 +285,55 @@ def test_lone_user_pair_with_no_generated_block_is_never_touched(tmp_path: Path)
     assert _KEEP in final
 
 
-def test_ambiguous_duplicate_generated_blocks_refuse_to_mutate(tmp_path: Path) -> None:
-    """Two blocks that both look generated: there is no safe way to pick one."""
-    from headroom.cli.wrap import _marked_block_is_ambiguous
+def test_duplicate_of_our_own_block_refuses_refresh_but_unwrap_still_cleans(
+    tmp_path: Path,
+) -> None:
+    """Two byte-identical copies of OUR block: refresh is ambiguous, removal is not.
 
+    Refusing to splice is right — there is no way to know which copy to update. But
+    refusing to *remove* would wedge the file permanently and mean `unwrap copilot`
+    cannot undo its own durable setup, so removal deletes every proven copy. That is
+    safe precisely because each one is byte-identical to what we wrote.
+    """
     p = tmp_path / "copilot-instructions.md"
-    body = f"# Rules\n{_KEEP}\n\n{_real_block()}\n{_real_block()}"
-    p.write_text(body, encoding="utf-8")
-    assert _marked_block_is_ambiguous(body.replace("\r\n", "\n")) is True
-    assert _inject_copilot_models_instructions(p, ["gpt-5.4"]) is False
-    assert p.read_text(encoding="utf-8") == body, "file was mutated while ambiguous"
+    p.write_text("# Mine\nkeep me\n", encoding="utf-8")
+    _inject_copilot_models_instructions(p, ["gpt-5.4"])
+    text = p.read_text(encoding="utf-8")
+    block = text[text.index(_START) :]
+    p.write_text(text + "\n" + block, encoding="utf-8")
+    assert p.read_text(encoding="utf-8").count(_START) == 2
+
+    frozen = p.read_text(encoding="utf-8")
+    assert _inject_copilot_models_instructions(p, ["gpt-5.5"]) is False
+    assert p.read_text(encoding="utf-8") == frozen, "mutated while ambiguous"
+
+    assert _remove_copilot_models_instructions(p) is True
+    final = p.read_text(encoding="utf-8")
+    assert _START not in final, "unwrap left a block behind (file would stay wedged)"
+    assert "keep me" in final
+
+
+def test_refresh_updates_in_place_without_duplicating(tmp_path: Path) -> None:
+    """Normal operation, guarded against over-correcting into append-only."""
+    p = tmp_path / "copilot-instructions.md"
+    p.write_text("# Mine\nkeep me\n", encoding="utf-8")
+    _inject_copilot_models_instructions(p, ["gpt-5.4"])
+    assert "gpt-5.4" in p.read_text(encoding="utf-8")
+    _inject_copilot_models_instructions(p, ["gpt-5.5"])
+    text = p.read_text(encoding="utf-8")
+    assert "gpt-5.5" in text
+    assert "gpt-5.4" not in text, "stale list left behind"
+    assert text.count(_START) == 1, "refresh appended instead of replacing"
+
+
+@pytest.mark.parametrize("content", [b"# Mine\nkeep me\n", b"# Mine\r\nkeep me\r\n"])
+def test_inject_then_remove_is_byte_identical(tmp_path: Path, content: bytes) -> None:
+    """A source-controlled file must come back exactly as it was, endings included."""
+    p = tmp_path / "copilot-instructions.md"
+    p.write_bytes(content)
+    _inject_copilot_models_instructions(p, ["gpt-5.4"])
+    _remove_copilot_models_instructions(p)
+    assert p.read_bytes() == content
 
 
 def test_invalid_utf8_fails_closed(tmp_path: Path) -> None:
@@ -275,18 +345,3 @@ def test_invalid_utf8_fails_closed(tmp_path: Path) -> None:
     assert p.read_bytes() == before
     assert _remove_copilot_models_instructions(p) is False
     assert p.read_bytes() == before
-
-
-def test_normal_lifecycle_still_works(tmp_path: Path) -> None:
-    """Guard against over-correcting into never updating anything."""
-    p = tmp_path / "copilot-instructions.md"
-    p.write_text("# Mine\nkeep me\n", encoding="utf-8")
-    _inject_copilot_models_instructions(p, ["gpt-5.4"])
-    assert "gpt-5.4" in p.read_text(encoding="utf-8")
-    _inject_copilot_models_instructions(p, ["gpt-5.5"])
-    text = p.read_text(encoding="utf-8")
-    assert "gpt-5.5" in text and "gpt-5.4" not in text
-    assert text.count(_START) == 1, "refresh duplicated the block"
-    _remove_copilot_models_instructions(p)
-    final = p.read_text(encoding="utf-8")
-    assert "keep me" in final and _START not in final

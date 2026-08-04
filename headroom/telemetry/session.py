@@ -482,7 +482,12 @@ def _fold(sess: _Session, outcome: Any, now: float, source: str = "proxy") -> No
     sess.sources[source] = sess.sources.get(source, 0) + 1
     sess.original_tokens += int(get("original_tokens") or 0)
     sess.attempted_tokens += int(get("attempted_input_tokens") or 0)
-    sess.input_tokens += int(get("optimized_tokens") or 0)
+    # Billed/volume figure, so prefer the provider's own count and fall back to
+    # the local one. It sits beside output/cache_read/cache_write/uncached, which
+    # are all provider-reported, so making it local would put one local number in
+    # a dict of provider numbers — and `tokens.input` is what a reader sums the
+    # cache buckets against.
+    sess.input_tokens += int(get("provider_input_tokens") or 0) or int(get("optimized_tokens") or 0)
     sess.output_tokens += int(get("output_tokens") or 0)
     sess.tokens_saved += int(get("tokens_saved") or 0)
     sess.cache_read_tokens += int(get("cache_read_tokens") or 0)

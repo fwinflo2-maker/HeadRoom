@@ -492,6 +492,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         project=project,
         client=outcome.client,
         tool_search_saved=tool_search_saved,
+        local_input_tokens=outcome.optimized_tokens,
     )
 
     # 2. Cost tracker (optional).

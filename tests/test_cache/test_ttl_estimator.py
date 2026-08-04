@@ -46,15 +46,15 @@ class TestEstimateTtls:
         # Alive at up to 480s, first observed death beyond that at 600s
         # -> TTL estimate is the safe upper end: 600.
         table = estimate_ttls(_corpus([120, 300, 480], [600, 900, 1200]))
-        assert table["openai"]["ttl_seconds"] == 600
         assert table["openai/gpt-5.5"]["ttl_seconds"] == 600
-        assert table["openai"]["max_hit_idle"] == 480
+        assert table["openai/gpt-5.5"]["max_hit_idle"] == 480
+        assert "openai" not in table  # provider aggregates are never emitted
 
     def test_death_at_or_below_max_hit_idle_is_not_an_upper_bound(self):
         # Deaths at 400/450 sit below a hit at 480 (variable eviction);
         # only the 700s death is beyond every observed life.
         table = estimate_ttls(_corpus([120, 300, 480], [400, 450, 700]))
-        assert table["openai"]["ttl_seconds"] == 700
+        assert table["openai/gpt-5.5"]["ttl_seconds"] == 700
 
     def test_no_death_beyond_life_skips_key(self):
         # Every observed death overlaps the life range: no safe upper end.
@@ -66,7 +66,14 @@ class TestEstimateTtls:
         assert estimate_ttls(_corpus([100, 200, 480], [600])) == {}  # 1 expiry < 3
         # Thresholds are tunable.
         table = estimate_ttls(_corpus([480], [600]), min_hits=1, min_expiry_misses=1)
-        assert table["openai"]["ttl_seconds"] == 600
+        assert table["openai/gpt-5.5"]["ttl_seconds"] == 600
+
+    def test_sub_one_floors_do_not_disable_the_evidence_requirement(self):
+        # An interval needs one life and one death sample to exist; floors below
+        # 1 must not let a key through to max()/min() on an empty list.
+        rows = [_row(idle=i, hit=False) for i in (600, 700, 800)]  # deaths only
+        assert estimate_ttls(rows, min_hits=0, min_expiry_misses=0) == {}
+        assert estimate_ttls(rows, min_hits=-5, min_expiry_misses=-5) == {}
 
     def test_non_ttl_expiry_misses_are_ignored(self):
         rows = _corpus([100, 200, 480], [600, 700]) + [
@@ -81,20 +88,35 @@ class TestEstimateTtls:
         rows = _corpus([100, 200, 480], [600, 700, 800]) + [
             _row(idle=0.0, hit=True),
             {"provider": "", "idle_seconds": 50, "is_miss": False},
-            {"provider": "openai", "idle_seconds": "nan-ish"},
+            {"provider": "openai", "model": "gpt-5.5", "idle_seconds": "nan-ish"},
+            {"provider": "openai", "idle_seconds": 50, "is_miss": False},  # no model
             "not a dict",  # type: ignore[list-item]
         ]
-        assert estimate_ttls(rows)["openai"]["ttl_seconds"] == 600
+        assert estimate_ttls(rows)["openai/gpt-5.5"]["ttl_seconds"] == 600
 
-    def test_provider_aggregate_spans_models(self):
-        rows = _corpus([100, 480, 200], [600, 700, 800]) + [
-            _row(model="gpt-5.5-mini", idle=i, hit=True) for i in (50, 90, 130)
+    def test_non_finite_idles_are_ignored(self):
+        # NaN/±Inf pass a bare `idle <= 0` (NaN comparisons are all False), then
+        # poison max()/min() and raise ValueError/OverflowError in int() — one
+        # such row must not take the whole batch down with it.
+        rows = _corpus([100, 200, 480], [600, 700, 800]) + [
+            _row(idle=float(v), hit=h) for v in ("nan", "inf", "-inf") for h in (True, False)
         ]
+        assert estimate_ttls(rows)["openai/gpt-5.5"]["ttl_seconds"] == 600
+
+    def test_one_models_death_cannot_close_anothers_life_interval(self):
+        # gpt-5.5 is alive at up to 1000s and never observed dead; mini dies at
+        # 1200s+. Pooled per-provider these would emit ttl=1200, which the
+        # consumer would then apply to gpt-5.5 (real TTL far higher) and to any
+        # unseen model, recompacting a still-warm prefix. Only mini is estimable.
+        rows = (
+            [_row(idle=i, hit=True) for i in (900, 950, 1000)]
+            + [_row(model="gpt-5.5-mini", idle=i, hit=True) for i in (100, 200, 300)]
+            + [_row(model="gpt-5.5-mini", idle=i, hit=False) for i in (1200, 1300, 1400)]
+        )
         table = estimate_ttls(rows)
-        # The mini model has no expiry evidence of its own -> no per-model key,
-        # but its hits still feed the provider aggregate.
-        assert "openai/gpt-5.5-mini" not in table
-        assert table["openai"]["hits"] == 6
+        assert table["openai/gpt-5.5-mini"]["ttl_seconds"] == 1200
+        assert "openai/gpt-5.5" not in table  # no death evidence of its own
+        assert "openai" not in table
 
 
 class TestWriteLearned:
@@ -138,7 +160,29 @@ class TestMain:
 
         assert main([]) == 0
         assert resolve_learned_ttl("openai", "gpt-5.5") == 600
-        assert resolve_learned_ttl("openai", "other-model") == 600  # provider fallback
+        # An unseen model gets nothing rather than gpt-5.5's bound: the consumer
+        # falls back to its own static default instead of a TTL learned from a
+        # cache population it has no evidence about.
+        assert resolve_learned_ttl("openai", "other-model") is None
+
+    def test_non_finite_jsonl_row_does_not_abort_the_run(self, paths):
+        obs, out = paths
+        # json.dumps emits bare NaN/Infinity and json.loads reads them back, so
+        # the recorder can put one in the log without any hand-editing.
+        # First row on purpose: max() keeps a leading NaN (every later `x > nan`
+        # is False), so this is the ordering that takes the run down.
+        rows = [_row(idle=float("nan"), hit=True)] + _corpus([120, 300, 480], [600, 900, 1200])
+        obs.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        assert "NaN" in obs.read_text()
+
+        assert main([]) == 0
+        assert json.loads(out.read_text())["openai/gpt-5.5"]["ttl_seconds"] == 600
+
+    def test_sub_one_sample_floors_are_rejected(self, paths):
+        with pytest.raises(SystemExit):
+            main(["--min-hits", "0"])
+        with pytest.raises(SystemExit):
+            main(["--min-expiry-misses", "-1"])
 
     def test_no_estimable_data_writes_nothing(self, paths, capsys):
         obs, out = paths
@@ -155,7 +199,7 @@ class TestMain:
         obs.write_text("\n".join(json.dumps(r) for r in _corpus([120, 300, 480], [600, 900, 1200])))
         assert main(["--dry-run"]) == 0
         assert not out.exists()
-        assert json.loads(capsys.readouterr().out)["openai"]["ttl_seconds"] == 600
+        assert json.loads(capsys.readouterr().out)["openai/gpt-5.5"]["ttl_seconds"] == 600
 
     def test_explicit_paths_override_env(self, paths, tmp_path):
         obs2 = tmp_path / "other.jsonl"
@@ -164,4 +208,4 @@ class TestMain:
             "\n".join(json.dumps(r) for r in _corpus([120, 300, 480], [600, 900, 1200]))
         )
         assert main(["--obs", str(obs2), "--out", str(out2)]) == 0
-        assert json.loads(out2.read_text())["openai"]["ttl_seconds"] == 600
+        assert json.loads(out2.read_text())["openai/gpt-5.5"]["ttl_seconds"] == 600

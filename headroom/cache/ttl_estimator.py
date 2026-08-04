@@ -18,6 +18,15 @@ recompaction (lost savings), while underestimating it would recompact a
 still-warm prefix and bust the cache (net cost). A key with no death evidence
 beyond its last observed life is skipped entirely for the same reason.
 
+That safety argument only holds when both ends of the interval describe the
+SAME cache population, so estimates are scoped to ``provider/model`` and
+nothing coarser. A ``ttl_expiry`` miss for model B does not upper-bound model
+A's TTL: pooling them per-provider would let B's death evidence close A's life
+interval and hand the consumer a TTL below A's real one — the one direction
+that costs money. Nor is there a conservative aggregate to fall back on: a
+value safe for a model we have never observed would have to upper-bound a TTL
+we have never seen. Models we cannot estimate get the static default instead.
+
 Runs out-of-process on purpose (zero live-feedback risk on the hot path); the
 proxy re-reads the learned table by mtime, so a periodic cron/launchd run is
 enough. Never imports anything request-scoped.
@@ -27,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import time
 from collections import defaultdict
@@ -66,13 +76,17 @@ def estimate_ttls(
 ) -> dict[str, dict[str, Any]]:
     """Per-key TTL estimates from raw observation rows.
 
-    Keys follow the ``resolve_learned_ttl`` lookup order: ``provider/model``
-    for every observed pair, plus a ``provider`` aggregate over all its models.
+    Keyed by ``provider/model`` only — the exact-match half of the
+    ``resolve_learned_ttl`` lookup. Rows carrying no model are dropped rather
+    than pooled under a bare ``provider`` key: see the module docstring for why
+    a cross-model aggregate is not a sound interval.
+
     A key is emitted only when it has both enough life evidence (``min_hits``
-    hits with a positive idle) and enough death evidence (``min_expiry_misses``
-    ``ttl_expiry`` misses), AND at least one death was observed at an idle
-    larger than every observed life — otherwise the interval has no safe upper
-    end and the static default is the better fallback.
+    hits with a positive, finite idle) and enough death evidence
+    (``min_expiry_misses`` ``ttl_expiry`` misses), AND at least one death was
+    observed at an idle larger than every observed life — otherwise the
+    interval has no safe upper end and the static default is the better
+    fallback.
     """
     hits: dict[str, list[float]] = defaultdict(list)
     expiries: dict[str, list[float]] = defaultdict(list)
@@ -83,29 +97,33 @@ def estimate_ttls(
         if not isinstance(provider, str) or not provider:
             continue
         model = row.get("model")
-        keys = [provider]
-        if isinstance(model, str) and model:
-            keys.append(f"{provider}/{model}")
+        if not isinstance(model, str) or not model:
+            continue  # no model -> no cache population to attribute the row to
+        key = f"{provider}/{model}"
         try:
             idle = float(row.get("idle_seconds", 0.0) or 0.0)
         except (TypeError, ValueError):
             continue
-        if idle <= 0:
+        # NaN and ±Inf survive a bare `idle <= 0` (every NaN comparison is False),
+        # then poison max()/min() and finally raise in int() — one malformed row
+        # would abort the whole batch. Drop them with the other bad input.
+        if not math.isfinite(idle) or idle <= 0:
             continue
         if row.get("is_miss"):
             if row.get("reason") == "ttl_expiry":
-                for k in keys:
-                    expiries[k].append(idle)
+                expiries[key].append(idle)
         else:
-            for k in keys:
-                hits[k].append(idle)
+            hits[key].append(idle)
 
     now = round(time.time(), 3)
     table: dict[str, dict[str, Any]] = {}
     for key in sorted(set(hits) | set(expiries)):
         key_hits = hits.get(key, [])
         key_expiries = expiries.get(key, [])
-        if len(key_hits) < min_hits or len(key_expiries) < min_expiry_misses:
+        # Floors of at least 1 either side: an interval needs one life and one
+        # death sample to exist at all, and this keeps the max()/min() below from
+        # running on an empty list no matter what a caller passes.
+        if len(key_hits) < max(1, min_hits) or len(key_expiries) < max(1, min_expiry_misses):
             continue
         max_hit_idle = max(key_hits)
         deaths_after_life = [x for x in key_expiries if x > max_hit_idle]
@@ -145,6 +163,14 @@ def write_learned(table: dict[str, dict[str, Any]], path: str) -> dict[str, Any]
     return merged
 
 
+def _sample_floor(value: str) -> int:
+    """argparse type for the evidence floors — below 1 there is no requirement."""
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
+    return n
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="headroom-cache-ttl",
@@ -165,8 +191,10 @@ def main(argv: list[str] | None = None) -> int:
         help="Learned-table JSON to write (default: $HEADROOM_CACHE_TTL_LEARNED_PATH "
         "or ~/.headroom/cache_ttl_learned.json)",
     )
-    parser.add_argument("--min-hits", type=int, default=DEFAULT_MIN_HITS)
-    parser.add_argument("--min-expiry-misses", type=int, default=DEFAULT_MIN_EXPIRY_MISSES)
+    parser.add_argument("--min-hits", type=_sample_floor, default=DEFAULT_MIN_HITS)
+    parser.add_argument(
+        "--min-expiry-misses", type=_sample_floor, default=DEFAULT_MIN_EXPIRY_MISSES
+    )
     parser.add_argument(
         "--dry-run", action="store_true", help="Print the estimate table without writing"
     )

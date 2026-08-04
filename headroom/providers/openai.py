@@ -23,7 +23,7 @@ from .base import Provider, TokenCounter
 logger = logging.getLogger(__name__)
 
 # Pricing metadata for transparency
-_PRICING_LAST_UPDATED = date(2025, 1, 14)
+_PRICING_LAST_UPDATED = date(2026, 8, 4)  # every _PRICING entry verified vs litellm
 _PRICING_STALE_DAYS = 60  # Warn if pricing data is older than this
 
 # Warning tracking
@@ -129,21 +129,35 @@ _CONTEXT_LIMITS: dict[str, int] = {
     "deepseek-coder-v2": 128_000,
 }
 
-# Fallback pricing - LiteLLM is preferred source
-# OpenAI pricing per 1M tokens (input, output)
-# NOTE: These are ESTIMATES. Always verify against actual OpenAI billing.
-# Last updated: 2025-01-14
+# USD per 1M tokens, (input, output). NOTE: these are ESTIMATES -- always verify
+# against actual OpenAI billing.
+#
+# Unlike get_context_limit, _get_pricing has NO litellm lookup in front of it, so
+# this table is authoritative for every consumer (client.py cost_before /
+# cost_after, reporting, evals). Every entry below was checked against litellm's
+# model_cost; keep the newer families explicit, because these are matched by
+# prefix and "gpt-4.1" would otherwise fall into "gpt-4" and be priced at the
+# legacy $30/$60 -- 15x its real rate, and 300x for gpt-4.1-nano.
 _PRICING: dict[str, tuple[float, float]] = {
     "gpt-4o": (2.50, 10.00),
     "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4.1": (2.00, 8.00),
+    "gpt-4.1-mini": (0.40, 1.60),
+    "gpt-4.1-nano": (0.10, 0.40),
+    "gpt-5": (1.25, 10.00),
+    "gpt-5-mini": (0.25, 2.00),
+    "gpt-5-nano": (0.05, 0.40),
     "gpt-4-turbo": (10.00, 30.00),
     "gpt-4": (30.00, 60.00),
     "gpt-3.5-turbo": (0.50, 1.50),
     "o1": (15.00, 60.00),
     "o1-preview": (15.00, 60.00),
     "o1-mini": (3.00, 12.00),
-    "o3": (10.00, 40.00),
+    # o3 was cut from $10/$40 to $2/$8 in June 2025; the old rate
+    # overstated every o3 cost estimate by 5x.
+    "o3": (2.00, 8.00),
     "o3-mini": (1.10, 4.40),
+    "o4-mini": (1.10, 4.40),
 }
 
 # Pattern-based defaults for unknown models
@@ -153,7 +167,7 @@ _PATTERN_DEFAULTS = {
     "gpt-4": {"context": 8192, "encoding": "cl100k_base", "pricing": (30.00, 60.00)},
     "gpt-3.5": {"context": 16385, "encoding": "cl100k_base", "pricing": (0.50, 1.50)},
     "o1": {"context": 200000, "encoding": "o200k_base", "pricing": (15.00, 60.00)},
-    "o3": {"context": 200000, "encoding": "o200k_base", "pricing": (10.00, 40.00)},
+    "o3": {"context": 200000, "encoding": "o200k_base", "pricing": (2.00, 8.00)},
 }
 
 # Default for completely unknown OpenAI models
@@ -651,10 +665,12 @@ class OpenAIProvider(Provider):
         if model in self._pricing:
             return self._pricing[model]
 
-        # Prefix match
-        for model_prefix, pricing in self._pricing.items():
+        # Prefix match, longest prefix first -- same shadowing hazard the
+        # context-limit and encoding lookups had: in plain dict order the
+        # shorter "gpt-4" entry claimed "gpt-4.1" and priced it at $30/$60.
+        for model_prefix in sorted(self._pricing, key=len, reverse=True):
             if model.startswith(model_prefix):
-                return pricing
+                return self._pricing[model_prefix]
 
         # Pattern-based inference
         family = _infer_model_family(model)

@@ -130,6 +130,7 @@ from headroom.providers.copilot import (
     validate_configuration as _validate_copilot_configuration,
 )
 from headroom.providers.cursor import render_setup_lines as _render_cursor_setup_lines
+from headroom.providers.grok import DEFAULT_API_URL as _GROK_DEFAULT_API_URL
 from headroom.providers.grok import build_launch_env as _build_grok_launch_env
 from headroom.providers.grok_build import render_setup_lines as _render_grok_build_setup_lines
 from headroom.providers.grok_build.config import (
@@ -6084,7 +6085,7 @@ def grok(
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
-        openai_api_url="https://api.x.ai",
+        openai_api_url=_GROK_DEFAULT_API_URL,
     )
 
 
@@ -6174,9 +6175,9 @@ def grok_build(
 
     \b
     Grok Build reads model endpoints from ``~/.grok/config.toml``. This
-    command starts the proxy, optionally sets up the selected CLI context
-    tool, injects a Headroom-managed ``[model.grok-build]`` override, and
-    prints next steps.
+    command starts the proxy (upstream ``https://api.x.ai``, same as
+    ``wrap grok``), injects a Headroom-managed ``[model.grok-build]``
+    override, and prints next steps.
 
     \b
     Example:
@@ -6203,6 +6204,8 @@ def grok_build(
         for line in _render_grok_build_setup_lines(actual_port, project=project):
             click.echo(line)
 
+    # Client hop is local proxy via config.toml; upstream must be xAI (not
+    # the OpenAI default). Omitting this caused 401s with Grok auth headers.
     _run_proxy_only_watcher(
         agent_label="grok-build",
         port=port,
@@ -6211,6 +6214,7 @@ def grok_build(
         memory=memory,
         agent_type="grok_build",
         print_setup_lines=_print_grok_build_setup,
+        openai_api_url=_GROK_DEFAULT_API_URL,
     )
 
 

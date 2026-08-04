@@ -46,6 +46,7 @@ def test_grok_build_setup_lines_include_proxy_url() -> None:
 
     assert "http://127.0.0.1:8787/v1" in joined
     assert "[model.grok-build]" in joined
+    assert "https://api.x.ai" in joined
 
 
 def test_grok_build_build_install_env_returns_proxy_url() -> None:

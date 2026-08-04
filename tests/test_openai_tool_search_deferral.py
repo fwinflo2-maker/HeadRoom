@@ -15,6 +15,7 @@ import pytest
 from headroom.proxy.helpers import (
     _model_supports_openai_tool_search,
     inject_tool_search_deferral_openai,
+    openai_tool_search_client_supported,
 )
 
 
@@ -55,6 +56,35 @@ def test_env_override_wins_then_falls_back(monkeypatch):
 
 
 # --- deferral behavior -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("client", "supported"),
+    [(None, True), ("codex", False), (" CODEX ", False), ("opencode", False), ("claude", True)],
+)
+def test_client_supported(client, supported):
+    assert openai_tool_search_client_supported(client) is supported
+
+
+def test_codex_client_does_not_inject():
+    tools = _tools()
+
+    out = inject_tool_search_deferral_openai(tools, "gpt-5.5", client="codex")
+
+    assert out is tools
+    assert all(tool.get("type") != "tool_search" for tool in out)
+    assert all("defer_loading" not in tool for tool in out)
+
+
+@pytest.mark.parametrize("client", [None, "claude-code"])
+def test_supported_clients_still_inject(client):
+    tools = _tools()
+
+    out = inject_tool_search_deferral_openai(tools, "gpt-5.5", client=client)
+
+    assert out is not tools
+    assert out[0] == {"type": "tool_search"}
+    assert any(tool.get("defer_loading") is True for tool in out)
 
 
 def test_defers_non_core_and_injects_search_tool():
@@ -169,7 +199,7 @@ def test_noop_for_a_client_that_cannot_execute_the_search_tool():
     tools = _tools()
     snapshot = copy.deepcopy(tools)
 
-    out = inject_tool_search_deferral_openai(tools, "gpt-5.5", client_can_tool_search=False)
+    out = inject_tool_search_deferral_openai(tools, "gpt-5.5", client="opencode")
 
     assert out is tools
     assert tools == snapshot
@@ -182,7 +212,7 @@ def test_supported_clients_keep_the_existing_deferral():
     # search still gets the same payload it got before.
     tools = _tools()
 
-    explicit = inject_tool_search_deferral_openai(tools, "gpt-5.5", client_can_tool_search=True)
+    explicit = inject_tool_search_deferral_openai(tools, "gpt-5.5", client="claude-code")
     implicit = inject_tool_search_deferral_openai(tools, "gpt-5.5")
 
     assert explicit == implicit

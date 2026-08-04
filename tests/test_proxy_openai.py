@@ -11,11 +11,11 @@ import pytest
 from starlette.datastructures import Headers
 
 from headroom.proxy.auth_mode import classify_client
-from headroom.proxy.handlers.openai import (
-    OpenAIHandlerMixin,
+from headroom.proxy.handlers.openai import OpenAIHandlerMixin
+from headroom.proxy.helpers import (
+    inject_tool_search_deferral_openai,
     openai_tool_search_client_supported,
 )
-from headroom.proxy.helpers import inject_tool_search_deferral_openai
 
 TOOL_SEARCH_MODEL = "gpt-5.5"
 
@@ -35,7 +35,7 @@ def _tool_payload() -> list[dict[str, object]]:
     [
         ({"user-agent": "opencode/0.4.2"}, "opencode", False),
         ({"x-client": "opencode"}, "opencode", False),
-        ({"user-agent": "codex-cli/1.2.3"}, "codex", True),
+        ({"user-agent": "codex-cli/1.2.3"}, "codex", False),
         ({"user-agent": "claude-code/2.0"}, "claude-code", True),
         ({"user-agent": "cursor/1.0"}, "cursor", True),
         ({}, None, True),
@@ -77,7 +77,7 @@ def test_request_headers_decide_the_outbound_tools_payload() -> None:
     forwarded = inject_tool_search_deferral_openai(
         tools,
         TOOL_SEARCH_MODEL,
-        client_can_tool_search=openai_tool_search_client_supported(classify_client(opencode)),
+        client=classify_client(opencode),
     )
     assert forwarded is tools
     assert not any(tool.get("type") == "tool_search" for tool in forwarded)
@@ -87,11 +87,10 @@ def test_request_headers_decide_the_outbound_tools_payload() -> None:
     forwarded = inject_tool_search_deferral_openai(
         tools,
         TOOL_SEARCH_MODEL,
-        client_can_tool_search=openai_tool_search_client_supported(classify_client(codex)),
+        client=classify_client(codex),
     )
-    assert forwarded is not tools
-    assert forwarded[0] == {"type": "tool_search"}
-    assert any(tool.get("defer_loading") for tool in forwarded[1:])
+    assert forwarded is tools
+    assert not any(tool.get("type") == "tool_search" for tool in forwarded)
     assert not any(tool.get("defer_loading") for tool in tools)
 
 
@@ -123,7 +122,7 @@ def test_native_responses_compressor_scopes_the_exclusion_per_call() -> None:
             {"input": "hello"},
             model=TOOL_SEARCH_MODEL,
             request_id="req-opencode",
-            client_can_tool_search=False,
+            client="opencode",
         )
         await handler._compress_openai_responses_payload_in_executor(
             {"input": "hello"},
@@ -134,8 +133,8 @@ def test_native_responses_compressor_scopes_the_exclusion_per_call() -> None:
     asyncio.run(_run())
 
     assert [{key: value for key, value in call.items() if key != "timing"} for call in seen] == [
-        {"client_can_tool_search": False},
-        {},
+        {"client": "opencode"},
+        {"client": None},
     ]
 
 
@@ -185,7 +184,7 @@ def test_a_narrow_compressor_override_still_works_for_an_excluded_client() -> No
             {"input": "hello"},
             model=TOOL_SEARCH_MODEL,
             request_id="req-opencode",
-            client_can_tool_search=False,
+            client="opencode",
         )
     )
 
@@ -201,7 +200,7 @@ def test_native_responses_compressor_reraises_internal_type_error() -> None:
     async def _run_compression(fn, *, timeout):  # noqa: ANN001, ANN202
         return fn()
 
-    def _compress(payload, *, model, request_id, client_can_tool_search, timing=None):  # noqa: ANN001, ANN202
+    def _compress(payload, *, model, request_id, client, timing=None):  # noqa: ANN001, ANN202
         nonlocal calls
         calls += 1
         raise sentinel
@@ -215,7 +214,7 @@ def test_native_responses_compressor_reraises_internal_type_error() -> None:
                 {"input": "hello"},
                 model=TOOL_SEARCH_MODEL,
                 request_id="req-opencode",
-                client_can_tool_search=False,
+                client="opencode",
             )
         )
 
@@ -272,7 +271,7 @@ def test_custom_base_path_excludes_the_reported_harness() -> None:
         )
     )
 
-    assert seen == [{"client_can_tool_search": False}]
+    assert seen == [{"client": "opencode"}]
 
 
 def test_custom_base_path_leaves_other_clients_alone() -> None:
@@ -287,7 +286,7 @@ def test_custom_base_path_leaves_other_clients_alone() -> None:
         )
     )
 
-    assert seen == [{}]
+    assert seen == [{"client": "codex"}]
 
 
 # --- production route: the native /v1/responses handler -----------------------
@@ -362,8 +361,8 @@ def _responses_body() -> dict[str, object]:
 @pytest.mark.parametrize(
     ("user_agent", "expected"),
     [
-        ("opencode/0.4.2", {"client_can_tool_search": False}),
-        ("codex-cli/1.2.3", {}),
+        ("opencode/0.4.2", {"client": "opencode"}),
+        ("codex-cli/1.2.3", {"client": "codex"}),
     ],
 )
 def test_native_responses_route_carries_the_client_decision(
@@ -397,8 +396,8 @@ def test_native_responses_route_carries_the_client_decision(
 @pytest.mark.parametrize(
     ("user_agent", "expected"),
     [
-        ("opencode/0.4.2", {"client_can_tool_search": False}),
-        ("codex-cli/1.2.3", {}),
+        ("opencode/0.4.2", {"client": "opencode"}),
+        ("codex-cli/1.2.3", {"client": "codex"}),
     ],
 )
 def test_websocket_route_carries_the_client_decision(

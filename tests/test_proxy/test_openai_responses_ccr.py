@@ -197,9 +197,10 @@ def test_ccr_intercept_exception_is_reraised_not_swallowed():
 
 def test_ccr_outcome_reads_final_round_usage_and_folds_dropped_round_into_cost():
     """The Responses path captures usage before CCR runs, so it must re-derive it
-    from the final body: the outcome carries the final round (60 in / 5 out), not
-    the initial one (50 / 10). The dropped initial round reaches the cost view via
-    the continuation fold, and only the cost view."""
+    from the final body: provider_input_tokens carries the final round (60 in / 5
+    out), not the initial one (50 / 10), while optimized_tokens stays on the local
+    tokenizer scale. The dropped initial round reaches the cost view via the
+    continuation fold, and only the cost view."""
     config = ProxyConfig(
         optimize=False,
         cache_enabled=False,
@@ -242,7 +243,8 @@ def test_ccr_outcome_reads_final_round_usage_and_folds_dropped_round_into_cost()
 
     outcome = captured["outcome"]
     assert outcome.output_tokens == 5
-    assert outcome.optimized_tokens == 60
+    assert outcome.optimized_tokens == outcome.original_tokens
+    assert outcome.provider_input_tokens == 60
     assert outcome.uncached_input_tokens == 60
 
     # Cost view carries the dropped initial round on top of the final one.

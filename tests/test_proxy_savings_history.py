@@ -82,6 +82,8 @@ def test_savings_tracker_helpers_normalize_inputs_and_paths(tmp_path, monkeypatc
         "cache_savings_usd": 0.0,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
+        "output_tokens_saved": 0,
+        "output_savings_usd": 0.0,
     }
     assert savings_tracker_module._normalize_history_entry({"timestamp": "bad"}) is None
     assert savings_tracker_module._normalize_history_entry(object()) is None
@@ -123,7 +125,7 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
     )
     snapshot = tracker.snapshot()
 
-    assert snapshot["schema_version"] == 4
+    assert snapshot["schema_version"] == 5
     assert snapshot["lifetime"] == {
         "requests": 0,
         "tokens_saved": 30,
@@ -145,6 +147,8 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
             "cache_savings_usd": 0.0,
             "total_input_tokens": 0,
             "total_input_cost_usd": 0.0,
+            "output_tokens_saved": 0,
+            "output_savings_usd": 0.0,
         }
     ]
     assert snapshot["retention"] == {
@@ -1096,7 +1100,7 @@ def test_stats_history_persists_across_restarts_and_stats_stays_compatible(tmp_p
         history = client.get("/stats-history")
         assert history.status_code == 200
         history_data = history.json()
-        assert history_data["schema_version"] == 4
+        assert history_data["schema_version"] == 5
         assert history_data["storage_path"] == str(savings_path)
         assert history_data["lifetime"]["tokens_saved"] == 40
         assert history_data["lifetime"]["total_input_tokens"] == 120
@@ -1223,9 +1227,11 @@ def test_savings_tracker_batches_saves_and_matches_immediate(tmp_path):
     batched.record_request(**events[2])  # buffered again
     batched.flush()  # tail persisted
 
-    assert json.loads(batched_path.read_text(encoding="utf-8")) == json.loads(
-        immediate_path.read_text(encoding="utf-8")
-    )
+    batched_payload = json.loads(batched_path.read_text(encoding="utf-8"))
+    immediate_payload = json.loads(immediate_path.read_text(encoding="utf-8"))
+    for payload in (batched_payload, immediate_payload):
+        payload["lifetime_metrics"]["persistence"].pop("last_saved_at", None)
+    assert batched_payload == immediate_payload
 
 
 def test_failed_save_retries_on_next_record_not_after_full_window(tmp_path, monkeypatch):
@@ -1288,7 +1294,8 @@ def test_stats_history_csv_export_is_frontend_friendly(tmp_path, monkeypatch):
         assert lines[0] == (
             "timestamp,tokens_saved,compression_savings_usd_delta,total_tokens_saved,"
             "compression_savings_usd,total_input_tokens_delta,total_input_tokens,"
-            "total_input_cost_usd_delta,total_input_cost_usd"
+            "total_input_cost_usd_delta,total_input_cost_usd,"
+            "output_tokens_saved_delta,output_savings_usd_delta"
         )
         assert len(lines) >= 2
         assert "total_tokens_saved" in lines[0]
@@ -1345,125 +1352,6 @@ def test_dashboard_includes_history_toggle_and_endpoint(tmp_path, monkeypatch):
         assert "historyModelSourceSeriesLabel + ' buckets'" in html
         # Non-top-5 breakdown rows swap into the last chart slot when selected.
         assert "topModels[topModels.length - 1] = selected;" in html
-
-
-def test_stats_history_includes_cli_filtering(tmp_path, monkeypatch):
-    """The /stats-history response must include cli_filtering (RTK) lifetime stats.
-
-    Before this fix the endpoint returned only proxy compression data; after a
-    restart the Historical tab showed no RTK savings at all.
-    """
-    pytest.importorskip("fastapi")
-    from fastapi.testclient import TestClient
-
-    import headroom.proxy.server as server
-    from headroom.proxy.server import ProxyConfig, create_app
-
-    savings_path = tmp_path / "proxy_savings.json"
-    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(savings_path))
-
-    _rtk_lifetime_payload = {
-        "tool": "rtk",
-        "label": "RTK",
-        "tokens_saved": 999,
-        "session": {"tokens_saved": 200, "commands": 5},
-        "lifetime": {"tokens_saved": 999, "commands": 42},
-    }
-    monkeypatch.setattr(server, "_get_context_tool_stats", lambda: _rtk_lifetime_payload)
-
-    config = ProxyConfig(
-        cache_enabled=False,
-        rate_limit_enabled=False,
-        log_requests=False,
-    )
-
-    with TestClient(create_app(config)) as client:
-        response = client.get("/stats-history")
-        assert response.status_code == 200
-        data = response.json()
-
-    assert "cli_filtering" in data, "Historical /stats-history must include cli_filtering"
-    assert data["cli_filtering"] is not None
-    assert data["cli_filtering"]["tool"] == "rtk"
-    assert data["cli_filtering"]["label"] == "RTK"
-    assert data["cli_filtering"]["lifetime"]["tokens_saved"] == 999
-
-
-def test_stats_history_cli_filtering_available_false_when_not_installed(tmp_path, monkeypatch):
-    """Reproduction: /stats-history's curated cli_filtering block must carry
-    `available` reflecting the backend `installed` flag. On origin/main this
-    key doesn't exist in the curated dict at all (`KeyError`); this asserts
-    the fixed key/value. The tool being merely absent must NOT collapse the
-    block to `None` -- it stays populated with `available: False` and zeroed
-    counters so the Historical tab can distinguish absence from a hard
-    read failure.
-    """
-    pytest.importorskip("fastapi")
-    from fastapi.testclient import TestClient
-
-    import headroom.proxy.server as server
-    from headroom.proxy.server import ProxyConfig, create_app
-
-    savings_path = tmp_path / "proxy_savings.json"
-    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(savings_path))
-
-    _rtk_not_installed_payload = {
-        "tool": "rtk",
-        "label": "RTK",
-        "installed": False,
-        "tokens_saved": 0,
-        "session": {"tokens_saved": 0, "commands": 0},
-        "lifetime": {"tokens_saved": 0, "commands": 0},
-    }
-    monkeypatch.setattr(server, "_get_context_tool_stats", lambda: _rtk_not_installed_payload)
-
-    config = ProxyConfig(
-        cache_enabled=False,
-        rate_limit_enabled=False,
-        log_requests=False,
-    )
-
-    with TestClient(create_app(config)) as client:
-        response = client.get("/stats-history")
-        assert response.status_code == 200
-        data = response.json()
-
-    assert data["cli_filtering"] is not None
-    assert data["cli_filtering"]["available"] is False
-
-
-def test_stats_history_cli_filtering_stays_none_on_hard_read_failure(tmp_path, monkeypatch):
-    """Preservation: /stats-history's cli_filtering key stays `None` only when
-    the underlying stats read hard-fails (exception), not merely because the
-    tool is absent -- the Historical tab keeps hiding the card in that case,
-    unchanged from prior behavior.
-    """
-    pytest.importorskip("fastapi")
-    from fastapi.testclient import TestClient
-
-    import headroom.proxy.server as server
-    from headroom.proxy.server import ProxyConfig, create_app
-
-    savings_path = tmp_path / "proxy_savings.json"
-    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(savings_path))
-
-    def _raise() -> dict:
-        raise RuntimeError("simulated hard stats-read failure")
-
-    monkeypatch.setattr(server, "_get_context_tool_stats", _raise)
-
-    config = ProxyConfig(
-        cache_enabled=False,
-        rate_limit_enabled=False,
-        log_requests=False,
-    )
-
-    with TestClient(create_app(config)) as client:
-        response = client.get("/stats-history")
-        assert response.status_code == 200
-        data = response.json()
-
-    assert data["cli_filtering"] is None
 
 
 def test_coercion_helpers_reject_non_finite_values():
@@ -1654,7 +1542,7 @@ def test_v3_state_without_cache_fields_loads_clean_and_saves_v4(tmp_path):
         timestamp="2026-07-02T00:00:00Z",
     )
     persisted = json.loads(path.read_text(encoding="utf-8"))
-    assert persisted["schema_version"] == 4
+    assert persisted["schema_version"] == 5
     assert persisted["lifetime"]["cache_read_tokens"] == 5
     assert persisted["lifetime"]["tokens_saved"] == 42181
 

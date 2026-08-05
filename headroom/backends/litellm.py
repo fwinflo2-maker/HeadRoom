@@ -445,7 +445,12 @@ def _anthropic_usage_from_litellm(litellm_usage: Any) -> dict[str, Any]:
     prompt_tokens = int(getattr(litellm_usage, "prompt_tokens", 0) or 0)
     usage: dict[str, Any] = {
         "input_tokens": max(prompt_tokens - cache_read - cache_write, 0),
-        "output_tokens": getattr(litellm_usage, "completion_tokens", 0),
+        # None-guard like the other fields: LiteLLM's Usage always carries the
+        # completion_tokens attribute, so the getattr default never fires, but a
+        # provider can leave it None. Emitting output_tokens=None would break the
+        # RequestOutcome int contract downstream (e.g. prometheus does
+        # tokens_output_total += output_tokens -> TypeError).
+        "output_tokens": int(getattr(litellm_usage, "completion_tokens", 0) or 0),
     }
     if cache_read or cache_write:
         usage["cache_read_input_tokens"] = cache_read
@@ -747,6 +752,39 @@ class LiteLLMBackend(Backend):
 
         return converted
 
+    def _system_field_to_message(self, system: Any) -> dict[str, Any]:
+        """Convert Anthropic's top-level `system` field to an OpenAI-style message.
+
+        `system` can be a plain string or a list of content blocks, each of
+        which may carry its own `cache_control` breakpoint (Claude Code puts
+        the prompt-caching marker on the last system block). Flattening the
+        list to a joined string, as this code used to do, drops that
+        `cache_control` entirely: litellm's Bedrock Converse transformation
+        only emits a `cachePoint` when it sees content blocks with
+        `cache_control` on them, never for a plain string. That silently
+        broke prompt caching of the system prefix. #1390 covers the analogous
+        case for tool_result blocks in `_convert_messages_for_litellm` above;
+        this handles the top-level `system` field, which was out of scope
+        there. Preserve block structure and cache_control so the breakpoint
+        survives into the litellm call.
+        """
+        if isinstance(system, str):
+            return {"role": "system", "content": system}
+        if isinstance(system, list):
+            blocks: list[dict[str, Any]] = []
+            for s in system:
+                if isinstance(s, dict):
+                    block: dict[str, Any] = {"type": "text", "text": s.get("text", "")}
+                    if "cache_control" in s:
+                        block["cache_control"] = s["cache_control"]
+                else:
+                    block = {"type": "text", "text": str(s)}
+                blocks.append(block)
+            return {"role": "system", "content": blocks}
+        # Shouldn't happen in practice (None is filtered out via "system" in
+        # body), but stay defensive rather than raising.
+        return {"role": "system", "content": str(system)}
+
     def _to_anthropic_response(
         self,
         litellm_response: Any,
@@ -754,6 +792,24 @@ class LiteLLMBackend(Backend):
     ) -> dict[str, Any]:
         """Convert LiteLLM/OpenAI response to Anthropic format."""
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+        # A non-streaming upstream response can be HTTP 200 with an empty
+        # ``choices`` list (e.g. Azure OpenAI content filtering, or any
+        # OpenAI-compatible gateway on a usage-only / filtered turn). The
+        # streaming sibling already `continue`s past this (`if not
+        # chunk.choices`); indexing ``choices[0]`` here would instead raise
+        # IndexError and 500 the request. Return a valid empty assistant turn.
+        if not getattr(litellm_response, "choices", None):
+            return {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": original_model,
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": _anthropic_usage_from_litellm(getattr(litellm_response, "usage", None)),
+            }
 
         # Extract content from OpenAI format
         choice = litellm_response.choices[0]
@@ -843,15 +899,7 @@ class LiteLLMBackend(Backend):
 
             # System prompt (Anthropic puts it in body, OpenAI in messages)
             if "system" in body:
-                system = body["system"]
-                if isinstance(system, str):
-                    kwargs["messages"].insert(0, {"role": "system", "content": system})
-                elif isinstance(system, list):
-                    # Anthropic list format
-                    system_text = " ".join(
-                        s.get("text", "") if isinstance(s, dict) else str(s) for s in system
-                    )
-                    kwargs["messages"].insert(0, {"role": "system", "content": system_text})
+                kwargs["messages"].insert(0, self._system_field_to_message(body["system"]))
 
             # Provider-specific region config
             if self.region:
@@ -956,14 +1004,7 @@ class LiteLLMBackend(Backend):
             if "tool_choice" in body:
                 kwargs["tool_choice"] = _convert_tool_choice(body["tool_choice"])
             if "system" in body:
-                system = body["system"]
-                if isinstance(system, str):
-                    kwargs["messages"].insert(0, {"role": "system", "content": system})
-                elif isinstance(system, list):
-                    system_text = " ".join(
-                        s.get("text", "") if isinstance(s, dict) else str(s) for s in system
-                    )
-                    kwargs["messages"].insert(0, {"role": "system", "content": system_text})
+                kwargs["messages"].insert(0, self._system_field_to_message(body["system"]))
 
             # Provider-specific region config
             if self.region:

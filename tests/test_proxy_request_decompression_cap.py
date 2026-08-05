@@ -279,8 +279,8 @@ except ImportError:
 @pytest.mark.skipif(not _HAS_FASTAPI, reason="fastapi not installed")
 def test_compress_endpoint_body_too_large_gzip(monkeypatch):
     """A gzip bomb sent to /v1/compress returns the configured status, not 400."""
-    from headroom.proxy.server import ProxyConfig, create_app
     from headroom.proxy.helpers import get_body_too_large_status
+    from headroom.proxy.server import ProxyConfig, create_app
 
     config = ProxyConfig(
         optimize=True,
@@ -314,8 +314,8 @@ def test_compress_endpoint_body_too_large_gzip(monkeypatch):
 @pytest.mark.skipif(not _HAS_FASTAPI, reason="fastapi not installed")
 def test_compress_bypass_body_too_large_gzip(monkeypatch):
     """A gzip bomb sent to /v1/compress with x-headroom-bypass also returns the configured status."""
-    from headroom.proxy.server import ProxyConfig, create_app
     from headroom.proxy.helpers import get_body_too_large_status
+    from headroom.proxy.server import ProxyConfig, create_app
 
     config = ProxyConfig(
         optimize=True,

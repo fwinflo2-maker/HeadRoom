@@ -914,7 +914,7 @@ class StreamingMixin:
         # Prefix-tracker mutation is provider-specific state that lives
         # outside the metric funnel. Run it before the funnel so the next
         # request inherits correct prefix state regardless of metric path.
-        if status_code < 400 and prefix_tracker is not None:
+        if 200 <= status_code < 300 and prefix_tracker is not None:
             import copy as _copy
 
             forwarded_messages = body.get("messages", [])
@@ -1652,6 +1652,7 @@ class StreamingMixin:
                     parsed_response=parsed_response,
                     client=client,
                     waste_signals=waste_signals,
+                    status_code=upstream_response.status_code,
                 )
                 if pending_messages:
                     pending_event = json.dumps(

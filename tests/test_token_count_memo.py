@@ -150,6 +150,27 @@ def test_message_hash_same_for_identical_messages() -> None:
     assert TokenCountMemo.message_hash(dict(m)) == TokenCountMemo.message_hash(dict(m))
 
 
+def test_forced_digest_collision_never_aliases_unequal_messages(monkeypatch) -> None:
+    """Canonical verification protects correctness even if the digest collides."""
+
+    class _CountingTokenizer:
+        ADDITIVE_COUNTS = True
+        REPLY_OVERHEAD = 0
+
+        def count_message(self, message) -> int:  # noqa: ANN001
+            return len(message["content"])
+
+        def count_messages(self, messages) -> int:  # noqa: ANN001
+            return sum(self.count_message(message) for message in messages)
+
+    monkeypatch.setattr(TokenCountMemo, "message_hash", staticmethod(lambda _message: "collision"))
+    memo = TokenCountMemo()
+    tokenizer = _CountingTokenizer()
+
+    assert count_messages_memoized(memo, tokenizer, [{"content": "a"}]) == 1
+    assert count_messages_memoized(memo, tokenizer, [{"content": "much longer"}]) == 11
+
+
 class TestTokenCountMemoEviction:
     def test_eviction_at_max_entries(self) -> None:
         memo = TokenCountMemo(max_entries=3)

@@ -51,7 +51,7 @@ class TokenCountMemo:
     def __init__(self, max_entries: int = 10000) -> None:
         self.max_entries = max_entries
         self._lock = threading.RLock()
-        self._counts: OrderedDict[str, int] = OrderedDict()
+        self._counts: OrderedDict[str, list[tuple[str, int]]] = OrderedDict()
         # Strong reference on purpose: identity (`is`) comparison against a
         # weak/GC'd tokenizer could alias a new instance at the same address.
         self._bound_tokenizer: object | None = None
@@ -65,6 +65,14 @@ class TokenCountMemo:
                 self._bound_tokenizer = tokenizer
 
     @staticmethod
+    def canonical_message(message: dict[str, Any]) -> str:
+        """Return the exact serialized value verified on every cache hit."""
+        try:
+            return json.dumps(message, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            return repr(message)
+
+    @staticmethod
     def message_hash(message: dict[str, Any]) -> str:
         """Hash the whole message — role, content, tool_calls, function_call,
         name — every field ``Tokenizer.count_message`` sums over, so a memo
@@ -72,24 +80,26 @@ class TokenCountMemo:
         ``CompressionCache.content_hash``: that hashes tool_result CONTENT
         only, not the whole message.)
         """
-        try:
-            raw = json.dumps(message, sort_keys=True, ensure_ascii=False)
-        except Exception:
-            raw = repr(message)
-        return hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]  # nosec B324
+        raw = TokenCountMemo.canonical_message(message)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-    def get(self, key: str) -> int | None:
+    def get(self, key: str, canonical: str | None = None) -> int | None:
         with self._lock:
-            count = self._counts.get(key)
-            if count is not None:
-                self._counts.move_to_end(key)
-            return count
+            entries = self._counts.get(key)
+            if entries is None:
+                return None
+            self._counts.move_to_end(key)
+            if canonical is None:
+                return entries[0][1]
+            return next((count for stored, count in entries if stored == canonical), None)
 
-    def put(self, key: str, count: int) -> None:
+    def put(self, key: str, count: int, canonical: str | None = None) -> None:
         with self._lock:
-            if key in self._counts:
-                del self._counts[key]
-            self._counts[key] = count
+            canonical = key if canonical is None else canonical
+            entries = self._counts.pop(key, [])
+            entries = [(stored, value) for stored, value in entries if stored != canonical]
+            entries.append((canonical, count))
+            self._counts[key] = entries
             while len(self._counts) > self.max_entries:
                 self._counts.popitem(last=False)
 
@@ -117,10 +127,11 @@ def count_messages_memoized(
     memo.bind_or_reset(tokenizer)
     total = 0
     for msg in messages:
+        canonical = TokenCountMemo.canonical_message(msg)
         key = TokenCountMemo.message_hash(msg)
-        count = memo.get(key)
+        count = memo.get(key, canonical)
         if count is None:
             count = tokenizer.count_message(msg)
-            memo.put(key, count)
+            memo.put(key, count, canonical)
         total += count
     return total + tokenizer.REPLY_OVERHEAD

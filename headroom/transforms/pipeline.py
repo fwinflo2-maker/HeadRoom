@@ -522,8 +522,8 @@ class TransformPipeline:
                 # off-path (anthropic.py background task) and feeds the result
                 # into the outcome funnel.
                 if saved_enough and tokens_before <= waste_signal_token_limit:
-                    deferred_input = waste_messages or messages
-                    deferred_compressed = current_messages
+                    deferred_input = deep_copy_messages(waste_messages or messages)
+                    deferred_compressed = deep_copy_messages(current_messages)
 
                     def _deferred_waste_parse() -> WasteSignals | None:
                         from ..parser import parse_messages

@@ -933,6 +933,7 @@ def test_text_block_cache_control_protected_with_assistant_optin(
         "",
         [],
         set(),
+        set(),
         route_counts=counts,
         compress_assistant_text_blocks=True,
     )
@@ -965,6 +966,7 @@ def test_tool_result_cache_control_protected(monkeypatch: pytest.MonkeyPatch) ->
         "",
         [],
         set(),
+        set(),
     )
     # cache_control hard-skip applies to tool_result too
     assert result["content"][0]["content"] == long_text
@@ -981,6 +983,7 @@ def test_assistant_text_blocks_skipped_by_default(
         msg["content"],
         "",
         [],
+        set(),
         set(),
     )
     # Default OFF: assistant text untouched, restoring pre-#431 cache safety
@@ -999,6 +1002,7 @@ def test_assistant_text_blocks_opt_in_compresses(
         "",
         [],
         set(),
+        set(),
         compress_assistant_text_blocks=True,
     )
     assert "[compressed]" in result["content"][0]["text"]
@@ -1016,6 +1020,7 @@ def test_user_text_blocks_never_compressed_even_with_assistant_optin(
         "",
         [],
         set(),
+        set(),
         compress_assistant_text_blocks=True,  # MUST NOT bleed into user
     )
     assert result["content"][0]["text"] == long_text
@@ -1032,6 +1037,7 @@ def test_system_text_blocks_skipped_when_skip_system_true(
         msg["content"],
         "",
         [],
+        set(),
         set(),
         skip_system=True,
         compress_assistant_text_blocks=True,
@@ -1051,6 +1057,7 @@ def test_tool_role_text_blocks_compressed_by_default(
         "",
         [],
         set(),
+        set(),
     )
     # tool role ≈ tool output — compress freely
     assert "[compressed]" in result["content"][0]["text"]
@@ -1068,6 +1075,7 @@ def test_unknown_role_text_blocks_skipped_for_safety(
         "",
         [],
         set(),
+        set(),
         compress_assistant_text_blocks=True,
     )
     # Unknown role: be safe, don't compress
@@ -1084,6 +1092,7 @@ def test_min_chars_gates_short_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
         "",
         [],
         set(),
+        set(),
         min_chars=500,
     )
     assert result["content"][0]["text"] == short_text
@@ -1098,6 +1107,7 @@ def test_pinning_skips_already_compressed(monkeypatch: pytest.MonkeyPatch) -> No
         msg["content"],
         "",
         [],
+        set(),
         set(),
     )
     # Already-compressed marker keeps proxy idempotent across turns

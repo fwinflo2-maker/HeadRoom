@@ -128,6 +128,38 @@ def test_defer_provider_runs_the_same_parse_lazily(monkeypatch):
     assert result.waste_signals_provider() is fake_ws
 
 
+def test_defer_provider_uses_pipeline_time_snapshots(monkeypatch):
+    """Later handler mutations cannot change deferred telemetry inputs."""
+    pipeline = TransformPipeline(HeadroomConfig())
+    pipeline.transforms = [_ShrinkTransform()]
+    monkeypatch.setattr(pipeline, "_get_tokenizer", lambda _model: _FakeTokenizer(10_000, 5_000))
+    waste_messages = [{"role": "user", "content": "original waste input"}]
+    captured = {}
+    fake_ws = SimpleNamespace(total=lambda: 1, to_dict=lambda: {"duplicate_tool_result": 1})
+
+    def _capture(messages, tokenizer, *, compressed_messages):  # noqa: ANN001
+        captured["messages"] = messages
+        captured["compressed"] = compressed_messages
+        return [], {}, fake_ws
+
+    monkeypatch.setattr("headroom.parser.parse_messages", _capture)
+    result = pipeline.apply(
+        [{"role": "user", "content": "request input"}],
+        model="claude-3-5-sonnet",
+        model_limit=1_000_000,
+        record_metrics=False,
+        waste_messages=waste_messages,
+        defer_waste_signals=True,
+    )
+    waste_messages[0]["content"] = "MUTATED WASTE"
+    result.messages[0]["content"] = "MUTATED RESULT"
+
+    assert result.waste_signals_provider is not None
+    assert result.waste_signals_provider() is fake_ws
+    assert captured["messages"][0]["content"] == "original waste input"
+    assert captured["compressed"][0]["content"] == "compressed"
+
+
 def test_defer_provider_absent_when_savings_too_small(monkeypatch):
     """Gate parity: below _MIN_TOKENS_SAVED_FOR_WASTE_SIGNALS the inline path
     would not have parsed, so deferral must not attach a provider either."""

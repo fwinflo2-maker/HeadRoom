@@ -14,6 +14,7 @@ import math
 import os
 import tempfile
 import threading
+from collections.abc import Callable
 from csv import DictWriter
 from datetime import datetime, timedelta, timezone
 from io import StringIO
@@ -570,7 +571,14 @@ class SavingsTracker:
         display_session_inactivity_minutes: int = (DEFAULT_DISPLAY_SESSION_INACTIVITY_MINUTES),
         stateless: bool = False,
         save_flush_every: int = 1,
+        *,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
+        # Injectable clock so tests can drive the display-session expiry and the
+        # state stamps with one value. Callers that pass nothing keep real wall
+        # time via a live lookup so existing module-level `_utc_now` monkeypatch
+        # tests keep working.
+        self._now = now if now is not None else lambda: _utc_now()
         # In stateless mode the tracker keeps live counters in memory but never
         # writes proxy_savings.json (honors HeadroomConfig.stateless, which
         # disables all filesystem writes for read-only / container deployments).
@@ -604,9 +612,11 @@ class SavingsTracker:
         self._persistence_error: str | None = None
         self._needs_schema_save = False
         self._state = self._load_state()
-        self._persistent_metrics = PersistentMetricsState(self._state.pop("lifetime_metrics", None))
+        self._persistent_metrics = PersistentMetricsState(
+            self._state.pop("lifetime_metrics", None), now=self._now
+        )
         self._display_metrics = PersistentMetricsState(
-            self._state.pop("display_session_metrics", None)
+            self._state.pop("display_session_metrics", None), now=self._now
         )
 
     @property
@@ -889,10 +899,7 @@ class SavingsTracker:
             "cache_savings_usd", _estimate_cache_savings_usd(model, cache_read_tokens)
         )
         with self._lock:
-            display_raw = self._display_metrics.to_dict()
-            last_activity = _parse_timestamp(display_raw.get("last_activity_at"))
-            if last_activity is not None and self._is_display_session_expired(last_activity):
-                self._display_metrics = PersistentMetricsState()
+            self._maybe_reset_display_session_locked()
             self._persistent_metrics.record_request(**metrics)
             self._display_metrics.record_request(**metrics)
             if persist:
@@ -902,6 +909,7 @@ class SavingsTracker:
         """Mirror the existing inbound stack dimension without another save."""
 
         with self._lock:
+            self._maybe_reset_display_session_locked()
             self._persistent_metrics.record_stack(stack)
             self._display_metrics.record_stack(stack)
 
@@ -911,6 +919,7 @@ class SavingsTracker:
         """Record a failed proxy request without changing legacy history."""
 
         with self._lock:
+            self._maybe_reset_display_session_locked()
             self._persistent_metrics.record_failed(provider=provider, model=model)
             self._display_metrics.record_failed(provider=provider, model=model)
             self._maybe_save_locked()
@@ -921,18 +930,21 @@ class SavingsTracker:
         """Record a rate-limited proxy request without changing legacy history."""
 
         with self._lock:
+            self._maybe_reset_display_session_locked()
             self._persistent_metrics.record_rate_limited(provider=provider, model=model)
             self._display_metrics.record_rate_limited(provider=provider, model=model)
             self._maybe_save_locked()
 
     def record_lifetime_cache_bust(self, *, tokens_lost: int) -> None:
         with self._lock:
+            self._maybe_reset_display_session_locked()
             self._persistent_metrics.record_cache_bust(tokens_lost=tokens_lost)
             self._display_metrics.record_cache_bust(tokens_lost=tokens_lost)
             self._maybe_save_locked()
 
     def record_lifetime_cache_miss(self, *, provider: str | None, reason: str | None) -> None:
         with self._lock:
+            self._maybe_reset_display_session_locked()
             self._persistent_metrics.record_cache_miss(provider=provider, reason=reason)
             self._display_metrics.record_cache_miss(provider=provider, reason=reason)
             self._maybe_save_locked()
@@ -941,6 +953,7 @@ class SavingsTracker:
         metrics = dict(metrics)
         metrics.pop("timestamp", None)
         with self._lock:
+            self._maybe_reset_display_session_locked()
             self._persistent_metrics.record_compression(**metrics)
             self._display_metrics.record_compression(**metrics)
             self._maybe_save_locked()
@@ -949,6 +962,7 @@ class SavingsTracker:
         metrics = dict(metrics)
         metrics.pop("timestamp", None)
         with self._lock:
+            self._maybe_reset_display_session_locked()
             self._persistent_metrics.record_codex_ws_unit(**metrics)
             self._display_metrics.record_codex_ws_unit(**metrics)
             self._maybe_save_locked()
@@ -957,6 +971,7 @@ class SavingsTracker:
         metrics = dict(metrics)
         metrics.pop("timestamp", None)
         with self._lock:
+            self._maybe_reset_display_session_locked()
             self._persistent_metrics.record_codex_ws_frame(**metrics)
             self._display_metrics.record_codex_ws_frame(**metrics)
             self._maybe_save_locked()
@@ -1088,15 +1103,23 @@ class SavingsTracker:
             response["projects"] = self._projects_snapshot_locked()
             return response
 
+    def _maybe_reset_display_session_locked(self) -> None:
+        """Reset an expired display session before the caller mutates it.
+
+        Caller must hold ``self._lock``. Run before the record call that stamps
+        a fresh timestamp, so expiry is gated on the stale timestamp. No-op when
+        no activity has been recorded (a fresh, empty session stays untouched).
+        """
+
+        last_activity = _parse_timestamp(self._display_metrics.to_dict().get("last_activity_at"))
+        if last_activity is not None and self._is_display_session_expired(last_activity):
+            self._display_metrics = PersistentMetricsState(now=self._now)
+
     def display_session_response(self) -> dict[str, Any]:
         """Return the current durable display-session aggregate."""
 
         with self._lock:
-            last_activity = _parse_timestamp(
-                self._display_metrics.to_dict().get("last_activity_at")
-            )
-            if last_activity is not None and self._is_display_session_expired(last_activity):
-                self._display_metrics = PersistentMetricsState()
+            self._maybe_reset_display_session_locked()
             return self._display_metrics.snapshot(
                 persistence={
                     "enabled": not self._stateless,
@@ -1633,9 +1656,9 @@ class SavingsTracker:
         *,
         reference_time: datetime | None = None,
     ) -> bool:
-        return (reference_time or _utc_now()) - last_activity > timedelta(
-            minutes=self._display_session_inactivity_minutes
-        )
+        return (
+            reference_time if reference_time is not None else self._now()
+        ) - last_activity > timedelta(minutes=self._display_session_inactivity_minutes)
 
     def _build_rollup(
         self,

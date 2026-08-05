@@ -163,9 +163,29 @@ class TestCodeBuddyPlugin:
         assert plugin.detect() is False
 
     def test_create_writer(self):
+        from headroom.learn.writer import CodeBuddyWriter
+
         plugin = CodeBuddyPlugin()
         writer = plugin.create_writer()
-        assert writer is not None
+        assert isinstance(writer, CodeBuddyWriter)
+
+    def test_writer_targets_codebuddy_memory(self, tmp_path: Path):
+        from headroom.learn.models import ProjectInfo, Recommendation, RecommendationTarget
+
+        project_data = tmp_path / ".codebuddy" / "projects" / "-repo"
+        project = ProjectInfo(name="repo", project_path=tmp_path / "repo", data_path=project_data)
+        recommendation = Recommendation(
+            target=RecommendationTarget.CONTEXT_FILE,
+            section="Workflow",
+            content="Use the project formatter.",
+        )
+
+        result = CodeBuddyPlugin().create_writer().write([recommendation], project, dry_run=False)
+
+        expected = project_data / "memory" / "MEMORY.md"
+        assert result.files_written == [expected]
+        assert "Use the project formatter." in expected.read_text(encoding="utf-8")
+        assert not (project.project_path / "CLAUDE.local.md").exists()
 
     def test_discover_projects_empty_dir(self, tmp_path: Path) -> None:
         projects_dir = tmp_path / ".codebuddy" / "projects"

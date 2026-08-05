@@ -19,7 +19,7 @@ from ..models import (
     SessionEvent,
     ToolCall,
 )
-from ..writer import ClaudeCodeWriter, ContextWriter
+from ..writer import CodeBuddyWriter, ContextWriter
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ class CodeBuddyPlugin(LearnPlugin, ConversationScanner):
         return self.projects_dir.exists() and any(self.projects_dir.iterdir())
 
     def create_writer(self) -> ContextWriter:
-        return ClaudeCodeWriter()
+        return CodeBuddyWriter()
 
     # --- ConversationScanner interface ---
 

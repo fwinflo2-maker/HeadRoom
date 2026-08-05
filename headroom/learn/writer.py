@@ -342,6 +342,40 @@ class ClaudeCodeWriter(ContextWriter):
 
 
 # =============================================================================
+# CodeBuddy Writer
+# =============================================================================
+
+
+class CodeBuddyWriter(ContextWriter):
+    """Write learned patterns to CodeBuddy's project memory file.
+
+    CodeBuddy loads ``~/.codebuddy/projects/<project>/memory/MEMORY.md``.
+    Both recommendation target kinds belong there; writing context-targeted
+    recommendations through :class:`ClaudeCodeWriter` would incorrectly create
+    ``CLAUDE.local.md`` in the user's project.
+    """
+
+    def write(
+        self,
+        recommendations: list[Recommendation],
+        project: ProjectInfo,
+        dry_run: bool = True,
+    ) -> WriteResult:
+        result = WriteResult()
+        result.dry_run = dry_run
+        if not recommendations:
+            return result
+
+        memory_path = project.memory_file or (project.data_path / "memory" / "MEMORY.md")
+        full_content = _merge_into_file(memory_path, recommendations)
+        result.add(memory_path, full_content)
+        if not dry_run:
+            memory_path.parent.mkdir(parents=True, exist_ok=True)
+            memory_path.write_text(full_content, encoding="utf-8")
+        return result
+
+
+# =============================================================================
 # Codex Writer (OpenAI Codex CLI)
 # =============================================================================
 
@@ -406,5 +440,35 @@ class GeminiWriter(ContextWriter):
         if not dry_run:
             gemini_md.parent.mkdir(parents=True, exist_ok=True)
             gemini_md.write_text(full_content, encoding="utf-8")
+
+        return result
+
+
+# =============================================================================
+# Grok Writer (Grok CLI)
+# =============================================================================
+
+
+class GrokWriter(ContextWriter):
+    """Writes learned patterns to GROK.md for Grok CLI."""
+
+    def write(
+        self,
+        recommendations: list[Recommendation],
+        project: ProjectInfo,
+        dry_run: bool = True,
+    ) -> WriteResult:
+        result = WriteResult()
+        result.dry_run = dry_run
+
+        if not recommendations:
+            return result
+
+        grok_md = project.context_file or (project.project_path / "GROK.md")
+        full_content = _merge_into_file(grok_md, recommendations)
+        result.add(grok_md, full_content)
+        if not dry_run:
+            grok_md.parent.mkdir(parents=True, exist_ok=True)
+            grok_md.write_text(full_content, encoding="utf-8")
 
         return result

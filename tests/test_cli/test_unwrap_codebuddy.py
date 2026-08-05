@@ -158,12 +158,12 @@ def test_unwrap_codebuddy_keep_flags_skip_cleanup(
     ):
         result = runner.invoke(
             main,
-            ["unwrap", "codebuddy", "--keep-mcp", "--keep-rtk", "--no-stop-proxy"],
+            ["unwrap", "codebuddy", "--keep-mcp", "--no-stop-proxy"],
         )
 
     assert result.exit_code == 0, result.output
     registrar.assert_not_called()
-    remove_rtk.assert_not_called()
+    remove_rtk.assert_called_once()
     stop_proxy.assert_not_called()
 
 

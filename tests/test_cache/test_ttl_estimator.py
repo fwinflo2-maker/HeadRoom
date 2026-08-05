@@ -122,23 +122,38 @@ class TestEstimateTtls:
 class TestWriteLearned:
     def test_merge_preserves_existing_keys(self, tmp_path):
         out = tmp_path / "learned.json"
-        out.write_text(json.dumps({"kimi": {"ttl_seconds": 900}}))
-        write_learned({"openai": {"ttl_seconds": 600}}, str(out))
+        out.write_text(json.dumps({"kimi/k2": {"ttl_seconds": 900}}))
+        write_learned({"openai/gpt-5.5": {"ttl_seconds": 600}}, str(out))
         data = json.loads(out.read_text())
-        assert data["kimi"]["ttl_seconds"] == 900
-        assert data["openai"]["ttl_seconds"] == 600
+        assert data["kimi/k2"]["ttl_seconds"] == 900
+        assert data["openai/gpt-5.5"]["ttl_seconds"] == 600
+
+    def test_legacy_bare_provider_keys_are_purged_on_write(self, tmp_path):
+        # Files written by the earlier per-provider version of this tool carry
+        # exactly the unsound cross-model aggregates the estimator no longer
+        # emits; a merge that preserves them would keep feeding the consumer's
+        # provider fallback forever.
+        out = tmp_path / "learned.json"
+        out.write_text(
+            json.dumps({"openai": {"ttl_seconds": 1200}, "kimi/k2": {"ttl_seconds": 900}})
+        )
+        write_learned({"openai/gpt-5.5": {"ttl_seconds": 600}}, str(out))
+        data = json.loads(out.read_text())
+        assert "openai" not in data
+        assert data["kimi/k2"]["ttl_seconds"] == 900
+        assert data["openai/gpt-5.5"]["ttl_seconds"] == 600
 
     def test_corrupt_existing_file_is_replaced_not_fatal(self, tmp_path):
         out = tmp_path / "learned.json"
         out.write_text("{not json")
-        write_learned({"openai": {"ttl_seconds": 600}}, str(out))
-        assert json.loads(out.read_text())["openai"]["ttl_seconds"] == 600
+        write_learned({"openai/gpt-5.5": {"ttl_seconds": 600}}, str(out))
+        assert json.loads(out.read_text())["openai/gpt-5.5"]["ttl_seconds"] == 600
 
     def test_non_dict_existing_file_is_replaced_not_merged(self, tmp_path):
         out = tmp_path / "learned.json"
         out.write_text("[1, 2]")
-        write_learned({"openai": {"ttl_seconds": 600}}, str(out))
-        assert json.loads(out.read_text()) == {"openai": {"ttl_seconds": 600}}
+        write_learned({"openai/gpt-5.5": {"ttl_seconds": 600}}, str(out))
+        assert json.loads(out.read_text()) == {"openai/gpt-5.5": {"ttl_seconds": 600}}
 
 
 class TestMain:
@@ -164,6 +179,30 @@ class TestMain:
         # falls back to its own static default instead of a TTL learned from a
         # cache population it has no evidence about.
         assert resolve_learned_ttl("openai", "other-model") is None
+
+    def test_upgrade_purges_legacy_provider_aggregate(self, paths):
+        # Upgrade regression: a learned file from the earlier per-provider
+        # version must not keep serving its aggregate to unseen models after
+        # a run of the model-scoped estimator.
+        obs, out = paths
+        out.write_text(json.dumps({"openai": {"ttl_seconds": 1200}}))
+        obs.write_text("\n".join(json.dumps(r) for r in _corpus([120, 300, 480], [600, 900, 1200])))
+
+        assert main([]) == 0
+        data = json.loads(out.read_text())
+        assert "openai" not in data
+        assert data["openai/gpt-5.5"]["ttl_seconds"] == 600
+        assert resolve_learned_ttl("openai", "unseen-model") is None
+
+    def test_upgrade_purge_runs_even_with_no_estimable_data(self, paths, capsys):
+        # The purge must not depend on today's window producing an estimate.
+        obs, out = paths
+        out.write_text(json.dumps({"openai": {"ttl_seconds": 1200}}))
+        obs.write_text(json.dumps(_row(idle=120, hit=True)) + "\n")
+
+        assert main([]) == 0
+        assert json.loads(out.read_text()) == {}
+        assert resolve_learned_ttl("openai", "unseen-model") is None
 
     def test_non_finite_jsonl_row_does_not_abort_the_run(self, paths):
         obs, out = paths

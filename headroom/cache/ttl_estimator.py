@@ -143,7 +143,12 @@ def write_learned(table: dict[str, dict[str, Any]], path: str) -> dict[str, Any]
     """Merge ``table`` into the learned file at ``path`` (atomic tmp+rename).
 
     Merging (not replacing) keeps keys learned from an earlier, since-rotated
-    observation window instead of silently un-learning them.
+    observation window instead of silently un-learning them — but only
+    ``provider/model`` keys. Bare-provider aggregates written by earlier
+    versions of this tool are exactly the unsound cross-model intervals the
+    module docstring rules out; left in place they would keep feeding
+    ``resolve_learned_ttl``'s provider fallback forever, so they are dropped
+    on every write.
     """
     merged: dict[str, Any] = {}
     try:
@@ -154,6 +159,7 @@ def write_learned(table: dict[str, dict[str, Any]], path: str) -> dict[str, Any]
     except (OSError, json.JSONDecodeError):
         pass
     merged.update(table)
+    merged = {k: v for k, v in merged.items() if "/" in k}
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = f"{path}.tmp.{os.getpid()}"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -207,7 +213,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         print(json.dumps(table, indent=2, sort_keys=True))
         return 0
-    if not table:
+    # With nothing to add AND no existing file there is nothing to do; if the
+    # file exists we write even an empty table so the legacy-aggregate purge in
+    # write_learned() runs regardless of whether today's window was estimable.
+    if not table and not os.path.exists(out_path):
         print(
             f"headroom-cache-ttl: no estimable keys in {obs_path} "
             f"({len(rows)} rows); nothing written"

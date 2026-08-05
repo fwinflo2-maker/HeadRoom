@@ -30,7 +30,7 @@ Headroom includes an AST-aware CodeCompressor (tree-sitter, 8 languages) but it'
 
 **Why this is the right default**: Code is almost always fetched because the user wants to work with it. Compressing function bodies would remove exactly what they need. LLMs like Claude are excellent at navigating large code files without compression.
 
-**Where code savings come from**: The IntelligentContextManager drops old code messages that are no longer relevant (scoring-based), which is a better strategy than stripping function bodies from active code.
+**Where code savings come from**: Headroom does not strip function bodies from active code or drop old code messages. Code savings come from compressing the newest content blocks (live-zone-only compression) when they are not protected, leaving the conversation history intact.
 
 **Override**: Set `protect_analysis_context=False` in `ContentRouterConfig` for aggressive code compression. Requires `headroom-ai[code]` for tree-sitter.
 
@@ -73,24 +73,23 @@ SmartCrusher doesn't use fixed K values. It uses information-theoretic sizing:
 
 These are kept even if they exceed the K budget.
 
-## Text Compression (LLMLingua)
+## ML Text Compression (Kompress, opt-in)
 
-- **Requires**: `headroom-ai[llmlingua]` — downloads ~2GB model, needs ~1GB RAM
-- **First call**: 10-30s model load latency (cached globally after)
-- **Sequence length**: Content chunked at 512 tokens (model limit)
-- **Content < 100 tokens**: Skipped
-- **Latency**: Adds overhead that doesn't break even on fast models (GPT-4o Mini, Sonnet). Use for **cost savings**, not speed
+- **Requires**: `headroom-ai[ml]` — downloads model weights and needs GPU/CPU RAM for inference
+- **First call**: model-load latency (cached globally after)
+- **Latency**: Adds overhead that doesn't break even on fast models. Use for **cost savings**, not speed
 - **Thread safety**: Single global model instance with lock — sequential access under concurrency
+
+> The earlier LLMLingua-2 integration (`headroom-ai[llmlingua]`) was retired and is no longer installable.
 
 ## Error Handling
 
 All compressors follow the same principle: **fail gracefully, return original content unchanged**.
 
 - Invalid JSON → passthrough (no error raised)
-- AST parse failure in CodeCompressor → falls back to original or LLMLingua
+- AST parse failure in CodeCompressor → falls back to original
 - Compression makes output larger → original returned
-- Missing optional dependencies (tree-sitter, LLMLingua) → passthrough with warning log
-- **One exception**: LLMLingua out-of-memory during model loading raises `RuntimeError`
+- Missing optional dependencies (tree-sitter, ML stack) → passthrough with warning log
 
 Errors are logged at WARNING level and never propagated to callers.
 
@@ -120,7 +119,7 @@ The Tool Output Intelligence Network (TOIN) learns compression patterns from usa
 ## Performance Characteristics
 
 - **ContentRouter** accounts for 91-98% of pipeline cost — it does the actual compression work
-- **CacheAligner** and **RollingWindow** are sub-millisecond
+- **CacheAligner** is sub-millisecond
 - Scaling is roughly **linear** with input size
 - Full benchmark data: [LATENCY_BENCHMARKS.md](LATENCY_BENCHMARKS.md)
 

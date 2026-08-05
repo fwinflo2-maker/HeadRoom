@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-IMAGE_DEFAULT="ghcr.io/chopratejas/headroom:latest"
+IMAGE_DEFAULT="ghcr.io/headroomlabs-ai/headroom:latest"
 INSTALL_IMAGE="${HEADROOM_DOCKER_IMAGE:-${IMAGE_DEFAULT}}"
 INSTALL_DIR="${HOME}/.local/bin"
 if [[ ! -d "${HOME}/.local" ]]; then
@@ -82,33 +82,6 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
 }
 
-detect_rtk_target() {
-  local system
-  local machine
-  system="$(uname -s)"
-  machine="$(uname -m)"
-
-  case "${system}" in
-    Darwin)
-      if [[ "${machine}" == "arm64" ]]; then
-        printf 'aarch64-apple-darwin'
-      else
-        printf 'x86_64-apple-darwin'
-      fi
-      ;;
-    Linux)
-      if [[ "${machine}" == "aarch64" ]]; then
-        printf 'aarch64-unknown-linux-gnu'
-      else
-        printf 'x86_64-unknown-linux-musl'
-      fi
-      ;;
-    *)
-      die "Unsupported host platform for Docker-native wrapper: ${system}/${machine}"
-      ;;
-  esac
-}
-
 ensure_host_dirs() {
   mkdir -p \
     "${HEADROOM_HOST_HOME}/.headroom" \
@@ -137,6 +110,10 @@ append_common_container_args() {
   ref+=(-w /workspace)
   ref+=(--env "HOME=${HEADROOM_CONTAINER_HOME}")
   ref+=(--env "PYTHONUNBUFFERED=1")
+  # Canonical Headroom filesystem contract (issue #175) — forward into the
+  # container so the proxy resolves state/config to the bind-mounted path.
+  ref+=(--env "HEADROOM_WORKSPACE_DIR=${HEADROOM_CONTAINER_HOME}/.headroom")
+  ref+=(--env "HEADROOM_CONFIG_DIR=${HEADROOM_CONTAINER_HOME}/.headroom/config")
   ref+=(-v "${PWD}:/workspace")
   ref+=(-v "${HEADROOM_HOST_HOME}/.headroom:${HEADROOM_CONTAINER_HOME}/.headroom")
   ref+=(-v "${HEADROOM_HOST_HOME}/.claude:${HEADROOM_CONTAINER_HOME}/.claude")
@@ -300,6 +277,9 @@ append_persistent_container_args() {
   ref+=(--workdir "${HEADROOM_CONTAINER_HOME}")
   ref+=(--env "HOME=${HEADROOM_CONTAINER_HOME}")
   ref+=(--env "PYTHONUNBUFFERED=1")
+  # Canonical Headroom filesystem contract (issue #175).
+  ref+=(--env "HEADROOM_WORKSPACE_DIR=${HEADROOM_CONTAINER_HOME}/.headroom")
+  ref+=(--env "HEADROOM_CONFIG_DIR=${HEADROOM_CONTAINER_HOME}/.headroom/config")
   ref+=(-v "${HEADROOM_HOST_HOME}/.headroom:${HEADROOM_CONTAINER_HOME}/.headroom")
   ref+=(-v "${HEADROOM_HOST_HOME}/.claude:${HEADROOM_CONTAINER_HOME}/.claude")
   ref+=(-v "${HEADROOM_HOST_HOME}/.codex:${HEADROOM_CONTAINER_HOME}/.codex")
@@ -595,7 +575,7 @@ Options:
   --mode TEXT                   Proxy optimization mode.  [default: token]
   --memory                      Enable persistent memory in the runtime.
   --no-telemetry                Disable anonymous telemetry in the runtime.
-  --image TEXT                  Docker image to use.  [default: HEADROOM_DOCKER_IMAGE or ghcr.io/chopratejas/headroom:latest]
+  --image TEXT                  Docker image to use.  [default: HEADROOM_DOCKER_IMAGE or ghcr.io/headroomlabs-ai/headroom:latest]
   -?, --help                    Show this message and exit.
 EOF
 }
@@ -778,34 +758,20 @@ parse_install_profile_arg() {
   done
 }
 
-run_claude_rtk_init() {
-  local rtk_bin="${HEADROOM_HOST_HOME}/.headroom/bin/rtk"
-  if [[ ! -x "${rtk_bin}" ]]; then
-    warn "rtk was not installed at ${rtk_bin}; Claude hooks were not registered"
-    return
-  fi
-
-  if ! "${rtk_bin}" init --global --auto-patch >/dev/null 2>&1; then
-    warn "Failed to register Claude hooks with rtk; continuing without hook registration"
-  fi
-}
-
 parse_wrap_args() {
   local -n out_known=$1
   local -n out_host=$2
   local -n out_port=$3
-  local -n out_no_rtk=$4
-  local -n out_no_proxy=$5
-  local -n out_learn=$6
-  local -n out_backend=$7
-  local -n out_anyllm=$8
-  local -n out_region=$9
-  shift 9
+  local -n out_no_proxy=$4
+  local -n out_learn=$5
+  local -n out_backend=$6
+  local -n out_anyllm=$7
+  local -n out_region=$8
+  shift 8
 
   out_known=()
   out_host=()
   out_port=8787
-  out_no_rtk=0
   out_no_proxy=0
   out_learn=0
   out_backend=""
@@ -829,11 +795,6 @@ parse_wrap_args() {
       --port=*)
         out_port="${1#*=}"
         validate_port "${out_port}"
-        out_known+=("$1")
-        shift
-        ;;
-      --no-rtk)
-        out_no_rtk=1
         out_known+=("$1")
         shift
         ;;
@@ -884,6 +845,13 @@ parse_wrap_args() {
         out_known+=("$1")
         shift
         ;;
+      --rtk|--no-rtk|--no-project-rtk|--keep-rtk|--context-tool|--no-context-tool|--context-tool=*)
+        # Retired CLI context tools (rtk, lean-ctx). Reject explicitly: the
+        # catch-all below forwards the first unknown flag AND everything after it
+        # to the wrapped tool, so a leftover --no-rtk in a script would silently
+        # swallow a following --port and be ignored by the wrapped CLI.
+        die "CLI context tools (rtk, lean-ctx) have been removed from Headroom. Drop $1 and unset HEADROOM_CONTEXT_TOOL; 'headroom wrap' uninstalls what they left behind on first run."
+        ;;
       *)
         out_host+=("$@")
         break
@@ -900,7 +868,6 @@ run_prepare_only() {
   args=(docker run --rm)
   append_tty_args args
   append_common_container_args args
-  args+=(--env "HEADROOM_RTK_TARGET=$(detect_rtk_target)")
   args+=(--entrypoint headroom "${HEADROOM_IMAGE}" wrap "${tool}" --prepare-only "$@")
   "${args[@]}"
 }
@@ -1437,15 +1404,15 @@ main() {
         return
       fi
 
-      (($# >= 2)) || die "Usage: headroom wrap <claude|codex|aider|cursor|openclaw> [...]"
+      (($# >= 2)) || die "Usage: headroom wrap <claude|codex|aider|cursor|openclaw|opencode> [...]"
       local tool="$2"
       shift 2
 
       case "${tool}" in
-        claude|codex|aider|cursor|openclaw)
+        claude|codex|aider|cursor|openclaw|opencode)
           ;;
         *)
-          die "Docker-native wrapper does not support 'wrap ${tool}'. Supported targets: claude, codex, aider, cursor, openclaw"
+          die "Docker-native wrapper does not support 'wrap ${tool}'. Supported targets: claude, codex, aider, cursor, openclaw, opencode"
           ;;
       esac
 
@@ -1463,8 +1430,8 @@ main() {
         return
       fi
 
-      local known_args host_args port no_rtk no_proxy learn backend anyllm region
-      parse_wrap_args known_args host_args port no_rtk no_proxy learn backend anyllm region "$@"
+      local known_args host_args port no_proxy learn backend anyllm region
+      parse_wrap_args known_args host_args port no_proxy learn backend anyllm region "$@"
 
       local proxy_args=()
       if [[ "${learn}" -eq 1 ]]; then
@@ -1494,9 +1461,6 @@ main() {
 
       case "${tool}" in
         claude)
-          if [[ "${no_rtk}" -eq 0 ]]; then
-            run_claude_rtk_init
-          fi
           ANTHROPIC_BASE_URL="http://127.0.0.1:${port}" run_host_tool claude "${host_args[@]}"
           ;;
         codex)

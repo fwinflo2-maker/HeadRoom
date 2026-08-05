@@ -385,12 +385,16 @@ class TestCCRContextVarScoping:
 class TestCCREntryPointLoading:
     """Verify _create_default_ccr_backend() env-based loading."""
 
-    def test_no_env_returns_none(self, monkeypatch):
-        """No HEADROOM_CCR_BACKEND → returns None (use InMemoryBackend)."""
+    def test_no_env_returns_sqlite(self, monkeypatch, tmp_path):
+        """No HEADROOM_CCR_BACKEND → SQLiteBackend (the persistent default;
+        restart survival + cross-worker sharing for the 30-min TTL)."""
         monkeypatch.delenv("HEADROOM_CCR_BACKEND", raising=False)
+        monkeypatch.setenv("HEADROOM_CCR_SQLITE_PATH", str(tmp_path / "ccr.db"))
         from headroom.cache.compression_store import _create_default_ccr_backend
 
-        assert _create_default_ccr_backend() is None
+        backend = _create_default_ccr_backend()
+        assert backend is not None
+        assert backend.get_stats()["backend_type"] == "sqlite"
 
     def test_memory_env_returns_none(self, monkeypatch):
         """HEADROOM_CCR_BACKEND=memory → returns None (use default)."""
@@ -521,7 +525,13 @@ class TestAdapterLifecycle:
         assert any("get:" in op for op in backend.ops)
 
     def test_toin_save_load_preserves_patterns(self, tmp_toin_path):
-        """Patterns survive save/load via backend."""
+        """Patterns survive save/load via backend.
+
+        PR-B5 retired the request-time `get_recommendation()` API
+        (it now returns None with a deprecation warning). Stats and
+        on-disk patterns must still survive save/load — that's the
+        observation API B5 preserves.
+        """
         config = TOINConfig(storage_path=tmp_toin_path)
         toin = ToolIntelligenceNetwork(config)
 
@@ -546,6 +556,7 @@ class TestAdapterLifecycle:
         assert stats["patterns_tracked"] >= 1
         assert stats["total_compressions"] >= 15
 
-        # Recommendations should work
-        hint = toin2.get_recommendation(sig)
-        assert hint.based_on_samples >= 15
+        # PR-B5: get_recommendation is observation-only and returns None.
+        # Recommendations now flow through the publish CLI →
+        # recommendations.toml → Rust loader path.
+        assert toin2.get_recommendation(sig) is None

@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import logging
+import os
+import threading
 import time
+from collections.abc import Callable
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from ..config import (
     CacheAlignerConfig,
     DiffArtifact,
     HeadroomConfig,
-    IntelligentContextConfig,
-    RollingWindowConfig,
-    ToolCrusherConfig,
     TransformDiff,
     TransformResult,
     WasteSignals,
@@ -24,15 +24,63 @@ from ..utils import deep_copy_messages
 from .base import Transform
 from .cache_aligner import CacheAligner
 from .content_router import ContentRouter
-from .intelligent_context import IntelligentContextManager
-from .rolling_window import RollingWindow
-from .smart_crusher import SmartCrusher
-from .tool_crusher import ToolCrusher
 
 if TYPE_CHECKING:
     from ..providers.base import Provider
 
 logger = logging.getLogger(__name__)
+
+# Waste-signal detection re-parses the *original* messages for telemetry only
+# (it never changes the compression result). On very large transcripts that
+# extra parse can take tens of seconds and blow the Anthropic compression
+# timeout, making the proxy fail open and discard an already-computed
+# compression (#296). Skip the diagnostic above this size to keep the result
+# on the critical path.
+MAX_WASTE_SIGNAL_DETECTION_TOKENS = 100_000
+
+# A token saving below this is treated as noise — waste-signal detection only
+# runs when compression saved more than this many tokens.
+_MIN_TOKENS_SAVED_FOR_WASTE_SIGNALS = 100
+
+# OTel GenAI semantic conventions (open-telemetry/semantic-conventions-genai).
+# The compression-pipeline span carries this gen_ai.* attribute alongside the
+# proprietary headroom.* ones, so Headroom's telemetry groups/filters by the
+# standard schema in any OTel-native backend (Grafana, Datadog, etc.). It is a
+# string literal rather than an opentelemetry.semconv constant because the gen_ai
+# attributes are stability=development (no stable constants are published).
+#
+# v1 emits only gen_ai.request.model — the one attribute this span can set
+# correctly and unconditionally (the model is always known here). The rest are
+# deliberately deferred to v2 because this span cannot set them correctly:
+#   - gen_ai.operation.name: apply() is shared by many callers (chat, /v1/compress,
+#     batch, Gemini countTokens), so no single value is right — it must be threaded
+#     from each caller, not hardcoded.
+#   - gen_ai.provider.name: Headroom's provider label can't distinguish Bedrock /
+#     Gemini from Anthropic / OpenAI at this layer (Bedrock routes via the
+#     Anthropic provider).
+#   - gen_ai.usage.*: provider-authoritative usage lives on the response path, not
+#     this pre-flight compression span (the compressed-input estimate stays under
+#     headroom.tokens.after).
+GEN_AI_REQUEST_MODEL = "gen_ai.request.model"
+
+
+_N = TypeVar("_N", int, float)
+
+
+def _breaker_env(name: str, default: _N, cast: Callable[[str], _N]) -> _N:
+    """Parse a circuit-breaker env var, falling back on bad input.
+
+    The breaker is a safety net — a typo'd value must degrade to the
+    default with a warning, not crash proxy startup.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return cast(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+        return default
 
 
 class TransformPipeline:
@@ -43,8 +91,11 @@ class TransformPipeline:
     1. Cache Aligner - normalize prefix for cache hits
     2. Content Router - intelligent content-aware compression (routes to appropriate
        compressor: Kompress for text, SmartCrusher for JSON, CodeCompressor for code, etc.)
-    3. SmartCrusher/ToolCrusher - fallback if ContentRouter disabled
-    4. IntelligentContextManager/RollingWindow - enforce token limits
+
+    Phase B PR-B1 retired the IntelligentContextManager / RollingWindow
+    "drop messages from history" stage. Live-zone-only compression is the
+    sole strategy going forward — message-list mutation no longer happens
+    in the pipeline.
     """
 
     def __init__(
@@ -69,11 +120,36 @@ class TransformPipeline:
         else:
             self.transforms = self._build_default_transforms()
 
+        # Circuit breaker (issue #847): after N consecutive pipeline
+        # failures, pass messages through untouched for a cooldown window
+        # instead of re-running (and re-failing) transforms on every
+        # request. Threshold <= 0 disables the breaker.
+        self._breaker_threshold = _breaker_env("HEADROOM_PIPELINE_BREAKER_THRESHOLD", 3, int)
+        self._breaker_cooldown_s = _breaker_env("HEADROOM_PIPELINE_BREAKER_COOLDOWN_S", 60.0, float)
+        self._breaker_lock = threading.Lock()
+        self._breaker_failures = 0
+        self._breaker_open_until = 0.0
+
     def _build_default_transforms(self) -> list[Transform]:
         """Build default transform pipeline from config."""
         transforms: list[Transform] = []
 
         # Order matters!
+
+        # 0. Tool-result interceptors (ast-grep Read outline, etc.) run first
+        # so downstream compressors operate on the already-shrunk content.
+        # OPT-IN: enable via HeadroomConfig.intercept_tool_results, or for
+        # non-config callers (CLI / SDK / tests) the env var
+        # HEADROOM_INTERCEPT_ENABLED=1. Off by default while this ships — lets
+        # users try it and compare before we make it the default.
+        import os as _os
+
+        if getattr(self.config, "intercept_tool_results", False) or _os.environ.get(
+            "HEADROOM_INTERCEPT_ENABLED"
+        ):
+            from headroom.proxy.interceptors import ToolResultInterceptorTransform
+
+            transforms.append(ToolResultInterceptorTransform())
 
         # 1. Cache Aligner (prefix stabilization)
         if self.config.cache_aligner.enabled:
@@ -87,42 +163,8 @@ class TransformPipeline:
         # - Logs -> LogCompressor
         # - Search results -> SearchCompressor
         # - HTML -> HTMLExtractor
-        if self.config.content_router_enabled:
-            transforms.append(ContentRouter())
-            logger.info("Pipeline using ContentRouter for intelligent content-aware compression")
-        elif self.config.smart_crusher.enabled:
-            # Fallback: SmartCrusher only handles JSON arrays
-            from .smart_crusher import SmartCrusherConfig as SCConfig
-
-            smart_config = SCConfig(
-                enabled=True,
-                min_items_to_analyze=self.config.smart_crusher.min_items_to_analyze,
-                min_tokens_to_crush=self.config.smart_crusher.min_tokens_to_crush,
-                variance_threshold=self.config.smart_crusher.variance_threshold,
-                uniqueness_threshold=self.config.smart_crusher.uniqueness_threshold,
-                similarity_threshold=self.config.smart_crusher.similarity_threshold,
-                max_items_after_crush=self.config.smart_crusher.max_items_after_crush,
-                preserve_change_points=self.config.smart_crusher.preserve_change_points,
-                factor_out_constants=self.config.smart_crusher.factor_out_constants,
-                include_summaries=self.config.smart_crusher.include_summaries,
-            )
-            transforms.append(SmartCrusher(smart_config))
-        elif self.config.tool_crusher.enabled:
-            # Fallback to fixed-rule crushing
-            transforms.append(ToolCrusher(self.config.tool_crusher))
-
-        # 3. Context Management (enforce limits last)
-        # IntelligentContextManager takes precedence over RollingWindow when enabled
-        if self.config.intelligent_context.enabled:
-            # Use semantic-aware context management with scoring
-            transforms.append(IntelligentContextManager(self.config.intelligent_context))
-            logger.info(
-                "Pipeline using IntelligentContextManager with strategies: "
-                "COMPRESS_FIRST -> SUMMARIZE -> DROP_BY_SCORE"
-            )
-        elif self.config.rolling_window.enabled:
-            # Fallback to position-based rolling window
-            transforms.append(RollingWindow(self.config.rolling_window))
+        transforms.append(ContentRouter())
+        logger.info("Pipeline using ContentRouter for intelligent content-aware compression")
 
         return transforms
 
@@ -157,6 +199,36 @@ class TransformPipeline:
 
         return self._provider.__class__.__name__.removesuffix("Provider").lower()
 
+    def _breaker_is_open(self) -> bool:
+        """True while the circuit breaker cooldown window is active."""
+        if self._breaker_threshold <= 0:
+            return False
+        with self._breaker_lock:
+            return time.monotonic() < self._breaker_open_until
+
+    def _breaker_record_failure(self) -> None:
+        """Count a pipeline failure; open the breaker at the threshold."""
+        if self._breaker_threshold <= 0:
+            return
+        with self._breaker_lock:
+            self._breaker_failures += 1
+            if self._breaker_failures >= self._breaker_threshold:
+                self._breaker_open_until = time.monotonic() + self._breaker_cooldown_s
+                self._breaker_failures = 0
+                logger.warning(
+                    "Pipeline circuit breaker OPEN after %d consecutive failures; "
+                    "passing messages through for %.0fs",
+                    self._breaker_threshold,
+                    self._breaker_cooldown_s,
+                )
+
+    def _breaker_record_success(self) -> None:
+        """Reset the consecutive-failure count after a clean run."""
+        if self._breaker_threshold <= 0:
+            return
+        with self._breaker_lock:
+            self._breaker_failures = 0
+
     def apply(
         self,
         messages: list[dict[str, Any]],
@@ -174,11 +246,17 @@ class TransformPipeline:
                 - output_buffer: Output buffer override.
                 - tool_profiles: Per-tool compression profiles.
                 - request_id: Optional request ID for diff artifact.
+                - waste_messages: Optional richer conversion of the same request
+                  used for waste-signal detection only (never transformed).
 
         Returns:
             Combined TransformResult.
         """
         record_metrics = kwargs.pop("record_metrics", True)
+        waste_messages = kwargs.pop("waste_messages", None)
+        waste_signal_token_limit = int(
+            kwargs.pop("waste_signal_token_limit", MAX_WASTE_SIGNAL_DETECTION_TOKENS)
+        )
         tokenizer = self._get_tokenizer(model)
         provider_name = self._provider_name()
 
@@ -191,6 +269,16 @@ class TransformPipeline:
             )
 
         # Start with original tokens
+        # Circuit breaker open — pass through untouched (issue #847).
+        if self._breaker_is_open():
+            passthrough_tokens = tokenizer.count_messages(messages)
+            return TransformResult(
+                messages=messages,
+                tokens_before=passthrough_tokens,
+                tokens_after=passthrough_tokens,
+                transforms_applied=["pipeline:circuit_open"],
+            )
+
         t_count = time.perf_counter()
         tokens_before = tokenizer.count_messages(messages)
         count_ms = (time.perf_counter() - t_count) * 1000
@@ -203,12 +291,16 @@ class TransformPipeline:
         )
 
         tracer = get_headroom_tracer()
-        span_attributes = {
+        span_attributes: dict[str, Any] = {
             "headroom.model": model,
             "headroom.provider": provider_name or "unknown",
             "headroom.message_count": len(messages),
             "headroom.tokens.before": tokens_before,
         }
+        # OTel GenAI semconv request descriptor — emitted alongside headroom.* so
+        # the span is groupable by the standard schema (v1: model only).
+        if model:
+            span_attributes[GEN_AI_REQUEST_MODEL] = model
         pipeline_span_context = (
             tracer.start_as_current_span(
                 "headroom.compression.pipeline",
@@ -238,10 +330,14 @@ class TransformPipeline:
 
             pipeline_start = time.perf_counter()
 
+            request_id = kwargs.get("request_id", "")
+            log_prefix = f"[{request_id}] " if request_id else ""
+
             frozen_count = kwargs.get("frozen_message_count", 0)
             if frozen_count > 0:
                 logger.info(
-                    "Pipeline: freezing first %d/%d messages (prefix cached by provider)",
+                    "%sPipeline: freezing first %d/%d messages (prefix cached by provider)",
+                    log_prefix,
                     frozen_count,
                     len(messages),
                 )
@@ -267,7 +363,11 @@ class TransformPipeline:
                 with transform_span_context as transform_span:
                     # Time the transform
                     t0 = time.perf_counter()
-                    result = transform.apply(current_messages, tokenizer, **kwargs)
+                    try:
+                        result = transform.apply(current_messages, tokenizer, **kwargs)
+                    except Exception:
+                        self._breaker_record_failure()
+                        raise
                     duration_ms = (time.perf_counter() - t0) * 1000
 
                     # Update messages for next transform
@@ -335,6 +435,9 @@ class TransformPipeline:
                             )
                         )
 
+            # All transforms ran without raising — reset the breaker.
+            self._breaker_record_success()
+
             # Single final token count — the only full recount in the pipeline.
             # Earlier per-transform counts come from each transform's own result.
             t_final_count = time.perf_counter()
@@ -349,7 +452,8 @@ class TransformPipeline:
             timing_parts = " ".join(f"{k}={v:.0f}ms" for k, v in all_timing.items())
             if total_saved > 0:
                 logger.info(
-                    "Pipeline complete: %d -> %d tokens (saved %d, %.1f%% reduction) [%s]",
+                    "%sPipeline complete: %d -> %d tokens (saved %d, %.1f%% reduction) [%s]",
+                    log_prefix,
                     tokens_before,
                     tokens_after,
                     total_saved,
@@ -357,7 +461,7 @@ class TransformPipeline:
                     timing_parts,
                 )
             else:
-                logger.debug("Pipeline complete: no token savings [%s]", timing_parts)
+                logger.debug("%sPipeline complete: no token savings [%s]", log_prefix, timing_parts)
 
             # Build diff artifact if enabled
             diff_artifact = None
@@ -370,13 +474,40 @@ class TransformPipeline:
                     transforms=transform_diffs,
                 )
 
-            # Detect waste signals in original messages (only when significant compression)
+            # Detect waste signals in original messages (only when significant
+            # compression). Handlers whose wire format carries tool output the
+            # message conversion drops (e.g. Gemini functionResponse parts, #819)
+            # pass a richer waste_messages list that is parsed instead — it is
+            # telemetry-only and never transformed.
             waste_signals: WasteSignals | None = None
-            if tokens_before > tokens_after and (tokens_before - tokens_after) > 100:
+            saved_enough = (
+                tokens_before > tokens_after
+                and (tokens_before - tokens_after) > _MIN_TOKENS_SAVED_FOR_WASTE_SIGNALS
+            )
+            if saved_enough and tokens_before > waste_signal_token_limit:
+                # Telemetry-only re-parse would risk the compression timeout on a
+                # request this large (#296); skip it and keep the result.
+                logger.debug(
+                    "%sSkipping waste-signal detection for %d-token request "
+                    "(limit=%d) to keep the compression result on the critical path",
+                    log_prefix,
+                    tokens_before,
+                    waste_signal_token_limit,
+                )
+            elif saved_enough:
                 try:
                     from ..parser import parse_messages
 
-                    _, _, waste_signals = parse_messages(messages, tokenizer)
+                    # current_messages (the post-transform copy) enables reread
+                    # attribution: repeats whose first serve was markerized by
+                    # this pipeline run count into reread_compressed_tokens
+                    # (#899). The length guard in parse_messages makes the
+                    # waste_messages path (different indexing) a safe no-op.
+                    _, _, waste_signals = parse_messages(
+                        waste_messages or messages,
+                        tokenizer,
+                        compressed_messages=current_messages,
+                    )
                     if waste_signals.total() == 0:
                         waste_signals = None
                 except Exception:
@@ -437,34 +568,20 @@ class TransformPipeline:
 
 
 def create_pipeline(
-    tool_crusher_config: ToolCrusherConfig | None = None,
     cache_aligner_config: CacheAlignerConfig | None = None,
-    rolling_window_config: RollingWindowConfig | None = None,
-    intelligent_context_config: IntelligentContextConfig | None = None,
 ) -> TransformPipeline:
     """
     Create a pipeline with specific configurations.
 
     Args:
-        tool_crusher_config: Tool crusher configuration.
         cache_aligner_config: Cache aligner configuration.
-        rolling_window_config: Rolling window configuration.
-        intelligent_context_config: Intelligent context configuration.
-            When provided with enabled=True, replaces RollingWindow with
-            semantic-aware context management.
 
     Returns:
         Configured TransformPipeline.
     """
     config = HeadroomConfig()
 
-    if tool_crusher_config is not None:
-        config.tool_crusher = tool_crusher_config
     if cache_aligner_config is not None:
         config.cache_aligner = cache_aligner_config
-    if rolling_window_config is not None:
-        config.rolling_window = rolling_window_config
-    if intelligent_context_config is not None:
-        config.intelligent_context = intelligent_context_config
 
     return TransformPipeline(config)

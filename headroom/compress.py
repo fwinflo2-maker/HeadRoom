@@ -58,10 +58,12 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
+from .agent_savings import apply_agent_savings_profile
 from .observability import get_otel_metrics
+from .pipeline import PipelineExtensionManager, PipelineStage, summarize_routing_markers
 from .utils import extract_user_query as _extract_user_query
 
 logger = logging.getLogger(__name__)
@@ -101,12 +103,26 @@ class CompressConfig:
     Set True for document compression, RAG pipelines, or when user messages
     contain large tool outputs."""
 
+    compress_system_messages: bool = True
+    """Compress system messages (default: True).
+    Set False to preserve system prompts exactly as-is. Useful for voice
+    agents where tool definitions and instructions must not be altered."""
+
     protect_recent: int = 4
     """Don't compress the last N messages (they're the active conversation).
     Set 0 to compress everything."""
 
     protect_analysis_context: bool = True
     """Detect 'analyze'/'review' intent and protect code from compression."""
+
+    frozen_message_count: int = 0
+    """Number of leading messages already anchored in the provider's prompt
+    cache. Transforms will not rewrite messages inside this frozen prefix
+    (read_lifecycle skips stale-Read replacements there), so compression
+    never converts 0.1x cached prefix reads into full-price rewrites.
+    Default 0 = no frozen prefix. The proxy handlers compute and pass this
+    automatically; library-mode callers that manage their own conversation
+    loop should pass the message count of the previous request."""
 
     # How aggressive
     target_ratio: float | None = None
@@ -115,10 +131,20 @@ class CompressConfig:
     Only affects Kompress (text compression). SmartCrusher (JSON) has its
     own logic based on array dedup."""
 
+    min_tokens_to_compress: int = 250
+    """Minimum token count for a message to be compressed.
+    Messages shorter than this are left unchanged. Default 250.
+    Set lower for voice agents where turns are short."""
+
     # Model variant
     kompress_model: str | None = None
-    """Kompress model variant. None = default ModernBERT. Future: 'finance'
-    for number-preserving compression on financial documents."""
+    """Kompress model ID. None = default (chopratejas/kompress-v2-base).
+    Set to a HuggingFace model ID for domain-specific compression.
+    Set to 'disabled' to skip ML compression entirely
+    (only SmartCrusher + CacheAligner will run)."""
+
+    savings_profile: str | None = None
+    """Named high-savings profile, e.g. 'agent-90' for Codex/Claude/Cursor."""
 
 
 @dataclass
@@ -165,7 +191,7 @@ def compress(
         config: Compression options (CompressConfig). Overrides defaults.
         **kwargs: Shorthand for CompressConfig fields. These override config:
             compress_user_messages, target_ratio, protect_recent,
-            protect_analysis_context, kompress_model.
+            protect_analysis_context, kompress_model, frozen_message_count.
 
     Returns:
         CompressResult with compressed messages and metrics.
@@ -185,14 +211,21 @@ def compress(
     if not messages or not optimize:
         return CompressResult(messages=messages)
 
-    # Build config from explicit config + kwargs
-    cfg = config or CompressConfig()
+    # Build config from explicit config + kwargs. ``replace(config)`` up front
+    # so kwargs overrides and any savings-profile pass never mutate the
+    # caller's long-lived ``CompressConfig`` — a shared per-agent config being
+    # silently rewritten by every request that overrode a single option is the
+    # scenario this guards against.
+    cfg = replace(config) if config is not None else CompressConfig()
     config_fields = {f.name for f in cfg.__dataclass_fields__.values()}
     for key, value in kwargs.items():
         if key in config_fields:
             setattr(cfg, key, value)
+    if cfg.savings_profile:
+        apply_agent_savings_profile(cfg, cfg.savings_profile)
 
     pipeline = _get_pipeline()
+    pipeline_extensions = PipelineExtensionManager(hooks=hooks, discover=False)
 
     try:
         # Compute biases from hooks if provided
@@ -203,6 +236,15 @@ def compress(
             ctx = CompressContext(model=model)
             messages = hooks.pre_compress(messages, ctx)
             biases = hooks.compute_biases(messages, ctx)
+
+        received_event = pipeline_extensions.emit(
+            PipelineStage.INPUT_RECEIVED,
+            operation="compress",
+            model=model,
+            messages=messages,
+        )
+        if received_event.messages is not None:
+            messages = received_event.messages
 
         # Extract user query from messages so transforms can score by
         # relevance.  Without this, SmartCrusher selects items by statistics
@@ -217,13 +259,66 @@ def compress(
             biases=biases,
             # Pass CompressConfig options through to transforms
             compress_user_messages=cfg.compress_user_messages,
+            compress_system_messages=cfg.compress_system_messages,
             target_ratio=cfg.target_ratio,
             protect_recent=cfg.protect_recent,
             protect_analysis_context=cfg.protect_analysis_context,
+            min_tokens_to_compress=cfg.min_tokens_to_compress,
+            kompress_model=cfg.kompress_model,
+            frozen_message_count=cfg.frozen_message_count,
         )
 
         tokens_before = result.tokens_before
         tokens_after = result.tokens_after
+        compressed_messages = result.messages
+
+        # Guard: if "optimization" inflated tokens, revert to originals.
+        # Mirrors the inflation guards in the proxy handlers
+        # (anthropic/openai/gemini/batch) — the library path had none.
+        if tokens_after > tokens_before:
+            logger.warning(
+                "Optimization inflated tokens (%d -> %d); reverting to original messages",
+                tokens_before,
+                tokens_after,
+            )
+            return CompressResult(
+                messages=messages,
+                tokens_before=tokens_before,
+                tokens_after=tokens_before,
+                tokens_saved=0,
+                compression_ratio=0.0,
+                transforms_applied=["inflation_guard:reverted"],
+            )
+
+        routing_markers = summarize_routing_markers(result.transforms_applied)
+        if routing_markers:
+            routed_event = pipeline_extensions.emit(
+                PipelineStage.INPUT_ROUTED,
+                operation="compress",
+                model=model,
+                messages=compressed_messages,
+                metadata={
+                    "routing_markers": routing_markers,
+                    "transforms_applied": result.transforms_applied,
+                },
+            )
+            if routed_event.messages is not None:
+                compressed_messages = routed_event.messages
+
+        compressed_event = pipeline_extensions.emit(
+            PipelineStage.INPUT_COMPRESSED,
+            operation="compress",
+            model=model,
+            messages=compressed_messages,
+            metadata={
+                "tokens_before": tokens_before,
+                "tokens_after": tokens_after,
+                "transforms_applied": result.transforms_applied,
+            },
+        )
+        if compressed_event.messages is not None:
+            compressed_messages = compressed_event.messages
+
         tokens_saved = tokens_before - tokens_after
         ratio = tokens_saved / tokens_before if tokens_before > 0 else 0.0
 
@@ -243,7 +338,7 @@ def compress(
             )
 
         return CompressResult(
-            messages=result.messages,
+            messages=compressed_messages,
             tokens_before=tokens_before,
             tokens_after=tokens_after,
             tokens_saved=tokens_saved,
@@ -267,6 +362,39 @@ def compress(
         )
 
 
+def compress_spreadsheet(
+    path: str,
+    model: str = "claude-sonnet-4-5-20250929",
+    model_limit: int = 200000,
+    **kwargs: Any,
+) -> CompressResult:
+    """Compress a binary spreadsheet (``.xlsx`` / ``.xls``).
+
+    Each sheet is rendered to CSV text and submitted as its own user message so
+    the tabular compressor (CSV → SmartCrusher, lossless-first + lossy CCR
+    fallback) is applied per sheet. Requires the ``spreadsheet`` extra
+    (``pip install headroom-ai[spreadsheet]``).
+
+    Args:
+        path: Path to a ``.xlsx`` or ``.xls`` file.
+        model: Model name (token counting / context limit).
+        model_limit: Model context window size in tokens.
+        **kwargs: Forwarded to :func:`compress` (e.g. ``target_ratio``).
+
+    Returns:
+        CompressResult over the per-sheet messages.
+    """
+    from headroom.transforms.spreadsheet_ingest import load_spreadsheet
+
+    sheets = load_spreadsheet(path)
+    messages = [{"role": "user", "content": text} for text in sheets.values()]
+    if not messages:
+        return CompressResult(messages=[])
+    # User messages hold the table text, so they must be compressible here.
+    kwargs.setdefault("compress_user_messages", True)
+    return compress(messages, model=model, model_limit=model_limit, **kwargs)
+
+
 def _get_pipeline() -> Any:
     """Get or create the singleton compression pipeline."""
     global _pipeline
@@ -280,11 +408,12 @@ def _get_pipeline() -> Any:
 
         from headroom.transforms import TransformPipeline
 
-        # Default pipeline: CacheAligner → ContentRouter → IntelligentContext
+        # Default pipeline: CacheAligner → ContentRouter
         # CacheAligner: stabilizes prefix for provider KV cache hits
         # ContentRouter: routes to the right compressor per content type
         #   (SmartCrusher for JSON, CodeCompressor for code, Kompress for text)
-        # IntelligentContext: enforces token limits with score-based dropping
+        # Phase B PR-B1 retired the trailing context-management stage —
+        # live-zone-only compression never drops messages.
         _pipeline = TransformPipeline()
         logger.debug("Headroom compression pipeline initialized")
         return _pipeline

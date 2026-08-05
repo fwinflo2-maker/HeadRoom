@@ -7,7 +7,10 @@ and proper wiring between components.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import threading
+from importlib.metadata import entry_points
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from headroom.memory.config import (
     EmbedderBackend,
@@ -19,6 +22,45 @@ from headroom.memory.config import (
 
 if TYPE_CHECKING:
     from headroom.memory.ports import Embedder, MemoryCache, MemoryStore, TextIndex, VectorIndex
+
+
+# Extension groups for memory backends registered via setuptools entry points.
+_MEMORY_STORE_GROUP = "headroom.memory_store"
+_MEMORY_VECTOR_GROUP = "headroom.memory_vector"
+_MEMORY_TEXT_GROUP = "headroom.memory_text"
+
+# Process-wide embedder cache keyed by (backend, model). Embedders are
+# stateless with respect to the memory store, so a single instance can
+# safely serve every per-project ``LocalBackend`` created by the
+# BackendRouter. Without this cache, opening N project DBs would load
+# the sentence-transformers / ONNX model N times.
+_EMBEDDER_CACHE: dict[tuple[str, str, str], Embedder] = {}
+_EMBEDDER_CACHE_LOCK = threading.Lock()
+
+
+def _load_external_backend(
+    group: str,
+    name: str | None,
+    field_name: str,
+    config: MemoryConfig,
+) -> Any:
+    """Load a memory backend registered via setuptools entry points.
+
+    Mirrors the pattern used by
+    `headroom.cache.compression_store._create_default_ccr_backend`.
+    """
+    if not name:
+        raise ValueError(
+            f"{field_name} is required when backend is EXTERNAL; "
+            f"set it to the entry-point name registered under '{group}'."
+        )
+    ep = next((e for e in entry_points(group=group) if e.name == name), None)
+    if ep is None:
+        raise ValueError(
+            f"No entry point registered under '{group}' with name '{name}'. "
+            f"Install the package that provides it."
+        )
+    return ep.load()(config)
 
 
 async def create_memory_system(
@@ -88,11 +130,25 @@ def _create_store(config: MemoryConfig) -> MemoryStore:
 
         return SQLiteMemoryStore(config.db_path)
 
+    if config.store_backend == StoreBackend.EXTERNAL:
+        return _load_external_backend(  # type: ignore[no-any-return]
+            _MEMORY_STORE_GROUP,
+            config.store_backend_name,
+            "store_backend_name",
+            config,
+        )
+
     raise ValueError(f"Unknown store backend: {config.store_backend}")
 
 
 def _create_embedder(config: MemoryConfig) -> Embedder:
-    """Create an embedder backend.
+    """Create or return a cached embedder backend.
+
+    The embedder is shared across every ``LocalBackend`` instance that
+    requests the same ``(embedder_backend, embedder_model)`` pair. This
+    matters for the per-project storage router, which can open many
+    backends in the same process and must not pay the
+    sentence-transformers / ONNX model-load cost more than once.
 
     Args:
         config: Memory system configuration.
@@ -103,35 +159,72 @@ def _create_embedder(config: MemoryConfig) -> Embedder:
     Raises:
         ValueError: If the embedder backend is not supported.
     """
-    if config.embedder_backend == EmbedderBackend.LOCAL:
-        from headroom.memory.adapters.embedders import LocalEmbedder
 
-        return LocalEmbedder(model_name=config.embedder_model)
+    # Validate inputs ahead of the cache. The cache key is
+    # ``(backend, model)`` and intentionally does NOT include the API
+    # key — but that means a cached OpenAI embedder would shadow the
+    # config-validation step for a subsequent caller who forgot to pass
+    # ``openai_api_key``. Run the validation up front instead.
+    if config.embedder_backend == EmbedderBackend.OPENAI and not config.openai_api_key:
+        raise ValueError("openai_api_key is required for OpenAI embedder")
 
-    if config.embedder_backend == EmbedderBackend.ONNX:
-        from headroom.memory.adapters.embedders import OnnxLocalEmbedder
+    key = (
+        config.embedder_backend.value
+        if hasattr(config.embedder_backend, "value")
+        else str(config.embedder_backend),
+        config.embedder_model or "",
+        # The Ollama backend is built with ``base_url=config.ollama_base_url``,
+        # so two configs that share a backend and model but point at different
+        # Ollama servers must NOT share a cached embedder — otherwise the second
+        # caller silently gets an embedder bound to the first server. (The
+        # ``openai_api_key`` omission is handled by the up-front validation
+        # above; ``ollama_base_url`` has no such guard and would just resolve to
+        # the wrong host.)
+        config.ollama_base_url or "",
+    )
 
-        return OnnxLocalEmbedder()
+    with _EMBEDDER_CACHE_LOCK:
+        cached = _EMBEDDER_CACHE.get(key)
+        if cached is not None:
+            return cached
 
-    if config.embedder_backend == EmbedderBackend.OPENAI:
-        from headroom.memory.adapters.embedders import OpenAIEmbedder
+        if config.embedder_backend == EmbedderBackend.LOCAL:
+            from headroom.memory.adapters.embedders import LocalEmbedder
 
-        if not config.openai_api_key:
-            raise ValueError("openai_api_key is required for OpenAI embedder")
-        return OpenAIEmbedder(
-            api_key=config.openai_api_key,
-            model_name=config.embedder_model,
-        )
+            embedder: Embedder = LocalEmbedder(model_name=config.embedder_model)
 
-    if config.embedder_backend == EmbedderBackend.OLLAMA:
-        from headroom.memory.adapters.embedders import OllamaEmbedder
+        elif config.embedder_backend == EmbedderBackend.ONNX:
+            from headroom.memory.adapters.embedders import OnnxLocalEmbedder
 
-        return OllamaEmbedder(
-            base_url=config.ollama_base_url,
-            model_name=config.embedder_model,
-        )
+            embedder = OnnxLocalEmbedder()
 
-    raise ValueError(f"Unknown embedder backend: {config.embedder_backend}")
+        elif config.embedder_backend == EmbedderBackend.OPENAI:
+            from headroom.memory.adapters.embedders import OpenAIEmbedder
+
+            embedder = OpenAIEmbedder(
+                api_key=config.openai_api_key,
+                model_name=config.embedder_model,
+            )
+
+        elif config.embedder_backend == EmbedderBackend.OLLAMA:
+            from headroom.memory.adapters.embedders import OllamaEmbedder
+
+            embedder = OllamaEmbedder(
+                base_url=config.ollama_base_url,
+                model_name=config.embedder_model,
+            )
+        else:
+            raise ValueError(f"Unknown embedder backend: {config.embedder_backend}")
+
+        _EMBEDDER_CACHE[key] = embedder
+        return embedder
+
+
+def _reset_embedder_cache_for_tests() -> None:
+    """Clear the process-wide embedder cache. Test-only seam."""
+
+    with _EMBEDDER_CACHE_LOCK:
+        _EMBEDDER_CACHE.clear()
 
 
 def _create_vector_index(config: MemoryConfig) -> VectorIndex:
@@ -147,6 +240,14 @@ def _create_vector_index(config: MemoryConfig) -> VectorIndex:
         ValueError: If the vector backend is not supported or unavailable.
     """
     backend = config.vector_backend
+
+    if backend == VectorBackend.EXTERNAL:
+        return _load_external_backend(  # type: ignore[no-any-return]
+            _MEMORY_VECTOR_GROUP,
+            config.vector_backend_name,
+            "vector_backend_name",
+            config,
+        )
 
     # AUTO: prefer SQLITE_VEC → HNSW → fail with helpful message
     if backend == VectorBackend.AUTO:
@@ -199,12 +300,21 @@ def _create_vector_index(config: MemoryConfig) -> VectorIndex:
 
         from headroom.memory.adapters.hnsw import HNSWVectorIndex
 
+        # Derive persistent save path from the main DB path so the HNSW
+        # index survives across process restarts (critical for cross-agent
+        # interop: memories saved by Codex MCP must be searchable by Claude).
+        hnsw_save_path: str | Path | None = None
+        if config.db_path:
+            hnsw_save_path = config.db_path.parent / f"{config.db_path.stem}_hnsw"
+
         return HNSWVectorIndex(
             dimension=config.vector_dimension,
             ef_construction=config.hnsw_ef_construction,
             m=config.hnsw_m,
             ef_search=config.hnsw_ef_search,
             max_entries=config.hnsw_max_entries,
+            save_path=hnsw_save_path,
+            auto_save=True,
         )
 
     raise ValueError(f"Unknown vector backend: {config.vector_backend}")
@@ -227,6 +337,14 @@ def _create_text_index(config: MemoryConfig) -> TextIndex:
 
         # FTS5TextIndex has a compatible interface but different method signatures
         return FTS5TextIndex(db_path=config.db_path)  # type: ignore[return-value]
+
+    if config.text_backend == TextBackend.EXTERNAL:
+        return _load_external_backend(  # type: ignore[no-any-return]
+            _MEMORY_TEXT_GROUP,
+            config.text_backend_name,
+            "text_backend_name",
+            config,
+        )
 
     raise ValueError(f"Unknown text backend: {config.text_backend}")
 

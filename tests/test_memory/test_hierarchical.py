@@ -183,6 +183,36 @@ class TestSQLiteMemoryStore:
             assert retrieved.content == memory.content
 
     @pytest.mark.asyncio
+    async def test_record_access_is_atomic_and_deduplicates_ids(self, store):
+        memories = [Memory(content=f"Memory {i}", user_id="alice") for i in range(2)]
+        await store.save_batch(memories)
+
+        first_access = datetime(2026, 7, 12, 9, 30)
+        updated = await store.record_access(
+            [memories[0].id, memories[0].id, memories[1].id, "missing"],
+            first_access,
+        )
+
+        assert updated == 2
+        first = await store.get(memories[0].id)
+        second = await store.get(memories[1].id)
+        assert first is not None
+        assert second is not None
+        assert first.access_count == 1
+        assert second.access_count == 1
+        assert first.last_accessed == first_access
+        assert second.last_accessed == first_access
+
+        second_access = datetime(2026, 7, 12, 9, 31)
+        assert await store.record_access([memories[0].id], second_access) == 1
+        first = await store.get(memories[0].id)
+        assert first is not None
+        assert first.access_count == 2
+        assert first.last_accessed == second_access
+
+        assert await store.record_access([]) == 0
+
+    @pytest.mark.asyncio
     async def test_delete(self, store, sample_memory):
         """Test deleting a memory."""
         await store.save(sample_memory)
@@ -209,6 +239,20 @@ class TestSQLiteMemoryStore:
         # Query Bob's memories
         results = await store.query(MemoryFilter(user_id="bob"))
         assert len(results) == 3
+
+    @pytest.mark.asyncio
+    async def test_query_offset_without_limit(self, store):
+        """A MemoryFilter with an offset but no limit must not emit `OFFSET`
+        without a `LIMIT` (a SQLite syntax error) — it should skip `offset` rows
+        and return the rest."""
+        await store.save_batch([Memory(content=f"Alice {i}", user_id="alice") for i in range(5)])
+
+        # Before the fix this raised sqlite3.OperationalError: near "OFFSET".
+        results = await store.query(MemoryFilter(user_id="alice", offset=2))
+        assert len(results) == 3
+
+        # offset past the end returns nothing (still no crash).
+        assert await store.query(MemoryFilter(user_id="alice", offset=10)) == []
 
     @pytest.mark.asyncio
     async def test_query_by_importance_range(self, store):
@@ -809,3 +853,56 @@ class TestLocalEmbedder:
     def test_dimension_property(self, embedder):
         """Test that dimension property returns correct value."""
         assert embedder.dimension == 384
+
+
+class TestOnnxLocalEmbedder:
+    """Tests for OnnxLocalEmbedder batching behavior."""
+
+    @pytest.mark.asyncio
+    async def test_embed_batch_uses_batched_onnx_inference(self):
+        """Test that non-empty inputs share ONNX batch inference."""
+        from headroom.memory.adapters.embedders import OnnxLocalEmbedder
+
+        class FakeEncoding:
+            def __init__(self, ids: list[int], attention_mask: list[int]) -> None:
+                self.ids = ids
+                self.attention_mask = attention_mask
+
+        class FakeTokenizer:
+            def encode_batch(self, texts: list[str]) -> list[FakeEncoding]:
+                encodings = []
+                for i, text in enumerate(texts, start=1):
+                    token = len(text) + i
+                    encodings.append(FakeEncoding([token, token + 1, 0], [1, 1, 0]))
+                return encodings
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.run_calls = 0
+
+            def run(self, _output_names, feeds):
+                self.run_calls += 1
+                input_ids = feeds["input_ids"]
+                batch_size, seq_len = input_ids.shape
+                token_embeddings = np.zeros((batch_size, seq_len, 384), dtype=np.float32)
+                token_embeddings[:, :, 0] = input_ids
+                token_embeddings[:, :, 1] = input_ids * 0.5
+                return [token_embeddings]
+
+        embedder = OnnxLocalEmbedder()
+        embedder.MAX_BATCH_SIZE = 8
+        embedder._session = FakeSession()
+        embedder._tokenizer = FakeTokenizer()
+        embedder._input_names = ["input_ids", "attention_mask", "token_type_ids"]
+
+        embeddings = await embedder.embed_batch(["alpha", "   ", "beta", "gamma"])
+
+        assert len(embeddings) == 4
+        assert embedder._session.run_calls == 1
+        assert np.array_equal(embeddings[1], np.zeros(384, dtype=np.float32))
+        assert embeddings[0].shape == (384,)
+        assert embeddings[2].shape == (384,)
+        assert embeddings[3].shape == (384,)
+        assert not np.allclose(embeddings[0], 0.0)
+        assert not np.allclose(embeddings[2], 0.0)
+        assert not np.allclose(embeddings[3], 0.0)

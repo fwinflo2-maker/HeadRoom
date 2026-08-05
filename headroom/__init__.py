@@ -73,8 +73,17 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any
 
+from ._ort import ensure_ort_dylib_pinned
 from ._version import __version__  # noqa: F401
-from .compress import CompressConfig, CompressResult, compress
+
+# Must run before anything can import `headroom._core`: on Windows the
+# Rust core resolves onnxruntime.dll at runtime (ort load-dynamic), and
+# the bare DLL search lands on the Windows ML System32 build, which
+# deadlocks ort session init (Win11 24H2+). Windows-gated, idempotent,
+# ~microseconds. See `headroom/_ort.py` for the full story.
+ensure_ort_dylib_pinned()
+
+from .compress import CompressConfig, CompressResult, compress, compress_spreadsheet  # noqa: E402
 
 # Keep a real callable bound for the one-function compression API so
 # `from headroom import compress` is never shadowed by the submodule object.
@@ -100,11 +109,9 @@ __all__ = [
     # Config
     "HeadroomConfig",
     "HeadroomMode",
-    "ToolCrusherConfig",
     "SmartCrusherConfig",
     "CacheAlignerConfig",
     "CacheOptimizerConfig",
-    "RollingWindowConfig",
     "RelevanceScorerConfig",
     # Data models
     "Block",
@@ -116,10 +123,8 @@ __all__ = [
     "TransformResult",
     "WasteSignals",
     # Transforms
-    "ToolCrusher",
     "SmartCrusher",
     "CacheAligner",
-    "RollingWindow",
     "TransformPipeline",
     # Cache optimizers
     "BaseCacheOptimizer",
@@ -169,12 +174,18 @@ __all__ = [
     "EmbedderBackend",
     # One-function compression API
     "compress",
+    "compress_spreadsheet",
     "CompressConfig",
     "CompressResult",
     # Hooks
     "CompressionHooks",
     "CompressContext",
     "CompressEvent",
+    # Canonical pipeline
+    "PipelineStage",
+    "PipelineEvent",
+    "PipelineExtensionManager",
+    "CANONICAL_PIPELINE_STAGES",
     # Shared context for multi-agent workflows
     "SharedContext",
 ]
@@ -202,11 +213,9 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # Config
     "HeadroomConfig": ("headroom.config", "HeadroomConfig"),
     "HeadroomMode": ("headroom.config", "HeadroomMode"),
-    "ToolCrusherConfig": ("headroom.config", "ToolCrusherConfig"),
     "SmartCrusherConfig": ("headroom.config", "SmartCrusherConfig"),
     "CacheAlignerConfig": ("headroom.config", "CacheAlignerConfig"),
     "CacheOptimizerConfig": ("headroom.config", "CacheOptimizerConfig"),
-    "RollingWindowConfig": ("headroom.config", "RollingWindowConfig"),
     "RelevanceScorerConfig": ("headroom.config", "RelevanceScorerConfig"),
     # Data models
     "Block": ("headroom.config", "Block"),
@@ -218,10 +227,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "TransformResult": ("headroom.config", "TransformResult"),
     "WasteSignals": ("headroom.config", "WasteSignals"),
     # Transforms
-    "ToolCrusher": ("headroom.transforms", "ToolCrusher"),
     "SmartCrusher": ("headroom.transforms", "SmartCrusher"),
     "CacheAligner": ("headroom.transforms", "CacheAligner"),
-    "RollingWindow": ("headroom.transforms", "RollingWindow"),
     "TransformPipeline": ("headroom.transforms", "TransformPipeline"),
     # Cache optimizers
     "BaseCacheOptimizer": ("headroom.cache", "BaseCacheOptimizer"),
@@ -264,10 +271,16 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "reset_otel_metrics": ("headroom.observability", "reset_otel_metrics"),
     # One-function API
     "compress": ("headroom.compress", "compress"),
+    "compress_spreadsheet": ("headroom.compress", "compress_spreadsheet"),
     # Hooks
     "CompressionHooks": ("headroom.hooks", "CompressionHooks"),
     "CompressContext": ("headroom.hooks", "CompressContext"),
     "CompressEvent": ("headroom.hooks", "CompressEvent"),
+    # Canonical pipeline
+    "PipelineStage": ("headroom.pipeline", "PipelineStage"),
+    "PipelineEvent": ("headroom.pipeline", "PipelineEvent"),
+    "PipelineExtensionManager": ("headroom.pipeline", "PipelineExtensionManager"),
+    "CANONICAL_PIPELINE_STAGES": ("headroom.pipeline", "CANONICAL_PIPELINE_STAGES"),
     # Shared context
     "SharedContext": ("headroom.shared_context", "SharedContext"),
 }

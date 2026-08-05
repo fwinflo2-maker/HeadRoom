@@ -106,18 +106,32 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
 
         return projects
 
-    def scan_project(self, project: ProjectInfo) -> list[SessionData]:
-        """Scan all Gemini session files for a project."""
-        sessions = []
+    def scan_project(
+        self, project: ProjectInfo, max_workers: int = 1, include_subagents: bool = True
+    ) -> list[SessionData]:
+        """Scan all Gemini session files for a project.
+
+        ``include_subagents`` is accepted for a uniform plugin contract but is a
+        no-op: Gemini stores sessions flat, with no nested transcript hierarchy.
+        """
         session_files = sorted(project.data_path.glob("session-*.json")) + sorted(
             project.data_path.glob("session-*.jsonl")
         )
+        if not session_files:
+            return []
 
-        for session_path in session_files:
-            session = self._scan_session(session_path)
-            if session and session.tool_calls:
-                sessions.append(session)
+        if max_workers <= 1 or len(session_files) <= 1:
+            return [s for f in session_files if (s := self._scan_session(f)) and s.tool_calls]
 
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        sessions: list[SessionData] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self._scan_session, f): f for f in session_files}
+            for future in as_completed(futures):
+                session = future.result()
+                if session and session.tool_calls:
+                    sessions.append(session)
         return sessions
 
     def _scan_session(self, session_path: Path) -> SessionData | None:
@@ -129,7 +143,7 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
     def _scan_json_session(self, json_path: Path) -> SessionData | None:
         """Parse a Gemini JSON session file."""
         try:
-            with open(json_path) as f:
+            with open(json_path, encoding="utf-8", errors="replace") as f:
                 data = json.load(f)
         except (OSError, json.JSONDecodeError) as e:
             logger.debug("Failed to read Gemini session %s: %s", json_path, e)
@@ -153,7 +167,7 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
         messages: list[dict] = []
 
         try:
-            with open(jsonl_path) as f:
+            with open(jsonl_path, encoding="utf-8", errors="replace") as f:
                 for line in f:
                     try:
                         entry = json.loads(line)
@@ -300,7 +314,7 @@ class GeminiPlugin(LearnPlugin, ConversationScanner):
     def _detect_project_path(self, session_path: Path) -> Path | None:
         """Try to detect the project path from a session file."""
         try:
-            with open(session_path) as f:
+            with open(session_path, encoding="utf-8", errors="replace") as f:
                 data = json.load(f)
         except (OSError, json.JSONDecodeError):
             return None

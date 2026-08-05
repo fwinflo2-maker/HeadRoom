@@ -24,11 +24,8 @@ Usage:
         tool_name="search_api",
     )
 
-    # Retrieve later
+    # Retrieve later (by hash; always returns the full original content)
     entry = store.retrieve(hash_key)
-
-    # Or search within
-    results = store.search(hash_key, "user query")
 """
 
 from __future__ import annotations
@@ -45,13 +42,95 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
-from ..relevance.bm25 import BM25Scorer
-
 if TYPE_CHECKING:
     from ..memory.tracker import ComponentStats
     from .backends import CompressionStoreBackend
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_CCR_TTL_SECONDS = 1800  # session-scale; override via HEADROOM_CCR_TTL_SECONDS
+CCR_TTL_SECONDS_ENV = "HEADROOM_CCR_TTL_SECONDS"
+
+_RETRIEVAL_LOG_PREVIEW_CHARS = 4096
+_SECRET_KEY_VALUE_RE = re.compile(
+    r"(?i)\b([A-Z0-9_-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)[A-Z0-9_-]*)"
+    r"(\s*[:=]\s*)([\"']?)([^\"'\s,}]+)"
+)
+_AUTH_VALUE_RE = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}")
+_API_KEY_VALUE_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+
+
+def _get_env_default_ttl_seconds() -> int:
+    raw_value = os.environ.get(CCR_TTL_SECONDS_ENV)
+    if raw_value is None or not raw_value.strip():
+        return DEFAULT_CCR_TTL_SECONDS
+
+    try:
+        ttl_seconds = int(raw_value)
+    except ValueError:
+        logger.warning(
+            "%s must be a positive integer number of seconds, got %r; using %s",
+            CCR_TTL_SECONDS_ENV,
+            raw_value,
+            DEFAULT_CCR_TTL_SECONDS,
+        )
+        return DEFAULT_CCR_TTL_SECONDS
+
+    if ttl_seconds <= 0:
+        logger.warning(
+            "%s must be greater than 0, got %s; using %s",
+            CCR_TTL_SECONDS_ENV,
+            ttl_seconds,
+            DEFAULT_CCR_TTL_SECONDS,
+        )
+        return DEFAULT_CCR_TTL_SECONDS
+
+    return ttl_seconds
+
+
+def format_retrieval_miss_detail(status: dict[str, Any]) -> str:
+    """Return an operator-facing miss reason for CCR retrieval failures."""
+    default_ttl = status.get("default_ttl_seconds", DEFAULT_CCR_TTL_SECONDS)
+    ttl_seconds = status.get("ttl_seconds", default_ttl)
+
+    if status.get("status") == "expired":
+        age_seconds = status.get("age_seconds")
+        if isinstance(age_seconds, (int, float)):
+            return f"Entry expired (CCR TTL: {ttl_seconds} seconds; age: {age_seconds:.0f} seconds)"
+        return f"Entry expired (CCR TTL: {ttl_seconds} seconds)"
+
+    return f"Entry not found (CCR TTL: {default_ttl} seconds)"
+
+
+def _redact_retrieval_log_payload(payload: str) -> str:
+    redacted = _SECRET_KEY_VALUE_RE.sub(r"\1\2\3[REDACTED]", payload)
+    redacted = _AUTH_VALUE_RE.sub(r"\1 [REDACTED]", redacted)
+    return _API_KEY_VALUE_RE.sub("sk-[REDACTED]", redacted)
+
+
+def _payload_for_retrieval_log(payload: str) -> dict[str, Any]:
+    redacted = _redact_retrieval_log_payload(payload)
+    preview = redacted[:_RETRIEVAL_LOG_PREVIEW_CHARS]
+    truncated = len(redacted) > len(preview)
+    return {
+        "payload_chars": len(payload),
+        "payload_preview_chars": len(preview),
+        "payload_truncated": truncated,
+        "payload_preview": preview,
+    }
+
+
+# Single source of truth for the retrieval-miss message. Actionable by
+# design: the model still has the marker in context (Read markers carry
+# the file path), so tell it how to recover instead of just reporting
+# the miss.
+CCR_MISS_MESSAGE = (
+    "Entry not found or expired. To recover: if the compression marker "
+    "references a file Read, re-read that file (the path is in the "
+    "marker; disk is the source of truth). If it was command output, "
+    "re-run the command. Entries expire after the store TTL "
+    "(default 30 minutes; configurable via HEADROOM_CCR_TTL_SECONDS)."
+)
 
 
 @dataclass
@@ -69,7 +148,7 @@ class CompressionEntry:
     tool_call_id: str | None
     query_context: str | None
     created_at: float
-    ttl: int = 300  # 5 minutes default
+    ttl: int = DEFAULT_CCR_TTL_SECONDS
 
     # TOIN integration: Store the tool signature hash for retrieval correlation
     # This MUST match the hash used by SmartCrusher when recording compression
@@ -106,7 +185,7 @@ class RetrievalEvent:
     total_items: int
     tool_name: str | None
     timestamp: float
-    retrieval_type: str  # "full" or "search"
+    retrieval_type: str  # always "full" (retrieval is by hash)
     tool_signature_hash: str | None = None  # For TOIN correlation
 
 
@@ -120,15 +199,15 @@ class CompressionStore:
     Design principles:
     - Zero external dependencies (pure Python)
     - Thread-safe for concurrent access
-    - TTL-based expiration (default 5 minutes)
+    - TTL-based expiration (default 300 seconds, env-configurable)
     - LRU-style eviction when capacity is reached
-    - Built-in BM25 search for filtering
+    - Hash-keyed retrieval that always returns the full original content
     """
 
     def __init__(
         self,
         max_entries: int = 1000,
-        default_ttl: int = 300,
+        default_ttl: int = DEFAULT_CCR_TTL_SECONDS,
         enable_feedback: bool = True,
         backend: CompressionStoreBackend | None = None,
     ):
@@ -136,10 +215,13 @@ class CompressionStore:
 
         Args:
             max_entries: Maximum number of entries to store.
-            default_ttl: Default TTL in seconds (5 minutes).
+            default_ttl: Default TTL in seconds (default 30 minutes — session scale).
             enable_feedback: Whether to track retrieval events.
-            backend: Storage backend to use. Defaults to InMemoryBackend.
-                     Custom backends can be passed for persistence (MongoDB, Redis).
+            backend: Storage backend to use. Defaults to InMemoryBackend
+                     when constructed directly; `get_compression_store()`
+                     defaults to SQLiteBackend for restart/multi-worker
+                     safety. Custom backends can be passed for
+                     persistence (MongoDB, Redis).
         """
         # Import here to avoid circular imports
         from .backends import InMemoryBackend
@@ -163,8 +245,10 @@ class CompressionStore:
         # Threshold for triggering heap rebuild (when 50% are stale)
         self._heap_rebuild_threshold = 0.5
 
-        # BM25 scorer for search
-        self._scorer = BM25Scorer()
+    @property
+    def default_ttl_seconds(self) -> int:
+        """Default TTL applied to new entries when callers do not override it."""
+        return self._default_ttl
 
     def store(
         self,
@@ -181,6 +265,7 @@ class CompressionStore:
         tool_signature_hash: str | None = None,
         compression_strategy: str | None = None,
         ttl: int | None = None,
+        explicit_hash: str | None = None,
     ) -> str:
         """Store compressed content and return hash for retrieval.
 
@@ -197,16 +282,77 @@ class CompressionStore:
             tool_signature_hash: Hash from ToolSignature for TOIN correlation.
             compression_strategy: Strategy used for compression.
             ttl: Custom TTL in seconds (uses default if not specified).
+            explicit_hash: Use this exact hex hash as the storage key
+                instead of computing SHA-256(original)[:24]. Required when
+                the marker that points at this entry was emitted by a
+                producer with its own hash function (e.g. SmartCrusher's
+                Rust row-drop path uses SHA-256[:12]). If not a hex
+                string, raises ``ValueError``. The marker hash and the
+                store key MUST match — otherwise ``/v1/retrieve/{hash}``
+                returns 404 even though the data is present.
 
         Returns:
             Hash key for retrieving this content.
         """
-        # Generate hash from original content
-        # CRITICAL FIX #5: Use 24 chars (96 bits) instead of 16 (64 bits) for better
-        # collision resistance. Birthday paradox: 50% collision at sqrt(2^n) entries.
-        # - 64 bits: ~4 billion entries for 50% collision
-        # - 96 bits: ~280 trillion entries for 50% collision
-        hash_key = hashlib.md5(original.encode()).hexdigest()[:24]  # nosec B324
+        # Generate hash from original content. Default: SHA-256[:24] of the
+        # original. When the caller provides `explicit_hash`, use it
+        # verbatim — required when the hash that ends up in the prompt
+        # marker is produced by another component (e.g. the Rust
+        # SmartCrusher row-drop path emits SHA-256[:12], which the
+        # Python store has to mirror so /v1/retrieve resolves it).
+        # 24 chars (96 bits) was chosen for collision resistance under the
+        # birthday bound: 50% collision probability at ~280 trillion entries
+        # (2^48), versus ~4 billion (2^32) for the previous 16-char default.
+        if explicit_hash is not None:
+            # Validate as hex. Bail loudly per `feedback_no_silent_fallbacks`
+            # — silently falling back to the default hash when the caller
+            # asked for a specific key would defeat the marker/store
+            # consistency we're trying to preserve.
+            if not explicit_hash or not all(c in "0123456789abcdefABCDEF" for c in explicit_hash):
+                raise ValueError(
+                    f"explicit_hash must be a non-empty hex string, got {explicit_hash!r}"
+                )
+            hash_key = explicit_hash.lower()
+        else:
+            # SHA-256 truncated to 24 hex chars (96 bits) — same collision
+            # space as the MD5[:24] this replaced. Switched from MD5 in
+            # PR #395 to silence CodeQL's `py/weak-sensitive-data-hashing`
+            # rule (the `usedforsecurity=False` parameter and the `lgtm`
+            # comment marker both failed to suppress it). The cache is
+            # in-memory, so changing the hash function on upgrade has no
+            # persistence-side effect — the same content always hashes
+            # deterministically under whichever function is in use.
+            hash_key = hashlib.sha256(original.encode()).hexdigest()[:24]
+
+        # Refuse to persist a bare CCR marker as an entry's "original"
+        # (#2694). A marker is a *pointer* to content, never content: an
+        # entry like `hash=abc123 -> "<<ccr:abc123,base64,2.0KB>>"` answers a
+        # retrieve with the very placeholder the caller is trying to resolve,
+        # and (worse) can overwrite a good entry with a useless one. Any
+        # producer that gets here has lost the source bytes upstream, so fail
+        # loudly rather than silently converting "retrievable" into "gone".
+        # Narrow by design: only a *bare* marker is rejected. Legitimate
+        # originals may legally CONTAIN markers (nested offloads, a tool that
+        # echoed one), and refusing those would drop recoverable data.
+        #
+        # The rejected value is never echoed into the log. It is provably a
+        # bare marker here, but `original` is the store's credential-bearing
+        # payload in the general case (this issue was reported against an
+        # OAuth token), and an error path is exactly where that sort of leak
+        # survives review. `hash_key` already identifies the entry.
+        stripped = original.strip()
+        if stripped.startswith("<<ccr:") and stripped.endswith(">>") and "\n" not in stripped:
+            logger.error(
+                "CCR store: refusing to persist a bare retrieval marker as "
+                "original_content (hash=%s tool=%s strategy=%s len=%d) — the "
+                "producer lost the source bytes; retrieval for this hash will "
+                "miss instead of returning a placeholder",
+                hash_key,
+                tool_name,
+                compression_strategy,
+                len(stripped),
+            )
+            return hash_key
 
         entry = CompressionEntry(
             hash=hash_key,
@@ -231,16 +377,22 @@ class CompressionStore:
             self.process_pending_feedback()
 
         with self._lock:
-            self._evict_if_needed()
-
-            # CRITICAL FIX: Hash collision detection
-            # If hash already exists with DIFFERENT content, log a warning.
-            # This indicates either a hash collision or duplicate store calls.
+            # Decide whether this is a NEW key before evicting. Evicting to make
+            # room only applies to a genuinely new entry; a re-store of an
+            # existing key overwrites in place (no room needed). Evicting first
+            # for a duplicate would needlessly destroy a live, unrelated entry
+            # and drop the store below capacity, making that entry's <<ccr:...>>
+            # marker (still sitting in the conversation) unredeemable — a 404.
+            # The CCR mirror bridge re-stores the same explicit_hash on every
+            # turn a marker is re-encountered, so duplicate stores are common.
             existing = self._backend.get(hash_key)
-            if existing is not None:
+            if existing is None:
+                self._evict_if_needed()
+            else:
+                # Hash already present. Different content means a true (extremely
+                # rare with SHA256[:24]) collision; same content is a duplicate
+                # re-store. Either way we overwrite in place.
                 if existing.original_content != original:
-                    # True hash collision - different content, same hash
-                    # This is extremely rare with SHA256[:24] but should be logged
                     logger.warning(
                         "Hash collision detected: hash=%s tool=%s (existing_len=%d, new_len=%d)",
                         hash_key,
@@ -249,12 +401,11 @@ class CompressionStore:
                         len(original),
                     )
                 else:
-                    # Same content being stored again - this is fine, just update
                     logger.debug(
                         "Duplicate store for hash=%s, updating entry",
                         hash_key,
                     )
-                # Mark old heap entry as stale since we're replacing
+                # Mark old heap entry as stale since we're replacing it.
                 self._stale_heap_entries += 1
 
             self._backend.set(hash_key, entry)
@@ -305,6 +456,15 @@ class CompressionStore:
                     retrieval_type="full",
                     tool_signature_hash=entry.tool_signature_hash,
                 )
+            self._log_retrieval_payload(
+                hash_key=hash_key,
+                query=query,
+                retrieval_type="full",
+                payload=entry.original_content,
+                items_retrieved=entry.original_item_count,
+                total_items=entry.original_item_count,
+                entry=entry,
+            )
 
             # CRITICAL: Make a deep copy to return
             # (entry could be modified/evicted after lock release)
@@ -350,113 +510,43 @@ class CompressionStore:
                 "compressed_item_count": entry.compressed_item_count,
                 "query_context": entry.query_context,
                 "compressed_content": entry.compressed_content,
+                "original_content_preview": entry.original_content[:2000],
                 "created_at": entry.created_at,
                 "ttl": entry.ttl,
             }
 
-    def search(
+    def _log_retrieval_payload(
         self,
+        *,
         hash_key: str,
-        query: str,
-        max_results: int = 20,
-        score_threshold: float = 0.3,
-    ) -> list[dict[str, Any]]:
-        """Search within cached content using BM25.
-
-        Args:
-            hash_key: Hash key of cached content.
-            query: Search query.
-            max_results: Maximum number of results to return.
-            score_threshold: Minimum BM25 score to include.
-
-        Returns:
-            List of matching items from original content.
-        """
-        # Get entry without logging (we'll log the search separately)
-        entry = self._get_entry_for_search(hash_key, query)
-        if entry is None:
-            return []
-
-        try:
-            items = json.loads(entry.original_content)
-            if not isinstance(items, list):
-                return []
-        except json.JSONDecodeError:
-            return []
-
-        if not items:
-            return []
-
-        # Score each item using BM25
-        item_strs = [json.dumps(item, default=str) for item in items]
-        scores = self._scorer.score_batch(item_strs, query)
-
-        # Filter and sort by score
-        scored_items = [
-            (items[i], scores[i].score)
-            for i in range(len(items))
-            if scores[i].score >= score_threshold
-        ]
-        scored_items.sort(key=lambda x: x[1], reverse=True)
-
-        results = [item for item, _ in scored_items[:max_results]]
-
-        # Log retrieval event
-        if self._enable_feedback:
-            with self._lock:
-                self._log_retrieval(
-                    hash_key=hash_key,
-                    query=query,
-                    items_retrieved=len(results),
-                    total_items=len(items),
-                    tool_name=entry.tool_name,
-                    retrieval_type="search",
-                    tool_signature_hash=entry.tool_signature_hash,
-                )
-            # Process feedback immediately to ensure TOIN learns in real-time
-            self.process_pending_feedback()
-
-        return results
-
-    def _get_entry_for_search(
-        self,
-        hash_key: str,
-        query: str | None = None,
-    ) -> CompressionEntry | None:
-        """Get entry without logging retrieval (used by search to avoid double-logging).
-
-        CRITICAL FIX #4: Returns a copy of the entry to prevent race conditions.
-        The caller may use the entry after we release the lock, and another thread
-        could modify or evict the original entry.
-
-        Args:
-            hash_key: Hash key returned by store().
-            query: Optional query for access tracking.
-
-        Returns:
-            CompressionEntry copy if found and not expired, None otherwise.
-        """
-        with self._lock:
-            entry = self._backend.get(hash_key)
-
-            if entry is None:
-                return None
-
-            if entry.is_expired():
-                self._backend.delete(hash_key)
-                # CRITICAL FIX: Track stale heap entry
-                self._stale_heap_entries += 1
-                return None
-
-            # Track access but don't log retrieval event (search will log separately)
-            entry.record_access(query)
-            # Update the backend with the modified entry
-            self._backend.set(hash_key, entry)
-
-            # CRITICAL FIX #4: Return a copy to prevent race conditions
-            # The entry contains mutable fields (search_queries list) that could be
-            # modified by other threads after we release the lock
-            return replace(entry, search_queries=list(entry.search_queries))
+        query: str | None,
+        retrieval_type: str,
+        payload: str,
+        items_retrieved: int,
+        total_items: int,
+        entry: CompressionEntry,
+    ) -> None:
+        event = {
+            "event": "headroom_retrieve",
+            "hash": hash_key,
+            "retrieval_type": retrieval_type,
+            "query": query,
+            "items_retrieved": items_retrieved,
+            "total_items": total_items,
+            "tool_name": entry.tool_name,
+            "tool_call_id": entry.tool_call_id,
+            "compression_strategy": entry.compression_strategy,
+            "tool_signature_hash": entry.tool_signature_hash,
+            "original_tokens": entry.original_tokens,
+            "compressed_tokens": entry.compressed_tokens,
+            "original_item_count": entry.original_item_count,
+            "compressed_item_count": entry.compressed_item_count,
+            **_payload_for_retrieval_log(payload),
+        }
+        logger.info(
+            "event=headroom_retrieve %s",
+            json.dumps(event, ensure_ascii=False, separators=(",", ":")),
+        )
 
     def exists(self, hash_key: str, clean_expired: bool = False) -> bool:
         """Check if a hash key exists and is not expired.
@@ -483,6 +573,42 @@ class CompressionStore:
                 return False
             return True
 
+    def get_entry_status(
+        self,
+        hash_key: str,
+        *,
+        clean_expired: bool = False,
+    ) -> dict[str, Any]:
+        """Return availability and TTL metadata for a stored entry."""
+        now = time.time()
+        with self._lock:
+            entry = self._backend.get(hash_key)
+            if entry is None:
+                return {
+                    "hash": hash_key,
+                    "status": "missing",
+                    "default_ttl_seconds": self._default_ttl,
+                }
+
+            age_seconds = now - entry.created_at
+            expires_at = entry.created_at + entry.ttl
+            expired = age_seconds > entry.ttl
+            status = {
+                "hash": hash_key,
+                "status": "expired" if expired else "available",
+                "ttl_seconds": entry.ttl,
+                "default_ttl_seconds": self._default_ttl,
+                "created_at": entry.created_at,
+                "expires_at": expires_at,
+                "age_seconds": age_seconds,
+            }
+
+            if expired and clean_expired:
+                self._backend.delete(hash_key)
+                self._stale_heap_entries += 1
+
+            return status
+
     def get_stats(self) -> dict[str, Any]:
         """Get store statistics for monitoring."""
         with self._lock:
@@ -501,6 +627,7 @@ class CompressionStore:
             return {
                 "entry_count": self._backend.count(),
                 "max_entries": self._max_entries,
+                "default_ttl_seconds": self._default_ttl,
                 "total_original_tokens": total_original_tokens,
                 "total_compressed_tokens": total_compressed_tokens,
                 "total_retrievals": total_retrievals,
@@ -855,12 +982,29 @@ def clear_request_compression_store() -> None:
 def _create_default_ccr_backend() -> CompressionStoreBackend | None:
     """Create a CCR backend from env (e.g. HEADROOM_CCR_BACKEND=redis).
 
-    Loads adapters via setuptools entry point 'headroom.ccr_backend'.
-    Returns None to use default InMemoryBackend.
+    Default (env unset or "sqlite"): SQLiteBackend at workspace_dir()/ccr_store.db
+    — restart-safe and shared across worker processes, which the
+    session-scale 30-minute TTL assumes.
+    "memory" opts back into the in-process dict. Other values load
+    adapters via setuptools entry point 'headroom.ccr_backend'.
+    Returns None to use InMemoryBackend.
     """
     backend_type = (os.environ.get("HEADROOM_CCR_BACKEND") or "").strip().lower()
-    if not backend_type or backend_type == "memory":
+    if backend_type == "memory":
         return None
+    if not backend_type or backend_type == "sqlite":
+        try:
+            from .backends.sqlite import SQLiteBackend
+
+            return SQLiteBackend()
+        except Exception as e:
+            logger.warning(
+                "Failed to initialize SQLite CCR backend (%s); "
+                "falling back to in-memory store. Retrieval will not "
+                "survive proxy restarts.",
+                e,
+            )
+            return None
     try:
         from importlib.metadata import entry_points
 
@@ -887,7 +1031,7 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
 
 def get_compression_store(
     max_entries: int = 1000,
-    default_ttl: int = 300,
+    default_ttl: int | None = None,
     backend: CompressionStoreBackend | None = None,
 ) -> CompressionStore:
     """Get the compression store instance.
@@ -899,6 +1043,7 @@ def get_compression_store(
     Args:
         max_entries: Maximum entries (only used on first call for global store).
         default_ttl: Default TTL (only used on first call for global store).
+            When omitted, HEADROOM_CCR_TTL_SECONDS overrides the 1800-second default.
         backend: Custom storage backend (only used on first call for global store).
                  Defaults to InMemoryBackend if not provided; env backend used if backend is None.
 
@@ -915,9 +1060,12 @@ def get_compression_store(
             if _compression_store is None:
                 if backend is None:
                     backend = _create_default_ccr_backend()
+                effective_default_ttl = (
+                    default_ttl if default_ttl is not None else _get_env_default_ttl_seconds()
+                )
                 _compression_store = CompressionStore(
                     max_entries=max_entries,
-                    default_ttl=default_ttl,
+                    default_ttl=effective_default_ttl,
                     backend=backend,
                 )
     return _compression_store

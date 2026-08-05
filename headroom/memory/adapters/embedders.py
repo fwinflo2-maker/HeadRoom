@@ -13,17 +13,129 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import warnings
+from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
 from headroom.models.config import ML_MODEL_DEFAULTS
+from headroom.onnx_runtime import create_cpu_session_options, hf_hub_download_local_first
 
 if TYPE_CHECKING:
     from sentence_transformers import SentenceTransformer
 
+# Suppress HuggingFace Hub warnings about missing tokens and rate limits.
+# These appear whenever hf_hub_download is called without HF_TOKEN set.
+# We operate in an authenticated-optional mode; warnings are not actionable.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
+# Also silence the huggingface_hub logger which emits rate-limit advisory messages.
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+# sentence_transformers uses httpx to check model file manifests on every startup.
+# These HEAD/GET requests generate INFO lines per worker; suppress to WARNING.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Local (torch / sentence-transformers) CPU thread cap — issue #198
+# =============================================================================
+# A long-lived proxy serves many requests concurrently. Each torch ``encode()``
+# fans out to BLAS (MKL / OpenBLAS / Accelerate) + OpenMP worker threads, which
+# default to roughly ``os.cpu_count()``. Under concurrency this oversubscribes
+# the CPU — N in-flight encodes x ~cpu_count threads each thrash the scheduler
+# and starve the asyncio event loop, so liveness probes (``/livez``) spike to
+# multiple seconds even though the loop itself is idle (issue #198).
+#
+# Capping intra-op parallelism makes a single encode modestly slower but lets
+# concurrent encodes scale linearly without thread-pool thrash — the standard
+# trade-off for serving torch models inside an async server. The ONNX embedder
+# already caps its threads (see ``onnx_runtime.create_cpu_session_options``);
+# this brings the torch path to parity.
+#
+# torch's OpenMP thread count is per-thread, and encodes run on executor worker
+# threads, so a one-shot cap would miss most workers. Instead, CPU encodes run
+# on a dedicated, size-limited executor whose ``initializer`` pins each worker's
+# thread pool once. Total embedding threads are then bounded by
+# ``workers (HEADROOM_EMBED_CONCURRENCY) x threads-per-encode
+# (HEADROOM_EMBED_NUM_THREADS)``. Applies to the CPU device only (GPU/MPS do
+# their compute off-CPU).
+_EMBED_THREADS_ENV = "HEADROOM_EMBED_NUM_THREADS"
+_DEFAULT_EMBED_THREADS = 1
+_EMBED_CONCURRENCY_ENV = "HEADROOM_EMBED_CONCURRENCY"
+_DEFAULT_EMBED_CONCURRENCY = 4
+_BLAS_THREAD_ENV_VARS = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
+
+
+def _resolve_positive_int_env(env_var: str, default: int) -> int:
+    """Read a positive integer from ``env_var``, falling back to ``default``.
+
+    A non-positive or unparseable value logs a warning and returns a safe value
+    (>= 1) rather than disabling the limit.
+    """
+    raw = os.environ.get(env_var)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; falling back to %d.", env_var, raw, default)
+        return default
+    if value < 1:
+        logger.warning("%s=%d is below 1; using 1.", env_var, value)
+        return 1
+    return value
+
+
+def _resolve_embed_thread_cap() -> int:
+    """Resolve the per-encode CPU thread cap (``HEADROOM_EMBED_NUM_THREADS``)."""
+    return _resolve_positive_int_env(_EMBED_THREADS_ENV, _DEFAULT_EMBED_THREADS)
+
+
+def _resolve_embed_concurrency() -> int:
+    """Resolve the max concurrent CPU encodes (``HEADROOM_EMBED_CONCURRENCY``).
+
+    Defaults to ``min(4, os.cpu_count())`` so embedding cannot occupy every core
+    and starve the event loop, while still allowing useful parallelism.
+    """
+    cpu = os.cpu_count() or 1
+    raw = os.environ.get(_EMBED_CONCURRENCY_ENV)
+    if raw is None:
+        return max(1, min(_DEFAULT_EMBED_CONCURRENCY, cpu))
+    return _resolve_positive_int_env(
+        _EMBED_CONCURRENCY_ENV, max(1, min(_DEFAULT_EMBED_CONCURRENCY, cpu))
+    )
+
+
+def _init_cpu_embed_worker() -> None:
+    """Pin a CPU embed worker's thread pool (runs once per worker; issue #198).
+
+    Sets BLAS/OpenMP env defaults (``setdefault`` never overrides an operator's
+    explicit setting) and bounds torch's intra-op pool for this worker thread.
+    Best-effort: failures never block embedding.
+    """
+    n = _resolve_embed_thread_cap()
+    for var in _BLAS_THREAD_ENV_VARS:
+        os.environ.setdefault(var, str(n))
+    try:
+        import torch
+
+        torch.set_num_threads(n)
+    except ImportError:
+        pass
+    except Exception as exc:  # pragma: no cover - defensive, never block embedding
+        logger.debug("Could not cap torch intra-op thread pool: %s", exc)
 
 
 def _normalize_embedding(embedding: np.ndarray) -> np.ndarray:
@@ -109,6 +221,10 @@ class LocalEmbedder:
         self._device: str | None = None
         self._dimension: int | None = None
         self._lock = asyncio.Lock()
+        # Dedicated single-worker executor, created only when the resolved device
+        # is MPS (see _load_model). torch-MPS is not thread-safe, so every encode()
+        # must run on one thread. Stays None for CPU/CUDA → default shared executor.
+        self._executor: ThreadPoolExecutor | None = None
 
     def _check_dependencies(self) -> None:
         """Check that required dependencies are installed."""
@@ -152,6 +268,26 @@ class LocalEmbedder:
         else:
             self._device = self._detect_device()
 
+        # CPU: run encodes on a dedicated, size-limited executor whose workers
+        # each pin their torch/BLAS/OpenMP thread pool (issue #198). Without this,
+        # N concurrent encodes on the shared default executor each fan out to
+        # ~os.cpu_count() BLAS threads and starve the asyncio event loop, spiking
+        # /livez latency. Total embed threads are bounded by workers x per-encode
+        # threads.
+        if self._device == "cpu" and self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=_resolve_embed_concurrency(),
+                thread_name_prefix="cpu-embed",
+                initializer=_init_cpu_embed_worker,
+            )
+
+        # torch-MPS is not thread-safe: concurrent encode() calls from the default
+        # multi-worker executor abort with "commit an already committed command
+        # buffer" (verified). Funnel every encode through one worker thread when on
+        # MPS so calls serialize; other devices keep the shared default executor.
+        if self._device == "mps" and self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mps-embed")
+
         # Use centralized registry for shared model instances
         self._model = MLModelRegistry.get_sentence_transformer(self._model_name, self._device)
 
@@ -185,7 +321,7 @@ class LocalEmbedder:
         model = self._model  # Local reference for lambda closure
         loop = asyncio.get_event_loop()
         embedding = await loop.run_in_executor(
-            None,
+            self._executor,
             lambda: model.encode(text, convert_to_numpy=True, normalize_embeddings=False),
         )
 
@@ -228,7 +364,7 @@ class LocalEmbedder:
             model = self._model  # Local reference for lambda closure
             loop = asyncio.get_event_loop()
             embeddings = await loop.run_in_executor(
-                None,
+                self._executor,
                 lambda: model.encode(
                     non_empty_texts, convert_to_numpy=True, normalize_embeddings=False
                 ),
@@ -262,9 +398,14 @@ class LocalEmbedder:
         return self.DEFAULT_MAX_TOKENS
 
     async def close(self) -> None:
-        """Close resources (no-op for local embedder)."""
-        # LocalEmbedder doesn't hold persistent connections
-        pass
+        """Close resources: shut down the MPS serialization executor and drop the
+        cached model reference so a later embed() fully re-initializes (and
+        re-creates the serialized executor) instead of encoding on a torn-down pool.
+        """
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
+            self._executor = None
+        self._model = None
 
 
 # =============================================================================
@@ -289,6 +430,7 @@ class OnnxLocalEmbedder:
     DEFAULT_DIMENSION = 384
     DEFAULT_MAX_TOKENS = 256
     ONNX_REPO = "Qdrant/all-MiniLM-L6-v2-onnx"
+    MAX_BATCH_SIZE = 2
 
     def __init__(self, max_length: int = 256) -> None:
         self._max_length = max_length
@@ -303,18 +445,22 @@ class OnnxLocalEmbedder:
             return
 
         import onnxruntime as ort
-        from huggingface_hub import hf_hub_download
         from tokenizers import Tokenizer
 
         logger.info("Loading ONNX embedding model (all-MiniLM-L6-v2, ~86MB)...")
 
-        model_path = hf_hub_download(self.ONNX_REPO, "model.onnx")
-        tok_path = hf_hub_download(self.ONNX_REPO, "tokenizer.json")
+        # Prefer local cache to avoid a redundant network HEAD on warm starts.
+        model_path = hf_hub_download_local_first(self.ONNX_REPO, "model.onnx")
+        tok_path = hf_hub_download_local_first(self.ONNX_REPO, "tokenizer.json")
 
-        # Set thread count to avoid pthread_setaffinity_np errors in Docker containers
-        sess_options = ort.SessionOptions()
-        sess_options.intra_op_num_threads = 1
-        sess_options.inter_op_num_threads = 1
+        # Keep a small thread pool for Docker compatibility and disable ORT's
+        # CPU memory arena/pattern caches so long-running proxy workers do not
+        # retain large anonymous heaps after embedding bursts.
+        sess_options = create_cpu_session_options(
+            ort,
+            intra_op_num_threads=1,
+            inter_op_num_threads=1,
+        )
         self._session = ort.InferenceSession(
             model_path, sess_options, providers=["CPUExecutionProvider"]
         )
@@ -325,17 +471,12 @@ class OnnxLocalEmbedder:
 
         logger.info("ONNX embedding model loaded (384-dim, no torch)")
 
-    def _embed_single(self, text: str) -> np.ndarray:
-        """Embed a single text string."""
-        assert self._session is not None
-        assert self._tokenizer is not None
-
-        if not text or not text.strip():
-            return np.zeros(self.DEFAULT_DIMENSION, dtype=np.float32)
-
-        encoded = self._tokenizer.encode(text)
-        input_ids = np.array([encoded.ids], dtype=np.int64)
-        attention_mask = np.array([encoded.attention_mask], dtype=np.int64)
+    def _build_feeds(
+        self,
+        input_ids: np.ndarray,
+        attention_mask: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        """Build ONNX feeds for a token batch."""
         token_type_ids = np.zeros_like(input_ids, dtype=np.int64)
 
         feeds: dict[str, np.ndarray] = {}
@@ -347,16 +488,37 @@ class OnnxLocalEmbedder:
             elif "token_type_ids" in name:
                 feeds[name] = token_type_ids
 
-        outputs = self._session.run(None, feeds)
-        token_embeddings = outputs[0]  # (1, seq_len, 384)
+        return feeds
+
+    def _embed_many(self, texts: list[str]) -> np.ndarray:
+        """Embed multiple non-empty text strings in one ONNX pass."""
+        assert self._session is not None
+        assert self._tokenizer is not None
+
+        encodings = self._tokenizer.encode_batch(texts)
+        input_ids = np.array([encoding.ids for encoding in encodings], dtype=np.int64)
+        attention_mask = np.array(
+            [encoding.attention_mask for encoding in encodings], dtype=np.int64
+        )
+
+        outputs = self._session.run(None, self._build_feeds(input_ids, attention_mask))
+        token_embeddings = outputs[0]  # (batch, seq_len, 384)
 
         # Mean pooling over non-padding tokens
         mask_expanded = attention_mask[:, :, np.newaxis].astype(np.float32)
         summed = np.sum(token_embeddings * mask_expanded, axis=1)
         counts = np.clip(mask_expanded.sum(axis=1), a_min=1e-9, a_max=None)
-        embedding = summed / counts
+        embeddings = summed / counts
 
-        return _normalize_embedding(embedding[0])
+        return _normalize_embeddings_batch(embeddings)
+
+    def _embed_single(self, text: str) -> np.ndarray:
+        """Embed a single text string."""
+        if not text or not text.strip():
+            return np.zeros(self.DEFAULT_DIMENSION, dtype=np.float32)
+
+        embedding = self._embed_many([text])[0]
+        return cast(np.ndarray, embedding)
 
     async def embed(self, text: str) -> np.ndarray:
         """Generate an embedding for a single text."""
@@ -364,18 +526,40 @@ class OnnxLocalEmbedder:
             if self._session is None:
                 await asyncio.get_event_loop().run_in_executor(None, self._load_model)
 
-        return await asyncio.get_event_loop().run_in_executor(None, self._embed_single, text)
+        loop = asyncio.get_event_loop()
+        embedding = await loop.run_in_executor(None, self._embed_single, text)
+        return cast(np.ndarray, embedding)
 
     async def embed_batch(self, texts: list[str]) -> list[np.ndarray]:
         """Generate embeddings for multiple texts."""
+        if not texts:
+            return []
+
         async with self._lock:
             if self._session is None:
                 await asyncio.get_event_loop().run_in_executor(None, self._load_model)
 
-        results = []
-        for text in texts:
-            emb = await asyncio.get_event_loop().run_in_executor(None, self._embed_single, text)
-            results.append(emb)
+        non_empty_indices: list[int] = []
+        non_empty_texts: list[str] = []
+        for i, text in enumerate(texts):
+            if text and text.strip():
+                non_empty_indices.append(i)
+                non_empty_texts.append(text)
+
+        results: list[np.ndarray] = [
+            np.zeros(self.dimension, dtype=np.float32) for _ in range(len(texts))
+        ]
+        if not non_empty_texts:
+            return results
+
+        loop = asyncio.get_event_loop()
+        for start in range(0, len(non_empty_texts), self.MAX_BATCH_SIZE):
+            batch_texts = non_empty_texts[start : start + self.MAX_BATCH_SIZE]
+            batch_indices = non_empty_indices[start : start + self.MAX_BATCH_SIZE]
+            embeddings = await loop.run_in_executor(None, self._embed_many, batch_texts)
+            for idx, embedding in zip(batch_indices, embeddings):
+                results[idx] = embedding
+
         return results
 
     @property

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Any
@@ -20,7 +21,9 @@ from .config import (
     SimulationResult,
 )
 from .parser import parse_messages
+from .pipeline import PipelineExtensionManager, PipelineStage, summarize_routing_markers
 from .providers.base import Provider
+from .providers.registry import call_client_transport
 from .storage import create_storage
 from .tokenizer import Tokenizer
 from .transforms import CacheAligner, TransformPipeline
@@ -31,6 +34,8 @@ from .utils import (
     format_cost,
     generate_request_id,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ChatCompletions:
@@ -281,9 +286,9 @@ class HeadroomClient:
                 enable_cache_optimizer=True, auto-detects from provider.
             enable_cache_optimizer: Enable provider-specific cache optimization.
             enable_semantic_cache: Enable query-level semantic caching.
-            config: Optional HeadroomConfig for full control over all settings
-                including intelligent_context. When provided, takes precedence
-                over individual settings like store_url, default_mode, etc.
+            config: Optional HeadroomConfig for full control over all settings.
+                When provided, takes precedence over individual settings like
+                store_url, default_mode, etc.
         """
         self._original = original_client
         self._provider = provider
@@ -324,6 +329,10 @@ class HeadroomClient:
 
         # Initialize transform pipeline
         self._pipeline = TransformPipeline(self._config, provider=self._provider)
+        self._pipeline_extensions = PipelineExtensionManager(
+            extensions=self._config.pipeline_extensions,
+            discover=self._config.discover_pipeline_extensions,
+        )
 
         # Initialize cache optimizer
         self._cache_optimizer: BaseCacheOptimizer | None = None
@@ -357,6 +366,16 @@ class HeadroomClient:
         self.chat = type("Chat", (), {"completions": ChatCompletions(self)})()
         # Public API - Anthropic style
         self.messages = Messages(self)
+        self._pipeline_extensions.emit(
+            PipelineStage.SETUP,
+            operation="sdk.setup",
+            provider=self._provider.name.lower(),
+            metadata={
+                "default_mode": self._default_mode.value,
+                "cache_optimizer_enabled": enable_cache_optimizer,
+                "semantic_cache_enabled": enable_semantic_cache,
+            },
+        )
 
     def _get_tokenizer(self, model: str) -> Tokenizer:
         """Get tokenizer for model using provider."""
@@ -391,6 +410,18 @@ class HeadroomClient:
         timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
         mode = HeadroomMode(headroom_mode) if headroom_mode else self._default_mode
 
+        input_event = self._pipeline_extensions.emit(
+            PipelineStage.INPUT_RECEIVED,
+            operation="sdk.request",
+            request_id=request_id,
+            provider=self._provider.name.lower(),
+            model=model,
+            messages=messages,
+            metadata={"api_style": api_style, "stream": stream, "mode": mode.value},
+        )
+        if input_event.messages is not None:
+            messages = input_event.messages
+
         tokenizer = self._get_tokenizer(model)
 
         # Analyze original messages
@@ -416,9 +447,7 @@ class HeadroomClient:
 
         # Apply transforms if in optimize mode
         if mode == HeadroomMode.OPTIMIZE:
-            output_buffer = (
-                headroom_output_buffer_tokens or self._config.rolling_window.output_buffer_tokens
-            )
+            output_buffer = headroom_output_buffer_tokens or self._config.output_buffer_tokens
             model_limit = self._get_context_limit(model)
 
             result = self._pipeline.apply(
@@ -432,6 +461,23 @@ class HeadroomClient:
             optimized_messages = result.messages
             tokens_after = result.tokens_after
             transforms_applied = result.transforms_applied
+
+            routing_markers = summarize_routing_markers(transforms_applied)
+            if routing_markers:
+                routed_event = self._pipeline_extensions.emit(
+                    PipelineStage.INPUT_ROUTED,
+                    operation="sdk.request",
+                    request_id=request_id,
+                    provider=self._provider.name.lower(),
+                    model=model,
+                    messages=optimized_messages,
+                    metadata={
+                        "routing_markers": routing_markers,
+                        "transforms_applied": transforms_applied,
+                    },
+                )
+                if routed_event.messages is not None:
+                    optimized_messages = routed_event.messages
 
             # Apply provider-specific cache optimization
             if self._cache_optimizer is not None or self._semantic_cache_layer is not None:
@@ -481,6 +527,23 @@ class HeadroomClient:
                     f"cache_optimizer:{t}" for t in (cache_result.transforms_applied or [])
                 )
 
+            compressed_event = self._pipeline_extensions.emit(
+                PipelineStage.INPUT_COMPRESSED,
+                operation="sdk.request",
+                request_id=request_id,
+                provider=self._provider.name.lower(),
+                model=model,
+                messages=optimized_messages,
+                metadata={
+                    "tokens_before": tokens_before,
+                    "tokens_after": tokens_after,
+                    "transforms_applied": transforms_applied,
+                },
+            )
+            if compressed_event.messages is not None:
+                optimized_messages = compressed_event.messages
+                tokens_after = tokenizer.count_messages(optimized_messages)
+
             # Recalculate prefix hash after optimization
             stable_prefix_hash = compute_prefix_hash(optimized_messages)
         else:
@@ -488,6 +551,20 @@ class HeadroomClient:
             optimized_messages = messages
             tokens_after = tokens_before
             transforms_applied = []
+
+        presend_event = self._pipeline_extensions.emit(
+            PipelineStage.PRE_SEND,
+            operation="sdk.request",
+            request_id=request_id,
+            provider=self._provider.name.lower(),
+            model=model,
+            messages=optimized_messages,
+            metadata={"api_style": api_style, "stream": stream},
+        )
+        if presend_event.messages is not None:
+            optimized_messages = presend_event.messages
+            tokens_after = tokenizer.count_messages(optimized_messages)
+            stable_prefix_hash = compute_prefix_hash(optimized_messages)
 
         # Create metrics
         metrics = RequestMetrics(
@@ -529,22 +606,36 @@ class HeadroomClient:
 
         # Call underlying client based on API style
         try:
-            if api_style == "anthropic":
-                return self._call_anthropic(
-                    model=model,
-                    messages=optimized_messages,
-                    stream=stream,
-                    metrics=metrics,
-                    **kwargs,
-                )
-            else:
-                return self._call_openai(
-                    model=model,
-                    messages=optimized_messages,
-                    stream=stream,
-                    metrics=metrics,
-                    **kwargs,
-                )
+            response = call_client_transport(
+                api_style,
+                self,
+                model=model,
+                messages=optimized_messages,
+                stream=stream,
+                metrics=metrics,
+                **kwargs,
+            )
+
+            self._pipeline_extensions.emit(
+                PipelineStage.POST_SEND,
+                operation="sdk.request",
+                request_id=request_id,
+                provider=self._provider.name.lower(),
+                model=model,
+                messages=optimized_messages,
+                response=response,
+                metadata={"api_style": api_style, "stream": stream},
+            )
+            self._pipeline_extensions.emit(
+                PipelineStage.RESPONSE_RECEIVED,
+                operation="sdk.request",
+                request_id=request_id,
+                provider=self._provider.name.lower(),
+                model=model,
+                response=response,
+                metadata={"api_style": api_style, "stream": stream},
+            )
+            return response
 
         except Exception as e:
             metrics.error = str(e)
@@ -561,33 +652,15 @@ class HeadroomClient:
         **kwargs: Any,
     ) -> Any:
         """Call OpenAI-style API."""
-        if stream:
-            response = self._original.chat.completions.create(
-                model=model,
-                messages=messages,
-                stream=True,
-                **kwargs,
-            )
-            return self._wrap_stream(response, metrics)
-        else:
-            response = self._original.chat.completions.create(
-                model=model,
-                messages=messages,
-                stream=False,
-                **kwargs,
-            )
-
-            # Extract output tokens from response
-            if hasattr(response, "usage") and response.usage:
-                metrics.tokens_output = response.usage.completion_tokens
-                # Check for cached tokens in usage
-                if hasattr(response.usage, "prompt_tokens_details"):
-                    details = response.usage.prompt_tokens_details
-                    if hasattr(details, "cached_tokens"):
-                        metrics.cached_tokens = details.cached_tokens
-
-            self._storage.save(metrics)
-            return response
+        return call_client_transport(
+            "openai",
+            self,
+            model=model,
+            messages=messages,
+            stream=stream,
+            metrics=metrics,
+            **kwargs,
+        )
 
     def _call_anthropic(
         self,
@@ -599,32 +672,15 @@ class HeadroomClient:
         **kwargs: Any,
     ) -> Any:
         """Call Anthropic-style API."""
-        if stream:
-            # Anthropic streaming returns a context manager
-            stream_manager = self._original.messages.stream(
-                model=model,
-                messages=messages,
-                **kwargs,
-            )
-            # Save metrics when stream is created
-            self._storage.save(metrics)
-            return stream_manager
-        else:
-            response = self._original.messages.create(
-                model=model,
-                messages=messages,
-                **kwargs,
-            )
-
-            # Extract output tokens from Anthropic response
-            if hasattr(response, "usage") and response.usage:
-                metrics.tokens_output = response.usage.output_tokens
-                # Check for cached tokens in Anthropic usage
-                if hasattr(response.usage, "cache_read_input_tokens"):
-                    metrics.cached_tokens = response.usage.cache_read_input_tokens
-
-            self._storage.save(metrics)
-            return response
+        return call_client_transport(
+            "anthropic",
+            self,
+            model=model,
+            messages=messages,
+            stream=stream,
+            metrics=metrics,
+            **kwargs,
+        )
 
     def _wrap_stream(
         self,
@@ -694,7 +750,7 @@ class HeadroomClient:
                     "content": response.content,
                 }
         except Exception:
-            pass
+            logger.debug("Failed to extract response content for semantic cache", exc_info=True)
         return None
 
     def _simulate(
@@ -719,9 +775,7 @@ class HeadroomClient:
         compute_prefix_hash(messages)
 
         # Apply transforms
-        output_buffer = (
-            headroom_output_buffer_tokens or self._config.rolling_window.output_buffer_tokens
-        )
+        output_buffer = headroom_output_buffer_tokens or self._config.output_buffer_tokens
         model_limit = self._get_context_limit(model)
 
         result = self._pipeline.simulate(
@@ -931,7 +985,6 @@ class HeadroomClient:
                 },
                 "transforms": {
                     "smart_crusher_enabled": bool,
-                    "rolling_window_enabled": bool,
                     "cache_aligner_enabled": bool,
                 },
             }
@@ -960,7 +1013,6 @@ class HeadroomClient:
             },
             "transforms": {
                 "smart_crusher_enabled": self._config.smart_crusher.enabled,
-                "rolling_window_enabled": self._config.rolling_window.enabled,
                 "cache_aligner_enabled": self._config.cache_aligner.enabled,
             },
         }

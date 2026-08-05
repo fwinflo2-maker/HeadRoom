@@ -91,13 +91,30 @@ class CodexPlugin(LearnPlugin, ConversationScanner):
             )
         ]
 
-    def scan_project(self, project: ProjectInfo) -> list[SessionData]:
-        """Scan all Codex session JSON files."""
-        sessions = []
-        for json_path in self._iter_session_files(project.data_path):
-            session = self._scan_session(json_path)
-            if session and session.tool_calls:
-                sessions.append(session)
+    def scan_project(
+        self, project: ProjectInfo, max_workers: int = 1, include_subagents: bool = True
+    ) -> list[SessionData]:
+        """Scan all Codex session JSON files.
+
+        ``include_subagents`` is accepted for a uniform plugin contract but is a
+        no-op: Codex stores sessions flat, with no nested transcript hierarchy.
+        """
+        session_files = self._iter_session_files(project.data_path)
+        if not session_files:
+            return []
+
+        if max_workers <= 1 or len(session_files) <= 1:
+            return [s for f in session_files if (s := self._scan_session(f)) and s.tool_calls]
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        sessions: list[SessionData] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self._scan_session, f): f for f in session_files}
+            for future in as_completed(futures):
+                session = future.result()
+                if session and session.tool_calls:
+                    sessions.append(session)
         return sessions
 
     def _scan_session(self, json_path: Path) -> SessionData | None:
@@ -109,7 +126,7 @@ class CodexPlugin(LearnPlugin, ConversationScanner):
     def _scan_json_session(self, json_path: Path) -> SessionData | None:
         """Parse a single Codex session file."""
         try:
-            with open(json_path) as f:
+            with open(json_path, encoding="utf-8", errors="replace") as f:
                 data = json.load(f)
         except (OSError, json.JSONDecodeError) as e:
             logger.debug("Failed to read Codex session %s: %s", json_path, e)
@@ -192,7 +209,7 @@ class CodexPlugin(LearnPlugin, ConversationScanner):
         msg_index = 0
 
         try:
-            with open(jsonl_path) as f:
+            with open(jsonl_path, encoding="utf-8", errors="replace") as f:
                 for line in f:
                     try:
                         entry = json.loads(line)

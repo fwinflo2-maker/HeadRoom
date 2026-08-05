@@ -1,6 +1,13 @@
 # VCS
-.git
+.git/*
+!.git/HEAD
+!.git/packed-refs
+!.git/refs/
+!.git/refs/**
 .github
+.github/*
+!.github/plugin/
+!.github/plugin/**
 .gitignore
 
 # Python artifacts
@@ -38,6 +45,8 @@ plugins/
 !plugins/
 !plugins/openclaw/
 !plugins/openclaw/**
+!plugins/headroom-agent-hooks/
+!plugins/headroom-agent-hooks/**
 node_modules/
 *.tgz
 
@@ -61,3 +70,8 @@ docker-compose*.yml
 .superpowers/
 examples/
 node-compile-cache/
+!e2e/
+!e2e/init/
+!e2e/init/**
+!.claude-plugin/
+!.claude-plugin/**

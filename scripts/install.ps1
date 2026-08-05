@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 
-$ImageDefault = 'ghcr.io/chopratejas/headroom:latest'
+$ImageDefault = 'ghcr.io/headroomlabs-ai/headroom:latest'
 $InstallImage = if ($env:HEADROOM_DOCKER_IMAGE) { $env:HEADROOM_DOCKER_IMAGE } else { $ImageDefault }
 $InstallDir = Join-Path $HOME '.local\bin'
 if (-not (Test-Path (Join-Path $HOME '.local'))) {
@@ -87,11 +87,6 @@ function Require-Command {
     }
 }
 
-function Get-RtkTarget {
-    $arch = if ($env:PROCESSOR_ARCHITECTURE -match 'ARM64') { 'aarch64' } else { 'x86_64' }
-    return "${arch}-pc-windows-msvc"
-}
-
 function Ensure-HostDirs {
     foreach ($dir in @(
         (Join-Path $HostHome '.headroom'),
@@ -136,6 +131,11 @@ function Get-SharedDockerArgs {
     $args.Add("HOME=$ContainerHome")
     $args.Add('--env')
     $args.Add('PYTHONUNBUFFERED=1')
+    # Canonical Headroom filesystem contract (issue #175).
+    $args.Add('--env')
+    $args.Add("HEADROOM_WORKSPACE_DIR=$ContainerHome/.headroom")
+    $args.Add('--env')
+    $args.Add("HEADROOM_CONFIG_DIR=$ContainerHome/.headroom/config")
     $args.Add('--volume')
     $args.Add("${PWD}:/workspace")
     $args.Add('--volume')
@@ -325,6 +325,11 @@ function Get-PersistentDockerArgs {
     $args.Add("HOME=$ContainerHome")
     $args.Add('--env')
     $args.Add('PYTHONUNBUFFERED=1')
+    # Canonical Headroom filesystem contract (issue #175).
+    $args.Add('--env')
+    $args.Add("HEADROOM_WORKSPACE_DIR=$ContainerHome/.headroom")
+    $args.Add('--env')
+    $args.Add("HEADROOM_CONFIG_DIR=$ContainerHome/.headroom/config")
     $args.Add('--volume')
     $args.Add((Join-Path $HostHome '.headroom') + ":$ContainerHome/.headroom")
     $args.Add('--volume')
@@ -606,7 +611,7 @@ function Show-InstallApplyHelp {
         '  --mode TEXT                   Proxy optimization mode.  [default: token]',
         '  --memory                      Enable persistent memory in the runtime.',
         '  --no-telemetry                Disable anonymous telemetry in the runtime.',
-        '  --image TEXT                  Docker image to use.  [default: HEADROOM_DOCKER_IMAGE or ghcr.io/chopratejas/headroom:latest]',
+        '  --image TEXT                  Docker image to use.  [default: HEADROOM_DOCKER_IMAGE or ghcr.io/headroomlabs-ai/headroom:latest]',
         '  -?, --help                    Show this message and exit.'
     )
     Write-Host ($lines -join [Environment]::NewLine)
@@ -813,20 +818,6 @@ function Parse-InstallProfileArgs {
     }
 
     return $profile
-}
-
-function Invoke-ClaudeRtkInit {
-    $rtkPath = Join-Path $HostHome '.headroom\bin\rtk.exe'
-    if (-not (Test-Path $rtkPath)) {
-        Write-Warning "rtk was not installed at $rtkPath; Claude hooks were not registered"
-        return
-    }
-
-    try {
-        & $rtkPath init --global --auto-patch | Out-Null
-    } catch {
-        Write-Warning "Failed to register Claude hooks with rtk; continuing without hook registration"
-    }
 }
 
 function Invoke-WithTemporaryEnv {
@@ -1357,7 +1348,6 @@ function Parse-WrapArgs {
     $known = New-Object System.Collections.Generic.List[string]
     $hostArgs = New-Object System.Collections.Generic.List[string]
     $port = 8787
-    $noRtk = $false
     $noProxy = $false
     $learn = $false
     $backend = $null
@@ -1385,12 +1375,6 @@ function Parse-WrapArgs {
             }
             '^--port=' {
                 $port = Parse-PortValue -Value ($arg -replace '^--port=', '')
-                $known.Add($arg)
-                $i += 1
-                continue
-            }
-            '^--no-rtk$' {
-                $noRtk = $true
                 $known.Add($arg)
                 $i += 1
                 continue
@@ -1454,6 +1438,13 @@ function Parse-WrapArgs {
                 $i += 1
                 continue
             }
+            '^--rtk$|^--no-rtk$|^--no-project-rtk$|^--keep-rtk$|^--context-tool$|^--context-tool=|^--no-context-tool$' {
+                # Retired CLI context tools (rtk, lean-ctx). Reject explicitly: the
+                # default branch below forwards the first unknown flag AND everything
+                # after it to the wrapped tool, so a leftover --no-rtk in a script
+                # would silently swallow a following --port and be ignored downstream.
+                Fail "CLI context tools (rtk, lean-ctx) have been removed from Headroom. Drop $arg and unset HEADROOM_CONTEXT_TOOL; 'headroom wrap' uninstalls what they left behind on first run."
+            }
             default {
                 for ($j = $i; $j -lt $Arguments.Count; $j++) {
                     $hostArgs.Add($Arguments[$j])
@@ -1467,7 +1458,6 @@ function Parse-WrapArgs {
         KnownArgs = $known.ToArray()
         HostArgs = $hostArgs.ToArray()
         Port = $port
-        NoRtk = $noRtk
         NoProxy = $noProxy
         Learn = $learn
         Backend = $backend
@@ -1486,8 +1476,6 @@ function Invoke-PrepareOnly {
     $dockerArgs.AddRange([string[]]@('run','--rm'))
     Add-TtyArgs -ArgsList $dockerArgs
     $dockerArgs.AddRange((Get-SharedDockerArgs))
-    $dockerArgs.Add('--env')
-    $dockerArgs.Add("HEADROOM_RTK_TARGET=$(Get-RtkTarget)")
     $dockerArgs.Add('--entrypoint')
     $dockerArgs.Add('headroom')
     $dockerArgs.Add($HeadroomImage)
@@ -1569,7 +1557,7 @@ switch ($args[0]) {
         }
 
         if ($args.Count -lt 2) {
-            Fail 'Usage: headroom wrap <claude|codex|aider|cursor|openclaw> [...]'
+            Fail 'Usage: headroom wrap <claude|codex|aider|cursor|openclaw|opencode> [...]'
         }
 
         $tool = $args[1]
@@ -1581,8 +1569,9 @@ switch ($args[0]) {
             'aider' { }
             'cursor' { }
             'openclaw' { }
+            'opencode' { }
             default {
-                Fail "Docker-native wrapper does not support 'wrap $tool'. Supported targets: claude, codex, aider, cursor, openclaw"
+                Fail "Docker-native wrapper does not support 'wrap $tool'. Supported targets: claude, codex, aider, cursor, openclaw, opencode"
             }
         }
 
@@ -1627,7 +1616,6 @@ switch ($args[0]) {
 
             switch ($tool) {
                 'claude' {
-                    if (-not $parsed.NoRtk) { Invoke-ClaudeRtkInit }
                     $exitCode = Invoke-WithTemporaryEnv -Environment @{ ANTHROPIC_BASE_URL = "http://127.0.0.1:$($parsed.Port)" } -Command 'claude' -Arguments $parsed.HostArgs
                     exit $exitCode
                 }

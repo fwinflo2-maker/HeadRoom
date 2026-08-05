@@ -26,27 +26,55 @@ import logging
 import os
 import tempfile
 import threading
+import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+from headroom import paths as _paths
 from headroom.subscription.base import QuotaTracker
 from headroom.subscription.client import SubscriptionClient
 from headroom.subscription.models import (
     HeadroomContribution,
+    RateLimitWindow,
     SubscriptionSnapshot,
     SubscriptionState,
     WindowDiscrepancy,
     WindowTokens,
     _utc_now,
+    synthesize_window_render,
 )
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_POLL_INTERVAL_S = 10
+_DEFAULT_POLL_INTERVAL_S = 300
 _DEFAULT_ACTIVE_WINDOW_S = 60
-_PERSIST_FILE_ENV = "HEADROOM_SUBSCRIPTION_STATE_PATH"
+_PERSIST_FILE_ENV = _paths.HEADROOM_SUBSCRIPTION_STATE_PATH_ENV
 _DEFAULT_PERSIST_DIR = ".headroom"
 _DEFAULT_PERSIST_FILE = "subscription_state.json"
+
+# Singleton on-demand poll floor (seconds): the dashboard may request a fresh
+# poll if the cached snapshot is stale, but we cap how often we will actually
+# hit Anthropic to avoid 429s / OAuth-token flagging. Bounded across users.
+_DEFAULT_ON_DEMAND_POLL_FLOOR_S = 60.0
+
+# Hard timeout for the on-demand poll so a slow upstream never blocks the
+# dashboard request handler.
+_ON_DEMAND_POLL_TIMEOUT_S = 2.0
+
+# Rolling-window lengths. Single-value constants because Anthropic's API
+# defines exactly one 5-hour and one 7-day window.
+_FIVE_HOUR_WINDOW = timedelta(hours=5)
+_SEVEN_DAY_WINDOW = timedelta(days=7)
+
+# A genuine 5-hour-window rollover advances ``five_hour.resets_at`` by ~5 hours.
+# The usage API, however, reports ``resets_at`` with second-level jitter — it has
+# been observed flapping between e.g. ``01:59:59Z`` and ``02:00:00Z`` on
+# consecutive polls within the *same* window. A bare ``!=`` comparison therefore
+# misfires on essentially every poll, zeroing the contribution counters every
+# poll interval instead of once per window. Only treat a *forward* jump larger
+# than this threshold as a real rollover (jitter is sub-second; a rollover is hours).
+_ROLLOVER_MIN_ADVANCE = timedelta(minutes=1)
 
 # Surge pricing threshold: if actual utilization is >N% higher than expected,
 # flag it as a potential surge pricing event.
@@ -58,10 +86,7 @@ _CACHE_MISS_RATIO_THRESHOLD = 0.10
 
 
 def _get_persist_path() -> Path:
-    env = os.environ.get(_PERSIST_FILE_ENV, "").strip()
-    if env:
-        return Path(env)
-    return Path.home() / _DEFAULT_PERSIST_DIR / _DEFAULT_PERSIST_FILE
+    return _paths.subscription_state_path()
 
 
 class SubscriptionTracker(QuotaTracker):
@@ -72,7 +97,7 @@ class SubscriptionTracker(QuotaTracker):
     alongside the Codex and Copilot trackers.
 
     Args:
-        poll_interval_s: Seconds between polls while active (1–300).
+        poll_interval_s: Seconds between polls while active (1–3600, default 300).
         active_window_s: Seconds since last notify_active call that keeps
             polling alive (default 60 = 1 minute).
         enabled: Set to ``False`` to disable tracking (mirrors
@@ -94,7 +119,7 @@ class SubscriptionTracker(QuotaTracker):
         client: SubscriptionClient | None = None,
     ) -> None:
         self._enabled = enabled
-        self._poll_interval_s = max(1, min(poll_interval_s, 300))
+        self._poll_interval_s = max(1, min(poll_interval_s, 3600))
         self._active_window_s = max(5.0, active_window_s)
         self._persist_path = persist_path or _get_persist_path()
         self._client = client or SubscriptionClient()
@@ -106,6 +131,11 @@ class SubscriptionTracker(QuotaTracker):
 
         self._stop_event: asyncio.Event | None = None
         self._poll_task: asyncio.Task[None] | None = None
+
+        # Unix-ts of the last on-demand poll triggered from the dashboard.
+        # Floor-gated by ``_DEFAULT_ON_DEMAND_POLL_FLOOR_S``.
+        self._last_on_demand_poll: float = 0.0
+        self._on_demand_poll_floor_s: float = _DEFAULT_ON_DEMAND_POLL_FLOOR_S
 
         self._load_persisted_state()
 
@@ -172,7 +202,6 @@ class SubscriptionTracker(QuotaTracker):
         *,
         tokens_submitted: int = 0,
         tokens_saved_compression: int = 0,
-        tokens_saved_rtk: int = 0,
         tokens_saved_cache_reads: int = 0,
         compression_savings_usd: float = 0.0,
         cache_savings_usd: float = 0.0,
@@ -185,7 +214,6 @@ class SubscriptionTracker(QuotaTracker):
             c = self._state.contribution
             c.tokens_submitted += max(tokens_submitted, 0)
             c.tokens_saved_compression += max(tokens_saved_compression, 0)
-            c.tokens_saved_rtk += max(tokens_saved_rtk, 0)
             c.tokens_saved_cache_reads += max(tokens_saved_cache_reads, 0)
             c.compression_savings_usd += max(compression_savings_usd, 0.0)
             c.cache_savings_usd += max(cache_savings_usd, 0.0)
@@ -210,6 +238,132 @@ class SubscriptionTracker(QuotaTracker):
             return self._state.is_active(active_window_s=self._active_window_s)
 
     # ------------------------------------------------------------------
+    # Display-time rendering (issue #281)
+    # ------------------------------------------------------------------
+
+    def render_state(self) -> dict[str, Any]:
+        """Return the dashboard-facing state dict, synthesizing post-reset.
+
+        Background poll cadence is capped at 5 minutes by Anthropic-tolerance
+        constraints; if the user's 5-hour window rolls over between two polls
+        the cached ``utilization_pct`` is stale and the dashboard would render
+        the OLD window's percentage even though Claude Code itself shows 0%
+        (issue #281). To avoid lying to the user without hammering the API,
+        we synthesize the post-reset windows here using locally-tracked
+        transcript token counts.
+
+        The returned dict preserves every key in :meth:`SubscriptionState
+        .to_dict` for backward compatibility; per-window dicts inside
+        ``latest`` gain ``synthesized: bool`` and ``resets_at_estimated:
+        bool`` keys plus an optional ``render_warning`` string when synthesis
+        falls back.
+        """
+        with self._lock:
+            base = self._state.to_dict()
+            snapshot = self._state.latest
+
+        if snapshot is None or base.get("latest") is None:
+            return base
+
+        latest_dict = base["latest"]
+        latest_dict["five_hour"] = self._render_window(
+            snapshot.five_hour,
+            window_duration=_FIVE_HOUR_WINDOW,
+            window_name="five_hour",
+        )
+        latest_dict["seven_day"] = self._render_window(
+            snapshot.seven_day,
+            window_duration=_SEVEN_DAY_WINDOW,
+            window_name="seven_day",
+        )
+        if snapshot.seven_day_opus is not None:
+            latest_dict["seven_day_opus"] = self._render_window(
+                snapshot.seven_day_opus,
+                window_duration=_SEVEN_DAY_WINDOW,
+                window_name="seven_day_opus",
+            )
+        if snapshot.seven_day_sonnet is not None:
+            latest_dict["seven_day_sonnet"] = self._render_window(
+                snapshot.seven_day_sonnet,
+                window_duration=_SEVEN_DAY_WINDOW,
+                window_name="seven_day_sonnet",
+            )
+        return base
+
+    def _render_window(
+        self,
+        window: RateLimitWindow | None,
+        *,
+        window_duration: timedelta,
+        window_name: str,
+    ) -> dict[str, Any]:
+        used_since_reset = self._compute_used_since_reset(window)
+        return synthesize_window_render(
+            window,
+            used_since_reset=used_since_reset,
+            window_duration=window_duration,
+            window_name=window_name,
+        )
+
+    def _compute_used_since_reset(self, window: RateLimitWindow | None) -> int | None:
+        """Read transcripts to count tokens spent strictly after ``window.resets_at``.
+
+        Returns ``None`` if the window has no observed reset time or if the
+        transcript scan fails (caller treats ``None`` as 0 for arithmetic
+        but propagates a render_warning when synthesis is otherwise
+        attempted).
+        """
+        if window is None or window.resets_at is None:
+            return None
+        now = _utc_now()
+        if now < window.resets_at:
+            return None
+        try:
+            from headroom.subscription import session_tracking
+
+            tokens = session_tracking.compute_window_tokens(
+                window.resets_at.timestamp(), now.timestamp()
+            )
+            return int(tokens.weighted_token_equivalent or tokens.total_raw())
+        except Exception as exc:
+            logger.warning("event=subscription_render_used_since_reset_failed error=%s", exc)
+            return None
+
+    async def maybe_poll_on_demand(self) -> None:
+        """Trigger at most one bounded poll per ``_DEFAULT_ON_DEMAND_POLL_FLOOR_S``.
+
+        Called from the ``/subscription-window`` endpoint so a dashboard
+        refresh can pull a fresh snapshot when the cache is stale, while
+        keeping fleet-wide poll rate within Anthropic tolerance. All
+        exceptions are swallowed and logged — never propagated.
+        """
+        now_ts = time.time()
+        with self._lock:
+            elapsed = now_ts - self._last_on_demand_poll
+            if elapsed < self._on_demand_poll_floor_s:
+                logger.info(
+                    "event=subscription_on_demand_poll_skipped_floor elapsed_s=%.1f floor_s=%.1f",
+                    elapsed,
+                    self._on_demand_poll_floor_s,
+                )
+                return
+            self._last_on_demand_poll = now_ts
+
+        logger.info(
+            "event=subscription_on_demand_poll_triggered floor_s=%.1f",
+            self._on_demand_poll_floor_s,
+        )
+        try:
+            await asyncio.wait_for(self._maybe_poll(), timeout=_ON_DEMAND_POLL_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "event=subscription_on_demand_poll_timeout timeout_s=%.1f",
+                _ON_DEMAND_POLL_TIMEOUT_S,
+            )
+        except Exception as exc:
+            logger.warning("event=subscription_on_demand_poll_failed error=%s", exc)
+
+    # ------------------------------------------------------------------
     # Poll loop
     # ------------------------------------------------------------------
 
@@ -221,8 +375,13 @@ class SubscriptionTracker(QuotaTracker):
             except Exception as exc:
                 logger.warning("Subscription tracker poll error: %s", exc)
             try:
+                # NOTE: do NOT wrap in asyncio.shield() — shield prevents the
+                # inner Event.wait() from being cancelled when wait_for times
+                # out, leaking one Task per poll interval. Over hours the
+                # accumulated idle waiters bog down the event loop scheduler
+                # (observed as the "aged proxy degradation" in 2026-04-17).
                 await asyncio.wait_for(
-                    asyncio.shield(self._stop_event.wait()),
+                    self._stop_event.wait(),
                     timeout=self._poll_interval_s,
                 )
                 break  # stop event was set
@@ -249,8 +408,9 @@ class SubscriptionTracker(QuotaTracker):
                 self._state.mark_error("fetch returned None")
             return
 
-        # Read transcript-based window tokens
-        window_tokens = _compute_window_tokens_for_snapshot(snapshot)
+        # Offload off the event loop: this scans every ~/.claude/projects/**/*.jsonl
+        # transcript and json.loads each line, which can take seconds and block /health.
+        window_tokens = await asyncio.to_thread(_compute_window_tokens_for_snapshot, snapshot)
 
         # Detect anomalies
         discrepancies = _detect_discrepancies(snapshot, window_tokens)
@@ -289,7 +449,7 @@ class SubscriptionTracker(QuotaTracker):
         if (
             prev_resets_at is not None
             and curr_resets_at is not None
-            and curr_resets_at != prev_resets_at
+            and curr_resets_at - prev_resets_at > _ROLLOVER_MIN_ADVANCE
         ):
             logger.info("5h window rolled over; resetting headroom contribution counters")
             self._state.contribution = HeadroomContribution()
@@ -326,8 +486,16 @@ class SubscriptionTracker(QuotaTracker):
             c = self._state.contribution
             c.tokens_submitted = int(contrib.get("tokens_submitted", 0))
             saved = contrib.get("tokens_saved", {})
-            c.tokens_saved_compression = int(saved.get("compression", 0))
-            c.tokens_saved_rtk = int(saved.get("rtk", 0))
+            # Newer state writes dashboard-facing ``compression`` as
+            # proxy-compression + CLI filtering. Prefer the raw proxy field when
+            # present so loading does not double-count CLI filtering.
+            c.tokens_saved_compression = int(
+                saved.get("proxy_compression", saved.get("compression", 0))
+            )
+            # State written before the CLI context tools were removed also carries
+            # ``cli_filtering`` / ``cli_filtering_raw`` / ``rtk`` / ``rtk_raw``
+            # counters. Those tools are gone, so the keys are simply ignored —
+            # read must stay tolerant of them rather than raising on an old file.
             c.tokens_saved_cache_reads = int(saved.get("cache_reads", 0))
             savings_usd = contrib.get("savings_usd", {})
             c.compression_savings_usd = float(savings_usd.get("compression", 0.0))

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import fnmatch
+import json
+from collections.abc import Iterable
+from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
@@ -21,30 +24,6 @@ class HeadroomMode(str, Enum):
 # Model context limits should be provided by the Provider
 # This dict allows user overrides only
 DEFAULT_MODEL_CONTEXT_LIMITS: dict[str, int] = {}
-
-
-@dataclass
-class ToolCrusherConfig:
-    """Configuration for tool output compression (naive/fixed-rule approach).
-
-    GOTCHAS:
-    - Keeps FIRST N items only - may miss important data later in arrays
-    - A spike at index 50 will be lost if max_array_items=10
-    - String truncation cuts at fixed length, may break mid-word/mid-sentence
-    - No awareness of data patterns or importance
-
-    Consider using SmartCrusherConfig instead for statistical analysis.
-    """
-
-    enabled: bool = False  # Disabled by default, SmartCrusher is preferred
-    min_tokens_to_crush: int = 500  # Only crush if > N tokens
-    max_array_items: int = 10  # Keep first N items
-    max_string_length: int = 1000  # Truncate strings > N chars
-    max_depth: int = 5  # Preserve structure to depth N
-    preserve_keys: set[str] = field(
-        default_factory=lambda: {"error", "status", "code", "id", "message", "name", "type"}
-    )
-    tool_profiles: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -120,130 +99,6 @@ class CacheAlignerConfig:
     # Separator used to mark where dynamic content begins in system message
     # Content before this separator is cached; content after is dynamic
     dynamic_tail_separator: str = "\n\n---\n[Dynamic Context]\n"
-
-
-@dataclass
-class RollingWindowConfig:
-    """Configuration for rolling window token cap.
-
-    GOTCHAS:
-    - Dropping old turns loses context the model may need:
-      - "As I mentioned earlier..." - what was mentioned is now gone
-      - "The user asked about X" - that turn may be dropped
-      - Implicit references to prior conversation become orphaned
-    - Tool call/result pairs are kept atomic (correct), BUT:
-      - Assistant text referencing a dropped tool result becomes confusing
-      - "Based on the search results..." when those results are gone
-    - keep_last_turns=2 may not be enough for complex multi-step reasoning
-    - No semantic analysis - drops oldest first regardless of importance
-
-    SAFER ALTERNATIVES:
-    - Increase keep_last_turns for agentic workloads
-    - Use summarization for old context (not implemented - would add latency)
-    - Set enabled=False for short conversations
-    """
-
-    enabled: bool = True
-    keep_system: bool = True  # Never drop system prompt
-    keep_last_turns: int = 2  # Never drop last N turns
-    output_buffer_tokens: int = 4000  # Reserve for output
-
-
-@dataclass
-class ScoringWeights:
-    """Weights for importance scoring factors.
-
-    All weights should sum to approximately 1.0 for normalized scoring.
-    These can be learned from TOIN retrieval patterns over time.
-
-    Design principle: NO HARDCODED PATTERNS. All importance is derived from:
-    - Computed metrics (recency, density, references)
-    - TOIN-learned patterns (field semantics, retrieval rates)
-    - Embedding similarity (semantic relevance)
-    """
-
-    recency: float = 0.20  # Exponential decay from conversation end
-    semantic_similarity: float = 0.20  # Embedding similarity to recent context
-    toin_importance: float = 0.25  # TOIN-learned field importance
-    error_indicator: float = 0.15  # TOIN-learned error field detection
-    forward_reference: float = 0.15  # Referenced by later messages
-    token_density: float = 0.05  # Information density (entropy-based)
-
-    def normalized(self) -> ScoringWeights:
-        """Return a copy with weights normalized to sum to 1.0."""
-        total = (
-            self.recency
-            + self.semantic_similarity
-            + self.toin_importance
-            + self.error_indicator
-            + self.forward_reference
-            + self.token_density
-        )
-        if total == 0:
-            return ScoringWeights()
-        return ScoringWeights(
-            recency=self.recency / total,
-            semantic_similarity=self.semantic_similarity / total,
-            toin_importance=self.toin_importance / total,
-            error_indicator=self.error_indicator / total,
-            forward_reference=self.forward_reference / total,
-            token_density=self.token_density / total,
-        )
-
-
-@dataclass
-class IntelligentContextConfig:
-    """Configuration for intelligent context management.
-
-    This extends RollingWindowConfig with semantic-aware scoring and
-    TOIN integration. All importance detection is learned, not hardcoded.
-
-    Phases:
-    - Phase 1 (current): Importance scoring + TOIN integration
-    - Phase 2 (future): Progressive summarization
-    - Phase 3 (future): Memory tiers with retrieval
-    """
-
-    # === Basic settings (backwards compatible with RollingWindowConfig) ===
-    enabled: bool = True
-    keep_system: bool = True
-    keep_last_turns: int = 2
-    output_buffer_tokens: int = 4000
-
-    # === Scoring configuration ===
-    use_importance_scoring: bool = True
-    scoring_weights: ScoringWeights = field(default_factory=ScoringWeights)
-
-    # Recency decay parameter (higher = faster decay)
-    recency_decay_rate: float = 0.1
-
-    # === TOIN integration ===
-    toin_integration: bool = True
-    toin_confidence_threshold: float = 0.3  # Min confidence to use TOIN signals
-
-    # === Strategy selection thresholds ===
-    # These determine when to try different strategies based on how much over budget
-    compress_threshold: float = 0.10  # Try deeper compression if <10% over
-
-    # === Summarization (Phase 2 - not yet implemented) ===
-    summarization_enabled: bool = False
-    summarization_model: str | None = None
-    summary_max_tokens: int = 500
-    summarize_threshold: float = 0.25  # Try summarization if <25% over
-
-    # === Memory tiers (Phase 3 - not yet implemented) ===
-    memory_tiers_enabled: bool = False
-    warm_tier_enabled: bool = False  # Summarized tier
-    cold_tier_enabled: bool = False  # Vector retrieval tier
-
-    def to_rolling_window_config(self) -> RollingWindowConfig:
-        """Convert to basic RollingWindowConfig for backwards compatibility."""
-        return RollingWindowConfig(
-            enabled=self.enabled,
-            keep_system=self.keep_system,
-            keep_last_turns=self.keep_last_turns,
-            output_buffer_tokens=self.output_buffer_tokens,
-        )
 
 
 @dataclass
@@ -355,7 +210,13 @@ class AnchorConfig:
 # Tool outputs that are reference data and must NOT be compressed.
 # Read/Glob/Grep contain exact file contents/search results the agent needs for edits.
 # Write/Edit record what changes were made — compressing them causes duplicate/conflicting edits.
+# WebSearch/WebFetch results are large reference payloads that must remain verbatim.
 # Bash is NOT excluded — its outputs (build logs, test output) are ideal compression targets.
+# To protect Bash or other non-excluded tools from lossy compression, use
+# HEADROOM_PROTECT_TOOL_RESULTS=Bash or --protect-tool-results Bash.
+# headroom_retrieve: its entire contract is returning already-retrieved, original
+# CCR content verbatim. Recompressing it writes a new <<ccr:hash>> marker the
+# agent can never redeem (#1077).
 DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
     {
         "Read",
@@ -363,16 +224,129 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         "Grep",
         "Write",
         "Edit",
-        "Bash",
+        "WebSearch",
+        "WebFetch",
+        "headroom_retrieve",
         # Lowercase variants for case-insensitive matching
         "read",
         "glob",
         "grep",
         "write",
         "edit",
-        "bash",
+        "web_search",
+        "web_fetch",
     }
 )
+
+# These excluded web-tool results must remain byte-faithful. Even the
+# excluded-tool lossless fold rewrites formatted JSON.
+# Three independent consumers key off this frozenset, all in
+# transforms/content_router.py: ContentRouter's two per-block CCR-retrieve
+# guards, and _cross_turn_dedup_messages's verbatim_tool_ids -- the latter has
+# no dedicated guard of its own, so removing headroom_retrieve from here would
+# silently reopen the retrieval loop for that path with cross-turn dedup on.
+DEFAULT_VERBATIM_EXCLUDE_TOOLS: frozenset[str] = frozenset(
+    {
+        "WebSearch",
+        "WebFetch",
+        "web_search",
+        "web_fetch",
+        "headroom_retrieve",
+    }
+)
+
+
+def _tool_name_aliases(name: str) -> tuple[str, ...]:
+    """Return equivalent spellings for tool exclusion matching."""
+    if not isinstance(name, str):
+        # Pre-existing fragility (not introduced here): a malformed message can
+        # put a non-string value in the tool-name map (see _build_tool_name_map's
+        # truthy-only `if tc_id and name:` filter). Fail safe -- no aliases means
+        # is_tool_excluded() returns False -- rather than crashing the pipeline.
+        return ()
+    aliases = [name]
+    lname = name.lower()
+
+    if lname.startswith("mcp__"):
+        # OpenAI-style MCP wrappers use mcp__server__tool. Custom agents that
+        # speak Anthropic sometimes emit the same wrapper as mcp_Server_tool.
+        parts = name.split("__", 2)
+        if len(parts) == 3 and parts[1] and parts[2]:
+            aliases.append(f"mcp_{parts[1]}_{parts[2]}")
+            aliases.append(parts[2])
+    elif lname.startswith("mcp_"):
+        parts = name.split("_", 2)
+        if len(parts) == 3 and parts[1] and parts[2]:
+            aliases.append(f"mcp__{parts[1]}__{parts[2]}")
+            aliases.append(parts[2])
+
+    return tuple(dict.fromkeys(aliases))
+
+
+# Hermes Agent's deferred-tool bridge. Hermes loads on-demand tools via a
+# `tool_search`/`tool_describe`/`tool_call` indirection; on the wire the
+# emitted tool call is named `tool_call` and the REAL tool name lives in the
+# arguments payload (`{"name": "...", "arguments": {...}}`). Tool exclusion /
+# protect lists match on the real name, so we must unwrap this bridge before
+# building the tool_call_id -> name map, or whitelists silently no-op for all
+# deferred tools.
+_HERMES_TOOL_CALL_WRAPPER = "tool_call"
+
+
+def unwrap_tool_call_name(name: str, arguments: Any) -> str:
+    """Extract the real tool name from a Hermes deferred ``tool_call`` wrapper.
+
+    Non-wrapper names pass through unchanged. Malformed/unparseable wrappers
+    fail open and return the wrapper name (caller decides what that means).
+    """
+    if name != _HERMES_TOOL_CALL_WRAPPER:
+        return name
+    raw = arguments
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            return name
+    if isinstance(raw, dict):
+        inner = raw.get("name")
+        if isinstance(inner, str) and inner.strip():
+            return inner.strip()
+    return name
+
+
+def is_tool_excluded(name: str, exclude_tools: Iterable[str]) -> bool:
+    """Return True if ``name`` matches the tool-exclusion set.
+
+    Plain entries match by exact (case-insensitive) name, so the common case
+    stays a set lookup. Entries containing a glob metacharacter (``*``, ``?`` or
+    ``[``) are matched with :func:`fnmatch.fnmatchcase`, letting a single pattern
+    such as ``mcp__*`` cover every tool an MCP server exposes without listing
+    each name (issue #870).
+
+    MCP tool wrappers are also matched through their common aliases. For example,
+    ``mcp__Headroom__headroom_retrieve`` and
+    ``mcp_Headroom_headroom_retrieve`` both match ``mcp__*`` and the bare
+    ``headroom_retrieve`` entry.
+    """
+    if not exclude_tools:
+        return False
+
+    patterns = tuple(exclude_tools)
+    if not patterns:
+        return False
+    aliases = _tool_name_aliases(name)
+    exact_patterns = set(patterns)
+    lower_exact_patterns = {pat.lower() for pat in exact_patterns}
+    if any(alias in exact_patterns or alias.lower() in lower_exact_patterns for alias in aliases):
+        return True
+
+    return any(
+        fnmatch.fnmatchcase(alias.lower(), pat.lower())
+        for alias in aliases
+        for pat in patterns
+        if "*" in pat or "?" in pat or "[" in pat
+    )
+
 
 # Tool names recognized as Read/Edit/Write for lifecycle tracking
 _READ_TOOL_NAMES: frozenset[str] = frozenset({"Read", "read"})
@@ -401,6 +375,48 @@ class ReadLifecycleConfig:
     compress_stale: bool = True  # Replace Reads of files that were later edited
     compress_superseded: bool = False  # Disabled: busts Anthropic prompt cache prefix
     min_size_bytes: int = 512  # Skip tiny Read outputs (not worth the overhead)
+
+
+@dataclass
+class ReadMaturationConfig:
+    """Mechanism B: hold-back Read maturation (compress before cache entry).
+
+    Motivation (measured by `headroom audit-reads`): the median Read stays
+    in context for ~118 assistant turns after it appears, billed at the
+    provider's cache-read rate every request — a Read's lifetime cost is
+    roughly 13x its size. The only cache-safe moment to shrink it is
+    BEFORE it is ever cache-written.
+
+    Mechanics: a fresh large Read is held out of the provider prefix
+    cache (the trailing cache breakpoint is relocated to just before it)
+    while its file is ACTIVE, stays verbatim the whole time the model is
+    working with it, and matures into a CCR-backed marker once the file
+    has been quiet for `quiesce_turns`. Only that final compressed form
+    ever enters the cache. No cached byte is ever mutated — there is
+    nothing to bust.
+
+    Activity-based (not a fixed hold window) because the audit-reads
+    simulation showed touch gaps are fat-tailed: next-touch p50 is 4
+    turns but p90 is 81 — no fixed window covers the tail, while a
+    quiesce rule covers the activity cluster and lets the tail self-heal
+    via the model's observed habit of re-reading ranges from disk (95%
+    of re-reads in real traffic are partial-range reads made while the
+    full text was still in context).
+
+    Disabled by default while the mechanism is validated in pilots.
+    """
+
+    enabled: bool = False
+    # Mature a held Read once its FILE has had no activity (reads or
+    # edits) for this many assistant turns. Simulation: next-touch p50
+    # is 4 turns, so 5 covers the median activity cluster.
+    quiesce_turns: int = 5
+    # Safety valve: mature regardless once held this many turns, bounding
+    # the hold-out cost for files that stay active for long stretches.
+    max_hold_turns: int = 25
+    # Only hold/mature Reads at least this large; small Reads are cached
+    # immediately as before (holding them costs more than it saves).
+    min_size_bytes: int = 2048
 
 
 @dataclass
@@ -471,7 +487,7 @@ class SmartCrusherConfig:
     - Set variance_threshold lower (1.5) to catch more change points
     """
 
-    enabled: bool = True  # Enabled by default (preferred over ToolCrusher)
+    enabled: bool = True  # Enabled by default — sole tool-output compressor
     min_items_to_analyze: int = 5  # Don't analyze tiny arrays
     min_tokens_to_crush: int = 200  # Only crush if > N tokens
     variance_threshold: float = 2.0  # Std devs for change point detection
@@ -505,6 +521,29 @@ class SmartCrusherConfig:
     # The remaining fraction is filled by importance scoring (errors, anomalies, etc.)
     first_fraction: float = 0.3  # 30% of K from start of array
     last_fraction: float = 0.15  # 15% of K from end of array
+
+    # Lossless-first dispatch: minimum byte-savings ratio for the lossless
+    # Table/CSV compaction path to win over the lossy path. Must stay in
+    # lockstep with the Rust default (smart_crusher config.rs) and the
+    # transforms-level dataclass.
+    lossless_min_savings_ratio: float = 0.15
+
+    # Strict lossless mode. When True, lossless tabular compaction still
+    # applies, but any path that would emit a CCR marker (lossy row-drop
+    # OR opaque-blob offload) leaves the content uncompacted instead, so
+    # the output is always marker-free and byte-recoverable. Mirrors the
+    # Rust default. See also `CCRConfig` — with this on, no `<<ccr:…>>`
+    # markers are produced regardless of CCR settings.
+    lossless_only: bool = False
+
+    # Compaction heuristics (mirror Rust CompactConfig). A field is "core"
+    # if present in at least this fraction of rows; arrays whose key sets
+    # are mostly non-core are bucketed by a discriminator instead.
+    compaction_core_field_fraction: float = 0.8
+    compaction_heterogeneous_core_ratio: float = 0.6
+    compaction_max_flatten_inner_keys: int = 6
+    compaction_min_buckets: int = 2
+    compaction_max_buckets: int = 8
 
 
 @dataclass
@@ -547,7 +586,7 @@ class CCRConfig:
     1. COMPRESS: SmartCrusher compresses array from 1000 to 20 items
     2. CACHE: Original 1000 items stored in CompressionStore
     3. INJECT: Marker added to tell LLM how to retrieve more
-    4. RETRIEVE: If LLM needs more, it calls headroom_retrieve(hash, query)
+    4. RETRIEVE: If LLM needs more, it calls headroom_retrieve(hash) to get the full original back
 
     Benefits:
     - Zero-risk compression: worst case = LLM retrieves what it needs
@@ -555,14 +594,20 @@ class CCRConfig:
     - Network effect: retrieval patterns improve compression for all users
 
     GOTCHAS:
-    - Cache has TTL (default 5 min) - retrieval fails after expiration
+    - Cache has TTL (default 30 min) - retrieval fails after expiration
     - Memory usage: ~1KB per cached entry
     - Only works with array compression (not string truncation)
     """
 
     enabled: bool = True  # Enable CCR (cache + retrieval markers)
     store_max_entries: int = 1000  # Max entries in compression store
-    store_ttl_seconds: int = 300  # Cache TTL (5 minutes)
+    # Session-scale TTL. The original 5-minute default predates agentic
+    # sessions that routinely run 30+ minutes; an expired entry silently
+    # converts "lossless with retrieval" into "lossy", so the TTL is the
+    # weakest link in the no-accuracy-loss guarantee. Kept in lockstep
+    # with Rust DEFAULT_TTL (crates/headroom-core/src/ccr/mod.rs) and
+    # DEFAULT_CCR_TTL_SECONDS (cache/compression_store.py).
+    store_ttl_seconds: int = 1800  # Cache TTL (30 minutes)
     inject_retrieval_marker: bool = True  # Add retrieval hint to compressed output
     feedback_enabled: bool = True  # Track retrieval events for learning
     min_items_to_cache: int = 20  # Only cache if original had >= N items
@@ -610,27 +655,32 @@ class HeadroomConfig:
     model_context_limits: dict[str, int] = field(
         default_factory=lambda: DEFAULT_MODEL_CONTEXT_LIMITS.copy()
     )
-    tool_crusher: ToolCrusherConfig = field(default_factory=ToolCrusherConfig)
     smart_crusher: SmartCrusherConfig = field(default_factory=SmartCrusherConfig)
     cache_aligner: CacheAlignerConfig = field(default_factory=CacheAlignerConfig)
-    rolling_window: RollingWindowConfig = field(default_factory=RollingWindowConfig)
     cache_optimizer: CacheOptimizerConfig = field(default_factory=CacheOptimizerConfig)
     ccr: CCRConfig = field(default_factory=CCRConfig)  # Compress-Cache-Retrieve
     prefix_freeze: PrefixFreezeConfig = field(default_factory=PrefixFreezeConfig)
 
-    # Content Router - intelligent content-type based compression
-    # Routes content to appropriate compressor (Kompress for text, SmartCrusher for JSON,
-    # CodeCompressor for code, LogCompressor for logs, etc.)
-    content_router_enabled: bool = True
+    # Output buffer reserved for the model's response when sizing the
+    # incoming context. Previously lived on RollingWindowConfig; hoisted
+    # to the top-level config when PR-B1 retired the rolling-window stage.
+    output_buffer_tokens: int = 4000
 
-    # Intelligent context management (Phase 2.5)
-    # When enabled, replaces RollingWindow with semantic-aware context management
-    intelligent_context: IntelligentContextConfig = field(
-        default_factory=lambda: IntelligentContextConfig(enabled=False)
-    )
+    # Deprecated compatibility argument. ContentRouter is always present
+    # in the default pipeline; accepting this avoids breaking old config
+    # constructors while keeping it out of runtime state.
+    content_router_enabled: InitVar[bool | None] = None
+
+    # Tool-result interceptors (ast-grep Read outline, etc.). Opt-in for now.
+    # Env var HEADROOM_INTERCEPT_ENABLED=1 also enables (for CLI `--intercept-tool-results`).
+    intercept_tool_results: bool = False
 
     # Debugging - opt-in diff artifact generation
     generate_diff_artifact: bool = False  # Enable to get detailed transform diffs
+
+    # Canonical pipeline lifecycle extensions
+    pipeline_extensions: list[Any] = field(default_factory=list)
+    discover_pipeline_extensions: bool = True
 
     def get_context_limit(self, model: str) -> int | None:
         """
@@ -674,6 +724,12 @@ class WasteSignals:
     whitespace_tokens: int = 0  # Repeated whitespace
     dynamic_date_tokens: int = 0  # Dynamic dates in system prompt
     repetition_tokens: int = 0  # Repeated content
+    reread_tokens: int = 0  # Tool results re-served after already appearing earlier
+    # Subset of reread_tokens whose first serve was compressed away (CCR
+    # marker left in its place) — re-reads attributable to over-compression
+    # rather than agent behavior (#899). Excluded from total() because the
+    # same tokens are already counted in reread_tokens.
+    reread_compressed_tokens: int = 0
 
     def total(self) -> int:
         """Total waste tokens detected."""
@@ -684,6 +740,7 @@ class WasteSignals:
             + self.whitespace_tokens
             + self.dynamic_date_tokens
             + self.repetition_tokens
+            + self.reread_tokens
         )
 
     def to_dict(self) -> dict[str, int]:
@@ -695,6 +752,8 @@ class WasteSignals:
             "whitespace": self.whitespace_tokens,
             "dynamic_date": self.dynamic_date_tokens,
             "repetition": self.repetition_tokens,
+            "reread": self.reread_tokens,
+            "reread_compressed": self.reread_compressed_tokens,
         }
 
 

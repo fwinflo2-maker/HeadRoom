@@ -50,8 +50,21 @@ curl http://localhost:8787/stats
 
 `/stats` keeps the existing live/session fields, including `savings_history`,
 for backward compatibility. The new `persistent_savings` block is durable local
-proxy compression history stored by default at `~/.headroom/proxy_savings.json`.
-Use `HEADROOM_SAVINGS_PATH` to override the file location.
+proxy compression history stored by default at
+`${HEADROOM_WORKSPACE_DIR}/proxy_savings.json` (i.e.
+`~/.headroom/proxy_savings.json` when `HEADROOM_WORKSPACE_DIR` is unset).
+Use `HEADROOM_SAVINGS_PATH` to override the file location directly, or
+set `HEADROOM_WORKSPACE_DIR` to relocate the entire state root. See the
+[Filesystem Contract](filesystem-contract.md) for details.
+
+> **`compression_savings_usd` needs LiteLLM (Python 3.13).** Dollar figures are
+> priced entirely from LiteLLM's cost tables, and LiteLLM can't be installed on
+> Python 3.14+. On 3.14 the token counts are unaffected but every USD field
+> (and the dashboard's *Proxy $ Saved* tile) reads `0`. `/stats` exposes a
+> top-level `"litellm_available"` boolean so clients can tell "genuinely $0"
+> apart from "pricing unavailable"; the dashboard uses it to prompt a reinstall
+> on 3.13 (`pipx reinstall headroom-ai --python python3.13`) rather than showing
+> a misleading `$0.00`.
 
 For Anthropic-style providers that return cache-write TTL buckets, `/stats`
 also surfaces observed cache TTL usage under `prefix_cache`:
@@ -96,7 +109,7 @@ curl http://localhost:8787/stats-history
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "generated_at": "2026-03-27T09:10:00Z",
   "lifetime": {
     "tokens_saved": 12500,
@@ -119,6 +132,12 @@ curl http://localhost:8787/stats-history
     "default_format": "json",
     "available_formats": ["json", "csv"],
     "available_series": ["history", "hourly", "daily", "weekly", "monthly"]
+  },
+  "history_summary": {
+    "mode": "compact",
+    "stored_points": 2048,
+    "returned_points": 500,
+    "compacted": true
   }
 }
 ```
@@ -128,11 +147,17 @@ compression history. It survives proxy restarts, tolerates missing or malformed
 state files, and powers the historical view in `/dashboard`. It now includes
 hourly, daily, weekly, and monthly chart-ready rollups.
 
+By default, the `history` array is compacted for transport efficiency. Use
+`history_mode=full` when you explicitly need the full retained checkpoint list,
+or `history_mode=none` when you only need the aggregate rollups and lifetime
+totals.
+
 For export-friendly downloads:
 
 ```bash
 curl "http://localhost:8787/stats-history?format=csv&series=daily"
 curl "http://localhost:8787/stats-history?format=csv&series=monthly"
+curl "http://localhost:8787/stats-history?history_mode=full"
 ```
 
 CSV exports are available for `history`, `hourly`, `daily`, `weekly`, and
@@ -157,6 +182,10 @@ headroom_tokens_saved_total 5678900
 # HELP headroom_requests_by_provider Requests by provider
 headroom_requests_by_provider{provider="anthropic"} 800
 headroom_requests_by_provider{provider="openai"} 434
+
+# HELP headroom_requests_by_stack Requests by Headroom integration stack
+headroom_requests_by_stack{stack="wrap_claude"} 612
+headroom_requests_by_stack{stack="adapter_ts_openai"} 48
 
 # HELP headroom_transform_timing_ms_sum Sum of transform timing in milliseconds
 headroom_transform_timing_ms_sum{transform="router"} 5123.7
@@ -228,10 +257,31 @@ Headroom's managed OTEL exporters are intentionally scoped to Headroom's own ins
 
 Headroom has two separate systems:
 
-- `HEADROOM_TELEMETRY` / `--no-telemetry` controls the privacy-preserving anonymous data-flywheel beacon and TOIN-related aggregate reporting.
+- `HEADROOM_TELEMETRY` / `--telemetry` / `--no-telemetry` controls the privacy-preserving anonymous data-flywheel beacon and TOIN-related aggregate reporting. It is **off by default** (opt-in): set `HEADROOM_TELEMETRY=on` or pass `--telemetry` to enable it.
 - `HEADROOM_OTEL_*` controls operational OTEL metric export.
 
 They are independent by design so you can disable the anonymous beacon while keeping OTEL metrics enabled, or vice versa.
+
+#### Beacon identity fields
+
+When the anonymous beacon is enabled, each report includes two identity fields
+so usage can be segmented by integration surface and deployment shape:
+
+- `headroom_stack` — how Headroom is invoked in this process. Values:
+  `proxy`, `wrap_<agent>` (e.g. `wrap_claude`, `wrap_codex`),
+  `adapter_<lang>_<provider>` (e.g. `adapter_ts_openai`), `mixed`
+  (multi-stack proxy with no dominant caller), or `unknown`. Overridable via
+  `HEADROOM_STACK`; `headroom wrap <tool>` sets it automatically.
+- `install_mode` — how the proxy is deployed. Values: `wrapped` (spawned by
+  `headroom wrap`), `persistent` (long-lived service on a fixed port),
+  `on_demand` (short-lived direct invocation), or `unknown`.
+- `requests_by_stack` — for proxies serving multiple integrations (e.g. a
+  persistent proxy hit by both `wrap_claude` and a TS adapter), a per-stack
+  request count dict mirroring the `headroom_requests_by_stack` counter.
+
+Clients tag requests with an `X-Headroom-Stack` header; the proxy's FastAPI
+middleware buckets these on `/v1/*`. Detection is best-effort — any failure
+falls back to `"unknown"` and never breaks the proxy.
 
 ### Langfuse
 
@@ -262,8 +312,7 @@ curl http://localhost:8787/health
 {
   "status": "healthy",
   "version": "0.1.0",
-  "uptime_seconds": 3600,
-  "llmlingua_enabled": false
+  "uptime_seconds": 3600
 }
 ```
 
@@ -361,8 +410,8 @@ DEBUG:headroom.transforms.smart_crusher:Kept items: [0,1,2,42,77,97,98,99] (erro
 # Log to file
 headroom proxy --log-file headroom.jsonl
 
-# Increase verbosity
-headroom proxy --log-level debug
+# Enable request logging
+headroom proxy --log-messages
 ```
 
 ## Grafana Dashboard

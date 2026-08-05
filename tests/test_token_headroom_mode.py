@@ -87,8 +87,13 @@ class TestMultiTurnCompression:
             _make_user_msg("now edit it"),
         ]
         frozen = cache.compute_frozen_count(messages)
-        # All 4 messages stable (user, tool_use, tool_result cached, user)
-        assert frozen == 4
+        # First 3 stable; trailing user message ("now edit it") is the
+        # live zone by construction — it has not been sent upstream
+        # before, so it cannot be in any provider prefix cache. Cap at
+        # len - 1 prevents the over-freeze pattern that produced 0 %
+        # compression for prose-format clients (issue observed
+        # 2026-05-07 with Cline+DeepSeek).
+        assert frozen == 3
 
         # apply_cached should swap the content
         result = cache.apply_cached(messages)
@@ -129,9 +134,10 @@ class TestMultiTurnCompression:
         # Now cache C too
         cache.store_compressed(CompressionCache.content_hash(code_c), "cc", tokens_saved=100)
 
-        # Turn 3: all cached
+        # Turn 3: all 6 messages structurally stable, but the trailing
+        # message is reserved as live zone. Frozen prefix = 5.
         frozen = cache.compute_frozen_count(messages)
-        assert frozen == 6  # all stable
+        assert frozen == 5
 
 
 class TestNoMessageInjection:
@@ -305,3 +311,251 @@ class TestUpdateFromResult:
         msg = _make_user_msg("same content")
         cache.update_from_result([msg], [msg])
         assert cache.get_stats()["entries"] == 0
+
+
+class TestProseFormatLiveZoneInvariant:
+    """Cline / OpenClaude / Aider — prose-format clients send tool calls
+    embedded in plain assistant text and tool results pasted into plain
+    user messages. There are no `tool_use`, `tool_result`, or
+    ``role: "tool"`` blocks anywhere in the conversation.
+
+    Pre-fix: ``compute_frozen_count`` walked all messages and found no
+    "unstable" boundary, returning ``len(messages)``. The pipeline then
+    froze every message — including the brand-new user turn — leaving
+    the live zone empty. ContentRouter saw ``saved 0`` on every request.
+    Bug observed 2026-05-07 with Cline+DeepSeek over /v1/chat/completions
+    in token mode.
+
+    Post-fix: cap at ``len(messages) - 1`` always reserves the trailing
+    message as the live zone. These tests lock that invariant.
+    """
+
+    def test_pure_user_assistant_turns_leave_live_zone(self):
+        cache = CompressionCache()
+        # A 6-turn Cline-shaped conversation: alternating user/assistant
+        # plain-text. No tool blocks of any kind.
+        messages = [
+            _make_user_msg("system instructions baked into first user msg"),
+            _make_assistant_msg("<execute_command>ls</execute_command>"),
+            _make_user_msg("[tool_result]\nfile1.py\nfile2.py\n[/tool_result]"),
+            _make_assistant_msg("<read_file>file1.py</read_file>"),
+            _make_user_msg("[tool_result]\n<contents...>\n[/tool_result]"),
+            _make_user_msg("now please refactor it"),
+        ]
+        frozen = cache.compute_frozen_count(messages)
+        # Pre-fix would return 6 (every plain message is "stable").
+        # Post-fix: 6 messages stable, capped at len-1 = 5.
+        assert frozen == 5
+        assert frozen < len(messages), (
+            "Live zone must never be empty; trailing user message must "
+            "always be available for compression"
+        )
+
+    def test_single_message_yields_zero_frozen(self):
+        # Edge case: only the user's first message, nothing to freeze.
+        cache = CompressionCache()
+        messages = [_make_user_msg("first turn")]
+        assert cache.compute_frozen_count(messages) == 0
+
+    def test_empty_messages_yields_zero(self):
+        cache = CompressionCache()
+        assert cache.compute_frozen_count([]) == 0
+
+    def test_two_messages_first_is_frozen_second_is_live(self):
+        cache = CompressionCache()
+        messages = [
+            _make_user_msg("turn 1 content"),
+            _make_user_msg("turn 2 — the live zone"),
+        ]
+        # First message structurally stable; trailing is live → 1 frozen.
+        assert cache.compute_frozen_count(messages) == 1
+
+    def test_anthropic_format_last_tool_result_is_still_live(self):
+        """Even when the trailing message is a tool_result whose content
+        IS in the cache, it stays in the live zone. Trailing == live by
+        construction; the cache-read decision is upstream's job."""
+        cache = CompressionCache()
+        code = _large_code_content(50)
+        cache.store_compressed(
+            CompressionCache.content_hash(code), "compressed code", tokens_saved=200
+        )
+        messages = [
+            _make_user_msg("hi"),
+            _make_assistant_msg("ok"),
+            _make_tool_result_msg("t1", code),
+        ]
+        frozen = cache.compute_frozen_count(messages)
+        # Walk gets to 3, cap clamps to 2 (= len-1).
+        assert frozen == 2
+
+    def test_openai_format_last_tool_msg_is_live(self):
+        cache = CompressionCache()
+        content = "tool output " * 100
+        cache.store_compressed(
+            CompressionCache.content_hash(content), "compressed", tokens_saved=300
+        )
+        messages = [
+            _make_user_msg("run cmd"),
+            _make_openai_tool_msg("tc1", content),
+        ]
+        # Walk: user (stable, 1), tool (cached, 2). Cap → 1.
+        assert cache.compute_frozen_count(messages) == 1
+
+
+# ── List-of-blocks tool_result content (Claude Code modern format) ──────────
+
+
+def _make_tool_result_list_content_msg(tool_id: str, texts: list[str]) -> dict:
+    """Anthropic-format tool result with list-of-blocks content.
+
+    Modern Claude Code sends ``tool_result`` content as a list of typed
+    blocks instead of a plain string.
+    """
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": tool_id,
+                "content": [{"type": "text", "text": t} for t in texts],
+            }
+        ],
+    }
+
+
+def _make_openai_tool_list_content_msg(tool_call_id: str, texts: list[str]) -> dict:
+    """OpenAI-format tool message with list-of-blocks content."""
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": [{"type": "text", "text": t} for t in texts],
+    }
+
+
+class TestExtractToolResultListContent:
+    """_extract_tool_result_content handles list-of-blocks content."""
+
+    def test_anthropic_string_content_preserved(self):
+        """Plain string content in Anthropic format still works."""
+        from headroom.cache.compression_cache import _extract_tool_result_content as f
+
+        msg = _make_tool_result_msg("t1", "hello world")
+        assert f(msg) == "hello world"
+
+    def test_anthropic_list_content_extracted(self):
+        """List-of-blocks content is extracted and joined."""
+        from headroom.cache.compression_cache import _extract_tool_result_content as f
+
+        msg = _make_tool_result_list_content_msg("t1", ["Line 1", "Line 2"])
+        assert f(msg) == "Line 1\nLine 2"
+
+    def test_anthropic_mixed_blocks(self):
+        """Non-text blocks (e.g. image) are skipped, only text blocks joined."""
+        from headroom.cache.compression_cache import _extract_tool_result_content as f
+
+        msg = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "content": [
+                        {"type": "text", "text": "Hello"},
+                        {"type": "image", "source": {"type": "base64", "data": "..."}},
+                        {"type": "text", "text": "World"},
+                    ],
+                }
+            ],
+        }
+        assert f(msg) == "Hello\nWorld"
+
+    def test_anthropic_list_empty_returns_none(self):
+        """Empty text-only list returns None."""
+        from headroom.cache.compression_cache import _extract_tool_result_content as f
+
+        msg = {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": []}],
+        }
+        assert f(msg) is None
+
+    def test_openai_list_content_extracted(self):
+        """OpenAI format tool message with list content is extracted."""
+        from headroom.cache.compression_cache import _extract_tool_result_content as f
+
+        msg = _make_openai_tool_list_content_msg("tc1", ["Result 1", "Result 2"])
+        assert f(msg) == "Result 1\nResult 2"
+
+    def test_openai_string_content_still_works(self):
+        """OpenAI format with plain string content is unchanged."""
+        from headroom.cache.compression_cache import _extract_tool_result_content as f
+
+        msg = _make_openai_tool_msg("tc1", "plain result")
+        assert f(msg) == "plain result"
+
+    def test_non_tool_msg_returns_none(self):
+        """Regular user/assistant messages return None."""
+        from headroom.cache.compression_cache import _extract_tool_result_content as f
+
+        assert f(_make_user_msg("hello")) is None
+        assert f(_make_assistant_msg("response")) is None
+
+
+class TestSwapToolResultListContent:
+    """_swap_tool_result_content preserves list-of-blocks structure."""
+
+    def test_swap_anthropic_list_content_preserves_structure(self):
+        """Swap on list-of-blocks content replaces text in place."""
+        from headroom.cache.compression_cache import _swap_tool_result_content
+
+        msg = _make_tool_result_list_content_msg("t1", ["original"])
+        swapped = _swap_tool_result_content(msg, "compressed")
+        inner = swapped["content"][0]["content"]
+        assert isinstance(inner, list)
+        assert inner[0]["type"] == "text"
+        assert inner[0]["text"] == "compressed"
+
+    def test_swap_anthropic_string_content_preserved(self):
+        """Swap on plain-string content still works."""
+        from headroom.cache.compression_cache import _swap_tool_result_content
+
+        msg = _make_tool_result_msg("t1", "original")
+        swapped = _swap_tool_result_content(msg, "compressed")
+        assert swapped["content"][0]["content"] == "compressed"
+
+    def test_swap_openai_list_content(self):
+        """Swap on OpenAI list-content replaces text."""
+        from headroom.cache.compression_cache import _swap_tool_result_content
+
+        msg = _make_openai_tool_list_content_msg("tc1", ["original"])
+        swapped = _swap_tool_result_content(msg, "compressed")
+        assert swapped["content"] == "compressed"
+
+    def test_swap_does_not_mutate_original(self):
+        """_swap_tool_result_content performs a deep copy."""
+        from headroom.cache.compression_cache import _swap_tool_result_content
+
+        msg = _make_tool_result_list_content_msg("t1", ["original"])
+        _swap_tool_result_content(msg, "compressed")
+        assert msg["content"][0]["content"][0]["text"] == "original"
+
+    def test_swap_list_content_adds_text_block_when_missing(self):
+        """When list has no text block, collapses to a single text block."""
+        from headroom.cache.compression_cache import _swap_tool_result_content
+
+        msg = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "content": [{"type": "image", "source": {"type": "base64", "data": "..."}}],
+                }
+            ],
+        }
+        swapped = _swap_tool_result_content(msg, "compressed")
+        inner = swapped["content"][0]["content"]
+        assert isinstance(inner, list)
+        assert len(inner) == 1
+        assert inner[0]["type"] == "text"
+        assert inner[0]["text"] == "compressed"

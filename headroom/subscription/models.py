@@ -4,15 +4,18 @@ Mirrors the Anthropic OAuth usage API response exactly, including:
   - five_hour / seven_day rolling windows (utilization + reset times)
   - seven_day_opus / seven_day_sonnet per-model 7-day windows
   - extra_usage overage block (credits stored in cents by Anthropic)
-  - Headroom contribution: tokens conserved by compression, rtk, cache
+  - Headroom contribution: tokens conserved by compression, CLI filtering, cache
   - Window discrepancy detection (surge pricing, cache-miss anomalies)
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -99,6 +102,129 @@ class RateLimitWindow:
             "resets_at": _to_utc_iso(self.resets_at) if self.resets_at else None,
             "seconds_to_reset": self.seconds_to_reset(),
         }
+
+
+# ---------------------------------------------------------------------------
+# Display-time synthesis
+# ---------------------------------------------------------------------------
+
+
+def synthesize_window_render(
+    window: RateLimitWindow | None,
+    *,
+    used_since_reset: int | None,
+    now: datetime | None = None,
+    window_duration: timedelta,
+    window_name: str = "window",
+) -> dict[str, Any]:
+    """Render a rate-limit window for the dashboard, synthesizing post-reset.
+
+    If ``now`` is past ``window.resets_at``, the cached snapshot is stale: we
+    return a synthesized dict whose ``used`` is the local transcript-derived
+    token count since the reset (capped at ``limit`` so we never display
+    >100%; we undercount tokens spent on Claude Code outside this proxy and
+    must never report >100%), and whose ``resets_at`` advances by
+    ``window_duration`` (marked ``estimated``). Otherwise the cached values
+    are returned verbatim with ``synthesized=False``.
+
+    On any unexpected data shape the function logs a warning and falls back
+    to the cached values with ``synthesized=False`` and a ``render_warning``
+    string — never raises into the caller.
+
+    Args:
+        window: The cached ``RateLimitWindow`` from the most recent poll.
+        used_since_reset: Locally-counted token usage strictly after
+            ``window.resets_at`` (None if we couldn't compute it).
+        now: Override the wall clock for testability. Defaults to UTC now.
+        window_duration: Length of the rolling window (e.g. 5h or 7d).
+        window_name: Label used in structured logs.
+
+    Returns:
+        A dict matching :meth:`RateLimitWindow.to_dict` plus the keys
+        ``synthesized: bool``, ``resets_at_estimated: bool`` and optional
+        ``render_warning: str``.
+    """
+    if window is None:
+        return {
+            "used": 0,
+            "limit": 0,
+            "utilization_pct": 0.0,
+            "resets_at": None,
+            "seconds_to_reset": None,
+            "synthesized": False,
+            "resets_at_estimated": False,
+        }
+
+    cached = window.to_dict()
+    cached["synthesized"] = False
+    cached["resets_at_estimated"] = False
+
+    if window.resets_at is None:
+        return cached
+
+    current_now = now if now is not None else _utc_now()
+
+    try:
+        if current_now < window.resets_at:
+            logger.debug(
+                "event=subscription_window_render_cached "
+                "window=%s used=%d limit=%d utilization_pct=%.2f",
+                window_name,
+                window.used,
+                window.limit,
+                window.utilization_pct,
+            )
+            return cached
+
+        # Past the reset boundary — synthesize.
+        limit = max(int(window.limit), 0)
+        used_local = int(used_since_reset) if used_since_reset is not None else 0
+        if used_local < 0:
+            used_local = 0
+        # Cap at limit: we undercount tokens spent on Claude Code outside this
+        # proxy; never report >100%.
+        capped_used = min(used_local, limit) if limit > 0 else used_local
+        utilization_pct = (capped_used / limit * 100.0) if limit > 0 else 0.0
+
+        # Walk forward by whole window_durations from the observed reset to
+        # land strictly after `current_now` — handles the rare case where the
+        # dashboard is loaded long after the reset (e.g. machine was asleep).
+        next_reset = window.resets_at
+        while next_reset <= current_now:
+            next_reset = next_reset + window_duration
+
+        seconds_to_reset = max((next_reset - current_now).total_seconds(), 0.0)
+
+        logger.debug(
+            "event=subscription_window_synthesized "
+            "window=%s used=%d limit=%d utilization_pct=%.2f "
+            "resets_at_estimated=%s",
+            window_name,
+            capped_used,
+            limit,
+            utilization_pct,
+            _to_utc_iso(next_reset),
+        )
+
+        return {
+            "used": capped_used,
+            "limit": limit,
+            "utilization_pct": round(utilization_pct, 2),
+            "resets_at": _to_utc_iso(next_reset),
+            "seconds_to_reset": seconds_to_reset,
+            "synthesized": True,
+            "resets_at_estimated": True,
+        }
+    except Exception as exc:
+        # Hard guarantee: never crash the dashboard. Loud warning so the
+        # operator can fix the underlying data shape.
+        logger.warning(
+            "event=subscription_render_synthesis_failed window=%s error=%s",
+            window_name,
+            exc,
+        )
+        cached["render_warning"] = f"synthesis_failed: {exc}"
+        return cached
 
 
 # ---------------------------------------------------------------------------
@@ -257,9 +383,6 @@ class HeadroomContribution:
     tokens_saved_compression: int = 0
     """Input tokens removed by proxy compression."""
 
-    tokens_saved_rtk: int = 0
-    """Tokens avoided by CLI filtering (rtk) before reaching context."""
-
     tokens_saved_cache_reads: int = 0
     """Input tokens served from Anthropic prefix-cache (discounted reads)."""
 
@@ -267,26 +390,45 @@ class HeadroomContribution:
     cache_savings_usd: float = 0.0
 
     def total_saved(self) -> int:
-        return self.tokens_saved_compression + self.tokens_saved_rtk + self.tokens_saved_cache_reads
+        return self.tokens_saved_compression + self.tokens_saved_cache_reads
+
+    def compression_saved(self) -> int:
+        """Tokens removed before model context by proxy compression."""
+
+        return self.tokens_saved_compression
 
     def total_savings_usd(self) -> float:
         return self.compression_savings_usd + self.cache_savings_usd
 
     def raw_without_headroom(self) -> int:
-        return self.tokens_submitted + self.tokens_saved_compression + self.tokens_saved_rtk
+        return self.tokens_submitted + self.tokens_saved_compression
 
     def efficiency_pct(self) -> float:
+        # Fraction of the pre-Headroom input that compression removed. Use
+        # compression_saved() (which excludes cache reads) as the numerator:
+        # raw_without_headroom() also excludes cache reads, so mixing
+        # total_saved() (which adds tokens_saved_cache_reads) into this ratio
+        # made it inconsistent with its own denominator and let efficiency exceed
+        # 100% (e.g. submitted=100, cache_reads=1000 -> 1000%). Cache reads are a
+        # provider-side discount on tokens that were still forwarded, not tokens
+        # Headroom removed, so they do not belong in a removal-efficiency ratio.
         raw = self.raw_without_headroom()
         if raw == 0:
             return 0.0
-        return round(self.total_saved() / raw * 100, 1)
+        return round(self.compression_saved() / raw * 100, 1)
 
     def to_dict(self) -> dict[str, Any]:
+        # Older persisted payloads also carry ``cli_filtering`` / ``rtk`` /
+        # ``cli_filtering_raw`` / ``rtk_raw`` keys from the retired CLI
+        # context-tool layer. They are simply no longer written or read;
+        # SubscriptionTracker loads state key-by-key with ``dict.get`` (never
+        # ``HeadroomContribution(**payload)``), so an on-disk payload carrying
+        # those extra keys still loads without raising.
         return {
             "tokens_submitted": self.tokens_submitted,
             "tokens_saved": {
-                "compression": self.tokens_saved_compression,
-                "rtk": self.tokens_saved_rtk,
+                "compression": self.compression_saved(),
+                "proxy_compression": self.tokens_saved_compression,
                 "cache_reads": self.tokens_saved_cache_reads,
                 "total": self.total_saved(),
             },

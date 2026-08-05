@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from headroom import paths as _paths
+
 if TYPE_CHECKING:
     from headroom.proxy.server import HeadroomProxy
 
@@ -37,8 +39,8 @@ logger = logging.getLogger("headroom.telemetry.reporter")
 # Grace period: if the cloud API is unreachable, use cached license for up to 7 days
 GRACE_PERIOD_SECONDS = 7 * 24 * 3600  # 7 days
 
-# Default cache location
-LICENSE_CACHE_PATH = Path.home() / ".headroom" / "license_cache.json"
+# Default cache location (workspace bucket, respects HEADROOM_WORKSPACE_DIR).
+LICENSE_CACHE_PATH = _paths.license_cache_path()
 
 
 @dataclass
@@ -330,14 +332,20 @@ class UsageReporter:
                     total_requests,
                     total_tokens_saved,
                 )
+                # Only advance the baseline after a confirmed 200. Usage is a
+                # delta against the last snapshot, so snapshotting on a failed
+                # send (non-200 or exception) would permanently drop this
+                # window's requests/tokens from billing — the next report starts
+                # from the advanced baseline and never re-includes them. Leaving
+                # both baselines intact makes the next report retry the full
+                # period. (The empty-report early-return above only advances the
+                # time, since there is nothing to lose.)
+                self._snapshot_metrics()
+                self._last_report_time = now
             else:
                 logger.warning("Usage report returned status %d", resp.status_code)
         except Exception:
             logger.warning("Failed to send usage report", exc_info=True)
-
-        # Update snapshot
-        self._snapshot_metrics()
-        self._last_report_time = now
 
     def _snapshot_metrics(self) -> None:
         """Take a snapshot of current proxy metrics for delta computation."""
@@ -355,7 +363,9 @@ class UsageReporter:
             return
         try:
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-            self._cache_path.write_text(json.dumps(self._license_info.to_dict(), indent=2))
+            self._cache_path.write_text(
+                json.dumps(self._license_info.to_dict(), indent=2), encoding="utf-8"
+            )
         except OSError:
             logger.warning("Could not save license cache to %s", self._cache_path)
 
@@ -363,7 +373,7 @@ class UsageReporter:
         """Load cached license info, or return a default if expired/missing."""
         try:
             if self._cache_path.exists():
-                data = json.loads(self._cache_path.read_text())
+                data = json.loads(self._cache_path.read_text(encoding="utf-8"))
                 cached = LicenseInfo.from_dict(data)
                 age = (datetime.now(timezone.utc) - cached.validated_at).total_seconds()
                 if age < GRACE_PERIOD_SECONDS:

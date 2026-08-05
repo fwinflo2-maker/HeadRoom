@@ -69,6 +69,16 @@ class RequestLog:
     cache_hit: bool
     transforms_applied: list[str]
 
+    # Provider-side cache economics (Anthropic prompt caching, #2438).
+    # ``cache_hit`` alone is ambiguous: a call billed cache-*creation* (write)
+    # cannot be told apart from a real cache-*read* hit. These raw deltas —
+    # already carried on RequestOutcome from the upstream response usage —
+    # let the JSONL telemetry reflect true economics (uncached input +
+    # cache_creation), not just the proxy's boolean.
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    uncached_input_tokens: int = 0
+
     # Waste signals detected in original messages
     waste_signals: dict[str, int] | None = None
 
@@ -309,6 +319,9 @@ class ProxyConfig:
     cost_tracking_enabled: bool = True
     budget_limit_usd: float | None = None
     budget_period: Literal["hourly", "daily", "monthly"] = "daily"
+    # What spend booked from Headroom's own token estimate (provider returned no
+    # usage breakdown) does to budget enforcement. See budget_basis_policy.
+    budget_estimated_basis: Literal["count", "ignore", "block"] = "count"
 
     # Logging
     log_requests: bool = True

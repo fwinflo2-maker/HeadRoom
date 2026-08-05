@@ -84,6 +84,20 @@ def resolution_candidates(model: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(candidates))
 
 
+def unwrapped_model_forms(model: str) -> tuple[str, ...]:
+    """Progressively drop leading gateway segments: ``a/b/c`` -> ``b/c``, ``c``.
+
+    A gateway-routed name wraps the real model id, and ``litellm.model_cost`` keys
+    the *unwrapped* form -- e.g. it has ``anthropic.claude-3-5-sonnet-20241022-v2:0``
+    but not ``bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0``. Deriving the
+    forms by splitting on ``/`` avoids maintaining yet another list of gateway
+    prefixes, and costs nothing when wrong: each candidate is an exact dict
+    lookup, so a bad guess simply misses.
+    """
+    parts = model.split("/")
+    return tuple("/".join(parts[i:]) for i in range(1, len(parts)))
+
+
 def pricing_lookup_candidates(model: str) -> tuple[str, ...]:
     """Return ordered LiteLLM model_cost keys to try for pricing lookup."""
     bare_model = _strip_vertex_version_suffix(model)
@@ -94,12 +108,17 @@ def pricing_lookup_candidates(model: str) -> tuple[str, ...]:
         for candidate_model in models
         for prefix in PRICE_LOOKUP_PROVIDER_PREFIXES
     )
+    # Unwrapped forms come after the prefixed ones so existing precedence is
+    # unchanged for names that already resolved.
+    candidates.extend(
+        form for candidate_model in models for form in unwrapped_model_forms(candidate_model)
+    )
     if bare_model != model and bare_model.lower().startswith("claude-"):
         candidates.extend((f"vertex_ai/{bare_model}", f"vertex_ai/{model}"))
     candidates.extend(
         alias
-        for candidate_model in models
-        for alias in (MODEL_ALIASES.get(candidate_model),)
+        for candidate in tuple(candidates)
+        for alias in (MODEL_ALIASES.get(candidate),)
         if alias is not None
     )
     return tuple(dict.fromkeys(candidates))

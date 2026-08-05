@@ -30,6 +30,7 @@ from headroom.proxy.helpers import (
 )
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
+from headroom.proxy.ws_headers import WS_HOP_BY_HOP_HEADERS
 from headroom.proxy.ws_session_registry import (
     TerminationCause,
     WebSocketSessionRegistry,
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
+from headroom.config import unwrap_tool_call_name
 from headroom.copilot_auth import (
     apply_copilot_api_auth,
     build_copilot_upstream_url,
@@ -67,14 +69,19 @@ from headroom.proxy.auth_mode import (
     should_stamp_codex_client,
 )
 from headroom.proxy.compression_decision import CompressionDecision
-from headroom.proxy.cost import _summarize_transforms, header_safe_transforms
+from headroom.proxy.cost import header_safe_transforms
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
-from headroom.proxy.project_context import classify_project, set_current_project
+from headroom.proxy.project_context import (
+    classify_project,
+    get_current_project,
+    set_current_project,
+)
+from headroom.proxy.token_counting import gemini_output_tokens
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -331,7 +338,7 @@ def _passthrough_usage_from_json(payload: Any) -> dict[str, int]:
     if isinstance(usage_meta, dict):
         return {
             "input_tokens": _usage_int(usage_meta.get("promptTokenCount")),
-            "output_tokens": _usage_int(usage_meta.get("candidatesTokenCount")),
+            "output_tokens": gemini_output_tokens(usage_meta),
             "cache_read_input_tokens": _usage_int(usage_meta.get("cachedContentTokenCount")),
         }
 
@@ -832,7 +839,7 @@ def _responses_input_to_learner_messages(
         if text:
             role = item.get("role")
             messages.append(
-                {"role": role if isinstance(role, str) and role else "user", "content": text}
+                {"role": role if isinstance(role, str) and role else "unknown", "content": text}
             )
     return messages
 
@@ -1205,6 +1212,12 @@ RESPONSES_CONTEXT_SEARCH_TIMEOUT_SECONDS = 2.0
 # typically sends the first frame within a few hundred milliseconds of the
 # accept) but short enough to bound the damage from a hung peer.
 WS_FIRST_FRAME_TIMEOUT_SECONDS = 60.0
+
+# Accepted values for ``config.mode`` on POST /v1/compress. Unset/None means
+# the default marker-free pipeline. Anything else is a 400 rather than a
+# silent fall-through to the default (a typo or an unsupported mode like
+# "lossless" would otherwise look like it worked).
+COMPRESS_MODES = ("ccr", "lossy_inline", "lossless_then_lossy")
 
 
 def _extract_codex_handshake_headers(upstream: Any) -> list[tuple[str, str]]:
@@ -1626,6 +1639,10 @@ class OpenAIHandlerMixin:
                 continue
             name = item.get("name")
             call_id = item.get("call_id")
+            if name:
+                # Hermes deferred tools arrive wrapped as `tool_call` with
+                # the real name inside the arguments/input payload.
+                name = unwrap_tool_call_name(name, item.get("arguments") or item.get("input"))
             if isinstance(name, str) and isinstance(call_id, str) and call_id:
                 function_name_by_call_id[call_id] = name
             if isinstance(name, str) and (
@@ -2201,6 +2218,7 @@ class OpenAIHandlerMixin:
         model: str,
         request_id: str,
         timing: dict[str, float] | None = None,
+        client: str | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
 
@@ -2338,7 +2356,9 @@ class OpenAIHandlerMixin:
         # one — hence a transform tag but no tokens_saved claim.
         from headroom.proxy.helpers import inject_tool_search_deferral_openai
 
-        _deferred_tools = inject_tool_search_deferral_openai(working.get("tools"), model)
+        _deferred_tools = inject_tool_search_deferral_openai(
+            working.get("tools"), model, client=client
+        )
         if _deferred_tools is not working.get("tools"):
             if working is payload:
                 working = copy.deepcopy(payload)
@@ -2359,16 +2379,48 @@ class OpenAIHandlerMixin:
         if registered_turn_hooks():
             if working is payload:
                 working = copy.deepcopy(payload)
+            # Match the ctx's `input or messages or []` truthy fallback so we write
+            # back / re-count the SAME list the hook was handed.
+            _msg_key = (
+                "input"
+                if working.get("input")
+                else ("messages" if working.get("messages") else None)
+            )
+            _msgs_before = (working.get(_msg_key) if _msg_key else None) or []
+            # Snapshot the pre-hook count BEFORE run_request_hooks — a hook may fold
+            # in place, which would corrupt a post-hook "before" measurement.
+            _mt_before = 0
+            if _msg_key:
+                try:
+                    _mt_before = self.openai_provider.get_token_counter(model).count_text(
+                        _json_debug_dumps(_msgs_before)
+                    )
+                except Exception:
+                    _mt_before = 0
             _req_ctx = TurnContext(
                 provider="openai",
                 model=str(model),
-                messages=working.get("input") or working.get("messages") or [],
+                messages=_msgs_before,
                 tools=working.get("tools"),
                 config=getattr(self, "config", None),
             )
             run_request_hooks(_req_ctx)
             if _req_ctx.tools is not working.get("tools"):
                 working["tools"] = _req_ctx.tools
+            # A hook may also fold the messages (replace or in-place). Write back a
+            # replaced list — previously dropped on this path — then re-count so the
+            # message-fold saving is both applied AND recorded in tokens_saved.
+            if _msg_key and _req_ctx.messages is not _msgs_before:
+                working[_msg_key] = _req_ctx.messages
+            if _msg_key and _mt_before:
+                try:
+                    _mt_after = self.openai_provider.get_token_counter(model).count_text(
+                        _json_debug_dumps(working.get(_msg_key) or [])
+                    )
+                    if _mt_after < _mt_before:
+                        tokens_saved += _mt_before - _mt_after
+                except Exception:
+                    pass
             modified = True
             transforms.append("openai:responses:turn_hook")
 
@@ -2508,6 +2560,7 @@ class OpenAIHandlerMixin:
         model: str,
         request_id: str,
         timeout: float = COMPRESSION_TIMEOUT_SECONDS,
+        client: str | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         timing: dict[str, float] = {}
 
@@ -2522,21 +2575,32 @@ class OpenAIHandlerMixin:
             shape_labels, shape_mutated = _shape_openai_responses_payload(
                 payload, model=model, request_id=request_id
             )
-            try:
-                result = self._compress_openai_responses_payload(
-                    payload,
-                    model=model,
-                    request_id=request_id,
-                    timing=timing,
-                )
-            except TypeError as exc:
-                if "unexpected keyword argument 'timing'" not in str(exc):
-                    raise
-                result = self._compress_openai_responses_payload(
-                    payload,
-                    model=model,
-                    request_id=request_id,
-                )
+            compression_kwargs: dict[str, Any] = {
+                "model": model,
+                "request_id": request_id,
+                "timing": timing,
+                "client": client,
+            }
+            while True:
+                try:
+                    result = self._compress_openai_responses_payload(
+                        payload,
+                        **compression_kwargs,
+                    )
+                    break
+                except TypeError as exc:
+                    unsupported_kwarg = next(
+                        (
+                            name
+                            for name in ("client", "timing")
+                            if f"unexpected keyword argument '{name}'" in str(exc)
+                            and name in compression_kwargs
+                        ),
+                        None,
+                    )
+                    if unsupported_kwarg is None:
+                        raise
+                    compression_kwargs.pop(unsupported_kwarg)
             if shape_labels:
                 # Carry the shaper labels on the transforms channel so the
                 # outcome funnel feeds the output-savings ledger
@@ -2993,6 +3057,28 @@ class OpenAIHandlerMixin:
                 messages,
                 openai_frozen_count,
             )
+        # Cold-prefix cache-miss hook, branch 2 (HEADROOM_COLD_RECOMPACT). When the
+        # prompt cache has lapsed (idle past TTL → dead, nothing to bust), unfreeze the
+        # whole prefix so the router recompacts it (cross-turn dedupe + superseded-read
+        # drop + lossless folds) — the lever for encrypted-reasoning models (Codex)
+        # whose reasoning we can't touch. Composes with branch 1 (plain-text reasoning
+        # drop at PRE_SEND for Kimi/GLM). Token mode only; deterministic → cache-stable.
+        if is_token_mode(self.config.mode) and os.environ.get(
+            "HEADROOM_COLD_RECOMPACT", ""
+        ).strip().lower() in ("1", "true", "yes"):
+            from headroom.cache.ttl_observations import resolve_learned_ttl
+            from headroom.transforms.cold_prefix import is_cold_prefix
+
+            # OpenAI/Kimi don't expose their cache TTL, so use the offline-learned
+            # value if available (else is_cold_prefix falls back to the static guess).
+            _learned_ttl = resolve_learned_ttl("openai", model)
+            if is_cold_prefix(openai_prefix_tracker, ttl_seconds=_learned_ttl):
+                logger.info(
+                    "[%s] cold-prefix recompaction: unfreezing prefix for "
+                    "dedupe/superseded-read compaction",
+                    request_id,
+                )
+                openai_frozen_count = 0
 
         _compression_failed = False
         original_messages = messages  # Preserve for 400-retry fallback
@@ -3398,9 +3484,111 @@ class OpenAIHandlerMixin:
             except Exception as e:
                 logger.debug(f"[{request_id}] tool schema compaction failed: {e}")
 
+            # Layer 2: tool description truncation (opt-in via
+            # HEADROOM_TOOL_DESC_MAX_CHARS). The Anthropic and Responses handlers
+            # both ran this pass; chat-completions never did, so the env var was a
+            # silent no-op for every chat client (opencode, Cline, Aider, Roo,
+            # LiteLLM-routed). Tool descriptions live on the tools array, which the
+            # message pipeline never sees, so nothing else was covering them.
+            # `compact_tool_descriptions` walks both the nested chat shape
+            # ({"function": {"description": ...}}) and the flat Responses shape.
+            try:
+                from headroom.proxy.tool_schema_compaction import (
+                    compact_tool_descriptions,
+                    tool_desc_max_chars,
+                )
+
+                _desc_max = tool_desc_max_chars()
+                if _desc_max > 0:
+                    _desc_payload, _desc_modified, _desc_before, _desc_after = (
+                        compact_tool_descriptions({"tools": tools}, _desc_max)
+                    )
+                    if _desc_modified and _desc_payload.get("tools") is not None:
+                        # Seed "before" only if schema compaction above didn't; the
+                        # two passes chain, so "after" must track the latest tools.
+                        if not tool_tokens_before_compaction:
+                            tool_tokens_before_compaction = tokenizer.count_text(
+                                _json_debug_dumps(tools)
+                            )
+                        tools = _desc_payload["tools"]
+                        transforms_applied.append("openai:chat:tool_desc_compaction")
+                        logger.debug(
+                            "[%s] tool description compaction: %d -> %d bytes "
+                            "(%.0f%% saved, max_chars=%d)",
+                            request_id,
+                            _desc_before,
+                            _desc_after,
+                            (1 - _desc_after / max(_desc_before, 1)) * 100,
+                            _desc_max,
+                        )
+            except Exception as e:
+                logger.debug(f"[{request_id}] tool desc compaction failed: {e}")
+
         body["messages"] = optimized_messages
         if tools or _original_tools is not None:
             body["tools"] = tools
+
+        # Reasoning compaction (HEADROOM_THINKING_COMPACT, off by default). Unlike
+        # Anthropic/OpenAI (encrypted reasoning handles, nothing to compress),
+        # Kimi/GLM/DeepSeek-R1 resend reasoning as PLAIN TEXT billed as input (Kimi
+        # K2.7: ~1,558 tok/block, kept every turn) — so Kompress can actually shrink
+        # it. Shape-driven: compacts the `reasoning_content` field (Kimi) and inline
+        # `<think>…</think>` (GLM/DeepSeek); no-ops when neither is present (OpenAI's
+        # own encrypted models). Deterministic → forwarded prefix stays cache-stable;
+        # keep_last_turns protects the active reasoning. Never breaks the request.
+        if os.environ.get("HEADROOM_THINKING_COMPACT", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            try:
+                from headroom.cache.ttl_observations import resolve_learned_ttl
+                from headroom.transforms.cold_prefix import is_cold_prefix
+                from headroom.transforms.compression_units import find_content_router
+                from headroom.transforms.thinking_compactor import (
+                    compact_reasoning_openai_chat,
+                )
+
+                # Cold-prefix cache-miss hook: on a warm turn Kompress the reasoning
+                # (deterministic → cache-stable); on a COLD turn (idle past provider
+                # TTL, cache dead) DROP it outright — the full block, safe because the
+                # cold turn re-caches from scratch. See cold_prefix / thinking_compactor.
+                # Uses the offline-learned TTL (Kimi/OpenAI don't expose it).
+                _rc_cold = is_cold_prefix(
+                    openai_prefix_tracker, ttl_seconds=resolve_learned_ttl("openai", model)
+                )
+                _rc_router = find_content_router(self.openai_pipeline)
+                _rc_kompress = (
+                    (_rc_router._get_remote_kompress() or _rc_router._get_kompress())
+                    if _rc_router is not None
+                    else None
+                )
+                # Drop needs no compressor; Kompress (warm) does.
+                if _rc_kompress is not None or _rc_cold:
+                    _rc_keep = int(os.environ.get("HEADROOM_THINKING_COMPACT_KEEP_LAST", "1"))
+                    optimized_messages, _rc_stats = compact_reasoning_openai_chat(
+                        optimized_messages,
+                        kompress=_rc_kompress,
+                        keep_last_turns=_rc_keep,
+                        drop=_rc_cold,
+                    )
+                    body["messages"] = optimized_messages
+                    if _rc_stats["turns_compacted"]:
+                        transforms_applied.append(
+                            f"openai:reasoning_{'drop' if _rc_cold else 'compact'}:{_rc_stats['turns_compacted']}"
+                        )
+                        logger.info(
+                            "[%s] reasoning %s: %d turns, %d blocks, %d->%d words (cold=%s)",
+                            request_id,
+                            "drop" if _rc_cold else "compact",
+                            _rc_stats["turns_compacted"],
+                            _rc_stats["blocks"],
+                            _rc_stats["words_before"],
+                            _rc_stats["words_after"],
+                            _rc_cold,
+                        )
+            except Exception as _rc_exc:  # never break the request on compaction
+                logger.warning("[%s] reasoning compaction skipped: %s", request_id, _rc_exc)
 
         presend_event = self.pipeline_extensions.emit(
             PipelineStage.PRE_SEND,
@@ -3421,6 +3609,12 @@ class OpenAIHandlerMixin:
             body["tools"] = tools
         if presend_event.headers is not None:
             headers = presend_event.headers
+        # Consistency: recount BOTH endpoints with the provider tokenizer. An upstream
+        # branch may have left original_tokens in the pipeline's char-estimator scale
+        # (result.tokens_before), which mismatches optimized_tokens (provider tokenizer)
+        # and yields impossible tok_after>tok_before. Recount original from the
+        # pre-compression snapshot so the message delta is on one scale.
+        original_tokens = tokenizer.count_messages(original_client_messages)
         optimized_tokens = tokenizer.count_messages(body["messages"])
         if tool_tokens_before_compaction > 0:
             try:
@@ -3430,20 +3624,22 @@ class OpenAIHandlerMixin:
         if 0 < tool_tokens_after_compaction < tool_tokens_before_compaction:
             original_tokens += tool_tokens_before_compaction
             optimized_tokens += tool_tokens_after_compaction
-        tokens_saved = original_tokens - optimized_tokens
+        tokens_saved = max(0, original_tokens - optimized_tokens)
 
         # Turn hooks (opt-in extensions): a registered hook may rewrite the
-        # outbound tools/messages before we send. Buffered requests only — a
-        # streamed turn can't be re-driven to resolve whatever the model asks to
-        # load. Gated on the registry so it is a no-op when none are registered;
-        # the net tool-schema token delta is recorded so it shows up as a saving.
+        # outbound tools/messages before we send. on_response re-drive (below, in
+        # the buffered response path) can't run on a stream, but on_request folds
+        # can — so on streaming we run only stream-safe (fold-only) hooks, and
+        # buffered runs all of them. Gated on the registry so it's a no-op when
+        # none are registered; the net tool-schema token delta is recorded as a
+        # saving.
         from headroom.proxy.turn_hooks import (
             TurnContext,
             registered_turn_hooks,
             run_request_hooks,
         )
 
-        if registered_turn_hooks() and not stream:
+        if registered_turn_hooks():
             _th_tools_before = body.get("tools")
             _th_tok_before = (
                 tokenizer.count_text(json.dumps(_th_tools_before, default=str))
@@ -3457,7 +3653,14 @@ class OpenAIHandlerMixin:
                 tools=_th_tools_before,
                 config=self.config,
             )
-            run_request_hooks(_th_ctx)
+            # Snapshot messages BEFORE the hook (same tokenizer) so we can tell whether
+            # the hook itself folded — comparing against optimized_tokens instead
+            # conflates a real fold with a cross-estimator scale delta.
+            try:
+                _th_msg_before: int | None = tokenizer.count_messages(body["messages"])
+            except Exception:
+                _th_msg_before = None
+            run_request_hooks(_th_ctx, stream_safe_only=stream)
             # A hook may either replace ctx.messages/ctx.tools or mutate them in
             # place (the contract allows both). Use object identity only to decide
             # whether body needs reassignment; measure the saving from the FINAL
@@ -3468,6 +3671,20 @@ class OpenAIHandlerMixin:
             if _th_ctx.tools is not _th_tools_before:
                 tools = _th_ctx.tools
                 body["tools"] = tools
+            # Recount messages after the hook (it may fold in place), preserving the
+            # tool-schema delta already folded into the headline above and keeping the
+            # scale consistent with original_tokens (both provider tokenizer).
+            try:
+                _th_msg_after = tokenizer.count_messages(body["messages"])
+                optimized_tokens = _th_msg_after
+                if 0 < tool_tokens_after_compaction < tool_tokens_before_compaction:
+                    optimized_tokens += tool_tokens_after_compaction
+                tokens_saved = max(0, original_tokens - optimized_tokens)
+                # Attribute to the hook ONLY when the hook itself reduced tokens.
+                if _th_msg_before is not None and _th_msg_after < _th_msg_before:
+                    transforms_applied.append("turn_hook")
+            except Exception:
+                logger.debug("turn-hook token re-count skipped", exc_info=True)
             _th_tok_after = (
                 tokenizer.count_text(json.dumps(_th_ctx.tools, default=str)) if _th_ctx.tools else 0
             )
@@ -3765,6 +3982,32 @@ class OpenAIHandlerMixin:
                         0, total_input_tokens - cache_read_tokens - cache_write_tokens
                     )
 
+                    # Cache-TTL learning seam: attribute this turn's cache outcome
+                    # (hit / ttl_expiry / prefix_change) and record it BEFORE
+                    # update_from_response overwrites the prior-turn state. Feeds the
+                    # offline TTL learner (HEADROOM_CACHE_TTL_LEARN); best-effort.
+                    try:
+                        from headroom.cache.ttl_observations import (
+                            observations_enabled,
+                            record_cache_observation,
+                        )
+
+                        # Only run the extra attribution when learning is enabled —
+                        # otherwise this path adds nothing over the base proxy.
+                        if observations_enabled() and hasattr(
+                            openai_prefix_tracker, "classify_cache_miss"
+                        ):
+                            record_cache_observation(
+                                provider="openai",
+                                model=model,
+                                attribution=openai_prefix_tracker.classify_cache_miss(
+                                    cache_read_tokens=cache_read_tokens,
+                                    current_forwarded_messages=optimized_messages,
+                                ),
+                            )
+                    except Exception:
+                        pass
+
                     openai_prefix_tracker.update_from_response(
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
@@ -3777,10 +4020,15 @@ class OpenAIHandlerMixin:
                             provider=self.anthropic_backend.name,
                             model=model,
                             original_tokens=original_tokens,
-                            optimized_tokens=total_input_tokens,
+                            # Local count, same tokenizer as original_tokens, so
+                            # every delta built from the pair is coherent. The
+                            # provider's own number rides along separately for
+                            # billing — see RequestOutcome's field docs.
+                            optimized_tokens=optimized_tokens,
+                            provider_input_tokens=total_input_tokens,
                             output_tokens=output_tokens,
                             tokens_saved=tokens_saved,
-                            attempted_input_tokens=total_input_tokens + tokens_saved,
+                            attempted_input_tokens=optimized_tokens + tokens_saved,
                             cache_read_tokens=cache_read_tokens,
                             cache_write_tokens=cache_write_tokens,
                             uncached_input_tokens=uncached_input_tokens,
@@ -4067,6 +4315,28 @@ class OpenAIHandlerMixin:
                     total_input_tokens,
                     cache_read_tokens,
                 )
+                # Cache-TTL learning seam (see the /v1/chat path above): record the
+                # cache-outcome attribution before update_from_response. Best-effort.
+                try:
+                    from headroom.cache.ttl_observations import (
+                        observations_enabled,
+                        record_cache_observation,
+                    )
+
+                    if observations_enabled() and hasattr(
+                        openai_prefix_tracker, "classify_cache_miss"
+                    ):
+                        record_cache_observation(
+                            provider="openai",
+                            model=model,
+                            attribution=openai_prefix_tracker.classify_cache_miss(
+                                cache_read_tokens=cache_read_tokens,
+                                current_forwarded_messages=optimized_messages,
+                            ),
+                        )
+                except Exception:
+                    pass
+
                 openai_prefix_tracker.update_from_response(
                     cache_read_tokens=cache_read_tokens,
                     cache_write_tokens=cache_write_tokens,
@@ -4076,17 +4346,9 @@ class OpenAIHandlerMixin:
                 # OpenAI has no write penalty — uncached = total - cached
                 uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
 
-                # (record_tokens clamps negative savings to 0 universally — the
-                # forwarded request is never larger than the original.)
-                if self.cost_tracker:
-                    self.cost_tracker.record_tokens(
-                        model,
-                        tokens_saved,
-                        optimized_tokens,
-                        cache_read_tokens=cache_read_tokens,
-                        cache_write_tokens=cache_write_tokens,
-                        uncached_tokens=uncached_input_tokens,
-                    )
+                # Cost is recorded exactly once by the outcome funnel below
+                # (_record_request_outcome -> emit_request_outcome -> cost_tracker.
+                # record_tokens); recording here too double-counted spend + budget.
 
                 # Memory: handle memory tool calls in OpenAI Chat Completions response.
                 # After executing tools, send a continuation request so the model
@@ -4173,13 +4435,16 @@ class OpenAIHandlerMixin:
                         model=model,
                         status_code=response.status_code,
                         original_tokens=original_tokens,
-                        optimized_tokens=total_input_tokens,
+                        # Same-tokenizer pair; provider count carried separately.
+                        optimized_tokens=optimized_tokens,
+                        provider_input_tokens=total_input_tokens,
                         output_tokens=output_tokens,
                         tokens_saved=tokens_saved,
-                        attempted_input_tokens=total_input_tokens + tokens_saved,
+                        attempted_input_tokens=optimized_tokens + tokens_saved,
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
                         uncached_input_tokens=uncached_input_tokens,
+                        cache_inferred=True,
                         total_latency_ms=total_latency,
                         overhead_ms=optimization_latency,
                         pipeline_timing=pipeline_timing,
@@ -4724,6 +4989,7 @@ class OpenAIHandlerMixin:
                     body,
                     model=model,
                     request_id=request_id,
+                    client=client,
                 )
                 attempted_input_tokens = int(_attempted_tokens)
                 if _transforms:
@@ -5154,35 +5420,24 @@ class OpenAIHandlerMixin:
                                 f"[{request_id}] Memory tool handling failed (responses): {e}"
                             )
 
-                    if self.cost_tracker:
-                        cache_write_tokens = _infer_openai_cache_write_tokens(
-                            total_input_tokens,
-                            cache_read_tokens,
-                        )
-                        uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
-                        # (record_tokens clamps negative savings to 0 universally.)
-                        self.cost_tracker.record_tokens(
-                            model,
-                            tokens_saved,
-                            total_input_tokens,
-                            cache_read_tokens=cache_read_tokens,
-                            cache_write_tokens=cache_write_tokens,
-                            uncached_tokens=uncached_input_tokens,
-                        )
-                    else:
-                        cache_write_tokens = _infer_openai_cache_write_tokens(
-                            total_input_tokens,
-                            cache_read_tokens,
-                        )
-                        uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
+                    # Cost is recorded once by the outcome funnel below; here we only
+                    # compute the cache-write / uncached split the funnel needs.
+                    # (Recording here too double-counted spend + budget on this path.)
+                    cache_write_tokens = _infer_openai_cache_write_tokens(
+                        total_input_tokens,
+                        cache_read_tokens,
+                    )
+                    uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
 
-                    effective_optimized_tokens = (
-                        total_input_tokens if total_input_tokens > 0 else optimized_tokens
-                    )
-                    effective_original_tokens = max(
-                        original_tokens,
-                        effective_optimized_tokens + tokens_saved,
-                    )
+                    # Was: optimized := provider count, then original := max(original,
+                    # optimized + saved) to stop `attempted` exceeding `original`.
+                    # That paper over the symptom by inflating `original` upward,
+                    # which is why the beacon still shipped `eligible_pct > 100`
+                    # from the other emit sites that lacked the same fudge. The
+                    # real cause was mixing tokenizer scales; keep the local pair
+                    # coherent and hand the provider count over separately.
+                    effective_optimized_tokens = optimized_tokens
+                    effective_original_tokens = original_tokens
 
                     _resp_log_tags = {
                         **(tags or {}),
@@ -5205,12 +5460,14 @@ class OpenAIHandlerMixin:
                             status_code=response.status_code,
                             original_tokens=effective_original_tokens,
                             optimized_tokens=effective_optimized_tokens,
+                            provider_input_tokens=total_input_tokens,
                             output_tokens=output_tokens,
                             tokens_saved=tokens_saved,
                             attempted_input_tokens=attempted_input_tokens,
                             cache_read_tokens=cache_read_tokens,
                             cache_write_tokens=cache_write_tokens,
                             uncached_input_tokens=uncached_input_tokens,
+                            cache_inferred=True,
                             total_latency_ms=total_latency,
                             overhead_ms=optimization_latency,
                             transforms_applied=tuple(transforms_applied),
@@ -5490,8 +5747,11 @@ class OpenAIHandlerMixin:
         # Captured in closure so per-turn RequestOutcome can stamp it.
         client = classify_client(ws_headers)
         # WS sessions bypass the HTTP middleware, so bind the project here;
-        # per-turn outcome emission inside this task inherits the context.
-        set_current_project(classify_project(ws_headers))
+        # per-turn outcome emission inside this task inherits the context. An
+        # explicit X-Headroom-Project header wins; otherwise fall back to the
+        # /p/<name> path prefix already bound by WebSocketProjectPrefixMiddleware
+        # so prefix-only clients (aider, Copilot BYOK, Cursor) stay attributed.
+        set_current_project(classify_project(ws_headers) or get_current_project())
         metrics_for_inbound_ws = getattr(self, "metrics", None)
         if metrics_for_inbound_ws is not None and hasattr(
             metrics_for_inbound_ws, "record_inbound_request"
@@ -5539,20 +5799,7 @@ class OpenAIHandlerMixin:
         # These are WebSocket handshake mechanics that the `websockets` library
         # generates fresh for the upstream connection — forwarding them would conflict.
         # Everything else (auth, org, beta, user-agent, custom headers) is forwarded as-is.
-        _skip_headers = frozenset(
-            {
-                "host",  # must match upstream, not local proxy
-                "connection",  # hop-by-hop
-                "upgrade",  # hop-by-hop
-                "sec-websocket-key",  # per-connection cryptographic nonce
-                "sec-websocket-version",  # protocol version (websockets lib sets this)
-                "sec-websocket-extensions",  # per-connection negotiation
-                "sec-websocket-accept",  # server-side only
-                "sec-websocket-protocol",  # handled via subprotocols param below
-                "content-length",  # hop-by-hop
-                "transfer-encoding",  # hop-by-hop
-            }
-        )
+        _skip_headers = WS_HOP_BY_HOP_HEADERS
         # PR-A5 (P5-49): also drop internal x-headroom-* from the upstream
         # WebSocket handshake. Inbound reads on `ws_headers` (memory user-id
         # below) keep working because we filter only when building
@@ -6392,6 +6639,7 @@ class OpenAIHandlerMixin:
                                 timeout=_codex_ws_compression_timeout_seconds()
                                 if client == "codex"
                                 else COMPRESSION_TIMEOUT_SECONDS,
+                                client=client,
                             )
                             for _timing_name, _timing_ms in _ws_compression_timing.items():
                                 _record_ws_compression_timing(_timing_name, _timing_ms)
@@ -6737,6 +6985,7 @@ class OpenAIHandlerMixin:
                                     timeout=_codex_ws_compression_timeout_seconds()
                                     if client == "codex"
                                     else COMPRESSION_TIMEOUT_SECONDS,
+                                    client=client,
                                 )
                                 for _timing_name, _timing_ms in frame_compression_timing.items():
                                     _record_ws_compression_timing(_timing_name, _timing_ms)
@@ -7207,41 +7456,10 @@ class OpenAIHandlerMixin:
                                 )
                             )
 
-                            # Structured PERF log line so ``headroom perf``
-                            # counts this Codex turn. Pre-P2 this emit was
-                            # missing, which is why Codex traffic showed up
-                            # as ``Requests: 0`` in the perf report even
-                            # under heavy load — the same visibility bug
-                            # class as #327's "Cache write: 0" report.
-                            _perf_input_tokens = max(0, input_delta)
-                            _perf_cache_read = max(0, cache_read_delta)
-                            _perf_cache_write = max(0, cache_write_delta)
-                            _perf_cache_hit_pct = (
-                                round(
-                                    _perf_cache_read / (_perf_cache_read + _perf_cache_write) * 100
-                                )
-                                if (_perf_cache_read + _perf_cache_write) > 0
-                                else 0
-                            )
-                            _perf_tok_before = _perf_input_tokens + max(0, saved_delta)
-                            _perf_num_msgs = (
-                                len(body.get("messages") or body.get("input") or [])
-                                if isinstance(body, dict)
-                                else 0
-                            )
-                            logger.info(
-                                f"[{request_id}] PERF "
-                                f"model={model_for_metrics} msgs={_perf_num_msgs} "
-                                f"tok_before={_perf_tok_before} "
-                                f"tok_after={_perf_input_tokens} "
-                                f"tok_saved={max(0, saved_delta)} "
-                                f"cache_read={_perf_cache_read} "
-                                f"cache_write={_perf_cache_write} "
-                                f"cache_hit_pct={_perf_cache_hit_pct} "
-                                f"opt_ms={overhead_delta_ms:.0f} "
-                                f"transforms={_summarize_transforms(transforms_applied)} "
-                                f"client={client or ''}"
-                            )
+                            # The PERF line for this Codex turn is emitted once by
+                            # the outcome funnel above (emit_request_outcome), using
+                            # the same per-turn deltas — a second emit here duplicated
+                            # every WS turn in `headroom perf` (double saved + requests).
 
                             ws_recorded_input_tokens_total = ws_input_tokens_total
                             ws_recorded_output_tokens_total = ws_output_tokens_total
@@ -8110,21 +8328,49 @@ class OpenAIHandlerMixin:
             with contextlib.suppress(Exception):
                 await websocket.close()
 
-    def _lossy_inline_pipeline(self) -> Any:
-        """Cached pipeline for ``/v1/compress`` ``config.mode="lossy_inline"``.
+    def _derived_compress_pipeline(self, key: str, **overrides: Any) -> Any:
+        """Cached ``/v1/compress`` pipeline derived from the live OpenAI router.
 
-        Runs the lossless byte/data fold first, then Kompresses the folded
-        remainder (``lossless_then_lossy``). ``ccr_inject_marker=False`` makes
-        every compressor (Kompress, SmartCrusher, search/log/config) emit inline
-        lossy output with NO ``<<ccr:…>>`` / ``Retrieve more: hash=`` marker and
-        NO CCR store write, so the result is safe to forward straight to a
-        provider with no retrieval round-trip. Derived once from the live OpenAI
-        router's config and reused read-only across requests.
+        ``overrides`` are applied to the live ContentRouter's config, so the
+        derived pipeline inherits every operator setting (Kompress on/off,
+        exclusions, profile knobs) and differs only in what the caller needs.
+
+        The derived router deliberately does NOT share the base router's
+        compression cache. ``ContentRouter._cache`` is per-instance, and its
+        keys do not encode the CCR-marker mode, so a shared cache would serve
+        marker-laden entries (written by the OpenAI request path) to this
+        marker-free path and vice versa. Sharing would be a correctness bug,
+        not an optimisation — the duplicate cache is the intended trade.
+
+        Built with ``provider=None`` on purpose: ``TransformPipeline`` then
+        resolves the tokenizer from the per-model registry
+        (``headroom.tokenizers.get_tokenizer``) on every call instead of pinning
+        one provider's counter for the whole route.
+
+        That matters because this route does no format conversion — callers send
+        whichever wire shape they already use. The provider counters walk only the
+        block types they own (``OpenAITokenCounter`` handles ``text`` and
+        ``image_url``; everything else falls through with NO else branch, so an
+        Anthropic ``tool_result`` contributed literally zero and ``tokens_saved``
+        reported 0 on requests where compression really ran). Every registry
+        tokenizer derives from ``BaseTokenizer``, whose ``_count_content_parts``
+        ends in a serialize-and-count catch-all, so no block type counts as zero
+        and there is no per-provider type list to keep in sync. It also stops
+        defaulting Gemini/Mistral/DeepSeek/Kimi traffic to a tiktoken count when
+        the registry already has a calibrated counter for them.
+
+        Note the pipeline's own ``_provider_name()`` is therefore ``None`` here.
+        That is honest for a provider-agnostic route — it used to report
+        ``"openai"`` even for Claude payloads — and the request outcome still
+        records ``provider="compress"`` for /stats and /metrics.
 
         ponytail: a first-request race just builds it twice — both are
         equivalent and Kompress weights are cached at module level, so no lock.
         """
-        cached = getattr(self, "_lossy_inline_pipeline_cache", None)
+        cache = getattr(self, "_compress_pipeline_cache", None)
+        if cache is None:
+            cache = self._compress_pipeline_cache = {}
+        cached = cache.get(key)
         if cached is not None:
             return cached
 
@@ -8135,29 +8381,88 @@ class OpenAIHandlerMixin:
         base = find_content_router(self.openai_pipeline)
         if base is None:  # ponytail: nothing to derive from — use default pipeline
             return self.openai_pipeline
-        cfg = replace(
-            base.config,
+        pipeline = TransformPipeline(
+            transforms=[ContentRouter(replace(base.config, **overrides), observer=self.metrics)],
+            provider=None,  # per-model registry tokenizer — see docstring
+        )
+        cache[key] = pipeline
+        return pipeline
+
+    def _no_ccr_pipeline(self) -> Any:
+        """Default ``/v1/compress`` pipeline: compress, but emit no CCR markers.
+
+        Every caller of this route is a gateway/sidecar or SDK client that
+        forwards the returned messages straight to a provider. A
+        ``Retrieve more: hash=`` marker is only useful to a caller that also
+        injects the ``headroom_retrieve`` tool AND can reach ``/v1/retrieve``
+        (loopback-only). LiteLLM's `headroom` guardrail — the main consumer —
+        does neither: it swaps ``messages`` and forwards. So markers here are a
+        dangling pointer for the model plus a pointless CCR store write.
+        ``config.mode="ccr"`` opts back in for callers that do run the loop
+        (e.g. the TypeScript SDK's ``retrieve``/``handleToolCall``).
+
+        Nothing else changes: same compressors, same aggressiveness. Measured
+        identical token savings to the marker-on default on OpenAI-shaped
+        gateway traffic.
+        """
+        return self._derived_compress_pipeline(
+            "no_ccr",
+            ccr_inject_marker=False,  # no markers in returned content
+            ccr_enabled=False,  # no CCR store writes
+        )
+
+    def _ccr_pipeline(self) -> Any:
+        """Pipeline for ``/v1/compress`` ``config.mode="ccr"``.
+
+        No config overrides: markers and CCR store writes are exactly what this
+        mode asks for, so it inherits the live router's settings verbatim. It is
+        still a DERIVED pipeline rather than ``openai_pipeline`` so the tokenizer
+        comes from the per-model registry instead of a pinned provider counter.
+        """
+        return self._derived_compress_pipeline("ccr")
+
+    def _lossy_inline_pipeline(self) -> Any:
+        """Pipeline for ``/v1/compress`` ``config.mode="lossy_inline"``.
+
+        Runs the lossless byte/data fold first, then Kompresses the folded
+        remainder (``lossless_then_lossy``), marker-free like
+        :meth:`_no_ccr_pipeline`. Kept as a distinct mode because the
+        fold-then-Kompress ordering is a different compression posture, not a
+        different CCR setting.
+        """
+        return self._derived_compress_pipeline(
+            "lossy_inline",
             lossless=False,  # lossy mode (not lossless-only)
             lossless_then_lossy=True,  # fold first, then Kompress the remainder
             ccr_inject_marker=False,  # inline, marker-free everywhere
             ccr_enabled=False,  # no CCR store writes
             smart_crusher_lossless_only=False,  # keep SmartCrusher lossy
-        )  # enable_kompress inherited: on by default, off if operator disabled it
-        pipeline = TransformPipeline(
-            transforms=[ContentRouter(cfg, observer=self.metrics)],
-            provider=self.openai_provider,
         )
-        self._lossy_inline_pipeline_cache = pipeline
-        return pipeline
 
     async def handle_compress(self, request: Request) -> JSONResponse:
         """Compress messages without calling an LLM.
 
         POST /v1/compress
         Body: {"messages": [...], "model": "...", "config": {}}
-        ``config.mode="lossy_inline"`` (alias ``"lossless_then_lossy"``) selects
-        the marker-free lossless-then-lossy pipeline whose output needs no CCR
-        retrieval round-trip — the mode to use behind a gateway/sidecar.
+
+        ``config.mode`` selects the pipeline:
+
+        * unset (default) — marker-free; forward the result straight to a
+          provider with no CCR retrieval round-trip (see _no_ccr_pipeline).
+        * ``"ccr"`` — CCR markers + store writes, for a caller that injects the
+          ``headroom_retrieve`` tool and can reach loopback ``/v1/retrieve``.
+        * ``"lossy_inline"`` (alias ``"lossless_then_lossy"``) — marker-free,
+          lossless fold first then Kompress the remainder.
+
+        Any other ``config.mode`` value is a 400 (see ``COMPRESS_MODES``).
+
+        ``config.frozen_message_count`` pins a prefix: the first N messages are
+        returned byte-for-byte unchanged, while still being visible to cross-message
+        transforms such as dedup. Callers that resend a growing conversation each turn
+        should set it to the number of messages the provider has already cached, so
+        compression does not rewrite the prefix and bust that cache. Must be a
+        non-negative integer; anything else is a 400.
+
         Returns compressed messages + metrics.
         """
         from fastapi.responses import JSONResponse
@@ -8247,10 +8552,31 @@ class OpenAIHandlerMixin:
             # Allow optional token_budget to override model's context limit
             # (used by OpenClaw compact() and other callers that need tighter budgets)
             token_budget = body.get("token_budget")
+            # Resolve the CONTEXT LIMIT against the model's own provider. This
+            # route accepts either wire shape, and LiteLLM's `headroom` guardrail
+            # passes Anthropic model names straight through
+            # (claude-sonnet-4-5-..., bedrock/anthropic.claude-3-5-sonnet,
+            # anthropic/claude-opus-4), where the OpenAI provider answers with its
+            # 128K default instead of 200K+. Substring match is enough — no model
+            # registry.
+            #
+            # Deliberately separate from tokenizer selection, which the derived
+            # pipelines resolve per model from the tokenizer registry (see
+            # _derived_compress_pipeline). Welding the two together would let a
+            # tokenizer decision move `model_limit`, and `model_limit` feeds
+            # context_pressure -> min_ratio: e.g. gpt-4-32k answered by the
+            # Anthropic table is 8,192 instead of 32,768, a 4x under-estimate that
+            # silently changes compression aggressiveness.
+            model_name = model if isinstance(model, str) else str(model)
+            limit_provider = (
+                self.anthropic_provider
+                if ("claude" in model_name.lower() or "anthropic" in model_name.lower())
+                else self.openai_provider
+            )
             context_limit = (
                 token_budget
                 if token_budget and isinstance(token_budget, int)
-                else self.openai_provider.get_context_limit(model)
+                else limit_provider.get_context_limit(model)
             )
             # Extract CompressConfig options from request body
             compress_config = body.get("config", {})
@@ -8260,14 +8586,60 @@ class OpenAIHandlerMixin:
             target_ratio = compress_config.get("target_ratio")
             protect_recent = compress_config.get("protect_recent")
             protect_analysis_context = compress_config.get("protect_analysis_context")
-            # Marker-free lossless-then-lossy mode: safe to forward downstream
-            # with no CCR retrieval round-trip (see _lossy_inline_pipeline).
+            # Leading messages already in the provider's prompt cache. Callers that
+            # resend a growing conversation every turn (agent loops) need to pin the
+            # prefix they have already paid for: without it the router compresses old
+            # messages harder as the conversation grows, so their bytes change and the
+            # cache misses from that point on. `protect_recent` guards the other end of
+            # the list and cannot express this.
+            frozen_message_count = compress_config.get("frozen_message_count")
+            if frozen_message_count is not None and (
+                isinstance(frozen_message_count, bool)
+                or not isinstance(frozen_message_count, int)
+                or frozen_message_count < 0
+            ):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "type": "invalid_request",
+                            "message": (
+                                f"Invalid config.frozen_message_count: {frozen_message_count!r}. "
+                                "Expected a non-negative integer."
+                            ),
+                        }
+                    },
+                )
+            # Mode selection. Default is marker-free (see _no_ccr_pipeline):
+            # no caller of this route can resolve a CCR marker unless it opts in
+            # with mode="ccr", which restores the full marker + store behaviour.
             mode = compress_config.get("mode")
-            pipeline = (
-                self._lossy_inline_pipeline()
-                if mode in ("lossy_inline", "lossless_then_lossy")
-                else self.openai_pipeline
-            )
+            if mode is not None and mode not in COMPRESS_MODES:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "type": "invalid_request",
+                            "message": (
+                                f"Invalid config.mode: {mode!r}. "
+                                f"Valid values are: {', '.join(COMPRESS_MODES)} "
+                                "(or omit config.mode for the default marker-free mode)."
+                            ),
+                        }
+                    },
+                )
+            if mode in ("lossy_inline", "lossless_then_lossy"):
+                pipeline = self._lossy_inline_pipeline()
+            elif mode == "ccr":
+                # Markers + store writes wanted, so inherit the live router config
+                # unchanged — but as a DERIVED pipeline, not `openai_pipeline`
+                # itself, so the per-model registry tokenizer applies here too.
+                # Sharing the request path's instance pinned the OpenAI counter,
+                # which reports zero for Anthropic content blocks. Costs this mode
+                # its own (cold) compression cache; correct metrics win.
+                pipeline = self._ccr_pipeline()
+            else:
+                pipeline = self._no_ccr_pipeline()
 
             pipeline_kwargs: dict = {
                 "model_limit": context_limit,
@@ -8281,6 +8653,8 @@ class OpenAIHandlerMixin:
                 pipeline_kwargs["protect_recent"] = int(protect_recent)
             if protect_analysis_context is not None:
                 pipeline_kwargs["protect_analysis_context"] = bool(protect_analysis_context)
+            if frozen_message_count is not None:
+                pipeline_kwargs["frozen_message_count"] = frozen_message_count
 
             # Offload the CPU-bound pipeline to the bounded compression executor
             # (mirrors the request handlers above). Running apply() inline blocked
@@ -8400,7 +8774,9 @@ class OpenAIHandlerMixin:
                 },
             )
 
-    async def _maybe_compress_passthrough_responses(self, body: bytes) -> bytes:
+    async def _maybe_compress_passthrough_responses(
+        self, body: bytes, *, client: str | None = None
+    ) -> bytes:
         """Compress an OpenAI Responses-shaped passthrough body, fail-open.
 
         Reuses the native `/v1/responses` compression path so custom
@@ -8419,15 +8795,22 @@ class OpenAIHandlerMixin:
         model = str(payload.get("model") or "passthrough")
         request_id = await self._next_request_id()
         try:
-            (
-                compressed_payload,
-                modified,
-                *_rest,
-            ) = await self._compress_openai_responses_payload_in_executor(
-                payload,
-                model=model,
-                request_id=request_id,
-            )
+            try:
+                result = await self._compress_openai_responses_payload_in_executor(
+                    payload,
+                    model=model,
+                    request_id=request_id,
+                    client=client,
+                )
+            except TypeError as exc:
+                if "unexpected keyword argument 'client'" not in str(exc):
+                    raise
+                result = await self._compress_openai_responses_payload_in_executor(
+                    payload,
+                    model=model,
+                    request_id=request_id,
+                )
+            compressed_payload, modified, *_rest = result
         except Exception as exc:  # noqa: BLE001 — fail-open on any compressor error
             logger.warning(
                 "[%s] passthrough Responses compression failed, forwarding verbatim: %s",
@@ -8542,7 +8925,7 @@ class OpenAIHandlerMixin:
             and path.rstrip("/").endswith("/responses")
             and body
         ):
-            compressed = await self._maybe_compress_passthrough_responses(body)
+            compressed = await self._maybe_compress_passthrough_responses(body, client=client)
             if compressed != body:
                 body = compressed
                 # Body size changed — let httpx recompute Content-Length.

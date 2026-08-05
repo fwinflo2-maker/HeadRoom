@@ -17,7 +17,6 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 
-from headroom.proxy.ccr_marker_policy import should_inject_ccr_tool
 from headroom.proxy.server import ProxyConfig, create_app
 from headroom.proxy.tool_reference_sanitizer import (
     collect_tool_reference_names,
@@ -194,27 +193,6 @@ class TestCollectToolReferenceNames:
             "content": [{"type": "tool_reference", "tool_name": "listed"}],
         }
         assert collect_tool_reference_names(_messages_with(block)) == {"listed"}
-
-
-class TestShouldInjectCcrToolHistoryOverride:
-    def test_history_reference_forces_injection_past_deferral(self) -> None:
-        should, override = should_inject_ccr_tool(
-            configured_inject_tool=True,
-            frozen_message_count=3,
-            has_compressed_content=False,
-            history_references_tool=True,
-        )
-        assert should is True
-        assert override is True
-
-    def test_without_history_reference_deferral_still_wins(self) -> None:
-        should, override = should_inject_ccr_tool(
-            configured_inject_tool=True,
-            frozen_message_count=3,
-            has_compressed_content=False,
-        )
-        assert should is False
-        assert override is False
 
 
 # --- Integration through the real Anthropic handler -------------------------

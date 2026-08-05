@@ -60,7 +60,7 @@ def test_finally_survives_early_proxy_start_failure(
 
     result = runner.invoke(
         main,
-        ["wrap", "claude", "--no-context-tool", "--no-mcp", "--no-tokensave", "--no-serena"],
+        ["wrap", "claude", "--no-mcp", "--no-tokensave", "--no-serena"],
     )
 
     # The finally must complete without masking the real failure, skip restoring settings that this run never wrote, and still clean up.

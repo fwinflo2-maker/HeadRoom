@@ -94,6 +94,42 @@ class TestOpenAITokenCounting:
         after = [{"role": "user", "content": [{"type": "tool_result", "content": small}]}]
         assert openai_tokenizer.count_messages(before) > openai_tokenizer.count_messages(after)
 
+    def test_nested_tool_result_image_count_stays_bounded(self, openai_tokenizer):
+        """Nested binary media gets a bounded image estimate, not base64 text tokens."""
+        text = "command output " * 200
+        msg = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "content": [
+                        {"type": "text", "text": text},
+                        {
+                            "type": "image",
+                            "source": {"type": "base64", "data": "A" * 1_000_000},
+                        },
+                    ],
+                }
+            ],
+        }
+
+        count = openai_tokenizer.count_message(msg)
+        assert count > openai_tokenizer.count_text(text)
+        assert count < openai_tokenizer.count_text(text) + 5_000
+
+    def test_tool_use_input_serialization_is_deterministic(self, openai_tokenizer):
+        """Equivalent mappings must have a stable wire-shaped token estimate."""
+        first = {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "name": "search", "input": {"a": 1, "b": 2}}],
+        }
+        second = {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "name": "search", "input": {"b": 2, "a": 1}}],
+        }
+
+        assert openai_tokenizer.count_message(first) == openai_tokenizer.count_message(second)
+
 
 class TestOpenAIModelLimits:
     def test_get_context_limit_gpt4o(self, openai_provider):

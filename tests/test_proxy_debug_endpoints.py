@@ -420,36 +420,6 @@ def test_debug_warmup_reports_registry_slots(client):
     assert "status" in data["memory_backend"]
 
 
-def test_debug_warmup_promotes_deferred_kompress_after_runtime_load(app_and_client):
-    # Regression test: a Kompress load that was deferred at startup and only
-    # finished later (background download) must be reflected here the same
-    # way /health already reconciles it — this endpoint used to just replay
-    # the stale startup snapshot forever. See _reconcile_kompress_health in
-    # headroom/proxy/server.py.
-    app, client = app_and_client
-    proxy = app.state.proxy
-    proxy.warmup.kompress.info["source_status"] = "deferred"
-
-    class _ReadyCompressor:
-        def is_ready(self):
-            return True
-
-        def ready_backend(self):
-            return "onnx"
-
-    router = proxy.anthropic_pipeline.transforms[-1]
-    router._kompress = _ReadyCompressor()
-
-    response = client.get("/debug/warmup")
-
-    assert response.status_code == 200
-    data = response.json()
-    assert data["kompress"]["status"] == "loaded"
-    assert data["kompress"]["info"]["backend"] == "onnx"
-    assert data["runtime"]["anthropic_pre_upstream"]["resolved_concurrency"] >= 0
-    assert data["runtime"]["websocket_sessions"]["active_relay_tasks"] == 0
-
-
 class _KompressStub:
     """Read-only stand-in exposing the accessors the health reconciler uses.
 

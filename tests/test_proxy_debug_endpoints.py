@@ -418,6 +418,8 @@ def test_debug_warmup_reports_registry_slots(client):
     assert "runtime" in data
     # Each slot has at least a status field.
     assert "status" in data["memory_backend"]
+    assert data["runtime"]["anthropic_pre_upstream"]["resolved_concurrency"] >= 0
+    assert data["runtime"]["websocket_sessions"]["active_relay_tasks"] == 0
 
 
 class _KompressStub:

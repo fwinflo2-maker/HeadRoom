@@ -1917,11 +1917,13 @@ class HeadroomProxy(
         logger.info(f"Failed:                {m.requests_failed}")
         logger.info(f"Input tokens:          {m.tokens_input_total:,}")
         logger.info(f"Output tokens:         {m.tokens_output_total:,}")
-        logger.info(f"Tokens saved:          {m.tokens_saved_total:,}")
+        # ONE headline: message compression + tool-schema deferral. Deferral can't move
+        # tok_before/after (tool bytes never reach count_messages), so it used to print
+        # as a separate line that read like a side metric rather than savings.
+        logger.info(f"Tokens saved:          {m.tokens_saved_total + m.tool_search_saved_total:,}")
         if m.tool_search_saved_total > 0:
-            # Tool-schema deferral / turn-hook tool shrink — counted apart from
-            # message compression (tool bytes never move tok_before/after).
-            logger.info(f"Tool schemas deferred: {m.tool_search_saved_total:,}")
+            logger.info(f"  messages:            {m.tokens_saved_total:,}")
+            logger.info(f"  tool schemas:        {m.tool_search_saved_total:,}")
         # Active-compression ratio: savings as a fraction of what we
         # *attempted* to compress (extracted units + tool schema),
         # NOT the whole request. The full-request denominator is
@@ -2362,6 +2364,22 @@ _is_known_websocket_callback_failure = is_known_websocket_callback_failure
 _tool_schema_saved_from_tags = tool_schema_saved_from_tags
 
 
+class WebSocketProjectPrefixMiddleware:
+    """Normalize project-prefixed WebSocket paths before route matching."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] == "websocket":
+            prefix_project = strip_project_path_prefix(scope)
+            headers = {
+                name.decode("latin-1"): value.decode("latin-1") for name, value in scope["headers"]
+            }
+            set_current_project(classify_project(headers) or prefix_project)
+        await self.app(scope, receive, send)
+
+
 def create_app(config: ProxyConfig | None = None) -> FastAPI:
     """Create FastAPI application."""
     if not FASTAPI_AVAILABLE:
@@ -2571,6 +2589,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         version=__version__,
         lifespan=lifespan,
     )
+    app.add_middleware(WebSocketProjectPrefixMiddleware)
     loop_health_state: LoopHealthState = {
         "status": "healthy",
         "known_failures": 0,
@@ -3353,6 +3372,20 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             content={"applied": applied, "runtime_env": runtime_env.effective_runtime_env()},
         )
 
+    # Vendored dashboard JS (tailwind/htmx/alpine). Mounted before
+    # register_provider_routes' catch-all so it is not tunneled upstream.
+    from starlette.staticfiles import StaticFiles
+
+    from headroom.dashboard import STATIC_DIR
+
+    # check_dir=False keeps a missing assets directory from aborting proxy
+    # startup: the dashboard JS 404s, but proxying itself still works.
+    app.mount(
+        "/dashboard/static",
+        StaticFiles(directory=STATIC_DIR, check_dir=False),
+        name="dashboard-static",
+    )
+
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard():
         """Serve the Headroom dashboard UI."""
@@ -3873,9 +3906,18 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 # should show — it answers "are we doing well *when we
                 # have something to compress?*" rather than diluting the
                 # win by frozen-prefix bytes we never touched.
+                # All-layers numerator, matching denominator: `attempted_input_tokens`
+                # already counts tool schemas we COMPACTED, so pairing it with a
+                # compression-only numerator undercounted every tool-heavy session.
+                # Deferred schemas are added to both sides — they were attempted work
+                # that succeeded completely.
                 "active_savings_percent": round(
-                    (proxy_compression_tokens / attempted_input_tokens * 100)
-                    if attempted_input_tokens > 0
+                    (
+                        all_layers_tokens_saved
+                        / (attempted_input_tokens + m.tool_search_saved_total)
+                        * 100
+                    )
+                    if (attempted_input_tokens + m.tool_search_saved_total) > 0
                     else 0,
                     2,
                 ),

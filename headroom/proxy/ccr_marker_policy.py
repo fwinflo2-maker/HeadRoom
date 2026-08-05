@@ -1,4 +1,8 @@
-"""CCR marker freshness and retrieval-tool injection policy."""
+"""CCR marker freshness policy.
+
+Retrieval-tool injection is decided by ``apply_session_sticky_ccr_tool`` in
+``headroom.proxy.helpers``, from what the session has actually forwarded.
+"""
 
 from __future__ import annotations
 
@@ -28,30 +32,6 @@ def has_new_ccr_markers(
     )
     previous.scan_for_markers(previous_forwarded_messages)
     return bool(current - set(previous.detected_hashes))
-
-
-def should_inject_ccr_tool(
-    *,
-    configured_inject_tool: bool,
-    frozen_message_count: int,
-    has_compressed_content: bool,
-    transcript_requires_tool: bool = False,
-) -> tuple[bool, bool]:
-    """Decide whether the CCR retrieval tool must be injected this turn.
-
-    ``transcript_requires_tool`` forces injection when the about-to-forward
-    transcript already names ``headroom_retrieve`` but tracker state was lost
-    (a ``/model`` switch or proxy restart) — the dangling reference would
-    otherwise 400. It does NOT set ``is_marker_override``: that flag stays
-    specific to fresh #1006 markers so the caller can log each cause distinctly.
-    """
-
-    inject_tool = configured_inject_tool
-    if inject_tool and frozen_message_count > 0:
-        inject_tool = False
-    is_marker_override = not inject_tool and has_compressed_content
-    should_inject = inject_tool or is_marker_override or transcript_requires_tool
-    return should_inject, is_marker_override
 
 
 def transcript_references_ccr_tool(

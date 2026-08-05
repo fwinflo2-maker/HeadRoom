@@ -381,7 +381,6 @@ def test_ccrtoolinjector_session_has_done_ccr_kwarg():
 # guard for the 400 "Tool reference 'headroom_retrieve' not found in available tools".
 
 from headroom.proxy.helpers import (  # noqa: E402
-    should_inject_ccr_tool,
     transcript_references_ccr_tool,
 )
 
@@ -520,33 +519,6 @@ def test_transcript_ref_matches_openai_tool_calls():
 def test_transcript_ref_openai_ignores_mcp_prefixed_name():
     msg = _openai_tool_call_msg(name="mcp__headroom__headroom_retrieve")
     assert transcript_references_ccr_tool([msg], provider="openai") is False
-
-
-# --- policy: should_inject_ccr_tool transcript override ---------------------
-
-
-def test_should_inject_transcript_override_beats_frozen_deferral():
-    """Frozen prefix defers config injection; a dangling reference overrides it."""
-    should_inject, is_marker_override = should_inject_ccr_tool(
-        configured_inject_tool=True,
-        frozen_message_count=5,
-        has_compressed_content=False,
-        transcript_requires_tool=True,
-    )
-    assert should_inject is True
-    # is_marker_override stays specific to fresh #1006 markers, not this path.
-    assert is_marker_override is False
-
-
-def test_should_inject_no_transcript_no_markers_stays_deferred():
-    should_inject, is_marker_override = should_inject_ccr_tool(
-        configured_inject_tool=True,
-        frozen_message_count=5,
-        has_compressed_content=False,
-        transcript_requires_tool=False,
-    )
-    assert should_inject is False
-    assert is_marker_override is False
 
 
 # --- integration: apply_session_sticky_ccr_tool transcript recovery ---------

@@ -247,3 +247,19 @@ def test_cost_tracker_with_provider_cost_and_custom_pricing() -> None:
     assert stats["total_tokens_saved"] == 50_000
     # 50,000 saved tokens at $3.00/1M = $0.15 saved
     assert stats["savings_usd"] == pytest.approx(0.15)
+
+
+def test_provider_cost_without_usage_is_measured_budget_basis() -> None:
+    """An exact upstream dollar cost must not be labeled as a token estimate."""
+    tracker = CostTracker()
+
+    tracker.record_tokens(
+        model="gateway/custom-model",
+        tokens_saved=0,
+        tokens_sent=1_000,
+        provider_cost_usd=0.25,
+    )
+
+    breakdown = tracker.period_cost_breakdown()
+    assert breakdown["measured_usd"] == pytest.approx(0.25)
+    assert breakdown["estimated_usd"] == 0.0

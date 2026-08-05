@@ -8420,6 +8420,16 @@ class OpenAIHandlerMixin:
 
         try:
             body = await _read_request_json(request)
+        except RequestBodyTooLarge:
+            return JSONResponse(
+                status_code=get_body_too_large_status(),
+                content={
+                    "error": {
+                        "type": "invalid_request",
+                        "message": "Request body too large.",
+                    }
+                },
+            )
         except Exception:
             return JSONResponse(
                 status_code=400,

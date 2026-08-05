@@ -262,3 +262,86 @@ def test_cap_is_sane_default():
     # The default cap mirrors the uncompressed request budget: a compressed
     # body must never expand beyond what the handler would accept anyway.
     assert MAX_DECOMPRESSED_BODY_BYTES > 0
+
+
+# ---------------------------------------------------------------------------
+# Integration: /v1/compress preserves body-too-large status (413 / configured)
+# ---------------------------------------------------------------------------
+
+try:
+    from fastapi.testclient import TestClient  # noqa: F811
+
+    _HAS_FASTAPI = True
+except ImportError:
+    _HAS_FASTAPI = False
+
+
+@pytest.mark.skipif(not _HAS_FASTAPI, reason="fastapi not installed")
+def test_compress_endpoint_body_too_large_gzip(monkeypatch):
+    """A gzip bomb sent to /v1/compress returns the configured status, not 400."""
+    from headroom.proxy.server import ProxyConfig, create_app
+    from headroom.proxy.helpers import get_body_too_large_status
+
+    config = ProxyConfig(
+        optimize=True,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+    )
+    app = create_app(config)
+
+    # Build a gzip payload whose decompressed size exceeds the cap.
+    # The bomb is just a highly compressible string (all 'A') so the
+    # compressed wire size stays tiny.
+    bomb_body = json.dumps({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "A" * (MAX_DECOMPRESSED_BODY_BYTES + 1)}],
+    }).encode("utf-8")
+    compressed = gzip.compress(bomb_body)
+    expected_status = get_body_too_large_status()
+
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+        resp = client.post(
+            "/v1/compress",
+            content=compressed,
+            headers={"Content-Encoding": "gzip", "Content-Type": "application/json"},
+        )
+        assert resp.status_code == expected_status, (
+            f"expected {expected_status}, got {resp.status_code}: {resp.text}"
+        )
+
+
+@pytest.mark.skipif(not _HAS_FASTAPI, reason="fastapi not installed")
+def test_compress_bypass_body_too_large_gzip(monkeypatch):
+    """A gzip bomb sent to /v1/compress with x-headroom-bypass also returns the configured status."""
+    from headroom.proxy.server import ProxyConfig, create_app
+    from headroom.proxy.helpers import get_body_too_large_status
+
+    config = ProxyConfig(
+        optimize=True,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+    )
+    app = create_app(config)
+
+    bomb_body = json.dumps({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "A" * (MAX_DECOMPRESSED_BODY_BYTES + 1)}],
+    }).encode("utf-8")
+    compressed = gzip.compress(bomb_body)
+    expected_status = get_body_too_large_status()
+
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+        resp = client.post(
+            "/v1/compress",
+            content=compressed,
+            headers={
+                "Content-Encoding": "gzip",
+                "Content-Type": "application/json",
+                "x-headroom-bypass": "true",
+            },
+        )
+        assert resp.status_code == expected_status, (
+            f"expected {expected_status}, got {resp.status_code}: {resp.text}"
+        )

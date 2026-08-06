@@ -36,11 +36,10 @@ def test_wrap_pi_launches_with_transient_provider_extension(
 
     with patch.object(wrap_mod.shutil, "which", return_value="pi"):
         with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
-            with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")):
-                result = runner.invoke(
-                    main,
-                    ["wrap", "pi", "--port", "9000", "--", "-p", "hello"],
-                )
+            result = runner.invoke(
+                main,
+                ["wrap", "pi", "--port", "9000", "--", "-p", "hello"],
+            )
 
     assert result.exit_code == 0, result.output
     assert captured["binary"] == "pi"
@@ -61,9 +60,7 @@ def test_wrap_pi_launches_with_transient_provider_extension(
     assert '"X-Headroom-Project":' in extension_source
     assert tmp_path.name in extension_source
 
-    agents_md = tmp_path / "AGENTS.md"
-    assert agents_md.exists()
-    assert "headroom:rtk-instructions" in agents_md.read_text(encoding="utf-8")
+    assert not (tmp_path / "AGENTS.md").exists()
 
 
 def test_wrap_pi_missing_binary_errors_clearly(
@@ -76,7 +73,7 @@ def test_wrap_pi_missing_binary_errors_clearly(
     monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
 
     with patch.object(wrap_mod.shutil, "which", return_value=None):
-        result = runner.invoke(main, ["wrap", "pi", "--no-context-tool"])
+        result = runner.invoke(main, ["wrap", "pi"])
 
     assert result.exit_code == 1
     assert "'pi' not found in PATH" in result.output

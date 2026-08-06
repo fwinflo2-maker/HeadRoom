@@ -72,46 +72,9 @@ class AnthropicHandlerMixin:
     """Mixin providing Anthropic API handler methods for HeadroomProxy."""
 
     async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
-        """Resolve a tokenizer and count messages off the event loop.
+        from headroom.proxy.token_counting import count_tokens_offloaded
 
-        Tokenizer resolution can be expensive on first use (HuggingFace
-        backends may download vocab files) and counting a full Claude Code
-        conversation is CPU-bound, so both run on the compression executor
-        bounded by ``COMPRESSION_TIMEOUT_SECONDS`` (GH #1701: an unbounded
-        on-loop load froze the whole server). On timeout or error this
-        fails open to character-based estimation.
-
-        Returns:
-            Tuple of ``(tokenizer, token_count)``. The tokenizer is fully
-            initialized, so later ``count_messages`` calls on it are pure
-            CPU work.
-        """
-        from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
-        from headroom.tokenizers import EstimatingTokenCounter, get_tokenizer
-
-        def _resolve_and_count():  # noqa: ANN202
-            tokenizer = get_tokenizer(model)
-            return tokenizer, tokenizer.count_messages(messages)
-
-        try:
-            return await self._run_compression_in_executor(
-                _resolve_and_count,
-                timeout=float(COMPRESSION_TIMEOUT_SECONDS),
-            )
-        except Exception as e:  # fail open — includes asyncio.TimeoutError
-            # Log the downgrade once per model, not per request.
-            fallback_models = getattr(self, "_token_count_fallback_models", None)
-            if fallback_models is None:
-                fallback_models = set()
-                self._token_count_fallback_models = fallback_models
-            if model not in fallback_models:
-                fallback_models.add(model)
-                logger.warning(
-                    f"Token counting for model {model} failed or timed out "
-                    f"({e.__class__.__name__}); falling back to estimation"
-                )
-            estimator = EstimatingTokenCounter()
-            return estimator, estimator.count_messages(messages)
+        return await count_tokens_offloaded(self, model, messages)
 
     @staticmethod
     def _resolve_ccr_workspace(
@@ -905,7 +868,7 @@ class AnthropicHandlerMixin:
                     await _finalize_pre_upstream()
                     raise HTTPException(
                         status_code=429,
-                        detail=f"Budget exceeded for {self.config.budget_period} period",
+                        detail=self.cost_tracker.budget_denial_detail(),
                     )
 
             # Memory: Get user ID when memory is enabled (fallback to "default" for simple DevEx).
@@ -1151,6 +1114,46 @@ class AnthropicHandlerMixin:
                     original_client_messages,
                     frozen_message_count,
                 )
+            # Cold-prefix cache-miss hook (HEADROOM_COLD_RECOMPACT). Claude's thinking is
+            # an encrypted handle we can't shrink, so when the prompt cache has lapsed
+            # (idle past TTL → dead, nothing to bust) we instead recompact the whole
+            # prefix — cross-turn dedupe (+HEADROOM_DEDUPE) + superseded-read drop +
+            # lossless folds. Decided once here, then applied per mode below: TOKEN mode
+            # sets frozen_message_count=0 (reuses the frozen==0 path); CACHE mode runs a
+            # lossless whole-prefix recompaction instead of the byte-identical splice
+            # (the splice preserves a dead cache) and skips the overlay replay. Both are
+            # deterministic → the recompacted prefix re-caches byte-stable on warm turns.
+            _cold_recompact_active = False
+            if os.environ.get("HEADROOM_COLD_RECOMPACT", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            ):
+                from headroom.transforms.cold_prefix import (
+                    anthropic_cache_ttl_seconds,
+                    is_cold_prefix,
+                )
+
+                # Read CC's ACTUAL prompt-cache TTL (request cache_control.ttl + the
+                # DISABLE_/ENABLE_/FORCE_PROMPT_CACHING_* env controls) instead of the
+                # static 300s guess — a wrong TTL is exactly what busts a warm cache.
+                # None ⇒ caching is OFF (no cache to bust) ⇒ recompact every turn.
+                _cc_ttl = anthropic_cache_ttl_seconds(
+                    model, original_client_messages, system_prompt
+                )
+                _cold_recompact_active = _cc_ttl is None or is_cold_prefix(
+                    prefix_tracker, ttl_seconds=_cc_ttl
+                )
+                if _cold_recompact_active:
+                    logger.info(
+                        "[%s] cold-prefix recompaction: cc_cache_ttl=%s idle=%.0fs — recompacting "
+                        "whole prefix (dedupe/superseded-read/lossless)",
+                        request_id,
+                        "disabled" if _cc_ttl is None else f"{_cc_ttl}s",
+                        idle_seconds,
+                    )
+                    if is_token_mode(self.config.mode):
+                        frozen_message_count = 0
 
             # PR-A6 (P5-50, preps P0-6): session-sticky `anthropic-beta` merge.
             # Read the client's beta value (note: anthropic-beta is NOT
@@ -1482,6 +1485,25 @@ class AnthropicHandlerMixin:
                             pipeline_timing = result.timing
                             original_tokens = result.tokens_before
                             optimized_tokens = result.tokens_after
+                    elif _cold_recompact_active:
+                        # CACHE mode, cold turn: the prompt cache is dead, so the
+                        # byte-identical splice preserves nothing. Recompact the whole
+                        # prefix losslessly (dedupe + superseded-read drop + folds) and
+                        # forward that — the overlay replay below is skipped on cold so
+                        # this survives. Deterministic → re-caches byte-stable warm.
+                        from headroom.transforms.cold_prefix import cold_recompact_messages
+
+                        recompacted, _cold_transforms = await self._run_compression_in_executor(
+                            lambda: cold_recompact_messages(
+                                original_client_messages,
+                                tokenizer=tokenizer,
+                                context=extract_user_query(original_client_messages),
+                            ),
+                            timeout=COMPRESSION_TIMEOUT_SECONDS,
+                        )
+                        optimized_messages = recompacted
+                        optimized_tokens = tokenizer.count_messages(optimized_messages)
+                        transforms_applied = _cold_transforms
                     else:
                         previous_original_messages = prefix_tracker.get_last_original_messages()
                         previous_forwarded_messages = prefix_tracker.get_last_forwarded_messages()
@@ -1594,16 +1616,22 @@ class AnthropicHandlerMixin:
                 overlay_cached_prefix,
             )
 
-            _ov = overlay_cached_prefix(
-                optimized_messages,
-                original_client_messages,
-                prefix_tracker.get_last_original_messages(),
-                prefix_tracker.get_last_forwarded_messages(),
-            )
-            _overlay_replayed = _ov != optimized_messages
-            if _overlay_replayed:
-                optimized_messages = _ov
-                optimized_tokens = tokenizer.count_messages(optimized_messages)
+            # On a confirmed-cold turn we deliberately do NOT replay the previously
+            # forwarded prefix: the cache is dead (nothing to keep byte-identical for)
+            # and the replay would clobber the whole-prefix recompaction we just did.
+            if _cold_recompact_active:
+                _overlay_replayed = False
+            else:
+                _ov = overlay_cached_prefix(
+                    optimized_messages,
+                    original_client_messages,
+                    prefix_tracker.get_last_original_messages(),
+                    prefix_tracker.get_last_forwarded_messages(),
+                )
+                _overlay_replayed = _ov != optimized_messages
+                if _overlay_replayed:
+                    optimized_messages = _ov
+                    optimized_tokens = tokenizer.count_messages(optimized_messages)
 
             # Own cache_control placement: the client moves the breakpoint each
             # turn and the overlay replays past markers, so they accumulate ~1/turn
@@ -1817,11 +1845,6 @@ class AnthropicHandlerMixin:
                     )
                     inject_system_instructions = False
                 configured_inject_tool = self.config.ccr_inject_tool
-                if configured_inject_tool and frozen_message_count > 0:
-                    logger.info(
-                        f"[{request_id}] CCR: deferring tool injection "
-                        f"(frozen_message_count={frozen_message_count}) to preserve cache"
-                    )
                 # Scan for compression markers + maybe inject system instructions.
                 # Tool-list injection is handled separately via the sticky helper.
                 injector = CCRToolInjector(
@@ -1837,47 +1860,34 @@ class AnthropicHandlerMixin:
                 # retrieval tool once a session has done CCR, regardless
                 # of whether THIS turn produced compressed content.
                 #
-                # #1006: if tool injection was deferred (frozen prefix) but
-                # compression just emitted NEW markers this turn, override the
-                # deferral — the agent has no other way to redeem those markers.
-                # The cache miss on this one request is preferable to silent
-                # data loss.  If the session has already done CCR the tool is
-                # already in the client's tool list, so sticky replay is a
-                # no-op and the cache is unaffected.
-                # ponytail: ceiling is one extra cache miss on the first CCR
-                # turn in a frozen-prefix session.
-                from headroom.proxy.helpers import (
-                    has_new_ccr_markers,
-                    should_inject_ccr_tool,
-                )
+                # Injection is deliberately NOT gated on
+                # ``frozen_message_count``. That counter answers "is the
+                # prefix warm?", but the decision needs "does the established
+                # prefix already contain the tool?" — which only
+                # ``SessionCcrTracker`` knows. Gating on the counter dropped a
+                # tool that was already inside the provider-cached prefix, and
+                # ``tools`` is the head of Anthropic's cache key, so every
+                # toggle invalidated the entire prefix in both directions.
+                # ``apply_session_sticky_ccr_tool`` carries the correct rule:
+                # a session that has never compressed still gets no tool, so
+                # dropping the gate cannot start injecting into non-CCR
+                # conversations.
+                if configured_inject_tool:
+                    from headroom.proxy.helpers import (
+                        apply_session_sticky_ccr_tool,
+                        has_new_ccr_markers,
+                    )
 
-                # #1850: only markers NEW this turn justify overriding the
-                # injection deferral (#1006). Markers replayed from the
-                # previously-forwarded prefix (overlay_cached_prefix) are
-                # historical — counting them would re-inject the tool on every
-                # frozen turn and bust the *tools* cache segment, undoing the
-                # overlay's messages-prefix cache-safety.
-                has_new_compressed_content = has_new_ccr_markers(
-                    current_detected_hashes=injector.detected_hashes,
-                    previous_forwarded_messages=prefix_tracker.get_last_forwarded_messages(),
-                    provider="anthropic",
-                )
-
-                should_inject, is_marker_override = should_inject_ccr_tool(
-                    configured_inject_tool=configured_inject_tool,
-                    frozen_message_count=frozen_message_count,
-                    has_compressed_content=has_new_compressed_content,
-                )
-                if should_inject:
-                    if is_marker_override:
-                        logger.info(
-                            f"[{request_id}] CCR: overriding injection deferral — "
-                            f"new markers emitted but headroom_retrieve unavailable "
-                            f"(frozen_message_count={frozen_message_count}); injecting to "
-                            "prevent unredeemable markers (#1006)"
-                        )
-                    from headroom.proxy.helpers import apply_session_sticky_ccr_tool
-
+                    # #1850: markers replayed from the previously-forwarded
+                    # prefix (overlay_cached_prefix) are historical; only
+                    # markers NEW this turn may drive a first-time injection,
+                    # else a replayed marker injects the tool into a session
+                    # that never actually compressed.
+                    has_new_compressed_content = has_new_ccr_markers(
+                        current_detected_hashes=injector.detected_hashes,
+                        previous_forwarded_messages=prefix_tracker.get_last_forwarded_messages(),
+                        provider="anthropic",
+                    )
                     tools, ccr_tool_injected = apply_session_sticky_ccr_tool(
                         provider="anthropic",
                         session_id=session_id,
@@ -2249,14 +2259,32 @@ class AnthropicHandlerMixin:
             # after tools are finalised (sorting, CCR injection) but before
             # the PRE_SEND pipeline event so extensions see the compacted
             # schema.  Mirrors the same pass that the OpenAI handler applies.
+            #
+            # Token accounting (see tool_schema_savings_policy): the compaction passes
+            # below rewrite the tool array, so both endpoints are countable and the
+            # delta is folded into original/optimized_tokens at the final recount.
+            # Without this the savings were computed, debug-logged, and discarded —
+            # Claude Code reported them nowhere.
+            _tool_tokens_before = 0
+            _tool_tokens_after = 0
+
+            def _count_tool_tokens(value: object) -> int:
+                try:
+                    return tokenizer.count_text(json.dumps(value, default=str))
+                except Exception:
+                    return 0
+
             _tools_compaction_started = time.time()
             try:
                 from headroom.proxy.tool_schema_compaction import compact_tools
 
+                _pre_compaction_tools = body.get("tools")
                 body, _tools_modified, _tools_before_bytes, _tools_after_bytes = compact_tools(body)
                 if _tools_modified:
                     tools = body["tools"]
                     transforms_applied.append("anthropic:tool_schema_compaction")
+                    _tool_tokens_before = _count_tool_tokens(_pre_compaction_tools)
+                    _tool_tokens_after = _count_tool_tokens(tools)
                     _tools_compaction_ms = (time.time() - _tools_compaction_started) * 1000
                     logger.debug(
                         "[%s] tool schema compaction: %d -> %d bytes (%.0f%% saved) in %.1fms",
@@ -2283,12 +2311,18 @@ class AnthropicHandlerMixin:
 
                 _desc_max = tool_desc_max_chars()
                 if _desc_max > 0:
+                    _pre_desc_tools = body.get("tools")
                     body, _desc_modified, _desc_before, _desc_after = compact_tool_descriptions(
                         body, _desc_max
                     )
                     if _desc_modified:
                         tools = body["tools"]
                         transforms_applied.append("anthropic:tool_desc_compaction")
+                        # Runs after schema compaction, so only seed "before" when that
+                        # pass didn't already; "after" always tracks the latest tools.
+                        if not _tool_tokens_before:
+                            _tool_tokens_before = _count_tool_tokens(_pre_desc_tools)
+                        _tool_tokens_after = _count_tool_tokens(tools)
                         logger.debug(
                             "[%s] tool description compaction: %d -> %d bytes (%.0f%% saved, max_chars=%d)",
                             request_id,
@@ -2367,7 +2401,10 @@ class AnthropicHandlerMixin:
                 optimized_tokens = tokenizer.count_messages(body["messages"])
                 tokens_saved = max(0, original_tokens - optimized_tokens)
 
-            # Server-side Tool Search (opt-in HEADROOM_TOOL_SEARCH): defer the
+            # Server-side Tool Search (on by default; HEADROOM_TOOL_SEARCH=0 opts
+            # out — the `coding` savings profile already seeded it on via
+            # seed_proxy_env_defaults, so default-on here just makes the same
+            # posture hold for entry points that never seeded): defer the
             # non-core tool schemas behind a tool_search tool so Anthropic excludes
             # them from the context window — they stop counting as input tokens until
             # the model searches for one — while every tool stays callable.
@@ -2386,7 +2423,7 @@ class AnthropicHandlerMixin:
             if (
                 provider_name == "anthropic"
                 and getattr(self, "anthropic_backend", None) is None
-                and os.environ.get("HEADROOM_TOOL_SEARCH", "").strip().lower()
+                and os.environ.get("HEADROOM_TOOL_SEARCH", "1").strip().lower()
                 in ("1", "true", "yes", "on", "auto")
             ):
                 from headroom.proxy.helpers import inject_tool_search_deferral
@@ -2412,6 +2449,35 @@ class AnthropicHandlerMixin:
                         f"{_ts_saved_tokens}tok"
                     )
 
+            # Tool-search history repair (#2805). Once deferral is on, the client
+            # stores Anthropic's server_tool_use / tool_search_tool_result blocks in
+            # its transcript forever, and upstream validates every tool_reference in
+            # that history against THIS request's tools array. Claude Code replays
+            # the same transcript on side-requests carrying a different, smaller
+            # tools array (the prompt-type Stop hook evaluator, /compact), which the
+            # proxy cannot predict — so upstream 400s with "Tool reference 'X' not
+            # found in available tools". Drop the blocks such a request cannot
+            # support. Runs AFTER the injection above so the tool we just added
+            # counts as present: on the main loop nothing is stripped and the prefix
+            # is untouched. Unconditional (not gated on the flag) so transcripts
+            # poisoned before the flag was turned off still recover.
+            from headroom.proxy.helpers import strip_unsupported_tool_search_blocks
+
+            _ts_repaired, _ts_stripped = strip_unsupported_tool_search_blocks(
+                body.get("messages"), body.get("tools")
+            )
+            if _ts_stripped:
+                body["messages"] = _ts_repaired
+                optimized_messages = _ts_repaired
+                body_mutation_tracker.mark_mutated("tool_search_history_repair")
+                transforms_applied.append(f"router:tool_search_repair:{_ts_stripped}blocks")
+                logger.info(
+                    "[%s] Tool search: dropped %d unsupportable history block(s) "
+                    "(tools array cannot resolve their tool_reference entries)",
+                    request_id,
+                    _ts_stripped,
+                )
+
             # Turn hooks (opt-in extensions): a registered hook may inspect or
             # rewrite the outbound tools/messages before we send upstream — the
             # extensible counterpart to the built-in deferral above. A single
@@ -2422,6 +2488,7 @@ class AnthropicHandlerMixin:
                 run_request_hooks,
             )
 
+            _pre_hook_tokens: int | None = None
             if registered_turn_hooks():
                 _req_ctx = TurnContext(
                     provider="anthropic",
@@ -2430,6 +2497,15 @@ class AnthropicHandlerMixin:
                     tools=body.get("tools"),
                     config=self.config,
                 )
+                # Snapshot BEFORE the hook (same tokenizer) so we can tell whether the
+                # hook itself folded — comparing against the pipeline's optimized_tokens
+                # instead conflates a real fold with a cross-estimator delta (see below).
+                try:
+                    _pre_hook_tokens = tokenizer.count_messages(optimized_messages)
+                except Exception:
+                    _pre_hook_tokens = None
+                _th_tools_before = body.get("tools")
+                _th_tok_before = _count_tool_tokens(_th_tools_before) if _th_tools_before else 0
                 run_request_hooks(_req_ctx)
                 if _req_ctx.messages is not optimized_messages:
                     optimized_messages = _req_ctx.messages
@@ -2437,6 +2513,44 @@ class AnthropicHandlerMixin:
                 if _req_ctx.tools is not body.get("tools"):
                     tools = _req_ctx.tools
                     body["tools"] = tools
+                # A hook may shrink the tool array either by replacing it or in place,
+                # so measure the FINAL tools object. Deferral-shaped (removes schemas
+                # count_messages never saw), hence a tag rather than a fold — mirrors
+                # the OpenAI chat path so a turn-hook extension is credited on both.
+                _th_tok_after = _count_tool_tokens(_req_ctx.tools) if _req_ctx.tools else 0
+                _th_saved = max(0, _th_tok_before - _th_tok_after)
+                if _th_saved > 0:
+                    tags["turn_hook_tools_saved_tokens"] = (
+                        int(tags.get("turn_hook_tools_saved_tokens", 0) or 0) + _th_saved
+                    )
+
+            # Consistency: report tok_before/tok_after with ONE tokenizer. The pipeline
+            # and the handler use different token estimators, and cache-mode branches
+            # can leave original_tokens (handler, line ~1049) and optimized_tokens
+            # (pipeline, result.tokens_after) on different scales — which produced
+            # impossible tok_after>tok_before deltas and masked real savings. Recount
+            # BOTH endpoints (pre-compression snapshot vs final outbound messages) with
+            # the handler tokenizer so the delta is meaningful. This also captures any
+            # turn-hook fold (optimized_messages is post-hook). Runs unconditionally.
+            try:
+                _orig_snapshot = original_client_messages  # noqa: F821 (bound at request start)
+                original_tokens = tokenizer.count_messages(_orig_snapshot)
+                optimized_tokens = tokenizer.count_messages(optimized_messages)
+                # Fold the tool-schema/desc compaction delta into BOTH endpoints so
+                # tok_before - tok_after == tok_saved stays coherent in the PERF line
+                # (count_messages never sees tool bytes). Same shape as the OpenAI chat
+                # handler; guarded so a no-op or inflating pass contributes nothing.
+                if 0 < _tool_tokens_after < _tool_tokens_before:
+                    original_tokens += _tool_tokens_before
+                    optimized_tokens += _tool_tokens_after
+                tokens_saved = max(0, original_tokens - optimized_tokens)
+                # Attribute the fold to the hook ONLY when the hook itself reduced
+                # tokens (same-tokenizer pre vs post) — not when the recount above
+                # merely normalized a cross-estimator scale difference.
+                if _pre_hook_tokens is not None and optimized_tokens < _pre_hook_tokens:
+                    transforms_applied.append("turn_hook")
+            except Exception:
+                logger.debug("consistency token re-count skipped", exc_info=True)
 
             # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER): verbosity
             # steering appended to the system-prompt tail + effort routing on
@@ -2530,7 +2644,17 @@ class AnthropicHandlerMixin:
                 headers["anthropic-beta"] = _client_beta_value
 
             # Forward request - use Bedrock backend if configured, otherwise direct API
-            if self.anthropic_backend is not None:
+            #
+            # An extension may have published a per-request routing decision on
+            # `request.state.headroom_route` (see proxy/route_advice.py). When
+            # it names a provider we do not already speak, serve this ONE
+            # request from a translating backend for it. Absent, unresolvable,
+            # or same-protocol -> `self.anthropic_backend`, i.e. exactly the
+            # behaviour this line had before.
+            from headroom.proxy.route_advice import resolver_for
+
+            request_backend = resolver_for(self).for_request(request, body=body)
+            if request_backend is not None:
                 # Route through Bedrock backend
                 try:
                     if stream:
@@ -2561,12 +2685,11 @@ class AnthropicHandlerMixin:
                             original_messages=original_client_messages,
                             prefix_tracker=prefix_tracker,
                             optimized_messages=optimized_messages,
+                            backend=request_backend,
                         )
                     else:
                         async with stage_timer.measure("upstream_connect"):
-                            backend_response = await self.anthropic_backend.send_message(
-                                body, headers
-                            )
+                            backend_response = await request_backend.send_message(body, headers)
                         self.pipeline_extensions.emit(
                             PipelineStage.POST_SEND,
                             operation="proxy.request",
@@ -2618,9 +2741,7 @@ class AnthropicHandlerMixin:
                         usage = backend_response.body.get("usage", {})
                         output_tokens = usage.get("output_tokens", 0)
 
-                        _backend_name = (
-                            self.anthropic_backend.name if self.anthropic_backend else "anthropic"
-                        )
+                        _backend_name = request_backend.name if request_backend else "anthropic"
                         # Eligible-only denominator for the active
                         # compression ratio: tokens in the live zone we
                         # actually attempted to compress. Frozen prefix
@@ -2665,6 +2786,13 @@ class AnthropicHandlerMixin:
                             miss = prefix_tracker.classify_cache_miss(
                                 cache_read_tokens=cr_tokens,
                                 current_forwarded_messages=optimized_messages,
+                            )
+                            from headroom.cache.ttl_observations import (
+                                record_cache_observation,
+                            )
+
+                            record_cache_observation(
+                                provider="anthropic", model=model, attribution=miss
                             )
                             if miss.is_miss:
                                 logger.info(
@@ -3296,6 +3424,13 @@ class AnthropicHandlerMixin:
                             miss = prefix_tracker.classify_cache_miss(
                                 cache_read_tokens=cr_tokens,
                                 current_forwarded_messages=optimized_messages,
+                            )
+                            from headroom.cache.ttl_observations import (
+                                record_cache_observation,
+                            )
+
+                            record_cache_observation(
+                                provider="anthropic", model=model, attribution=miss
                             )
                             if miss.is_miss:
                                 logger.info(

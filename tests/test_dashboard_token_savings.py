@@ -22,6 +22,10 @@ def test_token_savings_headline_uses_total_wire_denominator() -> None:
     assert "stats.tokens?.active_savings_percent" not in headline_body
     assert "stats.tokens?.proxy_attempted_tokens" not in headline_body
 
+    # The subtitle copy moved into help_text.json (overview.compression_ratio.body)
+    # and is wired through the getter. Assert the getter points at the help path and
+    # that the real copy renders, rather than expecting the stale inline literal.
     title_body = _getter_body(html, "headlineSavingsTitle")
-    assert "Of total wire input tokens" in title_body
-    assert "Of compressible tokens attempted" not in title_body
+    assert "helpText?.overview?.compression_ratio?.body" in title_body
+    assert "Of total wire input tokens" in html
+    assert "Of compressible tokens attempted" not in html

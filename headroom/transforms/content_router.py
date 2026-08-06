@@ -100,7 +100,6 @@ _detect_panic_warned = False
 _detect_native_unhealthy = False  # circuit breaker: native detect hung once (#575)
 _detect_native_verified = False  # native detect has returned once -> skip the watchdog
 
-
 # Shared calibrated fallback estimator (tiktoken cl100k_base ~90% accuracy,
 # content-type aware incl. JSON). Kept as one module-level instance so the
 # size heuristic lives in a single reusable place, not a hardcoded constant.

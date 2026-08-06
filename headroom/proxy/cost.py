@@ -15,6 +15,7 @@ from collections import deque
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from headroom.proxy import user_config
 from headroom.proxy.budget_basis_policy import (
     BUDGET_BASIS_BLOCK,
     BUDGET_BASIS_IGNORE,
@@ -749,6 +750,18 @@ class CostTracker:
             cache_read_tokens: Tokens served from cache (~10% of input rate)
             cache_write_tokens: Tokens written to cache (~125% of input rate)
         """
+        # User pricing override wins when configured for this model; otherwise
+        # fall through to LiteLLM's database (unchanged default behavior).
+        override = user_config.pricing_override_per_token(model)
+        if override is not None:
+            total_cost = (
+                input_tokens * override["input"]
+                + output_tokens * override["output"]
+                + cache_read_tokens * override["cache_read"]
+                + cache_write_tokens * override["cache_write"]
+            )
+            return float(total_cost) if total_cost > 0 else None
+
         litellm = _get_litellm_module()
         if litellm is None:
             _warn_pricing_once(
@@ -1021,6 +1034,9 @@ class CostTracker:
 
     def _get_list_price(self, model: str) -> float | None:
         """Get list input price per 1M tokens for a model."""
+        override = user_config.pricing_override_per_token(model)
+        if override is not None:
+            return override["input"] * 1_000_000
         litellm = _get_litellm_module()
         if litellm is None:
             return None
@@ -1040,6 +1056,9 @@ class CostTracker:
         Returns (cache_read, cache_write, uncached) per-token costs, or None
         if pricing is unavailable. Uses LiteLLM's native cache pricing data.
         """
+        override = user_config.pricing_override_per_token(model)
+        if override is not None:
+            return (override["cache_read"], override["cache_write"], override["input"])
         litellm = _get_litellm_module()
         if litellm is None:
             return None
@@ -1119,6 +1138,13 @@ class CostTracker:
                 _cr_price, _cw_price, uncached_price = prices
                 savings_usd += saved * uncached_price
 
+        # Period spend + remaining budget for the dashboard. Guarded so a
+        # bad clock or empty ledger never breaks /stats.
+        try:
+            period_spend = self.get_period_cost()
+        except Exception:
+            period_spend = 0.0
+
         return {
             "total_tokens_saved": total_saved,
             "total_input_tokens": total_input_tokens,
@@ -1136,4 +1162,8 @@ class CostTracker:
             # Period spend split by input-count provenance, so estimate-derived
             # spend stays separable from provider-reported spend (#2713).
             "budget_basis": self.period_cost_breakdown(),
+            "period_spend_usd": round(period_spend, 4),
+            "budget_remaining_usd": round(self.check_budget()[1], 4)
+            if self.budget_limit_usd is not None
+            else None,
         }

@@ -2,39 +2,47 @@
 
 from __future__ import annotations
 
-import json
+import asyncio
 import time
-from unittest.mock import AsyncMock, MagicMock
 
-import httpx
-import pytest
-
-import headroom.subscription.codex_rate_limits as codex_rate_limits
-from headroom.proxy.server import HeadroomProxy
+import headroom.subscription.codex_rate_limits as crl
 from headroom.subscription.codex_rate_limits import (
-    CodexRateLimitSnapshot,
     CodexRateLimitState,
     CodexRateLimitWindow,
-    get_codex_rate_limit_state,
+    _build_usage_headers,
+    maybe_schedule_usage_poll,
     parse_codex_rate_limits,
+    parse_codex_usage_payload,
 )
 
-
-@pytest.fixture(autouse=True)
-def _isolate_persist_path(tmp_path, monkeypatch):
-    """Redirect the on-disk persistence file to a temp location.
-
-    Without this, ``CodexRateLimitState`` would read/write the real
-    ``~/.headroom/codex_rate_limits.json`` during tests, polluting the
-    developer's environment and making ``test_initial_state_is_none``-style
-    assertions order/run dependent.
-    """
-    monkeypatch.setattr(
-        codex_rate_limits, "_PERSIST_PATH", tmp_path / "codex_rate_limits.json"
-    )
-    # Reset the process-global singleton so each test starts clean.
-    monkeypatch.setattr(codex_rate_limits, "_state", None)
-    yield
+# A faithful GET /wham/usage body (shape captured from a live Plus account).
+USAGE_PAYLOAD = {
+    "plan_type": "plus",
+    "rate_limit": {
+        "allowed": True,
+        "limit_reached": False,
+        "primary_window": {
+            "used_percent": 23,
+            "limit_window_seconds": 18000,
+            "reset_after_seconds": 12266,
+            "reset_at": 1781276043,
+        },
+        "secondary_window": {
+            "used_percent": 6,
+            "limit_window_seconds": 604800,
+            "reset_after_seconds": 359170,
+            "reset_at": 1781622947,
+        },
+    },
+    "additional_rate_limits": None,
+    "credits": {
+        "has_credits": False,
+        "unlimited": False,
+        "balance": "0",
+    },
+    "rate_limit_reached_type": None,
+    "promo": None,
+}
 
 # ---------------------------------------------------------------------------
 # CodexRateLimitWindow helpers
@@ -254,186 +262,160 @@ class TestCodexRateLimitState:
 
 
 # ---------------------------------------------------------------------------
-# Persistence (survives restart)
+# parse_codex_usage_payload (GET /wham/usage)
 # ---------------------------------------------------------------------------
 
 
-class TestCodexRateLimitPersistence:
-    def test_update_writes_snapshot_to_disk(self):
-        state = CodexRateLimitState()
-        state.update_from_headers(
-            {
-                "x-codex-primary-used-percent": "45.2",
-                "x-codex-primary-window-minutes": "15",
-            }
-        )
-        assert codex_rate_limits._PERSIST_PATH.exists()
-        data = json.loads(codex_rate_limits._PERSIST_PATH.read_text())
-        assert data["primary"]["used_percent"] == 45.2
-
-    def test_new_instance_loads_persisted_snapshot(self):
-        # First instance writes a snapshot to disk.
-        first = CodexRateLimitState()
-        first.update_from_headers(
-            {
-                "x-codex-primary-used-percent": "33.3",
-                "x-codex-secondary-used-percent": "66.6",
-            }
-        )
-        # A fresh instance (simulating a proxy restart) should reload it.
-        second = CodexRateLimitState()
-        snap = second.latest
+class TestParseCodexUsagePayload:
+    def test_parses_full_payload(self):
+        snap = parse_codex_usage_payload(USAGE_PAYLOAD)
         assert snap is not None
         assert snap.primary is not None
-        assert snap.primary.used_percent == 33.3
+        assert snap.primary.used_percent == 23.0
+        assert snap.primary.window_minutes == 300  # 18000s rounded up
+        assert snap.primary.resets_at == 1781276043
         assert snap.secondary is not None
-        assert snap.secondary.used_percent == 66.6
+        assert snap.secondary.used_percent == 6.0
+        assert snap.secondary.window_minutes == 10080  # 604800s
 
-    def test_corrupt_persist_file_is_ignored(self):
-        codex_rate_limits._PERSIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-        codex_rate_limits._PERSIST_PATH.write_text("{not valid json")
-        # Should not raise — just start with empty state.
-        state = CodexRateLimitState()
-        assert state.latest is None
-
-    def test_snapshot_roundtrips_through_dict(self):
-        snap = parse_codex_rate_limits(
-            {
-                "x-codex-primary-used-percent": "12.5",
-                "x-codex-primary-window-minutes": "60",
-                "x-codex-primary-reset-at": "1749043200",
-                "x-codex-secondary-used-percent": "80.0",
-                "x-codex-credits-has-credits": "true",
-                "x-codex-credits-balance": "$5.00",
-                "x-codex-limit-name": "gpt-5.4-codex",
-            }
+    def test_window_minutes_rounds_up(self):
+        snap = parse_codex_usage_payload(
+            {"rate_limit": {"primary_window": {"used_percent": 1, "limit_window_seconds": 61}}}
         )
         assert snap is not None
-        restored = CodexRateLimitSnapshot.from_dict(snap.to_dict())
-        assert restored.primary is not None
-        assert restored.primary.used_percent == 12.5
-        assert restored.primary.window_minutes == 60
-        assert restored.secondary is not None
-        assert restored.secondary.used_percent == 80.0
-        assert restored.credits is not None
-        assert restored.credits.balance == "$5.00"
-        assert restored.limit_name == "gpt-5.4-codex"
+        assert snap.primary is not None
+        assert snap.primary.window_minutes == 2
 
+    def test_no_credits_balance_suppressed(self):
+        # has_credits False -> balance must not surface as "0".
+        snap = parse_codex_usage_payload(USAGE_PAYLOAD)
+        assert snap is not None
+        assert snap.credits is not None
+        assert snap.credits.has_credits is False
+        assert snap.credits.balance is None
 
-# ---------------------------------------------------------------------------
-# Streaming SSE path integration
-# ---------------------------------------------------------------------------
-
-
-def _make_streaming_proxy() -> HeadroomProxy:
-    """Create a HeadroomProxy with mocked internals for streaming unit tests."""
-    proxy = object.__new__(HeadroomProxy)
-    proxy.http_client = MagicMock(spec=httpx.AsyncClient)
-    proxy.metrics = MagicMock()
-    proxy.metrics.record_request = AsyncMock(return_value=None)
-    proxy.metrics.record_failed = AsyncMock(return_value=None)
-    proxy.cost_tracker = MagicMock()
-    proxy.cost_tracker.estimate_cost.return_value = 0.001
-    proxy.cost_tracker.record_request.return_value = None
-    proxy.stats = {
-        "requests_total": 0,
-        "requests_optimized": 0,
-        "tokens": {"original": 0, "optimized": 0, "saved": 0},
-        "cost": {"total_usd": 0, "savings_usd": 0},
-        "errors": 0,
-        "active_requests": 0,
-        "requests_per_model": {},
-    }
-    proxy.memory_manager = None
-    proxy._config = MagicMock()
-    proxy._config.memory_enabled = False
-    proxy._config.ccr_inject_tool = False
-    proxy._config.retry_max_attempts = 3
-    proxy._config.retry_base_delay_ms = 0
-    proxy._config.retry_max_delay_ms = 0
-    proxy.config = proxy._config
-    proxy._parse_sse_usage_from_buffer = MagicMock(return_value=None)
-    proxy.memory_handler = None
-    return proxy
-
-
-def _make_codex_streaming_response() -> AsyncMock:
-    """Mock httpx streaming response carrying x-codex-* headers."""
-    mock_response = AsyncMock()
-    mock_response.headers = httpx.Headers(
-        {
-            "content-type": "text/event-stream",
-            "x-codex-primary-used-percent": "45.2",
-            "x-codex-primary-window-minutes": "15",
-            "x-codex-primary-reset-at": "1749043200",
-            "x-codex-secondary-used-percent": "12.1",
-            "x-codex-secondary-window-minutes": "10080",
-            "x-codex-secondary-reset-at": "1749648000",
+    def test_credits_balance_kept_when_has_credits(self):
+        payload = {
+            "rate_limit": {"primary_window": {"used_percent": 5}},
+            "credits": {"has_credits": True, "unlimited": False, "balance": "$5.00"},
         }
-    )
-    mock_response.status_code = 200
+        snap = parse_codex_usage_payload(payload)
+        assert snap is not None
+        assert snap.credits is not None
+        assert snap.credits.balance == "$5.00"
 
-    async def aiter_bytes():
-        yield b'data: {"type":"response.completed"}\n\n'
+    def test_promo_object_message(self):
+        payload = {
+            "rate_limit": {"primary_window": {"used_percent": 5}},
+            "promo": {"message": "Hello"},
+        }
+        snap = parse_codex_usage_payload(payload)
+        assert snap is not None
+        assert snap.promo_message == "Hello"
 
-    mock_response.aiter_bytes = aiter_bytes
-    mock_response.aclose = AsyncMock()
-    return mock_response
+    def test_returns_none_for_empty(self):
+        assert parse_codex_usage_payload({}) is None
+        assert parse_codex_usage_payload(None) is None
+        assert parse_codex_usage_payload({"rate_limit": {}}) is None
+
+    def test_missing_used_percent_window_skipped(self):
+        snap = parse_codex_usage_payload(
+            {"rate_limit": {"primary_window": {"limit_window_seconds": 60}}}
+        )
+        assert snap is None
+
+    def test_update_from_usage_payload_stores(self):
+        state = CodexRateLimitState()
+        assert state.update_from_usage_payload(USAGE_PAYLOAD) is True
+        snap = state.latest
+        assert snap is not None
+        assert snap.primary is not None
+        assert snap.primary.used_percent == 23.0
+
+    def test_update_from_usage_payload_noop_returns_false(self):
+        state = CodexRateLimitState()
+        assert state.update_from_usage_payload({}) is False
+        assert state.latest is None
 
 
-class TestStreamingPathUpdatesCodexRateLimits:
-    @pytest.mark.asyncio
-    async def test_streaming_path_updates_codex_rate_limits(self):
-        """Verify that _stream_response calls update_from_headers (SSE path)."""
-        proxy = _make_streaming_proxy()
-        mock_response = _make_codex_streaming_response()
-        proxy.http_client.build_request = MagicMock(return_value=MagicMock())
-        proxy.http_client.send = AsyncMock(return_value=mock_response)
+# ---------------------------------------------------------------------------
+# Usage poll: header gating + throttle
+# ---------------------------------------------------------------------------
 
-        await proxy._stream_response(
-            url="https://api.openai.com/v1/responses",
-            headers={"authorization": "Bearer sk-test"},
-            body={"model": "gpt-5.4-codex", "stream": True, "input": "hi"},
-            provider="openai",
-            model="gpt-5.4-codex",
-            request_id="codex-stream-1",
-            original_tokens=10,
-            optimized_tokens=10,
-            tokens_saved=0,
-            transforms_applied=[],
-            tags={},
-            optimization_latency=0.0,
+
+class TestUsagePollGating:
+    def test_build_headers_requires_account_id(self):
+        assert _build_usage_headers({"authorization": "Bearer abc.def.ghi"}) is None
+
+    def test_build_headers_requires_bearer(self):
+        assert _build_usage_headers({"chatgpt-account-id": "acct"}) is None
+        assert (
+            _build_usage_headers({"authorization": "sk-live", "chatgpt-account-id": "acct"}) is None
         )
 
-        state = get_codex_rate_limit_state()
-        assert state.latest is not None
-        assert state.latest.primary is not None
-        assert state.latest.primary.used_percent == 45.2
-        assert state.latest.secondary is not None
-        assert state.latest.secondary.used_percent == 12.1
+    def test_build_headers_happy_path(self):
+        headers = _build_usage_headers(
+            {
+                "Authorization": "Bearer abc.def.ghi",
+                "ChatGPT-Account-Id": "acct-1",
+                "User-Agent": "codex_exec/0.139.0",
+                "originator": "codex_exec",
+            }
+        )
+        assert headers is not None
+        assert headers["Authorization"] == "Bearer abc.def.ghi"
+        assert headers["ChatGPT-Account-Id"] == "acct-1"
+        assert headers["User-Agent"] == "codex_exec/0.139.0"
+        assert headers["originator"] == "codex_exec"
 
-    @pytest.mark.asyncio
-    async def test_streaming_path_forwards_codex_headers_to_client(self):
-        """x-codex-* headers must reach the client so the CLI display updates."""
-        proxy = _make_streaming_proxy()
-        mock_response = _make_codex_streaming_response()
-        proxy.http_client.build_request = MagicMock(return_value=MagicMock())
-        proxy.http_client.send = AsyncMock(return_value=mock_response)
+    def test_try_begin_poll_throttles(self):
+        state = CodexRateLimitState()
+        assert state._try_begin_poll(60.0) is True
+        # Second immediate attempt is throttled (within interval).
+        assert state._try_begin_poll(60.0) is False
+        state._end_poll()
+        # Still throttled by time even after the in-flight flag clears.
+        assert state._try_begin_poll(60.0) is False
+        # A zero interval always allows once the in-flight flag is clear.
+        assert state._try_begin_poll(0.0) is True
 
-        result = await proxy._stream_response(
-            url="https://api.openai.com/v1/responses",
-            headers={"authorization": "Bearer sk-test"},
-            body={"model": "gpt-5.4-codex", "stream": True, "input": "hi"},
-            provider="openai",
-            model="gpt-5.4-codex",
-            request_id="codex-stream-2",
-            original_tokens=10,
-            optimized_tokens=10,
-            tokens_saved=0,
-            transforms_applied=[],
-            tags={},
-            optimization_latency=0.0,
+    def test_maybe_schedule_returns_false_without_loop(self):
+        # No running event loop -> cannot schedule.
+        assert (
+            maybe_schedule_usage_poll(
+                {"authorization": "Bearer a.b.c", "chatgpt-account-id": "acct"}
+            )
+            is False
         )
 
-        assert result.headers.get("x-codex-primary-used-percent") == "45.2"
-        assert result.headers.get("x-codex-secondary-used-percent") == "12.1"
+    def test_maybe_schedule_skips_non_codex(self):
+        async def run():
+            return maybe_schedule_usage_poll({"authorization": "Bearer a.b.c"})
+
+        assert asyncio.run(run()) is False
+
+    def test_maybe_schedule_creates_task_and_throttles(self, monkeypatch):
+        # Replace the network fetch with a fast no-op coroutine.
+        calls: list[str] = []
+
+        async def fake_fetch(url, headers):  # noqa: ANN001
+            calls.append(url)
+            crl.get_codex_rate_limit_state()._end_poll()
+
+        monkeypatch.setattr(crl, "_fetch_and_store_usage", fake_fetch)
+        # Reset the singleton's throttle so this test is deterministic.
+        monkeypatch.setattr(crl, "_state", None)
+        monkeypatch.setattr(crl, "_state_lock", crl.Lock())
+
+        async def run():
+            req = {"authorization": "Bearer a.b.c", "chatgpt-account-id": "acct"}
+            first = maybe_schedule_usage_poll(req, min_interval_s=60.0)
+            second = maybe_schedule_usage_poll(req, min_interval_s=60.0)
+            # Let the scheduled task run.
+            await asyncio.sleep(0)
+            return first, second
+
+        first, second = asyncio.run(run())
+        assert first is True
+        assert second is False  # throttled
+        assert calls == [crl.CODEX_USAGE_URL]

@@ -821,22 +821,16 @@ def is_json_array_of_dicts(content: str) -> bool:
 
 # ── Boolean logic detection ───────────────────────────────────────────────────
 
-_BOOL_ENGLISH_OPS = re.compile(
-    r"\b(AND|OR|NOT|XOR|NAND|NOR|XNOR)\b", re.I
-)
+_BOOL_ENGLISH_OPS = re.compile(r"\b(AND|OR|NOT|XOR|NAND|NOR|XNOR)\b", re.I)
 _BOOL_SYMBOLIC_OPS = re.compile(
     r"(?<![a-zA-Z0-9_])[A-Z](?:\s*[.+^|&]\s*!?[A-Z])+",
 )
 _BOOL_VARIABLE = re.compile(r"^[A-Z]$")
-_BOOL_TABLE_HEADER = re.compile(
-    r"^[\|]?\s*([A-Za-z_]\w*\s*[\|]?\s*){2,}$"
-)
-_BOOL_TABLE_ROW = re.compile(
-    r"^[\s|]*([01][\s|]+)+[01][\s|]*$"
-)
+_BOOL_TABLE_HEADER = re.compile(r"^[\|]?\s*([A-Za-z_]\w*\s*[\|]?\s*){2,}$")
+_BOOL_TABLE_ROW = re.compile(r"^[\s|]*([01][\s|]+)+[01][\s|]*$")
 
 
-def _try_detect_boolean(content: str) -> "DetectionResult | None":
+def _try_detect_boolean(content: str) -> DetectionResult | None:
     """Detect boolean logic content: truth tables and boolean expressions.
 
     Returns a DetectionResult with ContentType.BOOLEAN_LOGIC when confident
@@ -845,15 +839,15 @@ def _try_detect_boolean(content: str) -> "DetectionResult | None":
     uppercase variables or an explicit truth table structure.
     """
     stripped = content.strip()
-    lines    = [l.strip() for l in stripped.splitlines() if l.strip()]
+    lines = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
 
     if not lines:
         return None
 
     # ── Truth table detection ─────────────────────────────────────────────
     # Require: 1 header row of variable names + N binary data rows
-    header_found    = False
-    binary_rows     = 0
+    header_found = False
+    binary_rows = 0
     header_var_count = 0
 
     for line in lines:
@@ -864,7 +858,7 @@ def _try_detect_boolean(content: str) -> "DetectionResult | None":
         if not header_found:
             # Header: all tokens look like identifiers, none are "0" or "1"
             if all(re.match(r"^[A-Za-z_]\w*$", w) for w in words) and len(words) >= 2:
-                header_found     = True
+                header_found = True
                 header_var_count = len(words)
                 continue
         if header_found:
@@ -887,7 +881,7 @@ def _try_detect_boolean(content: str) -> "DetectionResult | None":
     # Reject if content has lowercase identifiers (likely prose or code)
     text = " ".join(lines)
 
-    has_english_ops  = bool(_BOOL_ENGLISH_OPS.search(text))
+    has_english_ops = bool(_BOOL_ENGLISH_OPS.search(text))
     has_symbolic_ops = bool(_BOOL_SYMBOLIC_OPS.search(text))
 
     # Check uppercase-only variable pattern: single capital letters used as variables
@@ -896,7 +890,7 @@ def _try_detect_boolean(content: str) -> "DetectionResult | None":
 
     # Reject if there's prose (lowercase words longer than 2 chars not in operators)
     prose_words = re.findall(r"\b[a-z]{3,}\b", text)
-    known_ops   = {"and", "or", "not", "xor", "nand", "nor", "xnor"}
+    known_ops = {"and", "or", "not", "xor", "nand", "nor", "xnor"}
     prose_noise = [w for w in prose_words if w not in known_ops]
     if len(prose_noise) > 2:
         return None
@@ -913,14 +907,19 @@ def _try_detect_boolean(content: str) -> "DetectionResult | None":
 
 
 _NL_LOGIC_SIGNALS = [
-    re.compile(r"\b(output|signal|result|flag|state)\s+(is\s+)?(high|low|true|false|on|off)\s+(when|if)\b", re.I),
+    re.compile(
+        r"\b(output|signal|result|flag|state)\s+(is\s+)?(high|low|true|false|on|off)\s+(when|if)\b",
+        re.I,
+    ),
     re.compile(r"\b(true|on|active|high|enabled)\s+(only\s+)?(if|when|iff)\b", re.I),
-    re.compile(r"\b(lights?|motor|alarm|gate|relay|switch)\s+(turns?\s+)?(on|off)\s+(when|if)\b", re.I),
+    re.compile(
+        r"\b(lights?|motor|alarm|gate|relay|switch)\s+(turns?\s+)?(on|off)\s+(when|if)\b", re.I
+    ),
 ]
 _NL_OP_WORDS = re.compile(r"\b(and|or|not|xor|nor|nand|both|neither|either|unless|but not)\b", re.I)
 
 
-def _try_detect_nl_boolean(content: str) -> "DetectionResult | None":
+def _try_detect_nl_boolean(content: str) -> DetectionResult | None:
     """Detect natural-language descriptions of boolean/digital logic.
 
     Only fires when the prose clearly describes a logic function, not generic
@@ -936,7 +935,7 @@ def _try_detect_nl_boolean(content: str) -> "DetectionResult | None":
         return None
 
     signal_hit = any(pat.search(stripped) for pat in _NL_LOGIC_SIGNALS)
-    op_count   = len(_NL_OP_WORDS.findall(stripped))
+    op_count = len(_NL_OP_WORDS.findall(stripped))
 
     if signal_hit and op_count >= 1:
         return DetectionResult(

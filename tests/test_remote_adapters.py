@@ -24,6 +24,24 @@ def test_remote_embedder_implements_embedder_protocol() -> None:
     assert isinstance(embedder, Embedder)
 
 
+def test_memory_factory_uses_sidecar_adapters(monkeypatch: pytest.MonkeyPatch) -> None:
+    from headroom.memory.adapters.remote import RemoteEmbedder, RemoteVectorIndex
+    from headroom.memory.config import MemoryConfig
+    from headroom.memory.factory import (
+        _create_embedder,
+        _create_vector_index,
+        _reset_embedder_cache_for_tests,
+    )
+
+    monkeypatch.setenv("HEADROOM_EMBEDDING_SERVER_SOCKET", "/tmp/headroom-test.sock")
+    _reset_embedder_cache_for_tests()
+    try:
+        assert isinstance(_create_embedder(MemoryConfig()), RemoteEmbedder)
+        assert isinstance(_create_vector_index(MemoryConfig()), RemoteVectorIndex)
+    finally:
+        _reset_embedder_cache_for_tests()
+
+
 @pytest.mark.asyncio
 class TestRemoteEmbedderProtocol:
     """Test that RemoteEmbedder implements the Embedder protocol correctly."""
@@ -77,6 +95,12 @@ class TestRemoteEmbedderProtocol:
 @pytest.mark.asyncio
 class TestRemoteVectorIndex:
     """Test RemoteVectorIndex."""
+
+    async def test_update_embedding_does_not_claim_unsupported_success(self) -> None:
+        from headroom.memory.adapters.remote import RemoteVectorIndex
+
+        index = RemoteVectorIndex("/tmp/test.sock")
+        assert await index.update_embedding("m1", np.zeros(384, dtype=np.float32)) is False
 
     async def test_search_returns_results(self) -> None:
         from headroom.memory.adapters.remote import RemoteVectorIndex

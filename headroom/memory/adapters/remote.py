@@ -14,6 +14,7 @@ import json
 import logging
 import struct
 import uuid
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -324,6 +325,8 @@ class RemoteVectorIndex:
                 id=item["memory_id"],
                 content=item.get("content", ""),
                 user_id=item.get("user_id", ""),
+                created_at=datetime.now(timezone.utc),
+                valid_from=datetime.now(timezone.utc),
             )
             results.append(
                 VectorSearchResult(
@@ -335,11 +338,8 @@ class RemoteVectorIndex:
         return results
 
     async def update_embedding(self, memory_id: str, embedding: np.ndarray) -> bool:
-        """Update the embedding for an indexed memory (re-index)."""
-        # The server doesn't have a dedicated update-embedding operation.
-        # For now we just report success; a full remove+re-index would
-        # require the full Memory object which we don't have here.
-        return True
+        """Report unsupported rather than claiming an update that never happened."""
+        return False
 
     async def stats(self) -> dict[str, Any]:
         """Get index statistics from the server."""

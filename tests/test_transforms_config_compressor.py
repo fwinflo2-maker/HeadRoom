@@ -373,6 +373,168 @@ def test_compression_ratio_zero_for_empty_original() -> None:
     assert result.compression_ratio == 0.0
 
 
+# Tier 3: TOML array-of-tables → SmartCrusher csv-schema -----------------------
+
+
+def _mypy_overrides_toml(n: int) -> str:
+    """A pyproject-style TOML whose ``[[overrides]]`` array dominates the file."""
+    records = "\n\n".join(
+        f"[[tool.mypy.overrides]]\n"
+        f'module = "pkg.sub{i}.mod"\n'
+        f"ignore_missing_imports = true\n"
+        f"disallow_untyped_defs = false"
+        for i in range(n)
+    )
+    return "[tool.mypy]\nstrict = true\n\n" + records
+
+
+def _use_fresh_store(monkeypatch):  # noqa: ANN001, ANN201
+    from headroom.cache.compression_store import CompressionStore
+
+    store = CompressionStore()
+    monkeypatch.setattr("headroom.cache.compression_store.get_compression_store", lambda: store)
+    return store
+
+
+def test_tier3_folds_toml_array_of_tables(monkeypatch) -> None:
+    store = _use_fresh_store(monkeypatch)
+    toml = _mypy_overrides_toml(25)
+    comp = ConfigCompressor(ConfigCompressorConfig(enable_ccr=True))
+    result = comp.compress(toml)
+
+    assert result.was_modified
+    assert result.strategy == "config_schema_fold"
+    assert result.flavor == "toml"
+    assert len(result.compressed) < len(toml) // 2  # keys folded → big win
+    assert 0.0 < result.compression_ratio < 0.5
+    # The repeated per-record key appears once in the schema, not 25 times.
+    assert result.compressed.count("ignore_missing_imports") == 1
+    assert CCR_RETRIEVAL_MARKER_RE.search(result.compressed)
+    # The marker hash resolves to the byte-exact original.
+    assert result.ccr_hash is not None
+    assert store.retrieve(result.ccr_hash).original_content == toml
+
+
+def test_tier3_disabled_in_lossless_mode() -> None:
+    # enable_ccr off (lossless) → no fold, no marker, only reversible tiers.
+    comp = ConfigCompressor(ConfigCompressorConfig(enable_ccr=False))
+    result = comp.compress(_mypy_overrides_toml(25))
+    assert result.strategy != "config_schema_fold"
+    assert not CCR_RETRIEVAL_MARKER_RE.search(result.compressed)
+
+
+def test_tier3_flag_off_keeps_text_tiers(monkeypatch) -> None:
+    _use_fresh_store(monkeypatch)
+    comp = ConfigCompressor(ConfigCompressorConfig(enable_ccr=True, enable_schema_fold=False))
+    result = comp.compress(_mypy_overrides_toml(25))
+    assert result.strategy != "config_schema_fold"
+
+
+def test_tier3_skips_non_toml_flavor(monkeypatch) -> None:
+    _use_fresh_store(monkeypatch)
+    # A YAML list-of-mappings is structurally similar but must not be bridged
+    # (no stdlib YAML parser is a dependency).
+    comp = ConfigCompressor(ConfigCompressorConfig(enable_ccr=True))
+    result = comp.compress(K8S_MANIFEST)
+    assert result.strategy != "config_schema_fold"
+
+
+def test_tier3_skips_toml_without_array_of_tables(monkeypatch) -> None:
+    _use_fresh_store(monkeypatch)
+    comp = ConfigCompressor(ConfigCompressorConfig(enable_ccr=True))
+    # Valid TOML flavor, but no `[[ ]]` → SmartCrusher has no array to fold.
+    result = comp.compress(PYPROJECT_TOML)
+    assert result.strategy != "config_schema_fold"
+
+
+def test_tier3_declines_small_array_as_passthrough(monkeypatch) -> None:
+    _use_fresh_store(monkeypatch)
+    comp = ConfigCompressor(ConfigCompressorConfig(enable_ccr=True))
+    # Three long-valued records: SmartCrusher returns `passthrough` (the folded
+    # keys don't outweigh the unique values), so Tier 3 declines.
+    toml = "version = 3\n\n" + "\n\n".join(
+        f'[[package]]\nname = "crate-{i}"\nversion = "1.2.{i}"\nchecksum = "{i:064x}"'
+        for i in range(3)
+    )
+    result = comp.compress(toml)
+    assert result.strategy != "config_schema_fold"
+
+
+def test_tier3_store_failure_keeps_text_tiers(monkeypatch) -> None:
+    class _BrokenStore:
+        def store(self, *a, **kw):  # noqa: ANN002, ANN003
+            raise RuntimeError("disk full")
+
+    monkeypatch.setattr(
+        "headroom.cache.compression_store.get_compression_store",
+        lambda: _BrokenStore(),
+    )
+    comp = ConfigCompressor(ConfigCompressorConfig(enable_ccr=True))
+    result = comp.compress(_mypy_overrides_toml(25))
+    # Can't store the original → never emit the lossy fold.
+    assert result.strategy != "config_schema_fold"
+    assert not CCR_RETRIEVAL_MARKER_RE.search(result.compressed)
+
+
+def test_tier3_rejected_when_marker_overhead_exceeds_savings(monkeypatch) -> None:
+    _use_fresh_store(monkeypatch)
+    # An unreachable-in-practice savings floor forces the final gate to reject
+    # even a genuine fold, exercising the guard.
+    comp = ConfigCompressor(ConfigCompressorConfig(enable_ccr=True, min_savings_chars=10**6))
+    result = comp.compress(_mypy_overrides_toml(25))
+    assert result.strategy != "config_schema_fold"
+
+
+def test_schema_fold_bails_on_unparseable_toml(monkeypatch) -> None:
+    _use_fresh_store(monkeypatch)
+    import headroom.transforms.config_compressor as mod
+
+    monkeypatch.setattr(mod, "_load_toml", lambda _content: None)
+    comp = ConfigCompressor(ConfigCompressorConfig(enable_ccr=True))
+    # Detector still flags it TOML, but the fold parser bails → text tiers.
+    assert comp._schema_fold(_mypy_overrides_toml(25), "toml", "", 1.0) is None
+
+
+def test_schema_fold_bails_on_non_serializable_value(monkeypatch) -> None:
+    _use_fresh_store(monkeypatch)
+    import headroom.transforms.config_compressor as mod
+
+    monkeypatch.setattr(mod, "_load_toml", lambda _content: {"t": [{"v": {1, 2}}, {"v": {3, 4}}]})
+    comp = ConfigCompressor(ConfigCompressorConfig(enable_ccr=True))
+    # A value tomllib could never emit but that we can't represent faithfully.
+    assert comp._schema_fold("[[t]]\n", "toml", "", 1.0) is None
+
+
+def test_load_toml_returns_none_on_invalid() -> None:
+    from headroom.transforms.config_compressor import _load_toml
+
+    assert _load_toml('[[x]]\nk = "unterminated') is None
+    assert _load_toml('[[x]]\nk = "ok"') == {"x": [{"k": "ok"}]}
+
+
+def test_json_default_renders_dates_and_rejects_others() -> None:
+    import datetime as dt
+
+    from headroom.transforms.config_compressor import _json_default
+
+    assert _json_default(dt.date(2026, 7, 4)) == "2026-07-04"
+    assert _json_default(dt.datetime(2026, 7, 4, 9, 30)) == "2026-07-04T09:30:00"
+    with pytest.raises(TypeError):
+        _json_default(object())
+
+
+def test_tier3_toml_with_datetime_folds(monkeypatch) -> None:
+    _use_fresh_store(monkeypatch)
+    # TOML datetimes serialize through _json_default; the fold still applies.
+    toml = "\n\n".join(
+        f'[[event]]\nname = "e{i}"\nwhen = 2026-07-04T09:30:00\nactive = true' for i in range(20)
+    )
+    comp = ConfigCompressor(ConfigCompressorConfig(enable_ccr=True))
+    result = comp.compress(toml)
+    assert result.strategy == "config_schema_fold"
+    assert "2026-07-04T09:30:00" in result.compressed
+
+
 # Router wiring ---------------------------------------------------------------
 
 

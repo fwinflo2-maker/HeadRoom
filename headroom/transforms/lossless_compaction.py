@@ -25,6 +25,8 @@ __all__ = [
     "unfold_repeated_blocks",
     "search_heading",
     "search_unheading",
+    "search_dir_heading",
+    "search_dir_unheading",
     "diff_strip_index",
     "compact_lossless",
 ]
@@ -283,12 +285,149 @@ def search_unheading(text: str) -> str:
     return _join(out, had_trailing)
 
 
+# A dir-heading data row: ``<base>:<line>:<content>`` where base has no '/'.
+_DIR_DATA_RE = re.compile(r"^(?P<base>[^/\n:]+):(?P<line>\d+):(?P<content>.*)$")
+
+
+def search_dir_heading(text: str) -> str:
+    """Fold grep ``path:line:content`` rows by DIRECTORY.
+
+    Consecutive rows whose path shares a parent directory collapse to that
+    directory once (a header ending in ``/``), then ``base:line:content`` rows
+    beneath it. Complements :func:`search_heading` (which factors a repeated
+    *file*): this factors a repeated *directory* across distinct files — the
+    common ``grep -rn`` case where each file has a single match, so file-heading
+    saves nothing but the shared directory repeats on every row. Rows whose path
+    has no ``/`` pass through untouched. Exactly reversed by
+    :func:`search_dir_unheading`; ``compact_lossless`` verifies the round-trip.
+    """
+    lines, had_trailing = _split_keep_trailing(text)
+    if not lines:
+        return text
+    out: list[str] = []
+    current_dir: str | None = None
+    for line in lines:
+        m = _GREP_ROW_RE.match(line)
+        if m and "/" in m.group("path"):
+            path = m.group("path")
+            cut = path.rindex("/") + 1
+            dir_part, base = path[:cut], path[cut:]
+            if dir_part != current_dir:
+                out.append(dir_part)
+                current_dir = dir_part
+            out.append(f"{base}:{m.group('line')}:{m.group('content')}")
+        else:
+            out.append(line)
+            current_dir = None
+    return _join(out, had_trailing)
+
+
+def search_dir_unheading(text: str) -> str:
+    """Exact inverse of :func:`search_dir_heading`.
+
+    A *header* is a line ending in ``/`` immediately followed by a
+    ``base:line:content`` data row; it is consumed and re-prefixed onto each
+    following data row until a non-data line appears.
+    """
+    lines, had_trailing = _split_keep_trailing(text)
+    if not lines:
+        return text
+    out: list[str] = []
+    current_dir: str | None = None
+    n = len(lines)
+    i = 0
+    while i < n:
+        line = lines[i]
+        data = _DIR_DATA_RE.match(line)
+        if current_dir is not None and data:
+            out.append(f"{current_dir}{line}")
+            i += 1
+            continue
+        if line.endswith("/") and i + 1 < n and _DIR_DATA_RE.match(lines[i + 1]):
+            current_dir = line
+            i += 1
+            continue
+        current_dir = None
+        out.append(line)
+        i += 1
+    return _join(out, had_trailing)
+
+
 def diff_strip_index(text: str) -> str:
     """Drop ``index <sha>..<sha>`` lines from a unified diff (still applies)."""
     lines, had_trailing = _split_keep_trailing(text)
     if not lines:
         return text
     out = [line for line in lines if not _DIFF_INDEX_RE.match(line)]
+    return _join(out, had_trailing)
+
+
+# A whole-line file path: optional ``./``/``../`` root, >=1 directory segment,
+# then a basename. No whitespace or ':' (so grep ``path:line:content`` rows —
+# handled by search_heading — are excluded). Directory-only lines (trailing '/')
+# don't match (empty basename), which keeps the fold unambiguous.
+_PATH_ROW_RE = re.compile(r"^(?P<dir>(?:\.{0,2}/)?(?:[^/\s:]+/)+)(?P<base>[^/\s:]+)$")
+
+
+def path_heading(text: str) -> str:
+    """Fold a *pure* file-path listing (``find`` / ``ls -1`` / ``rg -l`` output)
+    into ripgrep-heading form: each parent directory printed once on its own
+    line (ending in ``/``), then the bare basenames beneath it.
+
+    Reversibility is not assumed here — ``compact_lossless`` verifies the exact
+    round-trip via :func:`path_unheading` and discards the fold on any mismatch
+    (e.g. a stray no-slash line mistaken for a basename), so mixed content is
+    always safe. Requires >=2 path rows or there is nothing to group.
+    Complements ``search_heading``, which only handles the ``path:line:content``
+    grep shape, not plain path lists.
+    """
+    lines, had_trailing = _split_keep_trailing(text)
+    if sum(1 for ln in lines if _PATH_ROW_RE.match(ln)) < 2:
+        return text
+    out: list[str] = []
+    current: str | None = None
+    for line in lines:
+        m = _PATH_ROW_RE.match(line)
+        if m:
+            d = m.group("dir")
+            if d != current:
+                out.append(d)
+                current = d
+            out.append(m.group("base"))
+        else:  # blank line inside/around the listing
+            out.append(line)
+            current = None
+    return _join(out, had_trailing)
+
+
+def path_unheading(text: str) -> str:
+    """Exact inverse of :func:`path_heading`.
+
+    A *header* is a line ending in ``/`` immediately followed by a basename row
+    (a non-empty line with no ``/``); it is consumed and re-prefixed onto each
+    following basename row until a blank line or another header.
+    """
+    lines, had_trailing = _split_keep_trailing(text)
+    if not lines:
+        return text
+    out: list[str] = []
+    current: str | None = None
+    n = len(lines)
+    i = 0
+    while i < n:
+        line = lines[i]
+        is_base = line != "" and "/" not in line
+        if current is not None and is_base:
+            out.append(current + line)
+            i += 1
+            continue
+        if line.endswith("/") and i + 1 < n and lines[i + 1] != "" and "/" not in lines[i + 1]:
+            current = line
+            i += 1
+            continue
+        current = None
+        out.append(line)
+        i += 1
     return _join(out, had_trailing)
 
 
@@ -318,8 +457,23 @@ def compact_lossless(content: str, kind: str) -> str:
             return candidate if _smaller(candidate, content) else content
 
         if kind == "search":
-            candidate = search_heading(content)
-            if search_unheading(candidate) != content:
+            # Two independent folds; keep the smaller that round-trips exactly.
+            # search_heading factors a repeated FILE (many matches in one file);
+            # search_dir_heading factors a repeated DIRECTORY (one match each
+            # across many files in a dir — the grep -rn case the file fold misses).
+            best = content
+            for candidate, inverse in (
+                (search_heading(content), search_unheading),
+                (search_dir_heading(content), search_dir_unheading),
+            ):
+                if inverse(candidate) == content and _smaller(candidate, best):
+                    best = candidate
+            return best
+
+        if kind == "paths":
+            # Pure path listings (find/ls -1/rg -l): fold repeated parent dirs.
+            candidate = path_heading(content)
+            if path_unheading(candidate) != content:
                 return content
             return candidate if _smaller(candidate, content) else content
 

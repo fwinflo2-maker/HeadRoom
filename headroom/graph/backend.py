@@ -19,12 +19,11 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 only
 class CodeGraphBackend(str, Enum):
     """Supported code-graph implementations."""
 
-    TOKENSAVE = "tokensave"
     CODEBASE_MEMORY = "codebase-memory-mcp"
     CODEGRAPH = "codegraph"
 
 
-DEFAULT_CODE_GRAPH_BACKEND = CodeGraphBackend.TOKENSAVE
+DEFAULT_CODE_GRAPH_BACKEND = CodeGraphBackend.CODEBASE_MEMORY
 CODE_GRAPH_BACKEND_CHOICES = tuple(backend.value for backend in CodeGraphBackend)
 _CONFIG_FILENAMES = ("headroom.toml", "headroom.yaml", "headroom.yml")
 

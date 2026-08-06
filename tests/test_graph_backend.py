@@ -23,14 +23,16 @@ def test_resolve_backend_precedence(tmp_path: Path, monkeypatch) -> None:
     assert backend.resolve_code_graph_backend(project_dir=tmp_path) == (
         CodeGraphBackend.CODEBASE_MEMORY
     )
-    assert backend.resolve_code_graph_backend("tokensave", project_dir=tmp_path) == (
-        CodeGraphBackend.TOKENSAVE
+    assert backend.resolve_code_graph_backend("codegraph", project_dir=tmp_path) == (
+        CodeGraphBackend.CODEGRAPH
     )
 
 
-def test_resolve_backend_defaults_to_tokensave(tmp_path: Path, monkeypatch) -> None:
+def test_resolve_backend_defaults_to_codebase_memory(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("HEADROOM_CODE_GRAPH_BACKEND", raising=False)
-    assert backend.resolve_code_graph_backend(project_dir=tmp_path) == CodeGraphBackend.TOKENSAVE
+    assert backend.resolve_code_graph_backend(project_dir=tmp_path) == (
+        CodeGraphBackend.CODEBASE_MEMORY
+    )
 
 
 def test_codegraph_backend_replaces_legacy_graph_backend(monkeypatch) -> None:
@@ -69,11 +71,11 @@ def test_codegraph_installer_uses_noninteractive_commands(monkeypatch, tmp_path:
     ]
 
 
-def test_tokensave_watcher_uses_sync_command(monkeypatch, tmp_path: Path) -> None:
+def test_codebase_memory_watcher_uses_index_command(monkeypatch, tmp_path: Path) -> None:
     graph_watcher = CodeGraphWatcher(
         tmp_path,
-        cbm_binary="tokensave",
-        backend=CodeGraphBackend.TOKENSAVE,
+        cbm_binary="codebase-memory-mcp",
+        backend=CodeGraphBackend.CODEBASE_MEMORY,
     )
     graph_watcher._running = True
     run_calls: list[list[str]] = []
@@ -82,13 +84,20 @@ def test_tokensave_watcher_uses_sync_command(monkeypatch, tmp_path: Path) -> Non
         run_calls.append(command)
         return SimpleNamespace(returncode=0, stderr="")
 
-    monkeypatch.setattr("headroom.graph.watcher.subprocess.run", fake_run)
+    monkeypatch.setattr("headroom.graph.watcher.run", fake_run)
     monkeypatch.setattr("headroom.graph.watcher.time.monotonic", lambda: 1.0)
     monkeypatch.setattr("headroom.graph.watcher.time.time", lambda: 2.0)
 
     graph_watcher._do_reindex()
 
-    assert run_calls == [["tokensave", "sync"]]
+    assert run_calls == [
+        [
+            "codebase-memory-mcp",
+            "cli",
+            "index_repository",
+            f'{{"repo_path": "{tmp_path}", "mode": "fast"}}',
+        ]
+    ]
     assert graph_watcher.stats["reindex_count"] == 1
 
 

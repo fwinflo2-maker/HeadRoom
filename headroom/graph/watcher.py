@@ -126,11 +126,6 @@ class CodeGraphWatcher:
 
             path = get_cbm_path()
             self.cbm_binary = str(path) if path else None
-        elif self.backend == CodeGraphBackend.TOKENSAVE:
-            from headroom.graph.tokensave_installer import get_tokensave_path
-
-            path = get_tokensave_path()
-            self.cbm_binary = str(path) if path else None
         self._observer: object | None = None
         self._debounce_timer: threading.Timer | None = None
         self._lock = threading.Lock()
@@ -230,16 +225,12 @@ class CodeGraphWatcher:
 
         try:
             start = time.monotonic()
-            command = (
-                [self.cbm_binary, "sync"]
-                if self.backend == CodeGraphBackend.TOKENSAVE
-                else [
-                    self.cbm_binary,
-                    "cli",
-                    "index_repository",
-                    json.dumps({"repo_path": self.project_dir, "mode": "fast"}),
-                ]
-            )
+            command = [
+                self.cbm_binary,
+                "cli",
+                "index_repository",
+                json.dumps({"repo_path": self.project_dir, "mode": "fast"}),
+            ]
             result = run(
                 command,
                 capture_output=True,

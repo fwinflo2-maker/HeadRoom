@@ -652,9 +652,7 @@ async def test_ws_later_frame_compression_is_actually_forwarded(monkeypatch):
 
     # The success-path bookkeeping (tokens_saved / frame count) must run —
     # proof the "modified" branch executed rather than short-circuiting.
-    modified_frames = [
-        frame for frame in handler.metrics.codex_ws_frames if frame.get("modified")
-    ]
+    modified_frames = [frame for frame in handler.metrics.codex_ws_frames if frame.get("modified")]
     assert modified_frames, "expected at least one frame recorded as modified=True"
 
 

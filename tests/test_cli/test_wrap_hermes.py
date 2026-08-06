@@ -53,8 +53,10 @@ def test_wrap_hermes_missing_binary_errors_clearly(
         result = runner.invoke(main, ["wrap", "hermes"])
 
     assert result.exit_code == 1
-    assert "'hermes' not found in PATH" in result.output
-    assert "https://hermes-agent.nousresearch.com/" in result.output
+    assert result.output == (
+        "Error: 'hermes' not found in PATH.\n"
+        "Install Hermes: https://hermes-agent.nousresearch.com/\n"
+    )
 
 
 def test_wrap_hermes_prepare_only_exits_cleanly(

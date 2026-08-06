@@ -76,6 +76,8 @@ def cache_write_multiplier_for_ttl(ttl_seconds: float | int | None) -> float:
     back to its environment setting when no request TTL is available.
     Invalid and non-positive values retain the 5-minute default.
     """
+    if ttl_seconds is None:
+        return CACHE_WRITE_MULTIPLIER
     try:
         ttl = float(ttl_seconds)
     except (TypeError, ValueError):

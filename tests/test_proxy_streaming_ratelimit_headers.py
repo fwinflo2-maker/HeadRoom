@@ -8,6 +8,7 @@ via dict(response.headers), but streaming responses used StreamingResponse
 without passing any upstream headers — silently dropping ratelimit info.
 """
 
+import asyncio
 import datetime as dt
 import json
 from unittest.mock import AsyncMock, MagicMock
@@ -67,6 +68,8 @@ class TestStreamingRatelimitHeaderForwarding:
         proxy._config.retry_max_attempts = 3
         proxy._config.retry_base_delay_ms = 0
         proxy._config.retry_max_delay_ms = 0
+        proxy._config.anthropic_auto_continue_enabled = False
+        proxy._config.anthropic_auto_continue_max_wait_seconds = 18_300.0
         proxy.config = proxy._config
         proxy._parse_sse_usage_from_buffer = MagicMock(return_value=None)
         proxy.memory_handler = None
@@ -126,6 +129,7 @@ class TestStreamingRatelimitHeaderForwarding:
     ):
         proxy = self._create_mock_proxy()
         proxy._config.retry_enabled = False
+        proxy._config.anthropic_auto_continue_enabled = True
         reset_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=1)
         error_response = AsyncMock()
         error_response.status_code = 429
@@ -175,6 +179,9 @@ class TestStreamingRatelimitHeaderForwarding:
     async def test_usage_limit_retry_failure_closes_stream_and_session(self, monkeypatch):
         proxy = self._create_mock_proxy()
         proxy._config.retry_enabled = False
+        proxy._config.anthropic_auto_continue_enabled = True
+        finalize = AsyncMock()
+        proxy._finalize_stream_response = finalize
         reset_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=1)
         error_response = AsyncMock()
         error_response.status_code = 402
@@ -213,6 +220,94 @@ class TestStreamingRatelimitHeaderForwarding:
         assert b"upstream returned status 401" in body
         assert body.endswith(b'event: message_stop\ndata: {"type":"message_stop"}\n\n')
         failed_retry.aclose.assert_awaited_once()
+        finalize.assert_awaited_once()
+        assert not proxy._active_streams
+
+    @pytest.mark.parametrize(
+        ("enabled", "max_wait"),
+        [(False, 18_300.0), (True, 0.1)],
+    )
+    @pytest.mark.asyncio
+    async def test_usage_limit_auto_continue_is_opt_in_and_bounded(self, enabled, max_wait):
+        proxy = self._create_mock_proxy()
+        proxy._config.retry_enabled = False
+        proxy._config.anthropic_auto_continue_enabled = enabled
+        proxy._config.anthropic_auto_continue_max_wait_seconds = max_wait
+        reset_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=60)
+        error_response = AsyncMock()
+        error_response.status_code = 429
+        error_response.headers = httpx.Headers({"content-type": "application/json"})
+        error_response.aread = AsyncMock(
+            return_value=json.dumps(
+                {"error": {"message": f"Usage limit reached; wait until {reset_at.isoformat()}"}}
+            ).encode()
+        )
+        error_response.aclose = AsyncMock()
+        proxy.http_client.build_request = MagicMock(return_value=MagicMock())
+        proxy.http_client.send = AsyncMock(return_value=error_response)
+
+        result = await proxy._stream_response(
+            url="https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": "sk-test"},
+            body={"model": "claude", "stream": True, "messages": []},
+            provider="anthropic",
+            model="claude",
+            request_id="test-auto-continue-gate",
+            original_tokens=0,
+            optimized_tokens=0,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+        )
+
+        assert result.status_code == 429
+        assert result.body == error_response.aread.return_value
+        assert proxy.http_client.send.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_usage_limit_wait_cancellation_finalizes_and_cleans_up(self, monkeypatch):
+        proxy = self._create_mock_proxy()
+        proxy._config.retry_enabled = False
+        proxy._config.anthropic_auto_continue_enabled = True
+        finalize = AsyncMock()
+        proxy._finalize_stream_response = finalize
+        reset_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=60)
+        error_response = AsyncMock()
+        error_response.status_code = 429
+        error_response.headers = httpx.Headers({"content-type": "application/json"})
+        error_response.aread = AsyncMock(
+            return_value=json.dumps(
+                {"error": {"message": f"Usage limit reached; wait until {reset_at.isoformat()}"}}
+            ).encode()
+        )
+        error_response.aclose = AsyncMock()
+        proxy.http_client.build_request = MagicMock(return_value=MagicMock())
+        proxy.http_client.send = AsyncMock(return_value=error_response)
+        monkeypatch.setattr(
+            streaming_module.asyncio,
+            "sleep",
+            AsyncMock(side_effect=asyncio.CancelledError),
+        )
+
+        result = await proxy._stream_response(
+            url="https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": "sk-test"},
+            body={"model": "claude", "stream": True, "messages": []},
+            provider="anthropic",
+            model="claude",
+            request_id="test-auto-continue-cancel",
+            original_tokens=0,
+            optimized_tokens=0,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            b"".join([chunk async for chunk in result.body_iterator])
+        finalize.assert_awaited_once()
         assert not proxy._active_streams
 
     def _create_mock_upstream_response(self, extra_headers=None):

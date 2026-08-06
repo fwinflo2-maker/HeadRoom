@@ -1395,6 +1395,7 @@ class StreamingMixin:
         get_codex_rate_limit_state().update_from_headers(dict(upstream_response.headers))
 
         limit_reset: tuple[float, str] | None = None
+        error_content = b""
         if upstream_response.status_code >= 400:
             logger.warning(
                 "[%s] Forwarding upstream streaming error status=%s url=%s",
@@ -1455,9 +1456,22 @@ class StreamingMixin:
 
             limit_reset = (
                 _anthropic_limit_reset(upstream_response.status_code, error_content)
-                if provider == "anthropic"
+                if provider == "anthropic" and self.config.anthropic_auto_continue_enabled
                 else None
             )
+            if (
+                limit_reset is not None
+                and limit_reset[0] > self.config.anthropic_auto_continue_max_wait_seconds
+            ):
+                logger.warning(
+                    "[%s] Anthropic usage-limit reset is %.1fs away, above the "
+                    "configured auto-continue ceiling of %.1fs; forwarding status %s",
+                    request_id,
+                    limit_reset[0],
+                    self.config.anthropic_auto_continue_max_wait_seconds,
+                    upstream_response.status_code,
+                )
+                limit_reset = None
             if limit_reset is None:
                 stream_state["total_bytes"] = len(error_content)
                 await self._finalize_stream_response(
@@ -1773,10 +1787,40 @@ class StreamingMixin:
 
         if limit_reset is not None:
             sleep_seconds, reset_display = limit_reset
+            wait_attempt_finalized = False
+
+            async def finalize_wait_attempt() -> None:
+                """Account for a wait/retry that never reaches the normal stream finalizer."""
+                nonlocal wait_attempt_finalized
+                if wait_attempt_finalized:
+                    return
+                wait_attempt_finalized = True
+                stream_state["total_bytes"] = len(error_content)
+                await self._finalize_stream_response(
+                    body=body,
+                    provider=provider,
+                    outcome_provider=outcome_provider,
+                    model=model,
+                    request_id=request_id,
+                    original_tokens=original_tokens,
+                    optimized_tokens=optimized_tokens,
+                    tokens_saved=tokens_saved,
+                    transforms_applied=transforms_applied,
+                    optimization_latency=optimization_latency,
+                    stream_state=stream_state,
+                    start_time=start_time,
+                    tags=tags,
+                    pipeline_timing=pipeline_timing,
+                    prefix_tracker=prefix_tracker,
+                    original_messages=original_messages,
+                    client=client,
+                    waste_signals=waste_signals,
+                )
 
             async def auto_continue_wrapper():
                 """Keep the client informed, retry once, then splice the real SSE stream."""
                 nonlocal upstream_response
+                retry_stream_started = False
                 try:
                     message_start = {
                         "type": "message_start",
@@ -1831,6 +1875,7 @@ class StreamingMixin:
                         logger.error(
                             "[%s] Anthropic auto-continue retry failed: %s", request_id, exc
                         )
+                        await finalize_wait_attempt()
                         error_text = (
                             "\n\n❌ Headroom could not reconnect after the usage-limit wait."
                         )
@@ -1854,6 +1899,7 @@ class StreamingMixin:
                             request_id,
                             retry_response.status_code,
                         )
+                        await finalize_wait_attempt()
                         error_text = (
                             "\n\n❌ Headroom retried after the usage-limit wait, but "
                             f"upstream returned status {retry_response.status_code}."
@@ -1876,6 +1922,7 @@ class StreamingMixin:
                     def shift_index(match: re.Match[str]) -> str:
                         return f'"index":{int(match.group(1)) + 1}'
 
+                    retry_stream_started = True
                     async for chunk in generate():
                         buffer.extend(chunk)
                         while b"\n\n" in buffer:
@@ -1912,6 +1959,10 @@ class StreamingMixin:
                                 yield f"{event_text}\n\n".encode()
                                 continue
                             yield bytes(event_bytes) + b"\n\n"
+                except asyncio.CancelledError:
+                    if not retry_stream_started:
+                        await asyncio.shield(finalize_wait_attempt())
+                    raise
                 finally:
                     self._cleanup_mid_turn_stream(session_key)
 

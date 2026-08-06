@@ -19,7 +19,7 @@ def test_codex_provider_section_omits_requires_openai_auth_by_default() -> None:
     assert "requires_openai_auth" not in section, (
         f"requires_openai_auth must be absent by default; got:\n{section}"
     )
-    assert "supports_websockets = false" in section
+    assert "supports_websockets = true" in section
     assert 'env_key = "OPENAI_API_KEY"' not in section
 
 

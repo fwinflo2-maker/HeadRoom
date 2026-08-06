@@ -390,6 +390,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     if/when another contract surface emerges, but YAGNI.
     """
     from headroom.copilot_auth import consume_request_routed_to_copilot
+    from headroom.pricing.opencode_prices import pricing_surface_from_tags
     from headroom.proxy.cost import _summarize_transforms
     from headroom.proxy.models import RequestLog
     from headroom.proxy.project_context import get_current_project
@@ -453,6 +454,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # Project attribution: explicit outcome field wins, else the value the
     # HTTP middleware / WS accept captured from ``X-Headroom-Project``.
     project = outcome.project or get_current_project()
+    pricing_surface = pricing_surface_from_tags(outcome.tags)
 
     # Tool-schema savings (deferral + turn-hook tool shrink) live in per-request
     # tags and never move tok_before/after; aggregate them into Metrics so the
@@ -487,10 +489,12 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         cache_write_5m_tokens=outcome.cache_write_5m_tokens,
         cache_write_1h_tokens=outcome.cache_write_1h_tokens,
         uncached_input_tokens=outcome.uncached_input_tokens,
+        cache_inferred=outcome.cache_inferred,
         attempted_input_tokens=outcome.attempted_input_tokens,
         output_tokens_saved=output_tokens_saved_est,
         project=project,
         client=outcome.client,
+        pricing_surface=pricing_surface,
         tool_search_saved=tool_search_saved,
         local_input_tokens=outcome.optimized_tokens,
     )
@@ -509,6 +513,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             uncached_tokens=outcome.uncached_input_tokens,
             cache_inferred=outcome.cache_inferred,
             output_tokens=outcome.output_tokens,
+            pricing_surface=pricing_surface,
         )
 
     # 3. Per-request log (optional). The ``client`` outcome field is

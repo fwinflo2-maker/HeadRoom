@@ -94,6 +94,7 @@ _OPENAI_RESPONSES_UNIT_CACHE_INIT_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR: ThreadPoolExecutor | None = None
 _CODEX_WS_COMPRESSION_TIMEOUT_SECONDS = 5.0
+_CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
 
 
 def _codex_ws_compression_timeout_seconds() -> float:
@@ -102,7 +103,6 @@ def _codex_ws_compression_timeout_seconds() -> float:
 
 _WS_ALLOWED_ORIGINS_ENV = "HEADROOM_WS_ORIGINS"
 _CORS_ALLOWED_ORIGINS_ENV = "HEADROOM_CORS_ORIGINS"
-_CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
 # Codex mirrors the responses-lite request header into the response.create
 # frame body under client_metadata; upstream rejects gpt-5.x when it is
 # truthy. Stripping the WS handshake header alone is insufficient
@@ -1324,6 +1324,54 @@ def _prefers_http1_passthrough(base_url: str) -> bool:
     """
     host = (urlparse(base_url).hostname or "").lower()
     return host == "chatgpt.com" or host.endswith(".chatgpt.com")
+
+
+def _resolve_openai_upstream_base_url(headers: dict[str, str], default_base_url: str) -> str:
+    """Resolve an OpenAI-compatible upstream base URL for this request.
+
+    Native OpenAI routes historically pinned to ``OPENAI_API_URL`` and ignored
+    ``x-headroom-base-url``. OpenCode provider-preserving routing for
+    OpenAI-compatible providers needs that override to survive on the native
+    path too, not only the generic passthrough catch-all.
+    """
+    base_url = headers.get("x-headroom-base-url", "").strip() or default_base_url.strip()
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/v1"):
+        return normalized[:-3]
+    return normalized
+
+
+def _resolve_openai_upstream_url(
+    headers: dict[str, str],
+    default_base_url: str,
+    fallback_path: str,
+    query: str = "",
+) -> str:
+    """Resolve an OpenAI-compatible upstream URL from Headroom routing hints.
+
+    OpenCode's transport shim normalizes provider requests to Headroom's native
+    ``/v1`` routes, then sends the provider's original path in
+    ``x-headroom-original-path``. Preserve that original path when the custom
+    base URL is valid; otherwise fall back to the canonical OpenAI path.
+    """
+    base_url = _resolve_openai_upstream_base_url(headers, default_base_url)
+    parsed_base = urlparse(base_url)
+    original_path = headers.get("x-headroom-original-path", "").strip()
+
+    if parsed_base.scheme in {"http", "https"} and parsed_base.netloc and original_path:
+        parsed_path = urlparse(original_path)
+        if (
+            original_path.startswith("/")
+            and not parsed_path.scheme
+            and not parsed_path.netloc
+            and not parsed_path.query
+            and not parsed_path.fragment
+        ):
+            url = build_copilot_upstream_url(base_url, original_path)
+            return f"{url}?{query}" if query else url
+
+    url = build_copilot_upstream_url(base_url, fallback_path)
+    return f"{url}?{query}" if query else url
 
 
 class OpenAIHandlerMixin:
@@ -4225,14 +4273,11 @@ class OpenAIHandlerMixin:
                         f"stream={stream}"
                     )
 
-                    # Diagnostic dump — OFF by default (can contain cleartext
-                    # prompt/tool/system content). Opt in via HEADROOM_DEBUG_DUMP
-                    # (=1 redacted, =full with content); never in stateless mode.
-                    dump_mode = _debug_dump_mode(self.config)
-                    if dump_mode != "off":
-                        try:
-                            from headroom import paths as _hr_paths
+                    try:
+                        from headroom import paths as _hr_paths
 
+                        dump_mode = _debug_dump_mode(self.config)
+                        if dump_mode != "off":
                             debug_dir = _hr_paths.debug_400_dir()
                             debug_dir.mkdir(parents=True, exist_ok=True)
                             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -4291,9 +4336,9 @@ class OpenAIHandlerMixin:
                             with open(debug_file, "w") as f:
                                 json.dump(debug_payload, f, indent=2, default=str)
 
-                            logger.warning(f"[{request_id}] Debug dump ({dump_mode}): {debug_file}")
-                        except Exception as dump_err:
-                            logger.error(f"[{request_id}] Failed to write debug dump: {dump_err}")
+                            logger.warning(f"[{request_id}] Full debug dump: {debug_file}")
+                    except Exception as dump_err:
+                        logger.error(f"[{request_id}] Failed to write debug dump: {dump_err}")
 
                 total_latency = (time.time() - start_time) * 1000
 
@@ -4624,10 +4669,6 @@ class OpenAIHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("content-length", None)
-        # The parsed request body has already been content-decoded. Remove
-        # entity headers that described the client-to-proxy wire body.
-        headers.pop("content-encoding", None)
-        headers.pop("transfer-encoding", None)
         # Strip accept-encoding so httpx negotiates its own encoding.
         # Cloudflare Workers forward "br, zstd" which OpenAI may honor;
         # if httpx lacks brotli support the response body is undecipherable → 502.
@@ -4842,7 +4883,6 @@ class OpenAIHandlerMixin:
                                     if current_input
                                     else memory_context
                                 )
-                                body_mutation_tracker.mark_mutated("responses_memory_context")
                                 log_memory_injection(
                                     request_id=request_id,
                                     session_id=None,
@@ -4857,7 +4897,6 @@ class OpenAIHandlerMixin:
                                 )
                                 if bytes_appended > 0:
                                     body["input"] = new_input
-                                    body_mutation_tracker.mark_mutated("responses_memory_context")
                                     log_memory_injection(
                                         request_id=request_id,
                                         session_id=None,
@@ -4965,17 +5004,12 @@ class OpenAIHandlerMixin:
         if is_chatgpt_auth:
             url = codex_responses_http_url()
         else:
-            upstream_base_url = _resolve_openai_upstream_base(request.headers)
-            handler_path = (
-                _resolve_openai_handler_path(request.headers, handler_path=_OPENAI_RESPONSES_PATH)
-                if upstream_base_url is not None
-                else "/v1/responses"
+            url = _resolve_openai_upstream_url(
+                dict(request.headers.items()),
+                self.OPENAI_API_URL,
+                "/v1/responses",
+                request.url.query,
             )
-            url = build_copilot_upstream_url(
-                upstream_base_url or self.OPENAI_API_URL,
-                handler_path,
-            )
-            url = _append_request_query(url, request.url.query)
 
         # The standalone Rust proxy has native /v1/responses item handling,
         # but the default CLI runtime is this Python proxy. Compress the
@@ -5009,7 +5043,6 @@ class OpenAIHandlerMixin:
                     # for A/B baseline accounting.
                     transforms_applied = [*_transforms, *list(transforms_applied)]
                 if _modified:
-                    body_mutation_tracker.mark_mutated("responses_compression")
                     tokens_saved = int(_tokens_saved)
                     optimized_tokens = max(0, original_tokens - tokens_saved)
                     logger.info(
@@ -5789,6 +5822,7 @@ class OpenAIHandlerMixin:
             headers=ws_headers,
             metadata={"path": _ws_path},
         )
+        upstream_base_url = _resolve_openai_upstream_base_url(ws_headers, self.OPENAI_API_URL)
         # Extract per-request tags from headers up front so the
         # session-end RequestLog can attach them. `_extract_tags` is
         # the same helper the HTTP handlers use; on a WebSocket the
@@ -5854,7 +5888,7 @@ class OpenAIHandlerMixin:
             )
         else:
             # API key auth → route to configured OpenAI API URL
-            base = self.OPENAI_API_URL
+            base = upstream_base_url
             ws_base = base.replace("https://", "wss://").replace("http://", "ws://")
             upstream_url = build_copilot_upstream_url(ws_base, "/v1/responses")
 
@@ -7451,6 +7485,7 @@ class OpenAIHandlerMixin:
                                     cache_read_tokens=max(0, cache_read_delta),
                                     cache_write_tokens=max(0, cache_write_delta),
                                     uncached_input_tokens=max(0, uncached_delta),
+                                    cache_inferred=max(0, cache_write_delta) > 0,
                                     total_latency_ms=latency_ms,
                                     overhead_ms=overhead_delta_ms,
                                     ttfb_ms=ttfb_for_record_ms,
@@ -7904,7 +7939,12 @@ class OpenAIHandlerMixin:
                     f"falling back to HTTP POST streaming"
                 )
                 await self._ws_http_fallback(
-                    websocket, body, first_msg_raw, upstream_headers, request_id
+                    websocket,
+                    body,
+                    first_msg_raw,
+                    upstream_headers,
+                    request_id,
+                    upstream_base_url,
                 )
 
             # ── WS session-end metric + RequestLog ──────────────────
@@ -8026,6 +8066,7 @@ class OpenAIHandlerMixin:
                         cache_read_tokens=residual_cache_read_tokens,
                         cache_write_tokens=residual_cache_write_tokens,
                         uncached_input_tokens=residual_uncached_input_tokens,
+                        cache_inferred=residual_cache_write_tokens > 0,
                         total_latency_ms=ws_session_duration_ms,
                         overhead_ms=final_overhead_delta_ms,
                         ttfb_ms=final_ttfb_ms,
@@ -8153,6 +8194,7 @@ class OpenAIHandlerMixin:
         first_msg_raw: str,
         upstream_headers: dict[str, str],
         request_id: str,
+        upstream_base_url: str | None = None,
     ) -> None:
         """Fall back to HTTP POST streaming when upstream WS fails.
 
@@ -8166,7 +8208,10 @@ class OpenAIHandlerMixin:
         if is_chatgpt_fallback:
             http_url = codex_responses_http_url()
         else:
-            http_url = build_copilot_upstream_url(self.OPENAI_API_URL, "/v1/responses")
+            base_url = _resolve_openai_upstream_base_url(
+                {"x-headroom-base-url": upstream_base_url or ""}, self.OPENAI_API_URL
+            )
+            http_url = build_copilot_upstream_url(base_url, "/v1/responses")
 
         # Build HTTP body from the WS response.create payload.
         # WS messages use {"type": "response.create", "response": {...}} wrapper.

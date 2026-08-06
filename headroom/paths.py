@@ -50,6 +50,7 @@ HEADROOM_SAVINGS_PATH_ENV = "HEADROOM_SAVINGS_PATH"
 HEADROOM_SAVINGS_EVENTS_PATH_ENV = "HEADROOM_SAVINGS_EVENTS_PATH"
 HEADROOM_TOIN_PATH_ENV = "HEADROOM_TOIN_PATH"
 HEADROOM_SUBSCRIPTION_STATE_PATH_ENV = "HEADROOM_SUBSCRIPTION_STATE_PATH"
+HEADROOM_OPENCODE_PRICING_CACHE_ENV = "HEADROOM_OPENCODE_PRICING_CACHE"
 HEADROOM_SETTINGS_PATH_ENV = "HEADROOM_SETTINGS_PATH"
 
 # ---------------------------------------------------------------------------
@@ -72,6 +73,7 @@ _SESSION_STATS_FILE = "session_stats.jsonl"
 _SAVINGS_EVENTS_FILE = "savings_events.jsonl"
 _SYNC_STATE_FILE = "sync_state.json"
 _BRIDGE_STATE_FILE = "bridge_state.json"
+_OPENCODE_PRICING_CACHE_FILE = "opencode_pricing_cache.json"
 _LOGS_DIR = "logs"
 _PROXY_LOG_FILE = "proxy.log"
 _DEBUG_400_DIR = "debug_400"
@@ -205,6 +207,20 @@ def savings_path(explicit: str | os.PathLike[str] | None = None) -> Path:
         explicit,
         HEADROOM_SAVINGS_PATH_ENV,
         workspace_dir() / _SAVINGS_FILE,
+    )
+
+
+def opencode_pricing_cache_path(explicit: str | os.PathLike[str] | None = None) -> Path:
+    """Return the path for the OpenCode reference-pricing disk cache.
+
+    Stores scraped OpenCode Zen/Go prices with a per-surface daily date stamp
+    so repeated proxy processes and restarts share one fetch per day.
+    """
+
+    return _resolve(
+        explicit,
+        HEADROOM_OPENCODE_PRICING_CACHE_ENV,
+        workspace_dir() / _OPENCODE_PRICING_CACHE_FILE,
     )
 
 
@@ -406,6 +422,7 @@ __all__ = [
     "HEADROOM_SAVINGS_EVENTS_PATH_ENV",
     "HEADROOM_TOIN_PATH_ENV",
     "HEADROOM_SUBSCRIPTION_STATE_PATH_ENV",
+    "HEADROOM_OPENCODE_PRICING_CACHE_ENV",
     "HEADROOM_SETTINGS_PATH_ENV",
     "set_process_stateless",
     "process_is_stateless",
@@ -414,6 +431,7 @@ __all__ = [
     "ensure_config_dir",
     "ensure_workspace_dir",
     "savings_path",
+    "opencode_pricing_cache_path",
     "toin_path",
     "subscription_state_path",
     "memory_db_path",

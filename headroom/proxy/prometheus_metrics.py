@@ -410,40 +410,13 @@ class PrometheusMetrics:
         return self._otel_metrics or get_otel_metrics()
 
     def _current_savings_tracker_totals(self) -> tuple[int, float]:
-        total_input_tokens = self._savings_tracker_input_tokens_offset + self.tokens_input_total
-        total_input_cost_usd = self._savings_tracker_input_cost_usd_offset
-
-        if self.cost_tracker is None:
-            return total_input_tokens, total_input_cost_usd
-
-        try:
-            cost_stats = self.cost_tracker.stats()
-        except Exception:
-            logger.debug("Failed to read cost tracker totals for savings history", exc_info=True)
-            return total_input_tokens, total_input_cost_usd
-
-        tracked_input_tokens = cost_stats.get("total_input_tokens")
-        tracked_input_cost_usd = cost_stats.get("total_input_cost_usd")
-
-        if tracked_input_tokens is not None:
-            try:
-                total_input_tokens = self._savings_tracker_input_tokens_offset + max(
-                    int(tracked_input_tokens),
-                    0,
-                )
-            except (TypeError, ValueError):
-                pass
-
-        if tracked_input_cost_usd is not None:
-            try:
-                total_input_cost_usd = self._savings_tracker_input_cost_usd_offset + max(
-                    float(tracked_input_cost_usd),
-                    0.0,
-                )
-            except (TypeError, ValueError):
-                pass
-
-        return total_input_tokens, total_input_cost_usd
+        # Savings history owns its cumulative input totals. The CostTracker can
+        # represent a different request population, so importing its totals here
+        # would contaminate dashboard history with unrelated traffic.
+        return (
+            self._savings_tracker_input_tokens_offset + self.tokens_input_total,
+            self._savings_tracker_input_cost_usd_offset,
+        )
 
     def record_stack(self, stack: str | None) -> None:
         """Increment the per-stack request counter.
@@ -685,10 +658,12 @@ class PrometheusMetrics:
         cache_write_5m_tokens: int = 0,
         cache_write_1h_tokens: int = 0,
         uncached_input_tokens: int = 0,
+        cache_inferred: bool = False,
         attempted_input_tokens: int = 0,
         output_tokens_saved: int = 0,
         project: str | None = None,
         client: str | None = None,
+        pricing_surface: str | None = None,
         tool_search_saved: int = 0,
         local_input_tokens: int | None = None,
     ):
@@ -819,9 +794,11 @@ class PrometheusMetrics:
                 tokens_saved=tokens_saved,
                 provider=provider,
                 project=project,
+                pricing_surface=pricing_surface,
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
                 uncached_input_tokens=uncached_input_tokens,
+                cache_write_inferred=cache_inferred,
                 total_input_tokens=total_input_tokens,
                 total_input_cost_usd=total_input_cost_usd,
                 output_tokens_saved=output_tokens_saved,

@@ -88,9 +88,7 @@ class TestNetCostGate:
         assert not _tool_slot_compressed(one_hour, messages)
         assert any(t.startswith("netcost:skip:") for t in one_hour.transforms_applied)
 
-    def test_request_one_hour_marker_overrides_env_fallback(
-        self, router, tokenizer, monkeypatch
-    ):
+    def test_request_one_hour_marker_overrides_env_fallback(self, router, tokenizer, monkeypatch):
         monkeypatch.setenv("HEADROOM_NET_COST_POLICY", "1")
         monkeypatch.delenv("HEADROOM_NET_COST_CACHE_TTL_SECONDS", raising=False)
         for name in (

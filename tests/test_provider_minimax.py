@@ -1,4 +1,5 @@
 """Tests for the MiniMax provider (token counts, context limits, costs, vision)."""
+
 from __future__ import annotations
 
 import pytest

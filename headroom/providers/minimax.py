@@ -108,8 +108,7 @@ class MiniMaxProvider(Provider):
         normalized = model.split("/")[-1]
         if normalized not in MODEL_CONTEXT_LIMITS:
             logger.warning(
-                "Unknown MiniMax model %r; using conservative default (128K). "
-                "Known models: %s",
+                "Unknown MiniMax model %r; using conservative default (128K). Known models: %s",
                 model,
                 ", ".join(sorted(MODEL_CONTEXT_LIMITS)),
             )

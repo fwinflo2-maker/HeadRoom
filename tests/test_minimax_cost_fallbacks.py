@@ -46,7 +46,9 @@ class TestGetCachePricesMiniMaxFallback:
         prices = tracker._get_cache_prices("MiniMax-M2.7-highspeed")
         assert prices is not None
         cache_read, cache_write, uncached = prices
-        assert uncached == pytest.approx(MODEL_INPUT_COST["MiniMax-M2.7-highspeed"] / 1_000_000, rel=1e-9)
+        assert uncached == pytest.approx(
+            MODEL_INPUT_COST["MiniMax-M2.7-highspeed"] / 1_000_000, rel=1e-9
+        )
 
     def test_minimax_prefix_stripped_before_lookup(self) -> None:
         tracker = self._make_tracker()
@@ -109,7 +111,7 @@ class TestGetCachePricesMiniMaxFallback:
           - cache_write == 125% of uncached (Anthropic's 25% write premium)
         """
         tracker = self._make_tracker()
-        prices = tracker._get_cache_prices(model)
+        prices = tracker._get_cache_prices_fallback(model)
         if prices is None:
             pytest.skip(
                 "No pricing source available for "
@@ -142,9 +144,7 @@ class TestGetCachePricesMiniMaxFallback:
             ("o3-mini", 1.10),
         ],
     )
-    def test_openai_gpt_pricing_consistent(
-        self, model: str, fallback_per_m: float
-    ) -> None:
+    def test_openai_gpt_pricing_consistent(self, model: str, fallback_per_m: float) -> None:
         """OpenAI pricing is internally consistent regardless of source.
 
         Either litellm's registry or our hardcoded fallback is used; in
@@ -152,7 +152,7 @@ class TestGetCachePricesMiniMaxFallback:
         numbers (50% off cache reads, no write premium).
         """
         tracker = self._make_tracker()
-        prices = tracker._get_cache_prices(model)
+        prices = tracker._get_cache_prices_fallback(model)
         if prices is None:
             pytest.skip(
                 "No pricing source available for "
@@ -178,11 +178,15 @@ class TestGetListPriceMiniMaxFallback:
 
     def test_minimax_m3_returns_per_million_price(self) -> None:
         tracker = self._make_tracker()
-        assert tracker._get_list_price("MiniMax-M3") == pytest.approx(MODEL_INPUT_COST["MiniMax-M3"], rel=1e-9)
+        assert tracker._get_list_price("MiniMax-M3") == pytest.approx(
+            MODEL_INPUT_COST["MiniMax-M3"], rel=1e-9
+        )
 
     def test_minimax_prefix_returns_per_million_price(self) -> None:
         tracker = self._make_tracker()
-        assert tracker._get_list_price("minimax/MiniMax-M3") == pytest.approx(MODEL_INPUT_COST["MiniMax-M3"], rel=1e-9)
+        assert tracker._get_list_price("minimax/MiniMax-M3") == pytest.approx(
+            MODEL_INPUT_COST["MiniMax-M3"], rel=1e-9
+        )
 
     def test_minimax_m27_family(self) -> None:
         tracker = self._make_tracker()
@@ -199,18 +203,25 @@ class TestSavingsTrackerMiniMaxFallback:
 
         r = _get_minimax_cost_per_token("MiniMax-M3")
         assert r is not None
-        assert r["input_cost_per_token"] == pytest.approx(MODEL_INPUT_COST["MiniMax-M3"] / 1_000_000, rel=1e-9)
+        assert r["input_cost_per_token"] == pytest.approx(
+            MODEL_INPUT_COST["MiniMax-M3"] / 1_000_000, rel=1e-9
+        )
         # Output pricing is exposed by MiniMaxProvider, the test
         # data layer matches the same shape.
         from headroom.providers.minimax import MODEL_OUTPUT_COST
-        assert r["output_cost_per_token"] == pytest.approx(MODEL_OUTPUT_COST["MiniMax-M3"] / 1_000_000, rel=1e-9)
+
+        assert r["output_cost_per_token"] == pytest.approx(
+            MODEL_OUTPUT_COST["MiniMax-M3"] / 1_000_000, rel=1e-9
+        )
 
     def test_minimax_prefix_returns_pricing(self) -> None:
         from headroom.proxy.savings_tracker import _get_minimax_cost_per_token
 
         r = _get_minimax_cost_per_token("minimax/MiniMax-M2.7-highspeed")
         assert r is not None
-        assert r["input_cost_per_token"] == pytest.approx(MODEL_INPUT_COST["MiniMax-M2.7-highspeed"] / 1_000_000, rel=1e-9)
+        assert r["input_cost_per_token"] == pytest.approx(
+            MODEL_INPUT_COST["MiniMax-M2.7-highspeed"] / 1_000_000, rel=1e-9
+        )
 
     def test_non_minimax_returns_none(self) -> None:
         from headroom.proxy.savings_tracker import _get_minimax_cost_per_token
@@ -239,7 +250,10 @@ class TestCacheStatsProviderMatch:
                 or (provider == "openai" and any(p in model_name for p in _openai_prefixes))
                 or (provider == "gemini" and "gemini" in model_name)
                 or (provider == "bedrock" and "claude" in model_name)
-                or (provider == "minimax" and ("MiniMax-M" in model_name or "minimax-m" in model_name.lower()))
+                or (
+                    provider == "minimax"
+                    and ("MiniMax-M" in model_name or "minimax-m" in model_name.lower())
+                )
             )
 
         assert matches("minimax", "MiniMax-M3") is True
@@ -307,6 +321,12 @@ class TestMiniMaxHandlerModelDetection:
 
         assert mod.MiniMaxHandlerMixin._strip_minimax_prefix("MiniMax-M3") == "MiniMax-M3"
         assert mod.MiniMaxHandlerMixin._strip_minimax_prefix("minimax/MiniMax-M3") == "MiniMax-M3"
-        assert mod.MiniMaxHandlerMixin._strip_minimax_prefix("minimax/MiniMax-M2.7-highspeed") == "MiniMax-M2.7-highspeed"
-        assert mod.MiniMaxHandlerMixin._strip_minimax_prefix("claude-sonnet-4-5") == "claude-sonnet-4-5"
+        assert (
+            mod.MiniMaxHandlerMixin._strip_minimax_prefix("minimax/MiniMax-M2.7-highspeed")
+            == "MiniMax-M2.7-highspeed"
+        )
+        assert (
+            mod.MiniMaxHandlerMixin._strip_minimax_prefix("claude-sonnet-4-5")
+            == "claude-sonnet-4-5"
+        )
         assert mod.MiniMaxHandlerMixin._strip_minimax_prefix("") == ""

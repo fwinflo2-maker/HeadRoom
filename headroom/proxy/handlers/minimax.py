@@ -76,9 +76,7 @@ class MiniMaxHandlerMixin:
                 return tail
         return model
 
-    def _resolve_minimax_upstream_url(
-        self, override: str | None = None
-    ) -> str:
+    def _resolve_minimax_upstream_url(self, override: str | None = None) -> str:
         """Resolve the upstream base URL for MiniMax traffic.
 
         Priority (first match wins):
@@ -104,9 +102,7 @@ class MiniMaxHandlerMixin:
         # create a cycle.
         from headroom.proxy.server import HeadroomProxy
 
-        return getattr(
-            HeadroomProxy, "ANTHROPIC_API_URL", "https://api.anthropic.com"
-        )
+        return getattr(HeadroomProxy, "ANTHROPIC_API_URL", "https://api.anthropic.com")
 
     async def handle_minimax_messages(
         self,
@@ -147,9 +143,7 @@ class MiniMaxHandlerMixin:
                 body_bytes = await request.body()
                 parsed = json.loads(body_bytes or b"{}")
                 if isinstance(parsed, dict) and "model" in parsed:
-                    parsed["model"] = self._strip_minimax_prefix(
-                        parsed["model"]
-                    )
+                    parsed["model"] = self._strip_minimax_prefix(parsed["model"])
                     new_body = json.dumps(parsed).encode()
                     try:
                         request._body = new_body  # type: ignore[attr-defined]
@@ -158,9 +152,7 @@ class MiniMaxHandlerMixin:
                         # body and patching model via model_override.
                         model_override = parsed["model"]
             except (json.JSONDecodeError, ValueError):
-                logger.warning(
-                    "minimax: could not parse body for model strip"
-                )
+                logger.warning("minimax: could not parse body for model strip")
 
         # Resolve the MiniMax-specific upstream URL.
         resolved_url = self._resolve_minimax_upstream_url(upstream_base_url)

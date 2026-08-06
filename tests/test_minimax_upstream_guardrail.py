@@ -60,10 +60,7 @@ class TestIsMiniMaxUpstream:
     def test_case_insensitive_host_match(self) -> None:
         # Host normalisation happens in urlparse().hostname.lower() — verify
         # that uppercase host parts are still recognised as MiniMax.
-        assert (
-            HeadroomProxy._is_minimax_upstream("https://AGENT.MINIMAX.IO/foo")
-            is True
-        )
+        assert HeadroomProxy._is_minimax_upstream("https://AGENT.MINIMAX.IO/foo") is True
 
 
 class TestCheckMiniMaxUpstreamGuardrail:
@@ -91,8 +88,8 @@ class TestCheckMiniMaxUpstreamGuardrail:
         # works in the production code path. Also bind the new
         # _is_minimax_upstream_for_self wrapper which the guardrail calls.
         proxy._is_minimax_upstream = HeadroomProxy._is_minimax_upstream
-        proxy._is_minimax_upstream_for_self = (
-            HeadroomProxy._is_minimax_upstream_for_self.__get__(proxy)
+        proxy._is_minimax_upstream_for_self = HeadroomProxy._is_minimax_upstream_for_self.__get__(
+            proxy
         )
         # The guardrail reads from the class-level ANTHROPIC_API_URL, so
         # we patch the class attribute (restored by the fixture below).
@@ -122,9 +119,7 @@ class TestCheckMiniMaxUpstreamGuardrail:
             if record.levelno >= logging.WARNING
         )
 
-    def test_minimax_env_target_with_minimax_upstream_no_log(
-        self, monkeypatch, caplog
-    ) -> None:
+    def test_minimax_env_target_with_minimax_upstream_no_log(self, monkeypatch, caplog) -> None:
         """Happy path — MiniMax ANTHROPIC_TARGET_API_URL + MiniMax upstream
         → info log only (or nothing), no warning."""
         monkeypatch.setenv(
@@ -157,7 +152,8 @@ class TestCheckMiniMaxUpstreamGuardrail:
         with caplog.at_level(logging.ERROR, logger="headroom.proxy"):
             HeadroomProxy._check_minimax_upstream_guardrail(proxy)
         errors = [
-            r for r in caplog.records
+            r
+            for r in caplog.records
             if r.levelno >= logging.ERROR and "minimax_guardrail" in r.message
         ]
         assert len(errors) == 1
@@ -179,7 +175,8 @@ class TestCheckMiniMaxUpstreamGuardrail:
         with caplog.at_level(logging.ERROR, logger="headroom.proxy"):
             HeadroomProxy._check_minimax_upstream_guardrail(proxy)
         errors = [
-            r for r in caplog.records
+            r
+            for r in caplog.records
             if r.levelno >= logging.ERROR and "minimax_guardrail" in r.message
         ]
         assert len(errors) == 1

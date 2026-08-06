@@ -106,9 +106,7 @@ class TestResolveMiniMaxUpstreamUrl:
     def test_override_wins_over_everything(self, mock_proxy_cls) -> None:
         """Caller-supplied URL beats config and env and fallback."""
         mock_proxy_cls.ANTHROPIC_API_URL = "https://api.anthropic.com"
-        handler = self._make_handler(
-            minimax_api_url="https://cfg.example/minimax"
-        )
+        handler = self._make_handler(minimax_api_url="https://cfg.example/minimax")
         with patch.dict(os.environ, {"MINIMAX_TARGET_API_URL": "https://env.example/minimax"}):
             result = MiniMaxHandlerMixin._resolve_minimax_upstream_url(
                 handler, override="https://override.example/minimax"
@@ -119,9 +117,7 @@ class TestResolveMiniMaxUpstreamUrl:
     def test_config_field_beats_env_and_fallback(self, mock_proxy_cls) -> None:
         """ProxyConfig.minimax_api_url beats env var and fallback."""
         mock_proxy_cls.ANTHROPIC_API_URL = "https://api.anthropic.com"
-        handler = self._make_handler(
-            minimax_api_url="https://cfg.example/minimax"
-        )
+        handler = self._make_handler(minimax_api_url="https://cfg.example/minimax")
         with patch.dict(os.environ, {"MINIMAX_TARGET_API_URL": "https://env.example/minimax"}):
             result = MiniMaxHandlerMixin._resolve_minimax_upstream_url(handler)
         assert result == "https://cfg.example/minimax"
@@ -150,9 +146,7 @@ class TestResolveMiniMaxUpstreamUrl:
         assert result == "https://agent.minimax.io/mavis/api/v1/llm"
 
     @patch("headroom.proxy.server.HeadroomProxy")
-    def test_explicit_minimax_upstream_does_not_route_to_anthropic(
-        self, mock_proxy_cls
-    ) -> None:
+    def test_explicit_minimax_upstream_does_not_route_to_anthropic(self, mock_proxy_cls) -> None:
         """When ProxyConfig.minimax_api_url is the direct MiniMax API,
         MiniMax traffic MUST NOT silently route to Anthropic.
 
@@ -162,9 +156,7 @@ class TestResolveMiniMaxUpstreamUrl:
         saw their MiniMax traffic silently going to Anthropic.
         """
         mock_proxy_cls.ANTHROPIC_API_URL = "https://api.anthropic.com"
-        handler = self._make_handler(
-            minimax_api_url="https://api.minimaxi.com/anthropic"
-        )
+        handler = self._make_handler(minimax_api_url="https://api.minimaxi.com/anthropic")
         result = MiniMaxHandlerMixin._resolve_minimax_upstream_url(handler)
         assert result == "https://api.minimaxi.com/anthropic"
         assert "anthropic.com" not in result, (

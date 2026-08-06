@@ -5,8 +5,10 @@ const http = nodeRequire("node:http") as typeof import("node:http");
 const https = nodeRequire("node:https") as typeof import("node:https");
 const http2 = nodeRequire("node:http2") as typeof import("node:http2");
 const childProcess = nodeRequire("node:child_process") as typeof import("node:child_process");
+const fs = nodeRequire("node:fs") as typeof import("node:fs");
 
 const BASE_URL_HEADER = "x-headroom-base-url";
+const ORIGINAL_PATH_HEADER = "x-headroom-original-path";
 const PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
 const STATE_KEY = Symbol.for("headroom.opencode.transport");
 
@@ -60,8 +62,15 @@ function setState(state: TransportState | undefined): void {
   (globalThis as GlobalWithHeadroomTransport)[STATE_KEY] = state;
 }
 
-function shimImportSpecifier(): string {
-  return new URL("../hook-shim/handler.js", import.meta.url).href;
+// ponytail: the shim only exists next to the checkout build
+// (plugins/opencode/dist/). The wheel ships entry.opencode.js alone, so
+// `--import=<missing file>` killed every Node child at startup — including
+// OpenCode's stdio MCP servers (issue #2798). No shim on disk, no injection:
+// children go direct instead of dying. Upgrade path is bundling the shim into
+// _dist/ so wheel installs get child-process routing back.
+function shimImportSpecifier(): string | undefined {
+  const shim = new URL("../hook-shim/handler.js", import.meta.url);
+  return fs.existsSync(shim) ? shim.href : undefined;
 }
 
 function withNodeImportOption(existing: string | undefined, shim: string): string {
@@ -78,13 +87,19 @@ function withNodeImportOption(existing: string | undefined, shim: string): strin
 function withShimEnv(env: NodeJS.ProcessEnv | Record<string, unknown> | undefined, proxyUrl: string): NodeJS.ProcessEnv {
   const nextEnv = { ...(env ?? process.env) } as NodeJS.ProcessEnv;
   nextEnv[PROXY_ENV] = proxyUrl;
-  nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shimImportSpecifier());
+  const shim = shimImportSpecifier();
+  if (shim) {
+    nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shim);
+  }
   return nextEnv;
 }
 
 function installProcessEnv(proxyUrl: string): void {
   process.env[PROXY_ENV] = proxyUrl;
-  process.env.NODE_OPTIONS = withNodeImportOption(process.env.NODE_OPTIONS, shimImportSpecifier());
+  const shim = shimImportSpecifier();
+  if (shim) {
+    process.env.NODE_OPTIONS = withNodeImportOption(process.env.NODE_OPTIONS, shim);
+  }
 }
 
 function isOptions(value: unknown): value is Record<string, unknown> {
@@ -178,6 +193,31 @@ function routedUrl(upstream: URL, proxy: URL): URL {
   return new URL(`${upstream.pathname}${upstream.search}`, proxy.origin);
 }
 
+function normalizedOpenAiProxyPath(pathname: string): string | undefined {
+  if (pathname.endsWith("/chat/completions")) {
+    return "/v1/chat/completions";
+  }
+  if (pathname.endsWith("/responses")) {
+    return "/v1/responses";
+  }
+  return undefined;
+}
+
+function routedUrlForOpenCode(upstream: URL, proxy: URL): { url: URL; originalPath: string | undefined } {
+  const normalizedPath = normalizedOpenAiProxyPath(upstream.pathname);
+  if (!normalizedPath) {
+    return {
+      url: routedUrl(upstream, proxy),
+      originalPath: undefined,
+    };
+  }
+
+  return {
+    url: new URL(`${normalizedPath}${upstream.search}`, proxy.origin),
+    originalPath: upstream.pathname,
+  };
+}
+
 function requestUrl(input: RequestInfo | URL): URL {
   if (input instanceof Request) {
     return new URL(input.url);
@@ -188,7 +228,12 @@ function requestUrl(input: RequestInfo | URL): URL {
   return new URL(String(input));
 }
 
-function mergeFetchHeaders(input: RequestInfo | URL, init?: RequestInit, upstream?: URL): Headers {
+function mergeFetchHeaders(
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+  upstream: URL | undefined,
+  originalPath: string | undefined = undefined,
+): Headers {
   const headers = new Headers(input instanceof Request ? input.headers : undefined);
   if (init?.headers) {
     new Headers(init.headers).forEach((value, key) => headers.set(key, value));
@@ -196,6 +241,9 @@ function mergeFetchHeaders(input: RequestInfo | URL, init?: RequestInit, upstrea
   if (upstream) {
     headers.set(BASE_URL_HEADER, upstream.origin);
     headers.delete("host");
+  }
+  if (originalPath) {
+    headers.set(ORIGINAL_PATH_HEADER, originalPath);
   }
   return headers;
 }
@@ -206,11 +254,11 @@ function withRoutedFetchInput(input: RequestInfo | URL, init: RequestInit | unde
     return [input, init];
   }
 
+  const { url: nextUrl, originalPath } = routedUrlForOpenCode(upstream, proxy);
   const nextInit = {
     ...init,
-    headers: mergeFetchHeaders(input, init, upstream),
+    headers: mergeFetchHeaders(input, init, upstream, originalPath),
   };
-  const nextUrl = routedUrl(upstream, proxy);
 
   if (input instanceof Request) {
     return [new Request(nextUrl, input), nextInit];
@@ -262,9 +310,16 @@ function urlFromRequestOptions(options: Record<string, unknown>): URL | undefine
   }
 }
 
-function headersForNodeRequest(options: Record<string, unknown>, upstream: URL): Record<string, string> {
+function headersForNodeRequest(
+  options: Record<string, unknown>,
+  upstream: URL,
+  originalPath: string | undefined,
+): Record<string, string> {
   const headers = new Headers(options.headers as HeadersInit | undefined);
   headers.set(BASE_URL_HEADER, upstream.origin);
+  if (originalPath) {
+    headers.set(ORIGINAL_PATH_HEADER, originalPath);
+  }
   headers.delete("host");
 
   const result: Record<string, string> = {};
@@ -279,7 +334,7 @@ function routedNodeOptions(parts: NodeRequestParts, proxy: URL): Record<string, 
     return undefined;
   }
 
-  const nextUrl = routedUrl(parts.url, proxy);
+  const { url: nextUrl, originalPath } = routedUrlForOpenCode(parts.url, proxy);
   const {
     agent: _agent,
     auth: _auth,
@@ -307,7 +362,7 @@ function routedNodeOptions(parts: NodeRequestParts, proxy: URL): Record<string, 
     hostname: nextUrl.hostname,
     port: nextUrl.port || undefined,
     path: `${nextUrl.pathname}${nextUrl.search}`,
-    headers: headersForNodeRequest(parts.options, parts.url),
+    headers: headersForNodeRequest(parts.options, parts.url, originalPath),
   };
 }
 

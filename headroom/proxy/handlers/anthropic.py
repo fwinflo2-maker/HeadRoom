@@ -1130,9 +1130,7 @@ class AnthropicHandlerMixin:
 
             # Resolve the authoritative request-level prompt-cache tier once.
             # The same value drives cold-prefix handling and net-cost pricing.
-            _cc_ttl = anthropic_cache_ttl_seconds(
-                model, original_client_messages, system_prompt
-            )
+            _cc_ttl = anthropic_cache_ttl_seconds(model, original_client_messages, system_prompt)
             _cold_recompact_active = False
             if os.environ.get("HEADROOM_COLD_RECOMPACT", "").strip().lower() in (
                 "1",

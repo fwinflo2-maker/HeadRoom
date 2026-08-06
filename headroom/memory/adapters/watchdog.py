@@ -13,7 +13,7 @@ import asyncio
 import logging
 import multiprocessing
 import time
-from typing import Any
+from typing import Any, cast
 
 logger = logging.getLogger(__name__)
 
@@ -101,11 +101,14 @@ class EmbeddingServerWatchdog:
     def _spawn_process(self) -> None:
         """Create and start a new server process using spawn context."""
         ctx = multiprocessing.get_context("spawn")
-        self._process = ctx.Process(
-            target=_server_target,
-            args=(self._socket_path, self._server_kwargs),
-            daemon=True,
-            name="headroom-embed-server",
+        self._process = cast(
+            multiprocessing.Process,
+            ctx.Process(
+                target=_server_target,
+                args=(self._socket_path, self._server_kwargs),
+                daemon=True,
+                name="headroom-embed-server",
+            ),
         )
         self._process.start()
         logger.info(
@@ -142,6 +145,18 @@ class EmbeddingServerWatchdog:
                 self._consecutive_crashes,
                 self._max_restarts,
             )
+
+            # Exit code 3 = permanent dependency error (e.g. missing hnswlib).
+            # Retrying will never help — give up immediately.
+            if exit_code == 3:
+                logger.error(
+                    "event=embedding_server_giving_up "
+                    "socket=%s reason=missing_dependency -- "
+                    "install with: uv sync --extra memory  OR  pip install hnswlib",
+                    self._socket_path,
+                )
+                self._started = False
+                return
 
             if self._consecutive_crashes > self._max_restarts:
                 logger.error(

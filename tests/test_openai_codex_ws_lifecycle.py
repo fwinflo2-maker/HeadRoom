@@ -589,6 +589,76 @@ async def test_ws_first_frame_non_timeout_exception_keeps_generic_reason(
 
 
 @pytest.mark.asyncio
+async def test_ws_later_frame_compression_is_actually_forwarded(monkeypatch):
+    """Regression for issue #2819: a later (2nd+) Codex WS response.create
+    frame whose compressor reports ``modified=True`` must have the REWRITTEN
+    payload sent upstream — not the original raw frame.
+
+    A misplaced ``return`` (introduced in #1579) sat at the same indentation
+    as the surrounding ``except`` block, so it fired unconditionally after
+    every later-frame compression attempt — success or failure — and always
+    forwarded ``raw_after_store`` (the pre-compression frame). Compressed
+    later frames were silently discarded on the wire, and the token/savings
+    accounting that only runs on the (dead) success path never accumulated,
+    which is why ``headroom perf`` showed 0 tokens for Codex sessions with
+    multiple turns.
+    """
+    second_frame = _first_frame()
+    upstream = _FakeUpstream([], hold_after_events=True)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    client_ws = _FakeWebSocket(
+        frames=[_first_frame(), second_frame],
+        hold_after_initial=True,
+        disconnect_after_n_sends=None,
+    )
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    monkeypatch.setattr(openai_module, "COMPRESSION_TIMEOUT_SECONDS", 30.0)
+
+    compressed_inner = {"model": "gpt-5.4", "input": "compressed"}
+    calls = 0
+
+    def _compress(payload, *, model, request_id, timing=None, client=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            # First frame: not modified (exercises the other call site).
+            return payload, False, 0, [], "router_no_compression", 10, 10, 0
+        # Later frame: compressor DID find savings.
+        return compressed_inner, True, 5, ["text"], "compressed", 10, 5, 10
+
+    async def _trigger() -> None:
+        await asyncio.sleep(0.05)
+        client_ws.trigger_disconnect()
+
+    handler._compress_openai_responses_payload = _compress  # type: ignore[method-assign]
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        trigger_task = asyncio.create_task(_trigger())
+        try:
+            await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=2.0)
+        finally:
+            trigger_task.cancel()
+            try:
+                await trigger_task
+            except asyncio.CancelledError:
+                pass
+
+    # The compressed payload must reach upstream for the later frame — not
+    # the untouched original second_frame.
+    assert upstream.sent[-1] != second_frame
+    assert json.loads(upstream.sent[-1])["response"] == compressed_inner
+
+    # The success-path bookkeeping (tokens_saved / frame count) must run —
+    # proof the "modified" branch executed rather than short-circuiting.
+    modified_frames = [
+        frame for frame in handler.metrics.codex_ws_frames if frame.get("modified")
+    ]
+    assert modified_frames, "expected at least one frame recorded as modified=True"
+
+
+@pytest.mark.asyncio
 async def test_ws_later_frame_timeout_records_failed_frame(caplog, monkeypatch):
     """Later Codex WS compression timeout records failed frame metrics."""
     second_frame = _first_frame()

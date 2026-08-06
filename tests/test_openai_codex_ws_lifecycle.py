@@ -657,6 +657,63 @@ async def test_ws_later_frame_compression_is_actually_forwarded(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ws_later_frame_non_timeout_exception_falls_back_to_original(caplog, monkeypatch):
+    """A non-timeout compression exception on a later frame must forward the
+    original frame via the except-block return (the line this PR moved back
+    inside the except), not fall through to the (now correctly gated)
+    success-path handling below it.
+    """
+    second_frame = _first_frame()
+    upstream = _FakeUpstream([], hold_after_events=True)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    client_ws = _FakeWebSocket(
+        frames=[_first_frame(), second_frame],
+        hold_after_initial=True,
+    )
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    monkeypatch.setattr(openai_module, "COMPRESSION_TIMEOUT_SECONDS", 30.0)
+
+    calls = 0
+
+    async def _run(fn, *, timeout: float):
+        nonlocal calls
+        calls += 1
+        handler.compression_executor_calls += 1
+        handler.compression_executor_timeouts.append(timeout)
+        if calls == 2:
+            raise RuntimeError("simulated later-frame compression failure")
+        return fn()
+
+    def _noop_compress(payload, *, model, request_id, timing=None, client=None):
+        return payload, False, 0, [], "test_noop", 10, 10, 0
+
+    async def _trigger() -> None:
+        await asyncio.sleep(0.05)
+        client_ws.trigger_disconnect()
+
+    handler._compress_openai_responses_payload = _noop_compress  # type: ignore[method-assign]
+    handler._run_compression_in_executor = _run  # type: ignore[method-assign]
+    caplog.set_level(logging.INFO, logger="headroom.proxy")
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        trigger_task = asyncio.create_task(_trigger())
+        try:
+            await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=2.0)
+        finally:
+            trigger_task.cancel()
+            try:
+                await trigger_task
+            except asyncio.CancelledError:
+                pass
+
+    # The failed later frame must forward the original, unmodified frame.
+    assert upstream.sent[-1] == second_frame
+    assert "reason=compression_exception" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_ws_later_frame_timeout_records_failed_frame(caplog, monkeypatch):
     """Later Codex WS compression timeout records failed frame metrics."""
     second_frame = _first_frame()

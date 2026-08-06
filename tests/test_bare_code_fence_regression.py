@@ -11,9 +11,7 @@ Requires the native `headroom._core` extension (build with `maturin develop`).
 
 import pytest
 
-pytest.importorskip(
-    "headroom._core", reason="requires built Rust extension (maturin develop)"
-)
+pytest.importorskip("headroom._core", reason="requires built Rust extension (maturin develop)")
 
 from headroom.transforms.content_router import (  # noqa: E402
     ContentRouter,

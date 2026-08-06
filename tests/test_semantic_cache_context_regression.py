@@ -6,13 +6,13 @@ ignored prior conversation, so convo B got convo A's cached answer when both
 ended in the same message (e.g. "continue", "fix it").
 """
 
-from headroom.cache.semantic import SemanticCacheLayer
 from headroom.cache.base import (
     BaseCacheOptimizer,
     CacheResult,
     CacheStrategy,
     OptimizationContext,
 )
+from headroom.cache.semantic import SemanticCacheLayer
 
 
 class _NoopOptimizer(BaseCacheOptimizer):

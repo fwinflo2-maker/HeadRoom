@@ -51,7 +51,7 @@ if (-not (Test-Path $PythonExe)) {
     throw "PythonExe not found: $PythonExe"
 }
 
-$proxyArgs = "-m headroom.cli proxy --host 127.0.0.1 --port $Port --mode $Mode --backend $Backend --telemetry"
+$proxyArgs = "-m headroom.cli proxy --host 127.0.0.1 --port $Port --mode $Mode --backend $Backend"
 
 $action = New-ScheduledTaskAction -Execute $PythonExe -Argument $proxyArgs -WorkingDirectory $HOME
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"

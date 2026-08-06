@@ -5,7 +5,7 @@ Claude Code and Codex, including a workaround for a gap in the built-in
 `persistent-service` / `persistent-task` install presets on standard
 (non-administrator) Windows accounts.
 
-Validated on: Windows 11 Pro (build 10.0.26200), headroom-ai 0.31.0
+Originally validated on: Windows 11 Pro (build 10.0.26200), headroom-ai 0.31.0
 (PyPI `win_amd64` wheel), against `main` at `v0.31.0-93-g2c9eb7c5`,
 Claude Code CLI, Codex Desktop.
 
@@ -126,17 +126,16 @@ a proxy that is still bound to the port but no longer tracked — the next
 Claude Code launch then hits a hook failure and appears to require manually
 killing headroom before Claude Code will start.
 
-This is very likely the Windows manifestation of
+This was likely the Windows manifestation of
 [headroomlabs-ai/headroom#822](https://github.com/headroomlabs-ai/headroom/pull/822)
-("fix(windows): unwedge compression on degraded ONNX runtimes"), which was
-still open (not merged) at the time of writing against `main`
-(`v0.31.0-93-g2c9eb7c5`). It does not reproduce via Codex on Windows, because
+("fix(windows): unwedge compression on degraded ONNX runtimes"), which merged
+after the original validation. It did not reproduce via Codex on Windows, because
 Codex hooks are currently disabled upstream on Windows
 (`headroom init codex` prints "Codex hooks are currently disabled upstream on
 Windows; provider routing was still installed."), so Codex never runs this
 code path — it only uses the static `config.toml` provider block.
 
-**Until #822 lands**, avoid running both the hook and a supervisor
+Even with #822 merged, avoid running both the hook and a supervisor
 (Scheduled Task or Windows Service) at the same time — pick one owner for the
 proxy's lifecycle. The workaround above assumes the Scheduled Task is the sole
 owner and the hooks have been removed from `settings.json`.

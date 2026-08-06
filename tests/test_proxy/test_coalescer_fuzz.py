@@ -1,7 +1,11 @@
 """Fuzzing tests for RequestCoalescer."""
+
 import asyncio
+
 import pytest
-from hypothesis import given, strategies as st, settings
+from hypothesis import given, settings
+from hypothesis import strategies as st
+
 from headroom.proxy.coalescer import RequestCoalescer
 
 

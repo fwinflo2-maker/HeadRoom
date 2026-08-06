@@ -1,5 +1,6 @@
 """Tests for LeanContext window-based truncation."""
-from headroom.transforms.lean_context import LeanContext, TruncationResult
+
+from headroom.transforms.lean_context import LeanContext
 
 
 def test_no_signals_keeps_ends():

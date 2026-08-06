@@ -1,24 +1,29 @@
 """Fuzzing tests for LeanContext — property-based testing with hypothesis."""
-import pytest
-from hypothesis import given, strategies as st, settings
+
+from hypothesis import given, settings
+from hypothesis import strategies as st
+
 from headroom.transforms.lean_context import LeanContext
 
 # Generate realistic tool output text
 tool_text = st.text(
-    alphabet=st.characters(whitelist_categories=('Lu','Ll','Nd','Zs','P')),
-    min_size=100, max_size=5000
+    alphabet=st.characters(whitelist_categories=("Lu", "Ll", "Nd", "Zs", "P")),
+    min_size=100,
+    max_size=5000,
 )
 
 # Generate text with embedded error signals
-error_signals = st.sampled_from([
-    "error[E0308]: mismatched types",
-    "Traceback (most recent call last):",
-    "panic at src/main.rs:42",
-    "FAILED: test_timeout",
-    "npm ERR! code ELIFECYCLE",
-    "TypeError: undefined is not a function",
-    "--- a/src/lib.rs\n+++ b/src/lib.rs",
-])
+error_signals = st.sampled_from(
+    [
+        "error[E0308]: mismatched types",
+        "Traceback (most recent call last):",
+        "panic at src/main.rs:42",
+        "FAILED: test_timeout",
+        "npm ERR! code ELIFECYCLE",
+        "TypeError: undefined is not a function",
+        "--- a/src/lib.rs\n+++ b/src/lib.rs",
+    ]
+)
 
 
 @given(text=tool_text)
@@ -71,7 +76,7 @@ def test_signal_always_kept(signal, padding):
     mid = padding // 2
     lines[mid] = signal
     text = "\n".join(lines)
-    
+
     lc = LeanContext(window_radius=5)
     result = lc.truncate(text)
     assert signal in result.text

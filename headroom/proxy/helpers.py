@@ -2596,6 +2596,8 @@ def inject_tool_search_deferral_openai(
     if deferred == 0:
         return tools  # nothing to defer → don't perturb the request / cache prefix
     return out
+
+
 # ── LeanContext (pure-Python, in-process) ────────────────────────────
 
 _leanctx_python_stats: dict[str, Any] = {
@@ -2610,19 +2612,19 @@ _leanctx_python_stats: dict[str, Any] = {
 
 def apply_leanctx_python(text: str, window_radius: int = 50) -> str:
     """Apply in-process LeanContext filtering to tool output text.
-    
+
     Returns filtered text and updates internal stats.
     """
     from headroom.transforms.lean_context import get_lean_context
-    
+
     lc = get_lean_context(window_radius)
     result = lc.truncate(text)
-    
+
     _leanctx_python_stats["lines_dropped"] += result.dropped_lines
     _leanctx_python_stats["calls"] += 1
     # Rough token estimate: 4 chars ≈ 1 token
     _leanctx_python_stats["tokens_saved"] += result.dropped_lines * 20  # ~20 tokens/line avg
-    
+
     return result.text
 
 

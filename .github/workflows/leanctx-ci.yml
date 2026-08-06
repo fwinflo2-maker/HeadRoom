@@ -8,14 +8,26 @@ on:
     paths:
       - 'headroom/transforms/lean_context.py'
       - 'headroom/proxy/coalescer.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - run: pip install pytest
-      - run: python -m pytest tests/test_transforms/test_lean_context.py tests/test_transforms/test_lean_context_bench.py tests/test_proxy/test_coalescer.py -v
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen --extra dev
+      - run: >-
+          uv run pytest
+          tests/test_transforms/test_lean_context.py
+          tests/test_transforms/test_lean_context_bench.py
+          tests/test_transforms/test_lean_context_fuzz.py
+          tests/test_proxy/test_coalescer.py
+          tests/test_proxy/test_coalescer_fuzz.py
+          -v

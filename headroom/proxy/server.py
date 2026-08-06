@@ -3916,8 +3916,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         **leanctx_py_stats,
                         "tokens": leanctx_tokens_saved,
                         "description": (
-                            "Tokens removed by the in-process LeanContext "
-                            "window truncator."
+                            "Tokens removed by the in-process LeanContext window truncator."
                         ),
                     },
                 },

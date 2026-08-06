@@ -29,9 +29,13 @@ logger = logging.getLogger(__name__)
 @dataclass
 class CoalescedRequest:
     """A request waiting to be batched."""
+
     payload: dict[str, Any]
-    future: asyncio.Future = field(default_factory=asyncio.Future)
+    future: asyncio.Future[dict[str, Any]] = field(init=False)
     arrived_at: float = field(default_factory=time.monotonic)
+
+    def __post_init__(self) -> None:
+        self.future = asyncio.get_running_loop().create_future()
 
 
 class RequestCoalescer:
@@ -47,35 +51,41 @@ class RequestCoalescer:
         self.max_batch = max_batch
         self._pending: list[CoalescedRequest] = []
         self._lock = asyncio.Lock()
-        self._flush_task: asyncio.Task | None = None
+        self._flush_task: asyncio.Task[None] | None = None
+
+    async def __aenter__(self) -> RequestCoalescer:
+        return self
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        await self.close()
 
     async def submit(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Submit a request. May be batched with other rapid requests."""
         req = CoalescedRequest(payload=payload)
-        
+
         async with self._lock:
             self._pending.append(req)
-            
+
             if len(self._pending) >= self.max_batch:
                 # Batch is full — flush immediately
                 await self._flush()
             elif self._flush_task is None:
                 # Start the flush timer
                 self._flush_task = asyncio.create_task(self._delayed_flush())
-        
+
         return await req.future
 
-    async def _delayed_flush(self):
+    async def _delayed_flush(self) -> None:
         """Wait for window_sec, then flush pending requests."""
         await asyncio.sleep(self.window_sec)
         async with self._lock:
             await self._flush()
 
-    async def _flush(self):
+    async def _flush(self) -> None:
         """Merge all pending requests into one and resolve futures."""
-        if self._flush_task:
+        if self._flush_task and self._flush_task is not asyncio.current_task():
             self._flush_task.cancel()
-            self._flush_task = None
+        self._flush_task = None
 
         if not self._pending:
             return
@@ -91,32 +101,35 @@ class RequestCoalescer:
 
         # Merge multiple requests
         merged = self._merge_requests([r.payload for r in pending])
-        
+
         logger.info(
             "coalesced %d requests into 1 batch (saved %d API calls)",
-            len(pending), len(pending) - 1,
+            len(pending),
+            len(pending) - 1,
         )
 
         # In production: send merged payload to upstream API
         # For now: return merged payload to all futures
         for req in pending:
-            req.future.set_result({
-                "coalesced": True,
-                "batch_size": len(pending),
-                "payload": merged,
-            })
+            req.future.set_result(
+                {
+                    "coalesced": True,
+                    "batch_size": len(pending),
+                    "payload": merged,
+                }
+            )
 
-    def _merge_requests(self, payloads: list[dict]) -> dict:
+    def _merge_requests(self, payloads: list[dict[str, Any]]) -> dict[str, Any]:
         """Merge multiple Anthropic-format payloads into one."""
         if not payloads:
             return {}
 
         # Use the first payload as base
         merged = dict(payloads[0])
-        
+
         # Merge messages from all payloads
-        all_messages = []
-        seen = set()
+        all_messages: list[Any] = []
+        seen: set[str] = set()
         for p in payloads:
             for msg in p.get("messages", []):
                 # Deduplicate identical messages
@@ -127,10 +140,10 @@ class RequestCoalescer:
 
         merged["messages"] = all_messages
         merged["_coalesced_from"] = len(payloads)
-        
+
         return merged
 
-    async def close(self):
+    async def close(self) -> None:
         """Flush any remaining requests and shut down."""
         async with self._lock:
             if self._flush_task:

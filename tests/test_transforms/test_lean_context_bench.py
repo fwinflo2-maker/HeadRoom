@@ -1,5 +1,7 @@
 """Benchmarks for LeanContext — performance and edge cases."""
+
 import time
+
 from headroom.transforms.lean_context import LeanContext
 
 
@@ -12,11 +14,11 @@ def test_large_text_performance():
     lines[500] = "error[E0308]: mismatched types at src/main.rs:500"
     lines[5000] = "Traceback (most recent call last):"
     text = "\n".join(lines)
-    
+
     t0 = time.perf_counter()
     result = lc.truncate(text)
     elapsed = (time.perf_counter() - t0) * 1000
-    
+
     assert elapsed < 500, f"Too slow: {elapsed:.1f}ms"
     assert result.signal_lines >= 2
 
@@ -47,12 +49,16 @@ def test_many_signals_nearby():
 def test_go_error_signals():
     """Go-specific error patterns."""
     lc = LeanContext(window_radius=5)
-    text = "\n".join(f"line {i}" for i in range(50)) + """
+    text = (
+        "\n".join(f"line {i}" for i in range(50))
+        + """
 src/handler.go:142:27: cannot use client (variable of type *http.Client) as...
 src/handler.go:287:15: undefined: ctx
 FAIL: TestRateLimit (0.02s)
     rate_test.go:89: expected 200, got 429
-""" + "\n".join(f"line {i}" for i in range(100, 150))
+"""
+        + "\n".join(f"line {i}" for i in range(100, 150))
+    )
     result = lc.truncate(text)
     assert result.signal_lines >= 2
 
@@ -60,12 +66,16 @@ FAIL: TestRateLimit (0.02s)
 def test_typescript_error_signals():
     """TypeScript-specific error patterns."""
     lc = LeanContext(window_radius=5)
-    text = "\n".join(f"line {i}" for i in range(50)) + """
+    text = (
+        "\n".join(f"line {i}" for i in range(50))
+        + """
 src/middleware.ts:42:18 - error TS2345: Argument of type 'string' is not assignable...
 src/auth.ts:156:7 - error TS2322: Type 'null' is not assignable to type 'User'
 npm ERR! code ELIFECYCLE
 npm ERR! errno 1
-""" + "\n".join(f"line {i}" for i in range(100, 150))
+"""
+        + "\n".join(f"line {i}" for i in range(100, 150))
+    )
     result = lc.truncate(text)
     assert result.signal_lines >= 2
 
@@ -73,7 +83,9 @@ npm ERR! errno 1
 def test_python_error_signals():
     """Python-specific error patterns."""
     lc = LeanContext(window_radius=5)
-    text = "\n".join(f"line {i}" for i in range(50)) + """
+    text = (
+        "\n".join(f"line {i}" for i in range(50))
+        + """
 =================================== FAILURES ===================================
 ___________________________ test_connection_pool ______________________________
     async def test_connection_pool():
@@ -81,7 +93,9 @@ ___________________________ test_connection_pool ______________________________
 E       RuntimeError: Task got Future attached to a different loop
 backend/tests/test_db.py:15: RuntimeError
 ========================= 1 failed, 4 passed in 2.03s =========================
-""" + "\n".join(f"line {i}" for i in range(100, 150))
+"""
+        + "\n".join(f"line {i}" for i in range(100, 150))
+    )
     result = lc.truncate(text)
     assert result.signal_lines >= 2
 
@@ -89,7 +103,9 @@ backend/tests/test_db.py:15: RuntimeError
 def test_build_output_signals():
     """Build output with cargo/npm/make."""
     lc = LeanContext(window_radius=5)
-    text = "\n".join(f"line {i}" for i in range(50)) + """
+    text = (
+        "\n".join(f"line {i}" for i in range(50))
+        + """
    Compiling rate-limiter v0.1.0
 error: could not compile `rate-limiter` due to 3 previous errors
 warning: unused import: `std::collections::HashMap`
@@ -97,7 +113,9 @@ warning: unused import: `std::collections::HashMap`
    |
 5  | use std::collections::HashMap;
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
-""" + "\n".join(f"line {i}" for i in range(100, 150))
+"""
+        + "\n".join(f"line {i}" for i in range(100, 150))
+    )
     result = lc.truncate(text)
     assert result.signal_lines >= 2
 

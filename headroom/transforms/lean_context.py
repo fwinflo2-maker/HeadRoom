@@ -22,7 +22,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-
 # Patterns that indicate "this line is important — keep context around it"
 SIGNAL_PATTERNS = [
     # Compiler errors
@@ -59,6 +58,7 @@ SIGNAL_PATTERNS = [
 @dataclass
 class TruncationResult:
     """Result of window-based truncation."""
+
     text: str
     original_lines: int
     kept_lines: int
@@ -95,25 +95,28 @@ class LeanContext:
                     break
             # Check 2-line windows (e.g. rustc error location + code)
             if i + 1 < len(lines):
-                window2 = lines[i] + "\n" + lines[i+1]
+                window2 = lines[i] + "\n" + lines[i + 1]
                 for pattern in SIGNAL_PATTERNS:
                     if pattern.search(window2):
                         signals.add(i)
-                        signals.add(i+1)
+                        signals.add(i + 1)
             # Check 3-line windows (e.g. diff hunks)
             if i + 2 < len(lines):
-                window3 = "\n".join(lines[i:i+3])
+                window3 = "\n".join(lines[i : i + 3])
                 for pattern in SIGNAL_PATTERNS:
                     if pattern.search(window3):
-                        signals.update(range(i, i+3))
+                        signals.update(range(i, i + 3))
         return signals
 
     def truncate(self, text: str) -> TruncationResult:
         """Truncate text, keeping only lines near signals."""
         if not text.strip():
             return TruncationResult(
-                text=text, original_lines=0, kept_lines=0,
-                dropped_lines=0, signal_lines=0,
+                text=text,
+                original_lines=0,
+                kept_lines=0,
+                dropped_lines=0,
+                signal_lines=0,
                 window_radius=self.window_radius,
             )
 
@@ -123,8 +126,11 @@ class LeanContext:
         if n <= self.window_radius * 2:
             # Text is short enough — keep everything
             return TruncationResult(
-                text=text, original_lines=n, kept_lines=n,
-                dropped_lines=0, signal_lines=0,
+                text=text,
+                original_lines=n,
+                kept_lines=n,
+                dropped_lines=0,
+                signal_lines=0,
                 window_radius=self.window_radius,
             )
 

@@ -1,6 +1,9 @@
 """Tests for request coalescer."""
+
 import asyncio
+
 import pytest
+
 from headroom.proxy.coalescer import RequestCoalescer
 
 
@@ -15,7 +18,10 @@ async def test_single_request_not_batched():
 @pytest.mark.asyncio
 async def test_rapid_requests_batched():
     c = RequestCoalescer(window_sec=0.3, max_batch=3)
-    tasks = [c.submit({"model": "test", "messages": [{"role": "user", "content": f"msg {i}"}]}) for i in range(3)]
+    tasks = [
+        c.submit({"model": "test", "messages": [{"role": "user", "content": f"msg {i}"}]})
+        for i in range(3)
+    ]
     results = await asyncio.gather(*tasks)
     for r in results:
         assert r["coalesced"] is True
@@ -26,7 +32,10 @@ async def test_rapid_requests_batched():
 @pytest.mark.asyncio
 async def test_max_batch_triggers_flush():
     c = RequestCoalescer(window_sec=10.0, max_batch=2)
-    tasks = [c.submit({"model": "test", "messages": [{"role": "user", "content": f"msg {i}"}]}) for i in range(2)]
+    tasks = [
+        c.submit({"model": "test", "messages": [{"role": "user", "content": f"msg {i}"}]})
+        for i in range(2)
+    ]
     results = await asyncio.gather(*tasks)
     for r in results:
         assert r["coalesced"] is True
@@ -37,10 +46,18 @@ async def test_max_batch_triggers_flush():
 @pytest.mark.asyncio
 async def test_deduplication():
     c = RequestCoalescer(window_sec=0.1, max_batch=3)
-    tasks = [c.submit({"model": "test", "messages": [
-        {"role": "user", "content": "same message"},
-        {"role": "user", "content": f"unique {i}"},
-    ]}) for i in range(3)]
+    tasks = [
+        c.submit(
+            {
+                "model": "test",
+                "messages": [
+                    {"role": "user", "content": "same message"},
+                    {"role": "user", "content": f"unique {i}"},
+                ],
+            }
+        )
+        for i in range(3)
+    ]
     results = await asyncio.gather(*tasks)
     merged = results[0]["payload"]
     messages = merged.get("messages", [])
@@ -58,3 +75,13 @@ async def test_solo_after_window():
     r2 = await c.submit({"model": "test", "messages": [{"role": "user", "content": "second"}]})
     assert r2["coalesced"] is False
     await c.close()
+
+
+@pytest.mark.asyncio
+async def test_async_context_manager_closes_cleanly():
+    async with RequestCoalescer(window_sec=0.01, max_batch=2) as coalescer:
+        result = await coalescer.submit(
+            {"model": "test", "messages": [{"role": "user", "content": "hi"}]}
+        )
+
+    assert result["coalesced"] is False

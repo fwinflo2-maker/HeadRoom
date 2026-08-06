@@ -20,6 +20,7 @@ Entry points:
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 import os
@@ -73,11 +74,18 @@ class EmbeddingServer:
         self._executor: ThreadPoolExecutor | None = None
         self._lock = Lock()
 
-        # Stats
+        # Stats counters
         self._total_requests: int = 0
         self._total_embed_calls: int = 0
         self._total_latency_ms: float = 0.0
         self._start_time: float = time.monotonic()
+        # Per-op breakdown
+        self._op_counts: dict[str, int] = collections.defaultdict(int)
+        # Rolling latency window for percentile calculation (last 1000 requests)
+        self._latency_window: collections.deque[float] = collections.deque(maxlen=1000)
+        # Batch efficiency tracking
+        self._total_batches: int = 0
+        self._total_batched_items: int = 0
 
         # Micro-batching
         self._batch_queue: asyncio.Queue[_PendingEmbed] = asyncio.Queue()
@@ -114,7 +122,7 @@ class EmbeddingServer:
     async def start(self) -> None:
         """Initialize resources."""
         self._executor = ThreadPoolExecutor(max_workers=self.embed_threads)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(self._executor, self._load_resources)
         # Start micro-batch processor
         self._batch_task = asyncio.create_task(self._batch_processor())
@@ -172,7 +180,7 @@ class EmbeddingServer:
             # Run batch through embedder in thread pool
             texts = [item.text for item in batch]
             try:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 embeddings: list[np.ndarray] = await loop.run_in_executor(
                     self._executor,
                     self._sync_embed_batch,
@@ -182,6 +190,8 @@ class EmbeddingServer:
                     if not item.future.done():
                         item.future.set_result(emb)
                 self._total_embed_calls += len(batch)
+                self._total_batches += 1
+                self._total_batched_items += len(batch)
             except Exception as exc:
                 for item in batch:
                     if not item.future.done():
@@ -235,6 +245,14 @@ class EmbeddingServer:
             elapsed_ms = (time.monotonic() - t0) * 1000.0
             self._total_requests += 1
             self._total_latency_ms += elapsed_ms
+            self._op_counts[op] += 1
+            self._latency_window.append(elapsed_ms)
+            logger.debug(
+                "event=embedding_server_request op=%s id=%s latency_ms=%.2f",
+                op,
+                req_id,
+                elapsed_ms,
+            )
             return result
 
         except Exception as exc:
@@ -251,7 +269,7 @@ class EmbeddingServer:
         texts: list[str] = request.get("texts", [])
         if not texts:
             return {"embeddings": []}
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         embeddings = await loop.run_in_executor(
             self._executor,
             self._sync_embed_batch,
@@ -320,7 +338,9 @@ class EmbeddingServer:
         # Reconstruct a Memory object from the dict
         # Only populate the fields we actually need for indexing
         created_at_str = memory_data.get("created_at")
-        created_at = datetime.fromisoformat(created_at_str) if created_at_str else datetime.now(timezone.utc)
+        created_at = (
+            datetime.fromisoformat(created_at_str) if created_at_str else datetime.now(timezone.utc)
+        )
 
         memory = Memory(
             id=memory_data["id"],
@@ -350,12 +370,38 @@ class EmbeddingServer:
             self._total_latency_ms / self._total_requests if self._total_requests > 0 else 0.0
         )
         index_size = self._index.size if self._index is not None else 0
+        avg_batch_size = (
+            self._total_batched_items / self._total_batches if self._total_batches > 0 else 0.0
+        )
+
+        # Compute p50/p95/p99 from rolling window (sorted ascending)
+        latency_sorted = sorted(self._latency_window)
+        n = len(latency_sorted)
+
+        def _pct(p: float) -> float:
+            if n == 0:
+                return 0.0
+            idx = int(p / 100.0 * n)
+            return round(latency_sorted[min(idx, n - 1)], 3)
+
         return {
             "index_size": index_size,
             "total_requests": self._total_requests,
             "total_embed_calls": self._total_embed_calls,
-            "avg_latency_ms": round(avg_latency_ms, 3),
+            "latency_ms": {
+                "avg": round(avg_latency_ms, 3),
+                "p50": _pct(50),
+                "p95": _pct(95),
+                "p99": _pct(99),
+                "window_size": n,
+            },
+            "batch": {
+                "total_batches": self._total_batches,
+                "avg_batch_size": round(avg_batch_size, 2),
+            },
+            "ops": dict(self._op_counts),
             "uptime_seconds": round(uptime_s, 1),
+            "embed_threads": self.embed_threads,
         }
 
 
@@ -419,7 +465,7 @@ async def serve(
         os.makedirs(socket_dir, exist_ok=True)
 
     # Set up graceful shutdown on SIGTERM
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
     def _handle_sigterm() -> None:

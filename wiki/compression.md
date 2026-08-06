@@ -406,7 +406,7 @@ print(f"CCR Key: {result.ccr_key}")             # For retrieval
 
 ## Boolean Compression
 
-Headroom includes a **lossless** boolean algebra compressor that reduces truth tables and boolean expressions to their minimal sum-of-products (SOP) form using the Quine-McCluskey algorithm via [boolean-algebra-engine](https://github.com/Shrivastava-Aditya/bool-LLM-ngn). Unlike Kompress, this path never approximates — the output is proven logically equivalent to the input.
+Headroom includes a deterministic boolean algebra compressor that reduces truth tables and boolean expressions to their minimal sum-of-products (SOP) form using the Quine-McCluskey algorithm via [boolean-algebra-engine](https://github.com/Shrivastava-Aditya/bool-LLM-ngn). For structured inputs, the output is logically equivalent to the parsed function. The optional natural-language path first uses an LLM to infer a function and is therefore probabilistic, not lossless.
 
 ### Content types handled
 
@@ -443,48 +443,9 @@ The router detects boolean content before routing:
 
 Source code and general prose that happen to use `and`/`or` are **not** detected — the detector requires single-letter uppercase variables or an explicit truth table structure to avoid false positives.
 
-### Telemetry and opt-out
+### Telemetry
 
-This path fires two anonymous events to the **boolean-algebra-engine** PostHog project:
-
-**`headroom_boolean_engine_loaded`** — fired once per headroom session the first time a boolean compression succeeds. Used to distinguish headroom-sourced engine usage from direct CLI installs.
-
-| Field | Value |
-|-------|-------|
-| `source` | `"headroom"` |
-
-**`headroom_boolean_compress`** — fired on each compression. Reports:
-
-| Field | Description |
-|-------|-------------|
-| `tokens_before` | Token count before compression |
-| `tokens_after` | Token count after compression |
-| `tokens_saved` | Tokens saved |
-| `savings_pct` | Savings as a percentage |
-| `variable_count` | Number of boolean variables |
-| `strategy` | `"truth_table"`, `"expression"`, or `"nl_expression"` |
-| `source` | Always `"headroom"` |
-
-No prompt content, file paths, or personally identifiable information is sent. The `distinct_id` reuses the `boolean-algebra-engine` install ID (stored in `~/.config/boolcalc/telemetry.json`) so headroom usage can be correlated with direct CLI usage under one anonymous profile.
-
-**To opt out**, set the environment variable before starting headroom:
-
-```bash
-export BOOLCALC_NO_TELEMETRY=1
-```
-
-Or add it to your headroom environment permanently:
-
-```bash
-# docker-compose.yml
-environment:
-  - BOOLCALC_NO_TELEMETRY=1
-
-# .env / shell profile
-BOOLCALC_NO_TELEMETRY=1
-```
-
-When the variable is set, no network request is made and no thread is spawned.
+The Headroom integration does not send usage events to the boolean-algebra-engine PostHog project or create a second analytics channel. Installing or using this optional compressor does not change Headroom's telemetry policy.
 
 ---
 

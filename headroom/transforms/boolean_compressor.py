@@ -8,11 +8,12 @@ Two compression paths share this module:
    (symbolic, English operators, mixed). Uses Quine-McCluskey via boolean-algebra-engine
    to produce the minimal SOP form.
 
-2. NLBooleanCompressor  — optional, requires an API key (Anthropic or OpenAI).
+2. NLBooleanCompressor  — optional and probabilistic; requires an API key.
    Handles natural-language logic descriptions such as
    "output is high when door is open AND motion is detected but not both".
    The NL layer (boolean-algebra-engine[nl]) calls an LLM once to extract the
-   boolean function, then synthesizes the minimal SOP — the math is still lossless.
+   boolean function, then synthesizes the minimal SOP. The synthesis is exact for
+   the inferred function, but the LLM extraction is not lossless.
    Activated only when ANTHROPIC_API_KEY or OPENAI_API_KEY is set in the environment.
 
 Compression examples:
@@ -20,9 +21,8 @@ Compression examples:
   - English expression (17 tokens)        → "B.C+A.C+A.B"  (4 tokens,  ~71% savings)
   - NL description (15 tokens)            → "A^B"          (2 tokens,  ~87% savings)
 
-Telemetry: fires an anonymous PostHog event to the boolean-algebra-engine project
-each time a compression occurs, reporting tokens_before, tokens_after, variable_count,
-and strategy. Respects BOOLCALC_NO_TELEMETRY=1.
+This integration does not send telemetry to boolean-algebra-engine or any other
+third-party analytics service.
 """
 
 from __future__ import annotations
@@ -30,7 +30,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -44,10 +43,7 @@ if TYPE_CHECKING:
 
 # Order matters: longer patterns before shorter ones
 _NORMALISE_RULES: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"\bXNOR\b", re.I), "^"),  # XNOR → ^ (not standard, but handle)
     (re.compile(r"\bXOR\b", re.I), "^"),
-    (re.compile(r"\bNAND\b", re.I), "!."),  # approximate
-    (re.compile(r"\bNOR\b", re.I), "!+"),  # approximate
     (re.compile(r"\bNOT\s+", re.I), "!"),
     (re.compile(r"\bAND\b", re.I), "."),
     (re.compile(r"\bOR\b", re.I), "+"),
@@ -175,9 +171,6 @@ class BooleanCompressor:
             result = self._compress_truth_table(content)
             if result is None:
                 result = self._compress_expression(content)
-            if result is not None:
-                _fire_engine_loaded()
-                _fire_telemetry(result)
             return result
         except Exception as exc:
             logger.debug("BooleanCompressor: compression failed: %s", exc)
@@ -235,6 +228,10 @@ class BooleanCompressor:
 
     def _compress_expression(self, content: str) -> BooleanCompressionResult | None:
         content_stripped = content.strip()
+        # These operators require grouping-aware rewrites. Never approximate
+        # them with character substitution on a path advertised as exact.
+        if re.search(r"\b(?:NAND|NOR|XNOR)\b", content_stripped, re.I):
+            return None
         # Only compress if it looks like a single expression (not prose)
         if "\n" in content_stripped and not re.search(
             r"\b(AND|OR|NOT|XOR)\b", content_stripped, re.I
@@ -278,123 +275,6 @@ class BooleanCompressor:
             variable_count=var_count,
             strategy="expression",
         )
-
-
-# ── Anonymous telemetry ───────────────────────────────────────────────────────
-
-_PH_KEY = "phc_Am4NNyVXotVffz6rcBy8xZVUZeaJCCbbHMu63pWMz3M8"
-_PH_ENDPOINT = "https://us.i.posthog.com/capture/"
-_CONFIG_FILE = (
-    __import__("pathlib").Path(
-        __import__("os").environ.get(
-            "XDG_CONFIG_HOME", __import__("pathlib").Path.home() / ".config"
-        )
-    )
-    / "boolcalc"
-    / "telemetry.json"
-)
-
-_engine_loaded_fired = False
-
-
-def _fire_engine_loaded() -> None:
-    """Fire a one-time event the first time BooleanCompressor compresses successfully.
-
-    Distinguishes headroom-sourced engine usage from direct CLI installs in PostHog.
-    Respects BOOLCALC_NO_TELEMETRY=1.
-    """
-    global _engine_loaded_fired
-    if _engine_loaded_fired or os.environ.get("BOOLCALC_NO_TELEMETRY"):
-        return
-    _engine_loaded_fired = True
-
-    def _send() -> None:
-        try:
-            import json
-            import urllib.request
-
-            install_id = "headroom-anonymous"
-            try:
-                if _CONFIG_FILE.exists():
-                    state = json.loads(_CONFIG_FILE.read_text())
-                    install_id = state.get("install_id", install_id)
-            except Exception:
-                pass
-
-            payload = json.dumps(
-                {
-                    "api_key": _PH_KEY,
-                    "event": "headroom_boolean_engine_loaded",
-                    "distinct_id": install_id,
-                    "properties": {"source": "headroom"},
-                }
-            ).encode()
-
-            req = urllib.request.Request(
-                _PH_ENDPOINT,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            urllib.request.urlopen(req, timeout=3)
-        except Exception:
-            pass
-
-    threading.Thread(target=_send, daemon=True).start()
-
-
-def _fire_telemetry(result: BooleanCompressionResult) -> None:
-    """Fire a PostHog event reporting boolean compression usage from headroom.
-
-    Uses the same install_id as the boolcalc CLI so PostHog can correlate
-    headroom usage with direct CLI usage under one user profile.
-    Runs in a daemon thread — never blocks compression.
-    Respects BOOLCALC_NO_TELEMETRY=1.
-    """
-    if os.environ.get("BOOLCALC_NO_TELEMETRY"):
-        return
-
-    def _send() -> None:
-        try:
-            import json
-            import urllib.request
-
-            install_id = "headroom-anonymous"
-            try:
-                if _CONFIG_FILE.exists():
-                    state = json.loads(_CONFIG_FILE.read_text())
-                    install_id = state.get("install_id", install_id)
-            except Exception:
-                pass
-
-            payload = json.dumps(
-                {
-                    "api_key": _PH_KEY,
-                    "event": "headroom_boolean_compress",
-                    "distinct_id": install_id,
-                    "properties": {
-                        "tokens_before": result.original_tokens,
-                        "tokens_after": result.compressed_tokens,
-                        "tokens_saved": result.tokens_saved,
-                        "savings_pct": round(result.savings_pct, 1),
-                        "variable_count": result.variable_count,
-                        "strategy": result.strategy,
-                        "source": "headroom",
-                    },
-                }
-            ).encode()
-
-            req = urllib.request.Request(
-                _PH_ENDPOINT,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            urllib.request.urlopen(req, timeout=3)
-        except Exception:
-            pass
-
-    threading.Thread(target=_send, daemon=True).start()
 
 
 # ── NL Boolean Compressor ─────────────────────────────────────────────────────
@@ -450,7 +330,8 @@ class NLBooleanCompressor:
 
     Uses one LLM call per compression to extract the boolean function from
     natural-language text; the Quine-McCluskey synthesis step is always
-    deterministic and lossless.
+    deterministic for the inferred function. Because the inference uses an LLM,
+    this path is probabilistic and must not be described as lossless.
     """
 
     def compress(self, content: str) -> BooleanCompressionResult | None:

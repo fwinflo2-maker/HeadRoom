@@ -1755,7 +1755,8 @@ def test_detect_content_overrides_html_misroute_for_grep_and_logs(
         "</section></main></body></html>"
     )
     assert _detect_content(html).content_type is ContentType.HTML
-||||||| parent of c4fb013c (test: cover BOOLEAN and NL_BOOLEAN strategy paths in content_router)
+
+
 # BOOLEAN and NL_BOOLEAN strategy paths (PR #779)
 # ---------------------------------------------------------------------------
 
@@ -1812,9 +1813,6 @@ def test_boolean_strategy_compresses_when_compressor_available(
             return fake_result
 
     monkeypatch.setattr(router, "_get_boolean_compressor", lambda: FakeBoolean())
-    import headroom.transforms.boolean_compressor as bc_mod
-    monkeypatch.setattr(bc_mod, "_fire_telemetry", lambda result: None)
-
     compressed, tokens, chain = router._apply_strategy_to_content(
         content, CompressionStrategy.BOOLEAN, context=""
     )
@@ -1891,9 +1889,6 @@ def test_nl_boolean_strategy_compresses_when_compressor_available(
             return fake_result
 
     monkeypatch.setattr(router, "_get_nl_boolean_compressor", lambda: FakeNLBoolean())
-    import headroom.transforms.boolean_compressor as bc_mod
-    monkeypatch.setattr(bc_mod, "_fire_telemetry", lambda result: None)
-
     compressed, tokens, chain = router._apply_strategy_to_content(
         content, CompressionStrategy.NL_BOOLEAN, context=""
     )

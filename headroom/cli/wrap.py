@@ -132,6 +132,8 @@ from headroom.providers.copilot import (
 from headroom.providers.cursor import render_setup_lines as _render_cursor_setup_lines
 from headroom.providers.grok import (
     DEFAULT_API_URL as _GROK_DEFAULT_API_URL,
+)
+from headroom.providers.grok import (
     build_launch_env as _build_grok_launch_env,
 )
 from headroom.providers.grok_build import render_setup_lines as _render_grok_build_setup_lines

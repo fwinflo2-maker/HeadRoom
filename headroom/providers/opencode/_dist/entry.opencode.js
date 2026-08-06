@@ -12435,34 +12435,45 @@ function createHeadroomRetrieveTool(config2) {
   const origin = config2.proxyBaseUrl.replace(/\/+$/, "");
   return {
     name: "headroom_retrieve",
-    description: "Retrieve original uncompressed content from Headroom's compression store. Use when compressed context mentions a hash and you need the full details. Pass the hash from the compression marker (24 hex characters). Retrieval is by hash and always returns the full original content.",
+    description: "Retrieve original uncompressed content that was compressed to save tokens. Trust kept rows unless you have a concrete gap. Retrieve when you need raw, original, or complete content, or when you need to inspect the original payload for a specific follow-up. The hash is provided in compression markers like [N items compressed... hash=abc123].",
     parameters: {
       type: "object",
       properties: {
         hash: {
           type: "string",
           description: "The 24-character hex hash from the compression marker"
+        },
+        query: {
+          type: "string",
+          description: "Optional context hint for the concrete gap you are checking. The hint is recorded for feedback and stats; retrieval still returns the full original content."
         }
       },
       required: ["hash"]
     },
     execute: async (args) => {
-      const { hash: hash2 } = args;
+      const { hash: hash2, query } = args;
       if (!/^[a-f0-9]{24}$/i.test(hash2)) {
         return JSON.stringify({
           error: "Invalid hash format. Expected 24 hex characters."
         });
       }
       try {
-        const url2 = `${origin}/v1/retrieve/${hash2}`;
+        const url2 = `${origin}/v1/retrieve`;
+        const body = { hash: hash2 };
+        if (query) {
+          body.query = query;
+        }
         const resp = await fetch(url2, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
           signal: AbortSignal.timeout(1e4)
         });
         if (!resp.ok) {
-          const body = await resp.text().catch(() => "");
+          const body2 = await resp.text().catch(() => "");
           return JSON.stringify({
             error: `Retrieval failed: HTTP ${resp.status}`,
-            details: body
+            details: body2
           });
         }
         const data = await resp.json();
@@ -12470,7 +12481,7 @@ function createHeadroomRetrieveTool(config2) {
       } catch (error45) {
         return JSON.stringify({
           error: `Retrieval failed: ${error45}`,
-          hint: "The compressed content may have expired (default TTL: 30 minutes)"
+          hint: "The compressed content may have expired under the current proxy TTL."
         });
       }
     }

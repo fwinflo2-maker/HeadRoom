@@ -444,6 +444,44 @@ class TestMemoryExportImport:
         assert "# Headroom Memory Context" in result.output
         assert "Working on authentication feature" in result.output
 
+    @pytest.mark.parametrize(
+        ("export_format", "suffix", "expected"),
+        [
+            ("knowledge-worker", ".json", "headroom-knowledge-worker/v1"),
+            ("context", ".md", "# Headroom Memory Context"),
+        ],
+    )
+    def test_scoped_export_writes_rendered_output_to_file(
+        self,
+        runner: CliRunner,
+        populated_db: str,
+        tmp_path: Path,
+        export_format: str,
+        suffix: str,
+        expected: str,
+    ) -> None:
+        output_file = tmp_path / f"memory-export{suffix}"
+        result = runner.invoke(
+            main,
+            [
+                "memory",
+                "export",
+                "--db-path",
+                populated_db,
+                "--format",
+                export_format,
+                "--scope",
+                "session",
+                "--session",
+                "session-123",
+                "--output",
+                str(output_file),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert expected in output_file.read_text(encoding="utf-8")
+
     def test_memory_audit_outputs_weak_claim_queue(
         self, runner: CliRunner, populated_db: str
     ) -> None:

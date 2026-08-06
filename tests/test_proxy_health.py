@@ -69,7 +69,7 @@ def test_readyz_excludes_kompress_from_aggregate_readiness(monkeypatch):
     assert payload["checks"]["kompress"] == {
         "enabled": True,
         "ready": False,
-        "status": "unhealthy",
+        "status": "degraded",
         "backend": None,
     }
 
@@ -141,7 +141,7 @@ def test_readyz_keeps_pending_kompress_unloaded(monkeypatch):
     assert payload["checks"]["kompress"] == {
         "enabled": True,
         "ready": False,
-        "status": "unhealthy",
+        "status": "degraded",
         "backend": None,
     }
     assert compressor.calls == ["is_ready"]
@@ -222,7 +222,7 @@ def test_readyz_never_calls_lazy_kompress_getters(monkeypatch):
     assert payload["checks"]["kompress"] == {
         "enabled": True,
         "ready": False,
-        "status": "unhealthy",
+        "status": "degraded",
         "backend": None,
     }
 
@@ -234,7 +234,7 @@ def test_readyz_never_calls_lazy_kompress_getters(monkeypatch):
             "null",
             None,
             False,
-            {"enabled": True, "ready": False, "status": "unhealthy", "backend": None},
+            {"enabled": True, "ready": False, "status": "degraded", "backend": None},
         ),
         (
             "null",

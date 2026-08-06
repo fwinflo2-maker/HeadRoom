@@ -2652,9 +2652,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         *,
         enabled: bool,
         ready: bool,
+        optional: bool = False,
         **details: Any,
     ) -> dict[str, Any]:
-        status = "disabled" if not enabled else ("healthy" if ready else "unhealthy")
+        if not enabled:
+            status = "disabled"
+        elif ready:
+            status = "healthy"
+        elif optional:
+            status = "degraded"
+        else:
+            status = "unhealthy"
         return {
             "enabled": enabled,
             "ready": (ready if enabled else True),
@@ -2770,6 +2778,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "kompress": _component_health(
                 enabled=kompress_enabled,
                 ready=proxy.warmup.kompress.status == "loaded",
+                optional=True,
                 backend=proxy.warmup.kompress.info.get("backend", None),
             ),
         }

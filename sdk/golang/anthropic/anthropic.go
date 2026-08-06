@@ -6,7 +6,7 @@ package anthropic
 import (
 	"context"
 
-	headroom "github.com/headroomlabs/headroom/sdk/golang"
+	headroom "github.com/headroomlabs-ai/headroom/sdk/golang"
 )
 
 // Compress takes Anthropic-shape messages ([]any with content-block arrays),

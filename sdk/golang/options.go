@@ -48,9 +48,9 @@ type CompressOptions struct {
 
 // HeadroomParams are extra request-scoped headroom_* options for chat.completions / messages.
 type HeadroomParams struct {
-	Mode                HeadroomMode
-	CachePrefixTokens   int
-	OutputBufferTokens  int
-	KeepTurns           int
-	ToolProfiles        map[string]map[string]any
+	Mode               HeadroomMode
+	CachePrefixTokens  int
+	OutputBufferTokens int
+	KeepTurns          int
+	ToolProfiles       map[string]map[string]any
 }

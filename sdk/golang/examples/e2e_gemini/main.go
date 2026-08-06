@@ -14,8 +14,8 @@ import (
 	"os"
 	"time"
 
-	headroom "github.com/headroomlabs/headroom/sdk/golang"
-	"github.com/headroomlabs/headroom/sdk/golang/gemini"
+	headroom "github.com/headroomlabs-ai/headroom/sdk/golang"
+	"github.com/headroomlabs-ai/headroom/sdk/golang/gemini"
 )
 
 func main() {

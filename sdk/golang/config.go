@@ -60,20 +60,20 @@ type ScoringWeights struct {
 }
 
 type IntelligentContextConfig struct {
-	Enabled                  *bool           `json:"enabled,omitempty"`
-	KeepSystem               *bool           `json:"keep_system,omitempty"`
-	KeepLastTurns            *int            `json:"keep_last_turns,omitempty"`
-	OutputBufferTokens       *int            `json:"output_buffer_tokens,omitempty"`
-	UseImportanceScoring     *bool           `json:"use_importance_scoring,omitempty"`
-	ScoringWeights           *ScoringWeights `json:"scoring_weights,omitempty"`
-	RecencyDecayRate         *float64        `json:"recency_decay_rate,omitempty"`
-	TOINIntegration          *bool           `json:"toin_integration,omitempty"`
-	TOINConfidenceThreshold  *float64        `json:"toin_confidence_threshold,omitempty"`
-	CompressThreshold        *float64        `json:"compress_threshold,omitempty"`
-	SummarizationEnabled     *bool           `json:"summarization_enabled,omitempty"`
-	SummarizationModel       *string         `json:"summarization_model,omitempty"`
-	SummaryMaxTokens         *int            `json:"summary_max_tokens,omitempty"`
-	SummarizeThreshold       *float64        `json:"summarize_threshold,omitempty"`
+	Enabled                 *bool           `json:"enabled,omitempty"`
+	KeepSystem              *bool           `json:"keep_system,omitempty"`
+	KeepLastTurns           *int            `json:"keep_last_turns,omitempty"`
+	OutputBufferTokens      *int            `json:"output_buffer_tokens,omitempty"`
+	UseImportanceScoring    *bool           `json:"use_importance_scoring,omitempty"`
+	ScoringWeights          *ScoringWeights `json:"scoring_weights,omitempty"`
+	RecencyDecayRate        *float64        `json:"recency_decay_rate,omitempty"`
+	TOINIntegration         *bool           `json:"toin_integration,omitempty"`
+	TOINConfidenceThreshold *float64        `json:"toin_confidence_threshold,omitempty"`
+	CompressThreshold       *float64        `json:"compress_threshold,omitempty"`
+	SummarizationEnabled    *bool           `json:"summarization_enabled,omitempty"`
+	SummarizationModel      *string         `json:"summarization_model,omitempty"`
+	SummaryMaxTokens        *int            `json:"summary_max_tokens,omitempty"`
+	SummarizeThreshold      *float64        `json:"summarize_threshold,omitempty"`
 }
 
 type RelevanceScorerConfig struct {
@@ -116,13 +116,13 @@ type SmartCrusherConfig struct {
 }
 
 type CacheOptimizerConfig struct {
-	Enabled                  *bool    `json:"enabled,omitempty"`
-	AutoDetectProvider       *bool    `json:"auto_detect_provider,omitempty"`
-	MinCacheableTokens       *int     `json:"min_cacheable_tokens,omitempty"`
-	EnableSemanticCache      *bool    `json:"enable_semantic_cache,omitempty"`
-	SemanticCacheSimilarity  *float64 `json:"semantic_cache_similarity,omitempty"`
-	SemanticCacheMaxEntries  *int     `json:"semantic_cache_max_entries,omitempty"`
-	SemanticCacheTtlSeconds  *int     `json:"semantic_cache_ttl_seconds,omitempty"`
+	Enabled                 *bool    `json:"enabled,omitempty"`
+	AutoDetectProvider      *bool    `json:"auto_detect_provider,omitempty"`
+	MinCacheableTokens      *int     `json:"min_cacheable_tokens,omitempty"`
+	EnableSemanticCache     *bool    `json:"enable_semantic_cache,omitempty"`
+	SemanticCacheSimilarity *float64 `json:"semantic_cache_similarity,omitempty"`
+	SemanticCacheMaxEntries *int     `json:"semantic_cache_max_entries,omitempty"`
+	SemanticCacheTtlSeconds *int     `json:"semantic_cache_ttl_seconds,omitempty"`
 }
 
 type CCRConfig struct {
@@ -152,23 +152,23 @@ type ReadLifecycleConfig struct {
 }
 
 type Config struct {
-	StoreURL              *string                   `json:"store_url,omitempty"`
-	DefaultMode           HeadroomMode              `json:"default_mode,omitempty"`
-	ModelContextLimits    map[string]int            `json:"model_context_limits,omitempty"`
-	ToolCrusher           *ToolCrusherConfig        `json:"tool_crusher,omitempty"`
-	SmartCrusher          *SmartCrusherConfig       `json:"smart_crusher,omitempty"`
-	CacheAligner          *CacheAlignerConfig       `json:"cache_aligner,omitempty"`
-	RollingWindow         *RollingWindowConfig      `json:"rolling_window,omitempty"`
-	CacheOptimizer        *CacheOptimizerConfig     `json:"cache_optimizer,omitempty"`
-	CCR                   *CCRConfig                `json:"ccr,omitempty"`
-	PrefixFreeze          *PrefixFreezeConfig       `json:"prefix_freeze,omitempty"`
-	ContentRouterEnabled  *bool                     `json:"content_router_enabled,omitempty"`
-	IntelligentContext    *IntelligentContextConfig `json:"intelligent_context,omitempty"`
-	GenerateDiffArtifact  *bool                     `json:"generate_diff_artifact,omitempty"`
+	StoreURL             *string                   `json:"store_url,omitempty"`
+	DefaultMode          HeadroomMode              `json:"default_mode,omitempty"`
+	ModelContextLimits   map[string]int            `json:"model_context_limits,omitempty"`
+	ToolCrusher          *ToolCrusherConfig        `json:"tool_crusher,omitempty"`
+	SmartCrusher         *SmartCrusherConfig       `json:"smart_crusher,omitempty"`
+	CacheAligner         *CacheAlignerConfig       `json:"cache_aligner,omitempty"`
+	RollingWindow        *RollingWindowConfig      `json:"rolling_window,omitempty"`
+	CacheOptimizer       *CacheOptimizerConfig     `json:"cache_optimizer,omitempty"`
+	CCR                  *CCRConfig                `json:"ccr,omitempty"`
+	PrefixFreeze         *PrefixFreezeConfig       `json:"prefix_freeze,omitempty"`
+	ContentRouterEnabled *bool                     `json:"content_router_enabled,omitempty"`
+	IntelligentContext   *IntelligentContextConfig `json:"intelligent_context,omitempty"`
+	GenerateDiffArtifact *bool                     `json:"generate_diff_artifact,omitempty"`
 }
 
 // Helpers for `*T` fields when callers don't want to manage pointers.
-func Bool(v bool) *bool          { return &v }
-func Int(v int) *int             { return &v }
-func Float(v float64) *float64   { return &v }
-func String(v string) *string    { return &v }
+func Bool(v bool) *bool        { return &v }
+func Int(v int) *int           { return &v }
+func Float(v float64) *float64 { return &v }
+func String(v string) *string  { return &v }

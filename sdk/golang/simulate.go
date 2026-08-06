@@ -4,16 +4,16 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/headroomlabs/headroom/sdk/golang/format"
+	"github.com/headroomlabs-ai/headroom/sdk/golang/format"
 )
 
 // SimulateOptions controls a simulation call.
 type SimulateOptions struct {
-	Model    string
-	BaseURL  string
-	APIKey   string
-	Config   *Config
-	Client   *Client
+	Model   string
+	BaseURL string
+	APIKey  string
+	Config  *Config
+	Client  *Client
 }
 
 // Simulate dry-runs compression: no LLM call, but the proxy returns what it

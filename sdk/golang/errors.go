@@ -8,7 +8,7 @@ import (
 // Error is the base type for every Headroom SDK error.
 // Use errors.As to inspect specific subtypes (ConnectionError, AuthError, …).
 type Error struct {
-	Kind    string         // e.g. "connection", "auth", "compress", "configuration"
+	Kind    string // e.g. "connection", "auth", "compress", "configuration"
 	Message string
 	Details map[string]any
 }

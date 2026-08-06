@@ -3,7 +3,7 @@ package headroom
 import (
 	"context"
 
-	"github.com/headroomlabs/headroom/sdk/golang/format"
+	"github.com/headroomlabs-ai/headroom/sdk/golang/format"
 )
 
 // Compress is the standalone, format-agnostic compress entry point.

@@ -7,7 +7,7 @@ Anthropic, and Google Gemini message formats.
 ## Install
 
 ```bash
-go get github.com/headroomlabs/headroom/sdk/golang
+go get github.com/headroomlabs-ai/headroom/sdk/golang
 ```
 
 Headroom compresses LLM context server-side. Start a proxy first:
@@ -22,7 +22,7 @@ headroom proxy --port 8787
 ```go
 import (
     "context"
-    headroom "github.com/headroomlabs/headroom/sdk/golang"
+    headroom "github.com/headroomlabs-ai/headroom/sdk/golang"
 )
 
 ctx := context.Background()
@@ -41,7 +41,7 @@ fmt.Printf("Saved %d tokens (%.0f%%)\n", res.TokensSaved, (1-res.CompressionRati
 ## Format-agnostic compress
 
 ```go
-import "github.com/headroomlabs/headroom/sdk/golang"
+import "github.com/headroomlabs-ai/headroom/sdk/golang"
 
 // Anthropic-shape input — auto-detected, converted to OpenAI for the proxy,
 // converted back to Anthropic in the result.
@@ -73,9 +73,11 @@ out, err := client.ChatCompletionsCreate(ctx, map[string]any{
 ## Streaming
 
 ```go
-import "github.com/headroomlabs/headroom/sdk/golang/stream"
+import "github.com/headroomlabs-ai/headroom/sdk/golang/stream"
 
-resp, _ := http.Get(...)             // SSE response from the proxy
+resp, _ := client.ChatCompletionsStream(ctx, map[string]any{
+    "model": "gpt-4o", "messages": msgs,
+}, nil)
 for ev, err := range stream.ParseSSE(resp) {
     if err != nil { break }
     // handle ev (map[string]any)
@@ -97,9 +99,9 @@ full, _ := sc.Get("research", true)     // original
 ## Adapters
 
 ```go
-import "github.com/headroomlabs/headroom/sdk/golang/openai"
-import "github.com/headroomlabs/headroom/sdk/golang/anthropic"
-import "github.com/headroomlabs/headroom/sdk/golang/gemini"
+import "github.com/headroomlabs-ai/headroom/sdk/golang/openai"
+import "github.com/headroomlabs-ai/headroom/sdk/golang/anthropic"
+import "github.com/headroomlabs-ai/headroom/sdk/golang/gemini"
 
 compressed, err := openai.WithHeadroom(ctx, msgs)
 ```

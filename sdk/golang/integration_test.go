@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	headroom "github.com/headroomlabs/headroom/sdk/golang"
-	"github.com/headroomlabs/headroom/sdk/golang/format"
-	"github.com/headroomlabs/headroom/sdk/golang/openai"
+	headroom "github.com/headroomlabs-ai/headroom/sdk/golang"
+	"github.com/headroomlabs-ai/headroom/sdk/golang/format"
+	"github.com/headroomlabs-ai/headroom/sdk/golang/openai"
 )
 
 // All tests in this file require a running proxy. The base URL is taken from

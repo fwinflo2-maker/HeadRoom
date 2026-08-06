@@ -69,7 +69,7 @@ from headroom import (
 ```
 
 ```go
-import "github.com/headroomlabs/headroom/sdk/golang"
+import "github.com/headroomlabs-ai/headroom/sdk/golang"
 
 // Sentinels for errors.Is matching:
 //   headroom.ErrConnection, headroom.ErrAuth, headroom.ErrCompress,
@@ -137,7 +137,7 @@ except HeadroomError as e:
 ```go
 import (
     "errors"
-    "github.com/headroomlabs/headroom/sdk/golang"
+    "github.com/headroomlabs-ai/headroom/sdk/golang"
 )
 
 _, err := client.Compress(ctx, msgs, headroom.CompressOptions{Model: "gpt-4o"})

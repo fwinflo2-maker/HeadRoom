@@ -215,10 +215,10 @@ node -e "const h = require('headroom-ai'); console.log('headroom-ai loaded')"
 
 ## Go
 
-The Go SDK lives at `github.com/headroomlabs/headroom/sdk/golang` and requires **Go 1.23+**.
+The Go SDK lives at `github.com/headroomlabs-ai/headroom/sdk/golang` and requires **Go 1.23+**.
 
 ```bash
-go get github.com/headroomlabs/headroom/sdk/golang
+go get github.com/headroomlabs-ai/headroom/sdk/golang
 ```
 
 <Callout type="info" title="The Go SDK needs a running proxy">
@@ -234,7 +234,7 @@ Then use it:
 ```go
 import (
     "context"
-    headroom "github.com/headroomlabs/headroom/sdk/golang"
+    headroom "github.com/headroomlabs-ai/headroom/sdk/golang"
 )
 
 client := headroom.NewClient(headroom.WithBaseURL("http://localhost:8787"))
@@ -245,7 +245,7 @@ res, _ := client.Compress(context.Background(), messages, headroom.CompressOptio
 ### Verify the install
 
 ```bash
-go run -v github.com/headroomlabs/headroom/sdk/golang@latest 2>&1 | head -1
+go run -v github.com/headroomlabs-ai/headroom/sdk/golang@latest 2>&1 | head -1
 ```
 
 ## Docker

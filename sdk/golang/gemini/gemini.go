@@ -5,7 +5,7 @@ package gemini
 import (
 	"context"
 
-	headroom "github.com/headroomlabs/headroom/sdk/golang"
+	headroom "github.com/headroomlabs-ai/headroom/sdk/golang"
 )
 
 // Compress takes Gemini-shape messages and returns Gemini-shape compressed output.

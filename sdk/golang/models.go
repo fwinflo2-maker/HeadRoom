@@ -33,11 +33,11 @@ type TransformDiff struct {
 }
 
 type DiffArtifact struct {
-	RequestID         string          `json:"request_id"`
-	OriginalTokens    int             `json:"original_tokens"`
-	OptimizedTokens   int             `json:"optimized_tokens"`
-	TotalTokensSaved  int             `json:"total_tokens_saved"`
-	Transforms        []TransformDiff `json:"transforms"`
+	RequestID        string          `json:"request_id"`
+	OriginalTokens   int             `json:"original_tokens"`
+	OptimizedTokens  int             `json:"optimized_tokens"`
+	TotalTokensSaved int             `json:"total_tokens_saved"`
+	Transforms       []TransformDiff `json:"transforms"`
 }
 
 type SimulationResult struct {
@@ -134,15 +134,15 @@ type HealthConfig struct {
 }
 
 type ProxyStats struct {
-	Requests      ProxyStatsRequests              `json:"requests"`
-	Tokens        ProxyStatsTokens                `json:"tokens"`
-	Latency       LatencyStats                    `json:"latency"`
-	Overhead      LatencyStats                    `json:"overhead"`
+	Requests       ProxyStatsRequests             `json:"requests"`
+	Tokens         ProxyStatsTokens               `json:"tokens"`
+	Latency        LatencyStats                   `json:"latency"`
+	Overhead       LatencyStats                   `json:"overhead"`
 	PipelineTiming map[string]PipelineTimingEntry `json:"pipeline_timing"`
-	WasteSignals  map[string]int                  `json:"waste_signals"`
-	Compression   ProxyStatsCompression           `json:"compression"`
-	Cost          map[string]any                  `json:"cost"`
-	FeedbackLoop  ProxyStatsFeedbackLoop          `json:"feedback_loop"`
+	WasteSignals   map[string]int                 `json:"waste_signals"`
+	Compression    ProxyStatsCompression          `json:"compression"`
+	Cost           map[string]any                 `json:"cost"`
+	FeedbackLoop   ProxyStatsFeedbackLoop         `json:"feedback_loop"`
 	RecentRequests []map[string]any               `json:"recent_requests,omitempty"`
 }
 
@@ -177,11 +177,11 @@ type PipelineTimingEntry struct {
 }
 
 type ProxyStatsCompression struct {
-	CCREntries              int `json:"ccr_entries"`
-	CCRMaxEntries           int `json:"ccr_max_entries"`
-	OriginalTokensCached    int `json:"original_tokens_cached"`
-	CompressedTokensCached  int `json:"compressed_tokens_cached"`
-	CCRRetrievals           int `json:"ccr_retrievals"`
+	CCREntries             int `json:"ccr_entries"`
+	CCRMaxEntries          int `json:"ccr_max_entries"`
+	OriginalTokensCached   int `json:"original_tokens_cached"`
+	CompressedTokensCached int `json:"compressed_tokens_cached"`
+	CCRRetrievals          int `json:"ccr_retrievals"`
 }
 
 type ProxyStatsFeedbackLoop struct {
@@ -192,10 +192,10 @@ type ProxyStatsFeedbackLoop struct {
 }
 
 type MemoryUsage struct {
-	ProcessMemory   ProcessMemory                `json:"process_memory"`
-	Components      map[string]ComponentMemory   `json:"components"`
-	TotalTrackedMb  float64                      `json:"total_tracked_mb"`
-	TargetBudgetMb  float64                      `json:"target_budget_mb"`
+	ProcessMemory  ProcessMemory              `json:"process_memory"`
+	Components     map[string]ComponentMemory `json:"components"`
+	TotalTrackedMb float64                    `json:"total_tracked_mb"`
+	TargetBudgetMb float64                    `json:"target_budget_mb"`
 }
 
 type ProcessMemory struct {
@@ -210,13 +210,13 @@ type ComponentMemory struct {
 }
 
 type RetrieveResult struct {
-	Hash                 string `json:"hash"`
-	OriginalContent      string `json:"original_content"`
-	OriginalTokens       int    `json:"original_tokens"`
-	OriginalItemCount    int    `json:"original_item_count"`
-	CompressedItemCount  int    `json:"compressed_item_count"`
-	ToolName             string `json:"tool_name"`
-	RetrievalCount       int    `json:"retrieval_count"`
+	Hash                string `json:"hash"`
+	OriginalContent     string `json:"original_content"`
+	OriginalTokens      int    `json:"original_tokens"`
+	OriginalItemCount   int    `json:"original_item_count"`
+	CompressedItemCount int    `json:"compressed_item_count"`
+	ToolName            string `json:"tool_name"`
+	RetrievalCount      int    `json:"retrieval_count"`
 	// Search variant
 	Query   string `json:"query,omitempty"`
 	Results []any  `json:"results,omitempty"`
@@ -251,22 +251,22 @@ type ToolHints struct {
 }
 
 type TOINStats struct {
-	Enabled                       bool    `json:"enabled"`
-	PatternsTracked               int     `json:"patterns_tracked"`
-	TotalCompressions             int     `json:"total_compressions"`
-	TotalRetrievals               int     `json:"total_retrievals"`
-	GlobalRetrievalRate           float64 `json:"global_retrieval_rate"`
-	PatternsWithRecommendations   int     `json:"patterns_with_recommendations"`
+	Enabled                     bool    `json:"enabled"`
+	PatternsTracked             int     `json:"patterns_tracked"`
+	TotalCompressions           int     `json:"total_compressions"`
+	TotalRetrievals             int     `json:"total_retrievals"`
+	GlobalRetrievalRate         float64 `json:"global_retrieval_rate"`
+	PatternsWithRecommendations int     `json:"patterns_with_recommendations"`
 }
 
 type TOINPattern struct {
-	Hash             string  `json:"hash"`
-	Compressions     int     `json:"compressions"`
-	Retrievals       int     `json:"retrievals"`
-	RetrievalRate    string  `json:"retrieval_rate"`
-	Confidence       float64 `json:"confidence"`
-	SkipRecommended  bool    `json:"skip_recommended"`
-	OptimalMaxItems  int     `json:"optimal_max_items"`
+	Hash            string  `json:"hash"`
+	Compressions    int     `json:"compressions"`
+	Retrievals      int     `json:"retrievals"`
+	RetrievalRate   string  `json:"retrieval_rate"`
+	Confidence      float64 `json:"confidence"`
+	SkipRecommended bool    `json:"skip_recommended"`
+	OptimalMaxItems int     `json:"optimal_max_items"`
 }
 
 // Query option structs.

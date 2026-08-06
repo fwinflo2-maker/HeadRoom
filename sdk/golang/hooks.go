@@ -7,11 +7,11 @@ import (
 
 // CompressContext is passed to hooks.
 type CompressContext struct {
-	Model       string
-	UserQuery   string
-	TurnNumber  int
-	ToolCalls   []string
-	Provider    string
+	Model      string
+	UserQuery  string
+	TurnNumber int
+	ToolCalls  []string
+	Provider   string
 }
 
 // CompressEvent is observable post-compression result handed to PostCompress.

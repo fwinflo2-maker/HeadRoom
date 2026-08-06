@@ -3,14 +3,17 @@ package headroom_test
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
-	headroom "github.com/headroomlabs/headroom/sdk/golang"
-	"github.com/headroomlabs/headroom/sdk/golang/anthropic"
-	"github.com/headroomlabs/headroom/sdk/golang/format"
-	"github.com/headroomlabs/headroom/sdk/golang/gemini"
+	headroom "github.com/headroomlabs-ai/headroom/sdk/golang"
+	"github.com/headroomlabs-ai/headroom/sdk/golang/anthropic"
+	"github.com/headroomlabs-ai/headroom/sdk/golang/format"
+	"github.com/headroomlabs-ai/headroom/sdk/golang/gemini"
+	sdkstream "github.com/headroomlabs-ai/headroom/sdk/golang/stream"
 )
 
 // Each test exercises one Client method and asserts the request reached the
@@ -115,7 +118,7 @@ func TestParity_CCRStats(t *testing.T) {
 func TestParity_RetrieveUnknownHash(t *testing.T) {
 	c := newTestClient(t)
 	// Unknown hash — should either return a structured error or an empty result.
-	_, err := c.Retrieve(context.Background(), "nonexistent_hash_xyz", "")
+	_, err := c.Retrieve(context.Background(), "nonexistent_hash_xyz")
 	if err != nil {
 		// Typed error is acceptable.
 		if _, ok := headroom.AsCompressError(err); !ok {
@@ -406,8 +409,26 @@ func TestParity_ProxyStatsShape(t *testing.T) {
 // TestParity_ConfigSentToProxy verifies that WithConfig is serialized into
 // the request body.
 func TestParity_ConfigSentToProxy(t *testing.T) {
+	var requestBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"messages":[{"role":"user","content":"hello world"}],
+			"tokens_before":2,
+			"tokens_after":2,
+			"tokens_saved":0,
+			"compression_ratio":1,
+			"transforms_applied":[],
+			"ccr_hashes":[]
+		}`))
+	}))
+	defer server.Close()
+
 	c := headroom.NewClient(
-		headroom.WithBaseURL(proxyURL()),
+		headroom.WithBaseURL(server.URL),
 		headroom.WithTimeout(15*time.Second),
 		headroom.WithConfig(&headroom.Config{
 			SmartCrusher: &headroom.SmartCrusherConfig{
@@ -424,6 +445,49 @@ func TestParity_ConfigSentToProxy(t *testing.T) {
 	}
 	if res.TokensBefore == 0 {
 		t.Error("expected non-zero tokens_before")
+	}
+	config, ok := requestBody["config"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected config object in request, got %#v", requestBody["config"])
+	}
+	smartCrusher, ok := config["smart_crusher"].(map[string]any)
+	if !ok || smartCrusher["enabled"] != true || smartCrusher["min_tokens_to_crush"] != float64(50) {
+		t.Fatalf("unexpected smart_crusher config: %#v", smartCrusher)
+	}
+}
+
+func TestParity_ChatCompletionsStream(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		if body["stream"] != true {
+			t.Errorf("expected stream=true, got %#v", body["stream"])
+		}
+		if got := r.Header.Get("x-headroom-mode"); got != string(headroom.ModeOptimize) {
+			t.Errorf("unexpected mode header: %q", got)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"id\":\"chunk-1\"}\n\ndata: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	client := headroom.NewClient(headroom.WithBaseURL(server.URL))
+	resp, err := client.ChatCompletionsStream(
+		context.Background(),
+		map[string]any{"model": "gpt-4o", "messages": []any{}},
+		&headroom.HeadroomParams{Mode: headroom.ModeOptimize},
+	)
+	if err != nil {
+		t.Fatalf("stream request: %v", err)
+	}
+	events, err := sdkstream.Collect(sdkstream.ParseSSE(resp))
+	if err != nil {
+		t.Fatalf("parse stream: %v", err)
+	}
+	if len(events) != 1 || events[0]["id"] != "chunk-1" {
+		t.Fatalf("unexpected events: %#v", events)
 	}
 }
 

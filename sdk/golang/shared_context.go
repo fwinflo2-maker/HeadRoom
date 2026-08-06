@@ -9,24 +9,24 @@ import (
 
 // ContextEntry is a single SharedContext slot.
 type ContextEntry struct {
-	Key              string    `json:"key"`
-	Original         string    `json:"original"`
-	Compressed       string    `json:"compressed"`
-	OriginalTokens   int       `json:"original_tokens"`
-	CompressedTokens int       `json:"compressed_tokens"`
-	Agent            string    `json:"agent,omitempty"`
-	Timestamp        float64   `json:"timestamp"`
-	Transforms       []string  `json:"transforms"`
-	SavingsPercent   float64   `json:"savings_percent"`
+	Key              string   `json:"key"`
+	Original         string   `json:"original"`
+	Compressed       string   `json:"compressed"`
+	OriginalTokens   int      `json:"original_tokens"`
+	CompressedTokens int      `json:"compressed_tokens"`
+	Agent            string   `json:"agent,omitempty"`
+	Timestamp        float64  `json:"timestamp"`
+	Transforms       []string `json:"transforms"`
+	SavingsPercent   float64  `json:"savings_percent"`
 }
 
 // SharedContextStats summarizes a SharedContext.
 type SharedContextStats struct {
-	Entries                int     `json:"entries"`
-	TotalOriginalTokens    int     `json:"total_original_tokens"`
-	TotalCompressedTokens  int     `json:"total_compressed_tokens"`
-	TotalTokensSaved       int     `json:"total_tokens_saved"`
-	SavingsPercent         float64 `json:"savings_percent"`
+	Entries               int     `json:"entries"`
+	TotalOriginalTokens   int     `json:"total_original_tokens"`
+	TotalCompressedTokens int     `json:"total_compressed_tokens"`
+	TotalTokensSaved      int     `json:"total_tokens_saved"`
+	SavingsPercent        float64 `json:"savings_percent"`
 }
 
 // SharedContextOptions configures a SharedContext.

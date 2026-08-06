@@ -6,7 +6,7 @@ package openai
 import (
 	"context"
 
-	headroom "github.com/headroomlabs/headroom/sdk/golang"
+	headroom "github.com/headroomlabs-ai/headroom/sdk/golang"
 )
 
 // Compress shrinks an OpenAI []Message slice via the proxy. If the proxy

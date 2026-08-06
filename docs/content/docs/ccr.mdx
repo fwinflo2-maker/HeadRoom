@@ -154,7 +154,7 @@ response = client.chat.completions.create(
 </Tab>
 <Tab value="Go">
 ```go
-import "github.com/headroomlabs/headroom/sdk/golang"
+import "github.com/headroomlabs-ai/headroom/sdk/golang"
 
 client := headroom.NewClient()
 
@@ -162,7 +162,7 @@ client := headroom.NewClient()
 // hash (returned in result.CCRHashes when present):
 result, _ := client.Compress(ctx, msgs, headroom.CompressOptions{Model: "gpt-4o"})
 for _, hash := range result.CCRHashes {
-    original, _ := client.Retrieve(ctx, hash, "" /* optional BM25 query */)
+    original, _ := client.Retrieve(ctx, hash)
     fmt.Printf("%d original tokens for tool %q\n", original.OriginalTokens, original.ToolName)
 }
 

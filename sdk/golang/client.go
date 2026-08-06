@@ -384,11 +384,9 @@ func (c *Client) ValidateSetup(ctx context.Context) (*ValidationResult, error) {
 // CCR retrieve
 // =====================================================================
 
-func (c *Client) Retrieve(ctx context.Context, hash, query string) (*RetrieveResult, error) {
+// Retrieve returns the full original content stored under hash.
+func (c *Client) Retrieve(ctx context.Context, hash string) (*RetrieveResult, error) {
 	body := map[string]any{"hash": hash}
-	if query != "" {
-		body["query"] = query
-	}
 	resp, err := c.do(ctx, http.MethodPost, "/v1/retrieve", body, nil)
 	if err != nil {
 		return nil, err

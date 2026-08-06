@@ -198,8 +198,10 @@ def test_lifespan_logs_shutdown_event(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_lifespan_shutdown_completes_when_beacon_hangs(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Lifespan shutdown must complete even if _beacon.stop() never returns.
+def test_lifespan_shutdown_completes_when_proxy_shutdown_hangs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lifespan shutdown must complete even if proxy.shutdown() never returns.
 
     Before the fix, an unbounded ``await _beacon.stop()`` would block the
     lifespan finally-block forever, requiring a second Ctrl+C.  The fix wraps
@@ -227,11 +229,9 @@ def test_lifespan_shutdown_completes_when_beacon_hangs(monkeypatch: pytest.Monke
     )
     app = create_app(config)
 
-    # Patch the beacon inside the already-created app's lifespan closure
-    # by monkeypatching TelemetryBeacon.stop globally.
-    import headroom.telemetry.beacon as beacon_mod
+    import headroom.proxy.server as server_mod
 
-    monkeypatch.setattr(beacon_mod.TelemetryBeacon, "stop", lambda self: hanging_stop())
+    monkeypatch.setattr(server_mod.HeadroomProxy, "shutdown", lambda self: hanging_stop())
 
     # If the fix is absent this would hang; with the fix it returns quickly.
     import time

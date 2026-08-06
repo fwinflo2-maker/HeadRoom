@@ -132,7 +132,6 @@ export {
   proxyLogPath,
   debug400Dir,
   binDir,
-  rtkPath,
   deployRoot,
   beaconLockPath,
   modelsConfigPath,

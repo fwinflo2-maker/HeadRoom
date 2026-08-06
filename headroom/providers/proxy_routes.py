@@ -9,6 +9,10 @@ from typing import Any
 from fastapi import FastAPI, Request, WebSocket
 
 from headroom.providers.cloudcode import normalize_cloudcode_passthrough_path
+from headroom.providers.codex.live import (
+    CODEX_LIVE_ROUTE_PATHS,
+    handle_codex_live_websocket,
+)
 from headroom.providers.codex.responses import handle_chatgpt_codex_responses_subpath
 from headroom.providers.model_metadata import (
     MODEL_METADATA_LIST_ENDPOINT,
@@ -63,26 +67,15 @@ from headroom.proxy.request_scope import normalize_request_path
 logger = logging.getLogger("headroom.proxy.routes")
 
 
-def _select_openai_base_url(proxy: Any, headers: dict[str, str]) -> str:
-    custom_base = headers.get("x-headroom-base-url", "")
-    if custom_base:
-        normalized = custom_base.rstrip("/")
-        return normalized[:-3] if normalized.endswith("/v1") else normalized
-    return _api_target(proxy, "openai")
-
-
 def _register_provider_passthrough_route(
     app: FastAPI,
     proxy: Any,
     spec: ProviderPassthroughRoute,
 ) -> None:
     async def provider_passthrough(request: Request):
-        base_url = _api_target(proxy, spec.provider_name)
-        if spec.provider_name == "openai":
-            base_url = _select_openai_base_url(proxy, dict(request.headers))
         return await proxy.handle_passthrough(
             request,
-            base_url,
+            _api_target(proxy, spec.provider_name),
             spec.sub_path,
             spec.provider_name,
         )
@@ -164,7 +157,7 @@ def _register_openai_responses_subpath_route(
         return await handle_openai_responses_subpath(
             proxy.http_client,
             request,
-            _select_openai_base_url(proxy, dict(request.headers)),
+            _api_target(proxy, "openai"),
             sub_path,
         )
 
@@ -186,12 +179,32 @@ def _register_openai_responses_routes(app: FastAPI, proxy: Any) -> None:
         _register_openai_responses_subpath_route(app, proxy, spec)
 
 
+def _register_codex_live_routes(app: FastAPI, proxy: Any) -> None:
+    for path in CODEX_LIVE_ROUTE_PATHS:
+
+        def register_websocket_route(route_path: str) -> None:
+            async def codex_live_websocket(websocket: WebSocket):
+                await handle_codex_live_websocket(
+                    websocket,
+                    proxy,
+                    _api_target(proxy, "openai"),
+                    route_path,
+                )
+
+            codex_live_websocket.__name__ = (
+                route_path.strip("/").replace("/", "_") + "_live_websocket"
+            )
+            app.websocket(route_path)(codex_live_websocket)
+
+        register_websocket_route(path)
+
+
 def _register_openai_image_route(app: FastAPI, proxy: Any, endpoint: OpenAIImageEndpoint) -> None:
     async def openai_image_endpoint(request: Request):
         return await handle_openai_image_endpoint(
             proxy,
             request,
-            openai_api_base_url=_select_openai_base_url(proxy, dict(request.headers)),
+            openai_api_base_url=_api_target(proxy, "openai"),
             endpoint=endpoint,
         )
 
@@ -428,11 +441,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             proxy,
             request,
             endpoint=MODEL_METADATA_LIST_ENDPOINT,
-            provider_api_base_url=(
-                _select_openai_base_url(proxy, dict(request.headers))
-                if provider_name == "openai"
-                else _api_target(proxy, provider_name)
-            ),
+            provider_api_base_url=_api_target(proxy, provider_name),
             provider_name=provider_name,
         )
 
@@ -443,15 +452,13 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             proxy,
             request,
             endpoint=model_metadata_get_endpoint(model_id),
-            provider_api_base_url=(
-                _select_openai_base_url(proxy, dict(request.headers))
-                if provider_name == "openai"
-                else _api_target(proxy, provider_name)
-            ),
+            provider_api_base_url=_api_target(proxy, provider_name),
             provider_name=provider_name,
         )
 
     _register_openai_image_routes(app, proxy)
+
+    _register_codex_live_routes(app, proxy)
 
     _register_provider_passthrough_routes(app, proxy)
 

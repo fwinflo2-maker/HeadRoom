@@ -1,5 +1,3 @@
-import { HeadroomPlugin, type HeadroomOpenCodePluginOptions } from "./plugin.js";
-
 export {
   DEFAULT_MODEL,
   DEFAULT_MODELS,
@@ -19,11 +17,7 @@ export {
   setDefaultProxyUrl,
 } from "./retrieve.js";
 export type { RetrieveToolConfig } from "./retrieve.js";
-export type { HeadroomOpenCodePluginOptions };
+export { HeadroomPlugin, default } from "./plugin.js";
+export type { HeadroomOpenCodePluginOptions } from "./plugin.js";
 
 export { installHeadroomTransport } from "./transport.js";
-
-export default {
-  id: "headroom-opencode",
-  server: HeadroomPlugin,
-};

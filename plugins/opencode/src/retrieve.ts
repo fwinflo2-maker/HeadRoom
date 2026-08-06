@@ -1,6 +1,5 @@
 import type { CompressResult } from "headroom-ai";
-
-import { stripTrailingSlashes } from "./urls.js";
+import { compress } from "headroom-ai";
 
 let _proxyUrlCache: string | null = null;
 
@@ -17,7 +16,7 @@ export interface RetrieveToolConfig {
 }
 
 export function createHeadroomRetrieveTool(config: RetrieveToolConfig) {
-  const origin = stripTrailingSlashes(config.proxyBaseUrl);
+  const origin = config.proxyBaseUrl.replace(/\/+$/, "");
 
   return {
     name: "headroom_retrieve",
@@ -80,12 +79,6 @@ export async function compressWithHeadroom(
     proxyUrl?: string;
   } = {},
 ): Promise<CompressResult> {
-  // Imported lazily: `headroom-ai` (the optional TypeScript SDK) is not a
-  // dependency most OpenCode users have installed. The plugin's default
-  // export (HeadroomPlugin) must load and register successfully without it;
-  // only this opt-in retrieval helper needs it, and only when actually
-  // called.
-  const { compress } = await import("headroom-ai");
   return compress(messages, {
     baseUrl: options.proxyUrl ?? getDefaultProxyUrl(),
     model: options.model ?? "gpt-4o",

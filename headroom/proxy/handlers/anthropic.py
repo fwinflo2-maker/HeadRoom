@@ -1123,24 +1123,22 @@ class AnthropicHandlerMixin:
             # lossless whole-prefix recompaction instead of the byte-identical splice
             # (the splice preserves a dead cache) and skips the overlay replay. Both are
             # deterministic → the recompacted prefix re-caches byte-stable on warm turns.
+            from headroom.transforms.cold_prefix import (
+                anthropic_cache_ttl_seconds,
+                is_cold_prefix,
+            )
+
+            # Resolve the authoritative request-level prompt-cache tier once.
+            # The same value drives cold-prefix handling and net-cost pricing.
+            _cc_ttl = anthropic_cache_ttl_seconds(
+                model, original_client_messages, system_prompt
+            )
             _cold_recompact_active = False
             if os.environ.get("HEADROOM_COLD_RECOMPACT", "").strip().lower() in (
                 "1",
                 "true",
                 "yes",
             ):
-                from headroom.transforms.cold_prefix import (
-                    anthropic_cache_ttl_seconds,
-                    is_cold_prefix,
-                )
-
-                # Read CC's ACTUAL prompt-cache TTL (request cache_control.ttl + the
-                # DISABLE_/ENABLE_/FORCE_PROMPT_CACHING_* env controls) instead of the
-                # static 300s guess — a wrong TTL is exactly what busts a warm cache.
-                # None ⇒ caching is OFF (no cache to bust) ⇒ recompact every turn.
-                _cc_ttl = anthropic_cache_ttl_seconds(
-                    model, original_client_messages, system_prompt
-                )
                 _cold_recompact_active = _cc_ttl is None or is_cold_prefix(
                     prefix_tracker, ttl_seconds=_cc_ttl
                 )
@@ -1339,6 +1337,7 @@ class AnthropicHandlerMixin:
                                     biases=biases,
                                     request_id=request_id,
                                     compression_policy=compression_policy,
+                                    cache_ttl_seconds=_cc_ttl,
                                     **proxy_pipeline_kwargs(self.config),
                                 ),
                                 lambda bg_result: comp_cache.update_from_result(
@@ -1383,6 +1382,7 @@ class AnthropicHandlerMixin:
                                             biases=biases,
                                             request_id=request_id,
                                             compression_policy=compression_policy,
+                                            cache_ttl_seconds=_cc_ttl,
                                             skip_kompress=True,
                                             **proxy_pipeline_kwargs(self.config),
                                         ),
@@ -1433,6 +1433,7 @@ class AnthropicHandlerMixin:
                                         biases=biases,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
+                                        cache_ttl_seconds=_cc_ttl,
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -1474,6 +1475,7 @@ class AnthropicHandlerMixin:
                                     biases=biases,
                                     request_id=request_id,
                                     compression_policy=compression_policy,
+                                    cache_ttl_seconds=_cc_ttl,
                                     **proxy_pipeline_kwargs(self.config),
                                 ),
                                 timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -1565,6 +1567,7 @@ class AnthropicHandlerMixin:
                                         biases=biases,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
+                                        cache_ttl_seconds=_cc_ttl,
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -3922,6 +3925,8 @@ class AnthropicHandlerMixin:
         compressed_requests = []
         pipeline_timing: dict[str, float] = {}
 
+        from headroom.transforms.cold_prefix import anthropic_cache_ttl_seconds
+
         # Apply compression to each request in the batch
         for batch_req in requests_list:
             custom_id = batch_req.get("custom_id", "")
@@ -3931,6 +3936,9 @@ class AnthropicHandlerMixin:
             messages = params.get("messages", [])
             original_messages = copy.deepcopy(messages)
             model = params.get("model", "unknown")
+            cache_ttl_seconds = anthropic_cache_ttl_seconds(
+                model, original_messages, params.get("system")
+            )
 
             if not messages or not self.config.optimize:
                 # No messages or optimization disabled - pass through unchanged
@@ -3967,7 +3975,7 @@ class AnthropicHandlerMixin:
                     # blocks every other request for the duration; a timeout
                     # here is caught below and passes the item through.
                     result = await self._run_compression_in_executor(
-                        lambda messages=messages, model=model, context_limit=context_limit, frozen_message_count=frozen_message_count: (
+                        lambda messages=messages, model=model, context_limit=context_limit, frozen_message_count=frozen_message_count, cache_ttl_seconds=cache_ttl_seconds: (
                             self.anthropic_pipeline.apply(
                                 messages=messages,
                                 model=model,
@@ -3975,6 +3983,7 @@ class AnthropicHandlerMixin:
                                 context=extract_user_query(messages),
                                 frozen_message_count=frozen_message_count,
                                 request_id=request_id,
+                                cache_ttl_seconds=cache_ttl_seconds,
                                 **proxy_pipeline_kwargs(self.config),
                             )
                         ),

@@ -11,6 +11,7 @@ from headroom.ccr.retrieve_policy import (
     render_retrieve_skill_markdown,
     render_retrieve_system_instructions,
     render_retrieve_tool_description,
+    render_skill_markdown,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -113,3 +114,15 @@ def test_classifier_treats_precise_line_row_and_quote_requests_as_concrete_gaps(
         assessment = classify_retrieve_need(request)
         assert assessment.should_retrieve
         assert not assessment.is_redundant
+
+
+def test_classifier_reports_no_clear_gap_without_signal() -> None:
+    assessment = classify_retrieve_need("Summarize the results for me.")
+
+    assert not assessment.should_retrieve
+    assert not assessment.is_redundant
+    assert assessment.reason == "no_clear_gap"
+
+
+def test_generic_skill_renderer_delegates_to_retrieve_renderer() -> None:
+    assert render_skill_markdown() == render_retrieve_skill_markdown()

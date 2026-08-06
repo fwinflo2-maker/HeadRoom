@@ -543,3 +543,56 @@ def test_run_stdio_reaps_process_on_parent_death(monkeypatch) -> None:
 
     assert excinfo.value.args[0] == 0
     assert cleaned["done"] is True
+
+
+def test_retrieve_via_proxy_forwards_query_hint_in_payload() -> None:
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    posted: dict[str, object] = {}
+
+    class _Response:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"original_content": "full payload"}
+
+    class _Client:
+        async def post(self, url: str, json: dict[str, str]) -> _Response:
+            posted["url"] = url
+            posted["json"] = json
+            return _Response()
+
+    server._http_client = _Client()
+
+    result = asyncio.run(server._retrieve_via_proxy("abc123", query="auth middleware"))
+
+    assert result["original_content"] == "full payload"
+    assert posted["url"].endswith("/v1/retrieve")
+    assert posted["json"] == {"hash": "abc123", "query": "auth middleware"}
+
+
+def test_retrieve_via_proxy_omits_empty_query_hint() -> None:
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    posted: dict[str, object] = {}
+
+    class _Response:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"original_content": "full payload"}
+
+    class _Client:
+        async def post(self, url: str, json: dict[str, str]) -> _Response:
+            posted["json"] = json
+            return _Response()
+
+    server._http_client = _Client()
+
+    asyncio.run(server._retrieve_via_proxy("abc123"))
+
+    assert posted["json"] == {"hash": "abc123"}

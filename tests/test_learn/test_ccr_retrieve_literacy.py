@@ -7,7 +7,7 @@ from unittest.mock import patch
 from headroom.ccr.retrieve_policy import LEARN_SECTION
 from headroom.learn.analyzer import SessionAnalyzer
 from headroom.learn.models import ProjectInfo, SessionData, SessionEvent, ToolCall
-from headroom.learn.plugins.codex import CodexPlugin
+from headroom.learn.plugins.codex import CodexPlugin, _extract_codex_message_text
 
 
 def _project(tmp_path: Path) -> ProjectInfo:
@@ -216,3 +216,84 @@ def test_codex_rollout_scanner_preserves_user_messages(tmp_path: Path) -> None:
     assert any(event.type == "tool_call" for event in session.events)
     user_message = next(event for event in session.events if event.type == "user_message")
     assert "Be sure" in user_message.text
+
+
+def test_codex_legacy_json_scanner_preserves_user_messages(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    session_file = sessions_dir / "legacy-1.json"
+    session_file.write_text(
+        json.dumps(
+            {
+                "session": {"id": "legacy-1"},
+                "items": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "Be sure the summary is enough."}
+                        ],
+                    },
+                    {
+                        "type": "function_call",
+                        "name": "headroom_retrieve",
+                        "call_id": "call-1",
+                        "arguments": json.dumps({"hash": "abc123"}),
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call-1",
+                        "output": '{"output": "rows"}',
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    plugin = CodexPlugin(codex_dir=tmp_path)
+    session = plugin._scan_json_session(session_file)
+
+    assert session is not None
+    assert session.session_id == "legacy-1"
+    user_message = next(event for event in session.events if event.type == "user_message")
+    assert "Be sure" in user_message.text
+    tool_event = next(event for event in session.events if event.type == "tool_call")
+    assert tool_event.tool_call is not None
+    assert tool_event.tool_call.name == "headroom_retrieve"
+    assert tool_event.tool_call.input_data == {"hash": "abc123"}
+    assert session.tool_calls[0].output == "rows"
+
+
+def test_codex_message_text_extraction_handles_non_block_content() -> None:
+    assert _extract_codex_message_text("  plain prompt  ") == "plain prompt"
+    assert _extract_codex_message_text({"type": "input_text"}) == ""
+    assert (
+        _extract_codex_message_text(["skipped", {"type": "input_text", "text": "kept"}]) == "kept"
+    )
+
+
+@patch(
+    "headroom.learn.analyzer._call_llm",
+    return_value={"context_file_rules": [], "memory_file_rules": []},
+)
+def test_analyzer_ignores_retrieve_calls_with_blank_tool_name(
+    _mock_call_llm, tmp_path: Path
+) -> None:
+    tool_call = _retrieve_call(2, name="   ")
+    session = SessionData(
+        session_id="s1",
+        tool_calls=[tool_call],
+        events=[
+            SessionEvent(
+                type="user_message",
+                msg_index=1,
+                text="Be sure the kept summary did not miss anything.",
+            ),
+            SessionEvent(type="tool_call", msg_index=2, tool_call=tool_call),
+        ],
+    )
+
+    result = SessionAnalyzer(model="test-model").analyze(_project(tmp_path), [session])
+
+    assert not any(rec.section == LEARN_SECTION for rec in result.recommendations)

@@ -5818,9 +5818,8 @@ if __name__ == "__main__":
         ),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),
         minimax_api_key=os.environ.get("MINIMAX_API_KEY") or getattr(args, "minimax_api_key", None),
-        minimax_api_url=_get_env_str(
-            "MINIMAX_TARGET_API_URL", getattr(args, "minimax_api_url", None)
-        ),
+        minimax_api_url=os.environ.get("MINIMAX_TARGET_API_URL")
+        or getattr(args, "minimax_api_url", None),
         # Backend settings
         backend=_get_env_str("HEADROOM_BACKEND", args.backend),  # type: ignore[arg-type]
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", args.bedrock_region),

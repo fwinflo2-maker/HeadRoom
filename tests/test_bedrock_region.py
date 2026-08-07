@@ -420,6 +420,23 @@ class TestBedrockModelMapping:
                     f"Expected {expected!r} for input {model_in!r}"
                 )
 
+    def test_litellm_qualified_cross_region_id_passes_through_with_contaminated_map(self):
+        """'bedrock/<cross-region-prefix>...' — the already LiteLLM-qualified form
+        documented in map_model_id's docstring — must also bypass discovery
+        remapping. Regression for the gap where only the bare 'us.anthropic...'
+        form was checked, so 'bedrock/us.anthropic...' still fell through to
+        normalization and could be remapped to a contaminating APPLICATION
+        profile in the discovery map."""
+        bad_app_profile = "bedrock/arn:aws:bedrock:ap-southeast-2:002037730852:application-inference-profile/6lgt8epqa0wf"
+        with patch(
+            "headroom.backends.litellm._fetch_bedrock_inference_profiles",
+            return_value={"claude-opus-4-8": bad_app_profile},
+        ):
+            backend = LiteLLMBackend(provider="bedrock", region="ap-southeast-2")
+            assert backend.map_model_id("bedrock/au.anthropic.claude-opus-4-8") == (
+                "bedrock/au.anthropic.claude-opus-4-8"
+            )
+
 
 # =============================================================================
 # Normalize Bedrock Profile ID (edge cases)

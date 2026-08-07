@@ -632,9 +632,9 @@ class LiteLLMBackend(Backend):
             _CROSS_REGION_PREFIXES = ("au.", "us.", "eu.", "apac.", "global.")
             if anthropic_model.startswith(_CROSS_REGION_PREFIXES):
                 return f"bedrock/{anthropic_model}"
-            if anthropic_model.startswith("bedrock/") and anthropic_model[len("bedrock/") :].startswith(
-                _CROSS_REGION_PREFIXES
-            ):
+            if anthropic_model.startswith("bedrock/") and anthropic_model[
+                len("bedrock/") :
+            ].startswith(_CROSS_REGION_PREFIXES):
                 return anthropic_model
 
             normalized = _normalize_bedrock_profile_id(anthropic_model)

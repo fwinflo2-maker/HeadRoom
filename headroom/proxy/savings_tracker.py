@@ -364,8 +364,6 @@ def _estimate_input_cost_usd(
     otherwise falls back to list-price input tokens.
     """
     total_input_tokens = _coerce_int(input_tokens)
-    if total_input_tokens <= 0:
-        return 0.0
     cache_read = _coerce_int(cache_read_tokens)
     cache_write = _coerce_int(cache_write_tokens)
     uncached = _coerce_int(uncached_input_tokens)

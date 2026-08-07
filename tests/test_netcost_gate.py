@@ -74,10 +74,10 @@ class TestNetCostGate:
         assert not any(t.startswith("netcost:skip:") for t in result.transforms_applied)
 
     def test_one_hour_ttl_prices_write_tier(self, router, tokenizer, monkeypatch):
-        # This is deliberately close to the 5-minute break-even: the larger
-        # 1h cache-write multiplier must turn the same candidate into a skip.
+        # 5-minute pricing still admits this shave, while the larger 1h
+        # cache-write multiplier must turn the same candidate into a skip.
         monkeypatch.setenv("HEADROOM_NET_COST_POLICY", "1")
-        messages = _messages(_tool_json(2000), suffix_filler_words=5)
+        messages = _messages(_tool_json(300), suffix_filler_words=1000)
 
         monkeypatch.delenv("HEADROOM_NET_COST_CACHE_TTL_SECONDS", raising=False)
         five_minute = router.apply([dict(m) for m in messages], tokenizer)
@@ -99,7 +99,7 @@ class TestNetCostGate:
         ):
             monkeypatch.delenv(name, raising=False)
 
-        messages = _messages(_tool_json(2000), suffix_filler_words=5)
+        messages = _messages(_tool_json(300), suffix_filler_words=1000)
         messages[0] = {
             "role": "user",
             "content": [

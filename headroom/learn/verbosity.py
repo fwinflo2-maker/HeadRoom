@@ -4,7 +4,7 @@ The premise (validated on real transcripts): users almost never *say* how terse
 they want answers — explicit "be brief" feedback is near-zero — but they *show*
 it behaviorally. They interrupt long answers, and they reply faster than a long
 answer could possibly have been read. Those signals are mechanical to extract
-from Claude Code's JSONL transcripts.
+from coding-agent transcripts (Claude Code JSONL and Grok CLI ``updates.jsonl``).
 
 This module:
 
@@ -162,15 +162,26 @@ class VerbosityProfile:
         path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
 
 
-def _parse_ts(s: str | None) -> float | None:
-    if not s:
+def _parse_ts(s: str | float | int | None) -> float | None:
+    if s is None or s == "":
         return None
+    if isinstance(s, (int, float)):
+        # Grok CLI writes unix seconds (sometimes ms). Normalize ms → seconds.
+        ts = float(s)
+        if ts > 1e12:  # clearly milliseconds
+            ts /= 1000.0
+        return ts
     try:
         from datetime import datetime
 
-        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
     except (ValueError, TypeError):
         return None
+
+
+def _is_grok_session(path: Path) -> bool:
+    """True for Grok CLI session files (``.../<session-id>/updates.jsonl``)."""
+    return path.name == "updates.jsonl"
 
 
 def _assistant_words_and_text(content: Any) -> tuple[int, str]:
@@ -201,6 +212,13 @@ def _human_text(content: Any) -> str | None:
 
 def _parse_session(path: Path) -> tuple[list[_Response], list[_HumanMsg], bool]:
     """Parse one transcript into responses + human messages + has_tools flag."""
+    if _is_grok_session(path):
+        return _parse_session_grok(path)
+    return _parse_session_claude(path)
+
+
+def _parse_session_claude(path: Path) -> tuple[list[_Response], list[_HumanMsg], bool]:
+    """Parse a Claude Code JSONL transcript."""
     responses: list[_Response] = []
     humans: list[_HumanMsg] = []
     has_tools = False
@@ -276,16 +294,186 @@ def _parse_session(path: Path) -> tuple[list[_Response], list[_HumanMsg], bool]:
     return responses, humans, has_tools
 
 
+def _grok_chunk_text(update: dict[str, Any]) -> str:
+    content = update.get("content")
+    if isinstance(content, dict):
+        text = content.get("text")
+        return text if isinstance(text, str) else ""
+    if isinstance(content, str):
+        return content
+    return ""
+
+
+def _grok_model_from_update(update: dict[str, Any], fallback: str = "") -> str:
+    meta = update.get("_meta")
+    if isinstance(meta, dict):
+        mid = meta.get("modelId")
+        if isinstance(mid, str) and mid:
+            return mid
+    usage = update.get("usage")
+    if isinstance(usage, dict):
+        model_usage = usage.get("modelUsage")
+        if isinstance(model_usage, dict) and model_usage:
+            # Prefer the model that spent the most output tokens in the turn.
+            best_model = ""
+            best_out = -1
+            for name, stats in model_usage.items():
+                if not isinstance(stats, dict):
+                    continue
+                out = int(stats.get("outputTokens") or 0)
+                if out >= best_out:
+                    best_out = out
+                    best_model = str(name)
+            if best_model:
+                return best_model
+    return fallback
+
+
+def _parse_session_grok(path: Path) -> tuple[list[_Response], list[_HumanMsg], bool]:
+    """Parse a Grok CLI ``updates.jsonl`` transcript.
+
+    Grok streams assistant text as many ``agent_message_chunk`` events and often
+    reports token usage only on ``turn_completed`` (whole-turn, not per message).
+    We coalesce consecutive agent chunks into one response, flushed on the next
+    user message, turn completion, or EOF.
+    """
+    responses: list[_Response] = []
+    humans: list[_HumanMsg] = []
+    has_tools = False
+    prior_messages: list[dict[str, Any]] = []
+    recent_context: list[str] = []
+    current_model = ""
+
+    # Streaming agent buffer for the open turn.
+    agent_parts: list[str] = []
+    agent_ts: float | None = None
+
+    def flush_agent(
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        model: str | None = None,
+    ) -> None:
+        nonlocal agent_parts, agent_ts
+        text = "".join(agent_parts)
+        words = len(text.split()) if text.strip() else 0
+        agent_parts = []
+        ts = agent_ts
+        agent_ts = None
+        if words <= 0 and output_tokens <= 0:
+            return
+        ctx = " ".join(recent_context[-_ECHO_CONTEXT_LOOKBACK:])
+        responses.append(
+            _Response(
+                words=words,
+                output_tokens=output_tokens,
+                input_tokens=input_tokens,
+                model=model or current_model or "unknown",
+                turn_kind=classify_turn(prior_messages).value,
+                has_tools=False,  # backfilled below
+                ts=ts,
+                echo=echo_ratio(text, ctx) if text and ctx else 0.0,
+            )
+        )
+        prior_messages.append({"role": "assistant", "content": text})
+
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return [], [], False
+
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        params = d.get("params")
+        if not isinstance(params, dict):
+            continue
+        update = params.get("update")
+        if not isinstance(update, dict):
+            continue
+        su = update.get("sessionUpdate")
+        ts = _parse_ts(d.get("timestamp"))
+
+        if su == "user_message_chunk":
+            # New human turn ends any open assistant stream (usage may be unknown).
+            flush_agent(model=current_model)
+            text = _grok_chunk_text(update)
+            current_model = _grok_model_from_update(update, current_model)
+            if not text.strip():
+                continue
+            prior_messages.append({"role": "user", "content": text})
+            # Grok has no Claude-style interrupt marker; treat explicit cancel text
+            # as interrupt when present so the signal isn't always zero.
+            is_interrupt = (
+                _INTERRUPT_MARKER in text
+                or "request interrupted" in text.lower()
+                or text.strip().lower() in {"cancel", "cancelled", "canceled", "stop"}
+            )
+            humans.append(_HumanMsg(ts=ts, is_interrupt=is_interrupt))
+            if not is_interrupt:
+                recent_context.append(text)
+            continue
+
+        if su == "agent_message_chunk":
+            chunk = _grok_chunk_text(update)
+            if not chunk:
+                continue
+            if not agent_parts:
+                agent_ts = ts
+            agent_parts.append(chunk)
+            continue
+
+        if su == "tool_call":
+            has_tools = True
+            continue
+
+        if su == "tool_call_update":
+            has_tools = True
+            # Feed tool output into echo context (best-effort).
+            raw_output = update.get("rawOutput")
+            if isinstance(raw_output, dict):
+                for key in ("output_for_prompt", "output", "FileContent"):
+                    value = raw_output.get(key)
+                    if isinstance(value, str) and value.strip():
+                        recent_context.append(value[:2000])
+                        break
+            continue
+
+        if su == "turn_completed":
+            usage = update.get("usage") if isinstance(update.get("usage"), dict) else {}
+            in_tok = int(usage.get("inputTokens") or 0) + int(usage.get("cachedReadTokens") or 0)
+            out_tok = int(usage.get("outputTokens") or 0)
+            model = _grok_model_from_update(update, current_model)
+            if model:
+                current_model = model
+            flush_agent(input_tokens=in_tok, output_tokens=out_tok, model=model)
+            continue
+
+    flush_agent(model=current_model)
+
+    for r in responses:
+        r.has_tools = has_tools
+    return responses, humans, has_tools
+
+
 def _ordered_events(path: Path) -> list[tuple[float | None, str, _Response | _HumanMsg]]:
     """Re-read interleaving order so fast-skip can pair a human reply to the
     assistant response immediately before it. Kept simple: re-parse with a tag.
     """
+    if _is_grok_session(path):
+        return _ordered_events_grok(path)
+    return _ordered_events_claude(path)
+
+
+def _ordered_events_claude(path: Path) -> list[tuple[float | None, str, _Response | _HumanMsg]]:
     out: list[tuple[float | None, str, Any]] = []
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
         return out
-    responses, humans, _ = _parse_session(path)
+    responses, humans, _ = _parse_session_claude(path)
     # The two lists are already in file order; interleave by re-walking lines.
     ri = hi = 0
     for line in lines:
@@ -317,6 +505,61 @@ def _ordered_events(path: Path) -> list[tuple[float | None, str, _Response | _Hu
             if hi < len(humans):
                 out.append((humans[hi].ts, "human", humans[hi]))
                 hi += 1
+    return out
+
+
+def _ordered_events_grok(path: Path) -> list[tuple[float | None, str, _Response | _HumanMsg]]:
+    """Interleave Grok human / assistant events for fast-skip pairing.
+
+    Assistant responses are emitted when a stream is flushed (turn_completed,
+    next user message, or EOF). Human events align with ``user_message_chunk``.
+    """
+    out: list[tuple[float | None, str, Any]] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return out
+    responses, humans, _ = _parse_session_grok(path)
+    ri = hi = 0
+    agent_open = False
+    agent_has_text = False
+
+    def emit_assistant() -> None:
+        nonlocal ri, agent_open, agent_has_text
+        if agent_open and agent_has_text and ri < len(responses):
+            out.append((responses[ri].ts, "assistant", responses[ri]))
+            ri += 1
+        agent_open = False
+        agent_has_text = False
+
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        params = d.get("params")
+        if not isinstance(params, dict):
+            continue
+        update = params.get("update")
+        if not isinstance(update, dict):
+            continue
+        su = update.get("sessionUpdate")
+        if su == "user_message_chunk":
+            # Flush open agent stream before the human (mirrors parse order).
+            emit_assistant()
+            text = _grok_chunk_text(update)
+            if not text.strip():
+                continue
+            if hi < len(humans):
+                out.append((humans[hi].ts, "human", humans[hi]))
+                hi += 1
+        elif su == "agent_message_chunk":
+            if _grok_chunk_text(update):
+                agent_open = True
+                agent_has_text = True
+        elif su == "turn_completed":
+            emit_assistant()
+    emit_assistant()
     return out
 
 

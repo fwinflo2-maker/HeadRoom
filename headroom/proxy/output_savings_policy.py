@@ -33,7 +33,21 @@ def model_family(model: str) -> str:
     so we bucket (e.g.) every ``claude-opus-*`` together.
     """
     m = model.lower()
-    for fam in ("opus", "sonnet", "haiku", "fable", "mythos", "gpt", "gemini"):
+    # Order matters for overlapping substrings (e.g. "claude-opus" vs bare names).
+    # deepseek / composer / grok cover common Grok CLI / multi-provider ids that
+    # otherwise collapse to the uninformative "other" bucket.
+    for fam in (
+        "opus",
+        "sonnet",
+        "haiku",
+        "fable",
+        "mythos",
+        "gpt",
+        "gemini",
+        "deepseek",
+        "composer",
+        "grok",
+    ):
         if fam in m:
             return fam
     return "other"

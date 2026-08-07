@@ -1358,7 +1358,7 @@ class TestSmartCrusherFallback:
         monkeypatch.setattr(
             crm.ContentRouter,
             "_try_ml_compressor",
-            lambda self, c, context="", question=None: (
+            lambda self, c, context="", question=None, **kwargs: (
                 c,
                 len(c.split()),
             ),
@@ -1461,7 +1461,7 @@ class TestSmartCrusherFallback:
         monkeypatch.setattr(
             crm.ContentRouter,
             "_try_ml_compressor",
-            lambda self, c, context="", question=None: (
+            lambda self, c, context="", question=None, **kwargs: (
                 c,
                 len(c.split()),
             ),
@@ -1492,7 +1492,7 @@ class TestSmartCrusherFallback:
         monkeypatch.setattr(
             crm.ContentRouter,
             "_try_ml_compressor",
-            lambda self, content, context="", question=None: (
+            lambda self, content, context="", question=None, **kwargs: (
                 content,
                 len(content.split()),
             ),

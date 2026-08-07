@@ -47,6 +47,9 @@ class TestIsMiniMaxUpstream:
             "https://api.anthropic.com/v1/messages",
             # OpenAI / other providers
             "https://api.openai.com/v1",
+            # Hostname-substring attacks must not pass the allowlist.
+            "https://agent.minimax.io.evil.example/v1",
+            "https://evil-agent.minimax.io.example/v1",
             # Localhost (test doubles, not a real upstream)
             "http://127.0.0.1:8787",
             # Malformed URL — should fall through to False, not raise.
@@ -159,7 +162,7 @@ class TestCheckMiniMaxUpstreamGuardrail:
         assert len(errors) == 1
         # The error message must surface the offending URL so the user can
         # grep for it in `~/.headroom/logs/proxy.log`.
-        assert "https://api.anthropic.com" in errors[0].message
+        assert errors[0].args[0] == "https://api.anthropic.com"
         assert "ANTHROPIC_TARGET_API_URL" in errors[0].message
 
     def test_session_token_marker_with_anthropic_upstream_logs_error(

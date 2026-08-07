@@ -1389,7 +1389,7 @@ class HeadroomProxy(
             host = (urlparse(url).hostname or "").lower()
         except ValueError:
             return False
-        return "agent.minimax.io" in host or "minimax.io" == host
+        return host in {"agent.minimax.io", "minimax.io"}
 
     @staticmethod
     def _is_minimax_upstream(url: str) -> bool:
@@ -1409,9 +1409,7 @@ class HeadroomProxy(
             host = (urlparse(url).hostname or "").lower()
         except ValueError:
             return False
-        return (
-            ("agent.minimax.io" in host) or (host == "minimax.io") or (host == "api.minimaxi.com")
-        )
+        return host in {"agent.minimax.io", "minimax.io", "api.minimaxi.com"}
 
     def _is_minimax_upstream_for_self(self, url: str) -> bool:
         """Instance-method wrapper around _is_minimax_upstream().

@@ -1143,12 +1143,12 @@ class StreamingMixin:
             _host = (urlparse(url).hostname or "").lower()
         except ValueError:
             _host = ""
-        if "agent.minimax.io" in _host or _host == "minimax.io":
+        if _host in {"agent.minimax.io", "minimax.io"}:
             _session_token = os.environ.get("MINIMAX_SESSION_TOKEN")
             if _session_token:
                 outbound_headers["authorization"] = f"Bearer {_session_token}"
                 outbound_headers.pop("x-api-key", None)
-        else:
+        elif _host == "api.minimaxi.com":
             _api_key = os.environ.get("MINIMAX_API_KEY")
             if _api_key:
                 outbound_headers["x-api-key"] = _api_key

@@ -84,13 +84,42 @@ def test_classifier_flags_thoroughness_without_query_as_redundant() -> None:
     assert not assessment.should_retrieve
 
 
-def test_classifier_flags_thoroughness_with_query_as_redundant() -> None:
+def test_classifier_flags_thoroughness_with_nonspecific_query_as_redundant() -> None:
     assessment = classify_retrieve_need(
         "Be sure the summary did not miss anything.",
-        query="auth",
+        query="just to be safe",
     )
     assert assessment.is_redundant
     assert not assessment.should_retrieve
+    assert assessment.reason == "thoroughness_without_gap"
+
+
+def test_classifier_prefers_specific_query_hint_over_thoroughness_wording() -> None:
+    verify_request = classify_retrieve_need(
+        "Verify the auth middleware result",
+        query="auth middleware",
+    )
+    double_check_request = classify_retrieve_need(
+        "Double-check the deploy step.",
+        query="rollback command",
+    )
+
+    for assessment in (verify_request, double_check_request):
+        assert assessment.should_retrieve
+        assert not assessment.is_redundant
+        assert assessment.reason == "specific_followup_with_query_hint"
+
+
+def test_classifier_ignores_nonspecific_query_hints() -> None:
+    thoroughness = classify_retrieve_need("Be careful not to skip anything.", query="everything")
+    neutral = classify_retrieve_need("Summarize the results for me.", query="just to be safe")
+
+    assert thoroughness.is_redundant
+    assert not thoroughness.should_retrieve
+    assert thoroughness.reason == "thoroughness_without_gap"
+    assert not neutral.should_retrieve
+    assert not neutral.is_redundant
+    assert neutral.reason == "no_clear_gap"
 
 
 def test_classifier_allows_targeted_or_raw_requests() -> None:

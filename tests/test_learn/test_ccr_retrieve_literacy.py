@@ -93,10 +93,10 @@ def test_analyzer_skips_targeted_retrieve_requests(_mock_call_llm, tmp_path: Pat
     "headroom.learn.analyzer._call_llm",
     return_value={"context_file_rules": [], "memory_file_rules": []},
 )
-def test_analyzer_emits_rule_for_thoroughness_retrieve_even_with_query(
+def test_analyzer_emits_rule_for_thoroughness_retrieve_with_nonspecific_query(
     _mock_call_llm, tmp_path: Path
 ) -> None:
-    tool_call = _retrieve_call(2, query="auth middleware")
+    tool_call = _retrieve_call(2, query="just to be safe")
     session = SessionData(
         session_id="s1",
         tool_calls=[tool_call],
@@ -113,6 +113,30 @@ def test_analyzer_emits_rule_for_thoroughness_retrieve_even_with_query(
     result = SessionAnalyzer(model="test-model").analyze(_project(tmp_path), [session])
 
     assert any(rec.section == LEARN_SECTION for rec in result.recommendations)
+
+
+@patch(
+    "headroom.learn.analyzer._call_llm",
+    return_value={"context_file_rules": [], "memory_file_rules": []},
+)
+def test_analyzer_skips_verify_requests_with_specific_query(_mock_call_llm, tmp_path: Path) -> None:
+    tool_call = _retrieve_call(2, query="auth middleware")
+    session = SessionData(
+        session_id="s1",
+        tool_calls=[tool_call],
+        events=[
+            SessionEvent(
+                type="user_message",
+                msg_index=1,
+                text="Verify the auth middleware result",
+            ),
+            SessionEvent(type="tool_call", msg_index=2, tool_call=tool_call),
+        ],
+    )
+
+    result = SessionAnalyzer(model="test-model").analyze(_project(tmp_path), [session])
+
+    assert all(rec.section != LEARN_SECTION for rec in result.recommendations)
 
 
 @patch(

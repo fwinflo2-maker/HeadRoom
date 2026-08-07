@@ -22,6 +22,81 @@ _THOROUGHNESS_PATTERNS = (
     re.compile(r"\bverify\b"),
 )
 
+_GENERIC_QUERY_TOKENS = frozenset(
+    {
+        "a",
+        "about",
+        "again",
+        "all",
+        "an",
+        "and",
+        "any",
+        "anything",
+        "at",
+        "be",
+        "careful",
+        "carefully",
+        "check",
+        "checked",
+        "checking",
+        "confirm",
+        "confirming",
+        "content",
+        "contents",
+        "correct",
+        "correctness",
+        "data",
+        "detail",
+        "details",
+        "double",
+        "everything",
+        "for",
+        "from",
+        "in",
+        "info",
+        "information",
+        "it",
+        "its",
+        "just",
+        "make",
+        "more",
+        "nothing",
+        "of",
+        "ok",
+        "okay",
+        "on",
+        "or",
+        "output",
+        "outputs",
+        "payload",
+        "please",
+        "response",
+        "responses",
+        "rest",
+        "result",
+        "results",
+        "safe",
+        "some",
+        "stuff",
+        "summary",
+        "sure",
+        "that",
+        "the",
+        "these",
+        "thing",
+        "things",
+        "this",
+        "thorough",
+        "thoroughly",
+        "those",
+        "to",
+        "verified",
+        "verify",
+        "verifying",
+        "with",
+    }
+)
+
 _CONCRETE_GAP_PATTERNS = (
     re.compile(r"\braw\b"),
     re.compile(r"\boriginal\b"),
@@ -158,6 +233,13 @@ def classify_retrieve_need(user_text: str, query: str | None = None) -> Retrieve
             reason="explicit_raw_or_exact_request",
         )
 
+    if _is_specific_query_hint(query_text):
+        return RetrieveNeedAssessment(
+            should_retrieve=True,
+            is_redundant=False,
+            reason="specific_followup_with_query_hint",
+        )
+
     if _matches(_THOROUGHNESS_PATTERNS, normalized):
         return RetrieveNeedAssessment(
             should_retrieve=False,
@@ -165,18 +247,18 @@ def classify_retrieve_need(user_text: str, query: str | None = None) -> Retrieve
             reason="thoroughness_without_gap",
         )
 
-    if query_text:
-        return RetrieveNeedAssessment(
-            should_retrieve=True,
-            is_redundant=False,
-            reason="specific_followup_with_query_hint",
-        )
-
     return RetrieveNeedAssessment(
         should_retrieve=False,
         is_redundant=False,
         reason="no_clear_gap",
     )
+
+
+def _is_specific_query_hint(query_text: str) -> bool:
+    # A hint earns precedence over thoroughness wording only when it names something
+    # beyond that same wording; otherwise it carries no gap the prose did not already.
+    tokens = re.findall(r"[a-z0-9]+", query_text.lower())
+    return any(token not in _GENERIC_QUERY_TOKENS for token in tokens)
 
 
 def _normalize(text: str) -> str:

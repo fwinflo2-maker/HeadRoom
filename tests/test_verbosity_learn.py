@@ -472,3 +472,40 @@ class TestGrokSignalExtraction:
         assert len(responses) == 1
         assert responses[0].has_tools is True
         assert responses[0].model == "grok-composer-2.5-fast"
+
+
+    def test_turn_completed_backfills_tokens_after_user_flush(self, tmp_path):
+        """If usage lands after the next user turn started, still attach tokens."""
+        long = " ".join(["word"] * 50)
+        p = _write_grok_session(
+            tmp_path,
+            "sess3",
+            [
+                _grok_update(
+                    "user_message_chunk",
+                    ts=1.0,
+                    content={"type": "text", "text": "ask"},
+                    _meta={"modelId": "deepseek/deepseek-v4-flash"},
+                ),
+                _grok_update(
+                    "agent_message_chunk",
+                    ts=2.0,
+                    content={"type": "text", "text": long},
+                ),
+                # Next user arrives before turn_completed (unusual but possible).
+                _grok_update(
+                    "user_message_chunk",
+                    ts=3.0,
+                    content={"type": "text", "text": "next"},
+                ),
+                _grok_update(
+                    "turn_completed",
+                    ts=4.0,
+                    usage={"inputTokens": 1000, "outputTokens": 42},
+                ),
+            ],
+        )
+        responses, _, _ = _parse_session(p)
+        assert len(responses) == 1
+        assert responses[0].output_tokens == 42
+        assert responses[0].input_tokens == 1000

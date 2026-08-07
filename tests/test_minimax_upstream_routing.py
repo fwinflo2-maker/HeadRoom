@@ -22,9 +22,35 @@ import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 from headroom.proxy.handlers.minimax import MiniMaxHandlerMixin
+from headroom.proxy.server import HeadroomProxy
+
+
+class _CapturingClient:
+    def __init__(self) -> None:
+        self.headers: dict[str, str] = {}
+
+    async def post(self, url: str, **kwargs) -> httpx.Response:  # noqa: ANN003
+        self.headers = dict(kwargs["headers"])
+        return httpx.Response(200, request=httpx.Request("POST", url), json={"ok": True})
+
+
+def _retry_proxy(*, minimax_api_key: str) -> tuple[HeadroomProxy, _CapturingClient]:
+    proxy = object.__new__(HeadroomProxy)
+    client = _CapturingClient()
+    proxy.http_client = client
+    proxy.config = SimpleNamespace(
+        minimax_api_key=minimax_api_key,
+        minimax_session_token=None,
+        retry_enabled=False,
+        retry_max_attempts=1,
+        retry_base_delay_ms=0,
+        retry_max_delay_ms=0,
+    )
+    return proxy, client
 
 
 class TestStripMiniMaxPrefix:
@@ -163,3 +189,34 @@ class TestResolveMiniMaxUpstreamUrl:
             "Regression: minimax_api_url is being ignored, "
             "MiniMax traffic is falling back to Anthropic"
         )
+
+
+@pytest.mark.asyncio
+async def test_minimax_api_key_is_not_sent_to_non_minimax_upstream(monkeypatch) -> None:
+    monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+    proxy, client = _retry_proxy(minimax_api_key="minimax-secret")
+
+    await proxy._retry_request(
+        "POST",
+        "https://api.anthropic.com/v1/messages",
+        {"authorization": "Bearer anthropic-secret"},
+        {"model": "claude-sonnet-4-5", "messages": []},
+    )
+
+    assert "x-api-key" not in client.headers
+    assert client.headers["authorization"] == "Bearer anthropic-secret"
+
+
+@pytest.mark.asyncio
+async def test_minimax_api_key_is_sent_to_direct_minimax_upstream(monkeypatch) -> None:
+    monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+    proxy, client = _retry_proxy(minimax_api_key="minimax-secret")
+
+    await proxy._retry_request(
+        "POST",
+        "https://api.minimaxi.com/anthropic/v1/messages",
+        {},
+        {"model": "MiniMax-M3", "messages": []},
+    )
+
+    assert client.headers["x-api-key"] == "minimax-secret"

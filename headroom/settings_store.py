@@ -697,6 +697,22 @@ SETTINGS: tuple[SettingField, ...] = (
 )
 
 _BY_KEY: dict[str, SettingField] = {f.key: f for f in SETTINGS}
+_BY_ENV: dict[str, SettingField] = {f.env: f for f in SETTINGS}
+
+
+def _normalize_keys(values: dict[str, Any]) -> dict[str, Any]:
+    """Rewrite any HEADROOM_* env-name key to its canonical registry key.
+
+    Keys already in canonical form, or genuinely unknown keys, pass through
+    unchanged so callers can still surface an ``unknown_keys`` error for them.
+    """
+    out: dict[str, Any] = {}
+    for key, value in values.items():
+        if key not in _BY_KEY and key in _BY_ENV:
+            out[_BY_ENV[key].key] = value
+        else:
+            out[key] = value
+    return out
 
 
 class SettingsValidationError(Exception):
@@ -792,6 +808,7 @@ def validate(values: dict[str, Any]) -> dict[str, Any]:
     Raises :class:`SettingsValidationError` when any key is unknown or any value
     fails coercion. Returns the coerced dict (``None`` values dropped) on success.
     """
+    values = _normalize_keys(values)
     unknown = [key for key in values if key not in _BY_KEY]
     field_errors: dict[str, str] = {}
     coerced: dict[str, Any] = {}
@@ -879,6 +896,7 @@ def save(values: dict[str, Any]) -> None:
     secret's display value verbatim when the user hasn't touched it; anything
     else is validated/coerced and stored.
     """
+    values = _normalize_keys(values)
     clear_keys = {key for key, value in values.items() if value is None and key in _BY_KEY}
     retained_keys = {
         key

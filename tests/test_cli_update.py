@@ -41,8 +41,22 @@ def test_detect_editable(monkeypatch):
 
 def test_detect_docker(monkeypatch):
     monkeypatch.setattr(up, "_in_docker", lambda: True)
+    monkeypatch.setattr(up, "_in_virtualenv", lambda: False)
     m = up.detect_install_method()
     assert m.kind == "docker" and m.can_self_update is False
+
+
+def test_detect_docker_in_venv_bypasses_docker_refuse(monkeypatch):
+    """A pip/venv install inside a container must not be blocked by the docker guard.
+
+    The docker check is there for Headroom-managed images; it must not prevent
+    self-update for a plain ``pip install`` into a venv that happens to run inside
+    a container (devcontainer, Codespace, self-hosted LXC, …).
+    """
+    monkeypatch.setattr(up, "_in_docker", lambda: True)
+    monkeypatch.setattr(up, "_in_virtualenv", lambda: True)
+    m = up.detect_install_method()
+    assert m.kind == "pip" and m.can_self_update is True
 
 
 def test_detect_pipx_by_path(monkeypatch):

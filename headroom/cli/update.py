@@ -351,12 +351,14 @@ def detect_install_method(extras: str | None = None) -> InstallMethod:
                 "reinstall with `pip install -U --force-reinstall .`."
             ),
         )
-    if _in_docker():
+    if _in_docker() and not _in_virtualenv():
         return InstallMethod(
             kind="docker",
             can_self_update=False,
             guidance=(
                 "Running inside a container — pull a newer Headroom image instead of self-updating."
+                " If Headroom was pip/pipx-installed into a venv inside this container,"
+                " activate that venv and run `pip install -U headroom-ai` directly."
             ),
         )
 

@@ -66,6 +66,83 @@ def get_store(db_path: str) -> SQLiteMemoryStore:
     return SQLiteMemoryStore(db_path)
 
 
+def _remove_from_search_indexes(db_path: str, memory_ids: list[str]) -> None:
+    """Remove specific memories from FTS5 and vector search indexes.
+
+    Best-effort: silently skips if an index doesn't exist or cannot be opened
+    (e.g. sqlite-vec not installed). Must be called after the primary store
+    delete so the server cannot serve stale results on next startup.
+    """
+    if not memory_ids:
+        return
+
+    import sqlite3
+
+    db = Path(db_path)
+
+    # FTS5 table lives in the same memory.db file.
+    try:
+        with sqlite3.connect(str(db)) as conn:
+            # Delete in chunks so the IN clause doesn't exceed SQLite's limit.
+            for i in range(0, len(memory_ids), 500):
+                chunk = memory_ids[i : i + 500]
+                placeholders = ",".join("?" * len(chunk))
+                conn.execute(
+                    f"DELETE FROM memory_fts WHERE memory_id IN ({placeholders})",
+                    chunk,
+                )
+            conn.commit()
+    except Exception:
+        pass
+
+    # Vector DB is a sibling file: memory.db -> memory_vectors.db.
+    vector_db = db.parent / f"{db.stem}_vectors.db"
+    if not vector_db.exists():
+        return
+    try:
+        with sqlite3.connect(str(vector_db)) as conn:
+            for i in range(0, len(memory_ids), 500):
+                chunk = memory_ids[i : i + 500]
+                placeholders = ",".join("?" * len(chunk))
+                rows = conn.execute(
+                    f"SELECT rowid FROM vec_metadata WHERE memory_id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                rowids = [r[0] for r in rows]
+                if rowids:
+                    rph = ",".join("?" * len(rowids))
+                    conn.execute(f"DELETE FROM vec_embeddings WHERE rowid IN ({rph})", rowids)
+                    conn.execute(f"DELETE FROM vec_metadata WHERE rowid IN ({rph})", rowids)
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _clear_all_search_indexes(db_path: str) -> None:
+    """Truncate both search indexes after a full purge. Best-effort."""
+    import sqlite3
+
+    db = Path(db_path)
+
+    try:
+        with sqlite3.connect(str(db)) as conn:
+            conn.execute("DELETE FROM memory_fts")
+            conn.commit()
+    except Exception:
+        pass
+
+    vector_db = db.parent / f"{db.stem}_vectors.db"
+    if not vector_db.exists():
+        return
+    try:
+        with sqlite3.connect(str(vector_db)) as conn:
+            conn.execute("DELETE FROM vec_embeddings")
+            conn.execute("DELETE FROM vec_metadata")
+            conn.commit()
+    except Exception:
+        pass
+
+
 def _resolve_memory(store: SQLiteMemoryStore, memory_id: str) -> Memory:
     """Resolve an exact or unambiguous partial memory ID."""
     memory = asyncio.run(store.get(memory_id))
@@ -620,10 +697,26 @@ def edit_memory(
                 mem = matches[0]
 
         # Update fields
+        content_changed = content is not None and content != mem.content
         if content is not None:
             mem.content = content
         if importance is not None:
             mem.importance = importance
+
+        if content_changed:
+            # Clear the stale embedding so the memory MCP server re-embeds on
+            # next startup. Also remove the old FTS5 and vector index entries
+            # now to avoid serving stale search results until then.
+            mem.embedding = None
+            _remove_from_search_indexes(db_path, [mem.id])
+            # Re-index FTS5 immediately with new content (no embedder needed).
+            try:
+                from ..memory.adapters.fts5 import FTS5TextIndex
+
+                fts = FTS5TextIndex(db_path=db_path)
+                asyncio.run(fts.index_memory(mem))
+            except Exception:
+                pass
 
         # Save
         asyncio.run(store.save(mem))
@@ -775,6 +868,7 @@ def delete_memories(
 
         # Delete
         deleted = asyncio.run(store.delete_batch(resolved_ids))
+        _remove_from_search_indexes(db_path, resolved_ids)
         print_success(f"Deleted {deleted} memory(ies).")
 
     except click.Abort:
@@ -897,6 +991,7 @@ def prune_memories(
         # Delete
         ids_to_delete = [m.id for m in memories]
         deleted = asyncio.run(store.delete_batch(ids_to_delete))
+        _remove_from_search_indexes(db_path, ids_to_delete)
         print_success(f"Deleted {deleted} memory(ies).")
 
     except click.BadParameter as e:
@@ -952,6 +1047,7 @@ def purge_memories(ctx: click.Context, db_path: str, confirm_flag: bool) -> None
 
         # Purge
         deleted = asyncio.run(store.clear_all())
+        _clear_all_search_indexes(db_path)
         print_success(f"Purged {deleted} memory(ies).")
 
     except click.Abort:

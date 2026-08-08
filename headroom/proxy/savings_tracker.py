@@ -164,6 +164,16 @@ def _normalize_model(value: Any) -> str:
     return cleaned or MODEL_UNKNOWN
 
 
+# `_resolve_litellm_model` is called on every savings-tracking update (i.e.
+# every request). For a model LiteLLM can't price (a custom / local / gateway
+# name), the uncached fallback below calls `litellm.cost_per_token` purely to
+# probe resolvability, which prints LiteLLM's noisy "Provider List:
+# https://docs.litellm.ai/docs/providers" banner on every failed probe (#2851).
+# Cache the resolution per model name so that probe runs once per process,
+# mirroring `_resolved_model_cache` in `headroom.pricing.litellm_pricing`.
+_model_resolution_cache: dict[str, str] = {}
+
+
 def _resolve_litellm_model(model: str) -> str:
     """Resolve model name to one LiteLLM recognizes.
 
@@ -173,7 +183,18 @@ def _resolve_litellm_model(model: str) -> str:
     "claude-opus" identically to the live /stats path. Uses the shared result
     only when it maps to a priced model_cost key; otherwise falls through to the
     bare-prefix logic below. Fail-soft: pricing never breaks bookkeeping.
+
+    Cached per model name — see ``_model_resolution_cache`` above.
     """
+    if model in _model_resolution_cache:
+        return _model_resolution_cache[model]
+
+    resolved = _resolve_litellm_model_uncached(model)
+    _model_resolution_cache[model] = resolved
+    return resolved
+
+
+def _resolve_litellm_model_uncached(model: str) -> str:
     litellm = _get_litellm_module()
     if litellm is None:
         return model

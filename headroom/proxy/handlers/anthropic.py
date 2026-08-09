@@ -2681,9 +2681,7 @@ class AnthropicHandlerMixin:
                 # Keep the PR's session memoization inside the worker thread so
                 # repeated recounts retain their savings without blocking the loop.
                 original_tokens = await asyncio.to_thread(_count_msgs, _orig_snapshot)
-                optimized_tokens = await asyncio.to_thread(
-                    _count_msgs, optimized_messages
-                )
+                optimized_tokens = await asyncio.to_thread(_count_msgs, optimized_messages)
                 # Fold the tool-schema/desc compaction delta into BOTH endpoints so
                 # tok_before - tok_after == tok_saved stays coherent in the PERF line
                 # (count_messages never sees tool bytes). Same shape as the OpenAI chat

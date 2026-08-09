@@ -25,7 +25,7 @@ from headroom.subscription.models import WindowTokens
 
 logger = logging.getLogger(__name__)
 
-# Maximum bytes to read per transcript file (10 MB cap — generous, typical files <1 MB)
+# Maximum recent bytes to read per transcript file (10 MB cap — typical files <1 MB)
 _MAX_FILE_BYTES = 10 * 1024 * 1024
 
 # Sonnet-normalised model family weights
@@ -82,10 +82,24 @@ def _walk_jsonl(directory: Path, results: list[Path]) -> None:
 
 def _read_transcript_lines(path: Path) -> list[str]:
     try:
-        size = path.stat().st_size
-        read_size = min(size, _MAX_FILE_BYTES)
         with path.open("rb") as fh:
-            raw = fh.read(read_size)
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            start = max(0, size - _MAX_FILE_BYTES)
+            if start > 0:
+                fh.seek(start - 1)
+                starts_at_line_boundary = fh.read(1) == b"\n"
+            else:
+                fh.seek(0)
+                starts_at_line_boundary = True
+            raw = fh.read(_MAX_FILE_BYTES)
+
+        if not starts_at_line_boundary:
+            separator = raw.find(b"\n")
+            if separator < 0:
+                return []
+            raw = raw[separator + 1 :]
+
         return [line for line in raw.decode("utf-8", errors="replace").splitlines() if line.strip()]
     except Exception:
         return []
@@ -122,6 +136,16 @@ def compute_window_tokens(start_ts: float, end_ts: float) -> WindowTokens:
     unattributed = WindowTokens()
 
     for path in find_transcript_files():
+        # Skip transcripts that cannot contain entries inside the window.
+        # Transcripts are append-only and chronological, so a file whose mtime is
+        # older than the window start has no entry within [start_ts, end_ts).
+        # Without this guard every poll json.loads()es every line of every
+        # transcript under ~/.claude/projects.
+        try:
+            if path.stat().st_mtime < start_ts:
+                continue
+        except OSError:
+            continue
         for line in _read_transcript_lines(path):
             try:
                 entry: dict[str, Any] = json.loads(line)

@@ -413,6 +413,40 @@ PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
 }
 
 
+# How long an upstream call may go silent before we give up on it.
+#
+# WHY THIS EXISTS. There was no timeout here at all, so a request the upstream
+# never answered blocked its caller forever. Observed 2026-08-07 under load:
+# four agent workers sat on ESTABLISHED connections for 36+ minutes while this
+# proxy answered /readyz in 0.11s. No error, no retry, no log line -- the
+# client just stops. That is the worst shape a failure can take, because it is
+# indistinguishable from slow work and no supervisor can tell the difference.
+#
+# A float, not an httpx.Timeout, on purpose: litellm expands a float into all
+# four httpx phases, so for a STREAMING call this becomes the maximum gap
+# BETWEEN CHUNKS rather than a cap on total generation time. A long answer
+# streaming steadily is never cut off; a stalled one dies. That is the
+# semantic we want, and it falls out of the simpler type.
+#
+# 600s is deliberately generous -- long enough that no healthy call is at
+# risk, short enough that a hang surfaces within a coffee break instead of
+# never.
+UPSTREAM_TIMEOUT_ENV = "HEADROOM_UPSTREAM_TIMEOUT"
+DEFAULT_UPSTREAM_TIMEOUT = 600.0
+
+
+def _upstream_timeout() -> float:
+    """Seconds. Never raises; a junk env value must not disable the timeout."""
+    import os
+
+    try:
+        v = float(os.getenv(UPSTREAM_TIMEOUT_ENV, DEFAULT_UPSTREAM_TIMEOUT))
+    except (TypeError, ValueError):
+        return DEFAULT_UPSTREAM_TIMEOUT
+    # 0 or negative would mean "no timeout" to httpx, which is the bug.
+    return v if v > 0 else DEFAULT_UPSTREAM_TIMEOUT
+
+
 def get_provider_config(provider: str) -> ProviderConfig:
     """Get provider config, with fallback for unknown providers."""
     if provider in PROVIDER_REGISTRY:
@@ -925,6 +959,9 @@ class LiteLLMBackend(Backend):
             logger.debug(f"LiteLLM request: model={litellm_model}")
 
             # Make the call
+            # Bounded, always: an upstream that never answers must not
+            # block the caller forever. setdefault so an explicit value wins.
+            kwargs.setdefault("timeout", _upstream_timeout())
             response = await acompletion(**kwargs)
 
             # Convert to Anthropic format
@@ -1055,6 +1092,9 @@ class LiteLLMBackend(Backend):
             kwargs["stream_options"] = {"include_usage": True}
 
             # Stream content — blocks emitted dynamically based on response
+            # Bounded, always: an upstream that never answers must not
+            # block the caller forever. setdefault so an explicit value wins.
+            kwargs.setdefault("timeout", _upstream_timeout())
             response = await acompletion(**kwargs)
             output_tokens = 0
             current_block_index = -1
@@ -1283,6 +1323,9 @@ class LiteLLMBackend(Backend):
             logger.debug(f"LiteLLM OpenAI request: model={litellm_model}")
 
             # Make the call
+            # Bounded, always: an upstream that never answers must not
+            # block the caller forever. setdefault so an explicit value wins.
+            kwargs.setdefault("timeout", _upstream_timeout())
             response = await acompletion(**kwargs)
 
             # Build the usage block. LiteLLM normalizes prompt-cache stats from
@@ -1452,6 +1495,9 @@ class LiteLLMBackend(Backend):
                 elif headers.get("x-api-key"):
                     kwargs["api_key"] = headers["x-api-key"]
 
+            # Bounded, always: an upstream that never answers must not
+            # block the caller forever. setdefault so an explicit value wins.
+            kwargs.setdefault("timeout", _upstream_timeout())
             response = await acompletion(**kwargs)
 
             async for chunk in response:

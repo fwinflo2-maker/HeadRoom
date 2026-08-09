@@ -1986,27 +1986,31 @@ class AnthropicHandlerMixin:
                 # dropping the gate cannot start injecting into non-CCR
                 # conversations.
                 if configured_inject_tool:
-                    from headroom.proxy.helpers import (
-                        apply_session_sticky_ccr_tool,
-                        has_new_ccr_markers,
-                    )
+                    from headroom.proxy.helpers import apply_session_sticky_ccr_tool
 
-                    # #1850: markers replayed from the previously-forwarded
-                    # prefix (overlay_cached_prefix) are historical; only
-                    # markers NEW this turn may drive a first-time injection,
-                    # else a replayed marker injects the tool into a session
-                    # that never actually compressed.
-                    has_new_compressed_content = has_new_ccr_markers(
-                        current_detected_hashes=injector.detected_hashes,
-                        previous_forwarded_messages=prefix_tracker.get_last_forwarded_messages(),
-                        provider="anthropic",
-                    )
+                    # Inject whenever the request carries ANY CCR marker, new or
+                    # replayed from the frozen prefix. #1850 narrowed the
+                    # first-time gate to markers created THIS turn to avoid
+                    # arming a session that never compressed, but a replayed
+                    # marker is exactly as unredeemable as a fresh one: the agent
+                    # redeems hashes it was handed turns ago (project instructions
+                    # can even tell it to), and if `headroom_retrieve` is absent
+                    # Anthropic rejects the whole request with 400 "Tool reference
+                    # 'headroom_retrieve' not found in available tools" (#2766). A
+                    # present marker means the session HAS compressed, so this
+                    # cannot start injecting into non-CCR conversations. It is also
+                    # the cache-stable choice: toggling the tool in and out of the
+                    # tools array between turns is what busts the tools cache
+                    # segment, whereas injecting consistently whenever markers
+                    # exist keeps it stable. The `SessionCcrTracker` is
+                    # per-process, so a proxy restart mid-conversation makes live
+                    # sessions look fresh again, which is what re-armed the 400.
                     tools, ccr_tool_injected = apply_session_sticky_ccr_tool(
                         provider="anthropic",
                         session_id=session_id,
                         request_id=request_id,
                         existing_tools=tools,
-                        has_compressed_content_this_turn=has_new_compressed_content,
+                        has_compressed_content_this_turn=injector.has_compressed_content,
                     )
                     if ccr_tool_injected:
                         logger.debug(
@@ -2514,6 +2518,29 @@ class AnthropicHandlerMixin:
                 optimized_tokens = _count_msgs(body["messages"])
                 tokens_saved = max(0, original_tokens - optimized_tokens)
 
+            from headroom.proxy.helpers import (
+                anthropic_first_party_tool_search_supported,
+                strip_first_party_tool_search_tools_for_third_party_upstream,
+            )
+
+            _anthropic_target_base_url = upstream_base_url or self.ANTHROPIC_API_URL
+            _third_party_anthropic_upstream = provider_name == "anthropic" and (
+                not anthropic_first_party_tool_search_supported(_anthropic_target_base_url)
+            )
+            if _third_party_anthropic_upstream:
+                _tools_before_strip = body.get("tools")
+                _tools_after_strip = strip_first_party_tool_search_tools_for_third_party_upstream(
+                    _tools_before_strip,
+                    _anthropic_target_base_url,
+                )
+                if _tools_after_strip is not _tools_before_strip:
+                    body["tools"] = _tools_after_strip
+                    tools = _tools_after_strip
+                    tags["third_party_tool_search_stripped"] = max(
+                        0,
+                        len(_tools_before_strip) - len(_tools_after_strip),
+                    )
+
             # Server-side Tool Search (on by default; HEADROOM_TOOL_SEARCH=0 opts
             # out — the `coding` savings profile already seeded it on via
             # seed_proxy_env_defaults, so default-on here just makes the same
@@ -2529,12 +2556,13 @@ class AnthropicHandlerMixin:
             # bytes are excluded from context this turn); the response usage confirms it.
             #
             # FIRST-PARTY ANTHROPIC ONLY: the tool_search_tool_* type + defer_loading
-            # here use the first-party Claude API shape (GA, no beta header). Bedrock
-            # (``anthropic_backend``) and Vertex/gateway providers gate tool search
-            # differently, so scope the injection to provider "anthropic" over the
-            # direct API and leave those paths untouched.
+            # here use the first-party Claude API shape (GA, no beta header). Custom
+            # Anthropic-compatible gateways reject that shape, so third-party routes
+            # strip client-originated tool_search_tool_* entries above and skip
+            # Headroom's own injector here.
             if (
                 provider_name == "anthropic"
+                and anthropic_first_party_tool_search_supported(_anthropic_target_base_url)
                 and getattr(self, "anthropic_backend", None) is None
                 and os.environ.get("HEADROOM_TOOL_SEARCH", "1").strip().lower()
                 in ("1", "true", "yes", "on", "auto")
@@ -2647,8 +2675,15 @@ class AnthropicHandlerMixin:
             # turn-hook fold (optimized_messages is post-hook). Runs unconditionally.
             try:
                 _orig_snapshot = original_client_messages  # noqa: F821 (bound at request start)
-                original_tokens = _count_msgs(_orig_snapshot)
-                optimized_tokens = _count_msgs(optimized_messages)
+                # Off the event loop (#2810): both passes are CPU-bound real BPE
+                # since #2543, and running them inline stalled every other
+                # in-flight request on the same process (~1s on a 2.3 MB body).
+                # Keep the PR's session memoization inside the worker thread so
+                # repeated recounts retain their savings without blocking the loop.
+                original_tokens = await asyncio.to_thread(_count_msgs, _orig_snapshot)
+                optimized_tokens = await asyncio.to_thread(
+                    _count_msgs, optimized_messages
+                )
                 # Fold the tool-schema/desc compaction delta into BOTH endpoints so
                 # tok_before - tok_after == tok_saved stays coherent in the PERF line
                 # (count_messages never sees tool bytes). Same shape as the OpenAI chat
@@ -2742,7 +2777,11 @@ class AnthropicHandlerMixin:
                     parsed_original = json.loads(original_body_bytes)
                     if parsed_original != body:
                         body_mutation_tracker.mark_mutated("structural_diff_vs_original")
-                except (json.JSONDecodeError, ValueError):
+                # MemoryError is not a ValueError, so a re-parse spike on 1M-context
+                # bodies used to escape and abort an otherwise-fine request (#2768).
+                # This block is a safety net; marking mutated is already the safe
+                # outcome (it forces canonical re-serialization).
+                except (json.JSONDecodeError, ValueError, MemoryError, RecursionError):
                     body_mutation_tracker.mark_mutated("original_unparseable")
 
             if (

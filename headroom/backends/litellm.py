@@ -447,6 +447,47 @@ def _upstream_timeout() -> float:
     return v if v > 0 else DEFAULT_UPSTREAM_TIMEOUT
 
 
+# Providers that cannot possibly accept an Anthropic `sk-ant-` credential.
+#
+# Explicit, rather than the inverse "anything not Anthropic": an unrecognised
+# provider is usually a compatible or self-hosted gateway, and guessing wrong
+# there drops a key that WAS working. Bedrock/Vertex are absent because the
+# dispatch sites already skip them entirely (env-based auth).
+#
+# ponytail: a hand-kept tuple; grow it as targets are confirmed. A registry
+# lookup would be the upgrade if this ever outgrows a handful of entries.
+_REJECTS_ANTHROPIC_KEY = ("openai", "azure", "gemini")
+
+
+def _caller_key_travels_to(model: str, key: str) -> bool:
+    """Can this inbound credential authenticate the provider we are about to call?
+
+    The caller authenticates to the PROXY. A routing extension may then rewrite
+    the model across families mid-request (claude-opus-5 -> gpt-5-mini), and the
+    caller's key does not travel with that rewrite: we forward `sk-ant-...` to
+    OpenAI and earn a guaranteed 401, which reads downstream as "the cheap model
+    failed the task" rather than as the routing bug it is.
+
+    Only an unambiguous mismatch is refused. `sk-ant-` is Anthropic's documented
+    vendor-specific prefix, so it cannot authenticate one of the providers above.
+    Every other credential -- a plain Bearer token, an OpenAI-style `sk-` that a
+    dozen vendors also mint, anything aimed at a compatible or custom gateway --
+    is unclassifiable from the string alone and keeps the pass-through.
+
+    Returning False drops the api_key kwarg, so litellm falls back to the target
+    provider's own env credential: the only key that can work.
+    """
+    if not key.startswith("sk-ant-"):
+        return True
+    try:
+        from litellm import get_llm_provider
+
+        provider = (get_llm_provider(model)[1] or "").lower()
+    except Exception:  # noqa: BLE001 - unclassifiable model, keep pass-through
+        return True
+    return provider not in _REJECTS_ANTHROPIC_KEY
+
+
 def get_provider_config(provider: str) -> ProviderConfig:
     """Get provider config, with fallback for unknown providers."""
     if provider in PROVIDER_REGISTRY:
@@ -951,10 +992,14 @@ class LiteLLMBackend(Backend):
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                if auth_header.startswith("Bearer "):
-                    kwargs["api_key"] = auth_header[7:]
-                elif headers.get("x-api-key"):
-                    kwargs["api_key"] = headers["x-api-key"]
+                _caller_key = (
+                    auth_header[7:]
+                    if auth_header.startswith("Bearer ")
+                    else headers.get("x-api-key", "")
+                )
+                # Only forward it if it can actually authenticate the TARGET.
+                if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
+                    kwargs["api_key"] = _caller_key
 
             logger.debug(f"LiteLLM request: model={litellm_model}")
 
@@ -1059,10 +1104,14 @@ class LiteLLMBackend(Backend):
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                if auth_header.startswith("Bearer "):
-                    kwargs["api_key"] = auth_header[7:]
-                elif headers.get("x-api-key"):
-                    kwargs["api_key"] = headers["x-api-key"]
+                _caller_key = (
+                    auth_header[7:]
+                    if auth_header.startswith("Bearer ")
+                    else headers.get("x-api-key", "")
+                )
+                # Only forward it if it can actually authenticate the TARGET.
+                if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
+                    kwargs["api_key"] = _caller_key
 
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
@@ -1315,10 +1364,14 @@ class LiteLLMBackend(Backend):
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                if auth_header.startswith("Bearer "):
-                    kwargs["api_key"] = auth_header[7:]
-                elif headers.get("x-api-key"):
-                    kwargs["api_key"] = headers["x-api-key"]
+                _caller_key = (
+                    auth_header[7:]
+                    if auth_header.startswith("Bearer ")
+                    else headers.get("x-api-key", "")
+                )
+                # Only forward it if it can actually authenticate the TARGET.
+                if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
+                    kwargs["api_key"] = _caller_key
 
             logger.debug(f"LiteLLM OpenAI request: model={litellm_model}")
 
@@ -1490,10 +1543,14 @@ class LiteLLMBackend(Backend):
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                if auth_header.startswith("Bearer "):
-                    kwargs["api_key"] = auth_header[7:]
-                elif headers.get("x-api-key"):
-                    kwargs["api_key"] = headers["x-api-key"]
+                _caller_key = (
+                    auth_header[7:]
+                    if auth_header.startswith("Bearer ")
+                    else headers.get("x-api-key", "")
+                )
+                # Only forward it if it can actually authenticate the TARGET.
+                if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
+                    kwargs["api_key"] = _caller_key
 
             # Bounded, always: an upstream that never answers must not
             # block the caller forever. setdefault so an explicit value wins.

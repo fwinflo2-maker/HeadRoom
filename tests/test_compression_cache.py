@@ -17,7 +17,6 @@ def small_cache() -> CompressionCache:
     return CompressionCache(max_entries=3)
 
 
-
 class TestCompressionCacheRetention:
     def test_stable_hashes_are_bounded(self) -> None:
         cache = CompressionCache(max_entries=3)

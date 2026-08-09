@@ -357,8 +357,6 @@ def detect_install_method(extras: str | None = None) -> InstallMethod:
             can_self_update=False,
             guidance=(
                 "Running inside a container — pull a newer Headroom image instead of self-updating."
-                " If Headroom was pip/pipx-installed into a venv inside this container,"
-                " activate that venv and run `pip install -U headroom-ai` directly."
             ),
         )
 

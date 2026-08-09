@@ -69,9 +69,10 @@ def get_store(db_path: str) -> SQLiteMemoryStore:
 def _remove_from_search_indexes(db_path: str, memory_ids: list[str]) -> None:
     """Remove specific memories from FTS5 and vector search indexes.
 
-    Best-effort: silently skips if an index doesn't exist or cannot be opened
-    (e.g. sqlite-vec not installed). Must be called after the primary store
-    delete so the server cannot serve stale results on next startup.
+    FTS5 cleanup uses a bare sqlite3 connection (FTS5 is built-in).
+    Vector cleanup requires sqlite-vec to load the vec0 virtual-table
+    module; when not installed a warning is printed and the call returns
+    so callers are aware rather than silently leaving stale entries.
     """
     if not memory_ids:
         return
@@ -80,10 +81,9 @@ def _remove_from_search_indexes(db_path: str, memory_ids: list[str]) -> None:
 
     db = Path(db_path)
 
-    # FTS5 table lives in the same memory.db file.
+    # FTS5 table lives in the same memory.db file (built-in, no extension needed).
     try:
         with sqlite3.connect(str(db)) as conn:
-            # Delete in chunks so the IN clause doesn't exceed SQLite's limit.
             for i in range(0, len(memory_ids), 500):
                 chunk = memory_ids[i : i + 500]
                 placeholders = ",".join("?" * len(chunk))
@@ -92,15 +92,30 @@ def _remove_from_search_indexes(db_path: str, memory_ids: list[str]) -> None:
                     chunk,
                 )
             conn.commit()
-    except Exception:
-        pass
+    except Exception as exc:
+        print_warning(f"FTS5 index cleanup incomplete: {exc}")
 
     # Vector DB is a sibling file: memory.db -> memory_vectors.db.
+    # vec_embeddings is a vec0 virtual table — the sqlite-vec extension must be
+    # loaded on every connection before touching it.
     vector_db = db.parent / f"{db.stem}_vectors.db"
     if not vector_db.exists():
         return
+
+    try:
+        import sqlite_vec
+    except ImportError:
+        print_warning(
+            "sqlite-vec is not installed; stale vector index entries may remain. "
+            "Install with: pip install sqlite-vec"
+        )
+        return
+
     try:
         with sqlite3.connect(str(vector_db)) as conn:
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
             for i in range(0, len(memory_ids), 500):
                 chunk = memory_ids[i : i + 500]
                 placeholders = ",".join("?" * len(chunk))
@@ -114,12 +129,16 @@ def _remove_from_search_indexes(db_path: str, memory_ids: list[str]) -> None:
                     conn.execute(f"DELETE FROM vec_embeddings WHERE rowid IN ({rph})", rowids)
                     conn.execute(f"DELETE FROM vec_metadata WHERE rowid IN ({rph})", rowids)
             conn.commit()
-    except Exception:
-        pass
+    except Exception as exc:
+        print_warning(f"Vector index cleanup incomplete: {exc}")
 
 
 def _clear_all_search_indexes(db_path: str) -> None:
-    """Truncate both search indexes after a full purge. Best-effort."""
+    """Truncate both search indexes after a full purge.
+
+    Same extension-loading requirement as :func:`_remove_from_search_indexes`;
+    surfaces actionable warnings rather than silently skipping failures.
+    """
     import sqlite3
 
     db = Path(db_path)
@@ -128,19 +147,32 @@ def _clear_all_search_indexes(db_path: str) -> None:
         with sqlite3.connect(str(db)) as conn:
             conn.execute("DELETE FROM memory_fts")
             conn.commit()
-    except Exception:
-        pass
+    except Exception as exc:
+        print_warning(f"FTS5 index cleanup incomplete: {exc}")
 
     vector_db = db.parent / f"{db.stem}_vectors.db"
     if not vector_db.exists():
         return
+
+    try:
+        import sqlite_vec
+    except ImportError:
+        print_warning(
+            "sqlite-vec is not installed; stale vector index entries may remain. "
+            "Install with: pip install sqlite-vec"
+        )
+        return
+
     try:
         with sqlite3.connect(str(vector_db)) as conn:
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
             conn.execute("DELETE FROM vec_embeddings")
             conn.execute("DELETE FROM vec_metadata")
             conn.commit()
-    except Exception:
-        pass
+    except Exception as exc:
+        print_warning(f"Vector index cleanup incomplete: {exc}")
 
 
 def _resolve_memory(store: SQLiteMemoryStore, memory_id: str) -> Memory:

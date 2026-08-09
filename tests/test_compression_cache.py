@@ -31,9 +31,7 @@ class TestCompressionCacheRetention:
 
     def test_first_seen_is_bounded(self) -> None:
         cache = CompressionCache(max_entries=3)
-        hashes = [
-            CompressionCache.content_hash(f"first-seen-{index}") for index in range(4)
-        ]
+        hashes = [CompressionCache.content_hash(f"first-seen-{index}") for index in range(4)]
 
         for content_hash in hashes:
             cache.should_defer_compression(content_hash)
@@ -42,9 +40,7 @@ class TestCompressionCacheRetention:
         assert hashes[0] not in cache._first_seen
         assert hashes[-1] in cache._first_seen
 
-    def test_expired_first_seen_starts_new_window(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_expired_first_seen_starts_new_window(self, monkeypatch: pytest.MonkeyPatch) -> None:
         cache = CompressionCache(max_entries=3)
         content_hash = CompressionCache.content_hash("repeated content")
         timestamps = iter([1_000.0, 1_271.0, 1_272.0])
@@ -114,9 +110,7 @@ class TestCompressionCacheRetention:
         def worker(thread_id: int) -> None:
             try:
                 for index in range(100):
-                    content_hash = CompressionCache.content_hash(
-                        f"thread-{thread_id}-{index}"
-                    )
+                    content_hash = CompressionCache.content_hash(f"thread-{thread_id}-{index}")
                     cache.mark_stable(content_hash)
                     cache.should_defer_compression(content_hash)
             except Exception as exc:  # pragma: no cover

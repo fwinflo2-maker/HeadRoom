@@ -700,21 +700,6 @@ _BY_KEY: dict[str, SettingField] = {f.key: f for f in SETTINGS}
 _BY_ENV: dict[str, SettingField] = {f.env: f for f in SETTINGS}
 
 
-def _normalize_keys(values: dict[str, Any]) -> dict[str, Any]:
-    """Rewrite any HEADROOM_* env-name key to its canonical registry key.
-
-    Keys already in canonical form, or genuinely unknown keys, pass through
-    unchanged so callers can still surface an ``unknown_keys`` error for them.
-    """
-    out: dict[str, Any] = {}
-    for key, value in values.items():
-        if key not in _BY_KEY and key in _BY_ENV:
-            out[_BY_ENV[key].key] = value
-        else:
-            out[key] = value
-    return out
-
-
 class SettingsValidationError(Exception):
     """Raised when a settings payload has unknown keys or invalid values.
 
@@ -728,6 +713,49 @@ class SettingsValidationError(Exception):
         super().__init__(
             f"settings validation failed: unknown={unknown_keys} errors={field_errors}"
         )
+
+
+def _normalize_keys(values: dict[str, Any]) -> dict[str, Any]:
+    """Rewrite any HEADROOM_* env-name key to its canonical registry key.
+
+    Keys already in canonical form, or genuinely unknown keys, pass through
+    unchanged so callers can still surface an ``unknown_keys`` error for them.
+
+    Raises :class:`SettingsValidationError` when both the canonical key and its
+    env-name alias appear in the same payload with different values (e.g.
+    ``rpm=10`` and ``HEADROOM_RPM=20`` simultaneously).  Same-value duplicates
+    are silently deduplicated to the canonical key.
+    """
+    out: dict[str, Any] = {}
+    for key, value in values.items():
+        if key not in _BY_KEY and key in _BY_ENV:
+            canonical = _BY_ENV[key].key
+            if canonical in out and out[canonical] != value:
+                raise SettingsValidationError(
+                    [],
+                    {
+                        canonical: (
+                            f"conflicting values for {canonical!r} via canonical key"
+                            f" and env alias {key!r}: {out[canonical]!r} vs {value!r}"
+                        )
+                    },
+                )
+            out[canonical] = value
+        else:
+            if key in _BY_KEY:
+                env_alias = _BY_KEY[key].env
+                if env_alias in values and values[env_alias] != value:
+                    raise SettingsValidationError(
+                        [],
+                        {
+                            key: (
+                                f"conflicting values for {key!r} via canonical key"
+                                f" and env alias {env_alias!r}: {value!r} vs {values[env_alias]!r}"
+                            )
+                        },
+                    )
+            out[key] = value
+    return out
 
 
 def _coerce(field: SettingField, value: Any) -> Any:

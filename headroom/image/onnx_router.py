@@ -14,6 +14,7 @@ from __future__ import annotations
 import io
 import logging
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,18 @@ logger = logging.getLogger(__name__)
 
 _TECHNIQUE_ROUTER_REPO = "chopratejas/technique-router-onnx"
 _SIGLIP_ENCODER_REPO = "chopratejas/siglip-image-encoder-onnx"
+
+# The query classifier is a MiniLM INT8 graph over a fixed [1, 64] input (the
+# tokenizer pads to exactly 64 below), so it saturates after a handful of
+# threads. Left at ORT's default the pool scales with the core count and the
+# per-call cost grows without buying latency -- on a 20-core box that measured
+# 10.07 ms / 33.65 CPU-ms versus 8.57 ms / 20.76 CPU-ms at 4 threads.
+# Capped rather than fixed so smaller hosts keep ORT's own choice.
+_CLASSIFIER_MAX_INTRA_OP_THREADS = 4
+
+
+def _classifier_intra_op_threads() -> int:
+    return max(1, min(_CLASSIFIER_MAX_INTRA_OP_THREADS, os.cpu_count() or 1))
 
 
 # ImageSignals, RouteDecision, Technique imported from trained_router
@@ -64,7 +77,11 @@ class OnnxTechniqueRouter:
         model_path = hf_hub_download_local_first(_TECHNIQUE_ROUTER_REPO, "model_quantized.onnx")
         self._classifier_session = ort.InferenceSession(
             model_path,
-            create_cpu_session_options(ort),
+            create_cpu_session_options(
+                ort,
+                intra_op_num_threads=_classifier_intra_op_threads(),
+                inter_op_num_threads=1,
+            ),
             providers=["CPUExecutionProvider"],
         )
 

@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -150,6 +151,7 @@ class DirectMem0Adapter:
         """
         self._config = config or Mem0Config()
         self._mem0_client: Any = None
+        self._openai_client: Any = None
         self._embedder: Any = None
         self._neo4j_graph: Any = None
         self._neo4j_driver: Any = None
@@ -949,9 +951,68 @@ class DirectMem0Adapter:
         """Whether this backend supports vector search."""
         return True
 
-    async def close(self) -> None:
-        """Close connections and release resources."""
-        if self._neo4j_driver:
-            self._neo4j_driver.close()
+    async def close(self, timeout: float = 60.0) -> None:
+        """Drain background writes and close all initialized resources.
+
+        Args:
+            timeout: Maximum seconds to wait for background writes before
+                cancelling them.
+        """
+        if self._background_tasks:
+            task_items = list(self._background_tasks.items())
+            tasks = [task for _, task in task_items]
+            _, pending = await asyncio.wait(tasks, timeout=timeout)
+
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+            for task_id, task in task_items:
+                if task.cancelled():
+                    self._task_results[task_id] = {
+                        "status": "cancelled",
+                        "task_id": task_id,
+                    }
+                    continue
+
+                try:
+                    self._task_results[task_id] = {
+                        "status": "completed",
+                        "result": task.result(),
+                    }
+                except Exception as e:
+                    self._task_results[task_id] = {
+                        "status": "failed",
+                        "error": str(e),
+                    }
+            self._background_tasks.clear()
+
+        resources = [
+            ("Mem0 client", self._mem0_client),
+            ("OpenAI client", self._openai_client),
+            ("Qdrant client", self._qdrant_client),
+            ("Neo4j driver", self._neo4j_driver),
+            ("embedder", self._embedder),
+            ("Neo4j graph", self._neo4j_graph),
+        ]
         self._mem0_client = None
+        self._openai_client = None
+        self._qdrant_client = None
+        self._neo4j_driver = None
+        self._embedder = None
+        self._neo4j_graph = None
         self._initialized = False
+
+        for name, resource in resources:
+            if resource is None:
+                continue
+            close = getattr(resource, "close", None) or getattr(resource, "aclose", None)
+            if close is None:
+                continue
+            try:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as e:
+                logger.warning("Failed to close %s: %s", name, e)

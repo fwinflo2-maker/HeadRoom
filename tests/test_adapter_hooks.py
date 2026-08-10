@@ -148,6 +148,18 @@ class TestTOINBackendProtocol:
         assert loaded == {"version": "2.0", "new": True}
         assert "old" not in loaded
 
+    def test_save_writes_compact_json_not_pretty_printed(self, fs_backend, tmp_toin_path):
+        """Regression for issue #2886: pretty-printing (indent=2) roughly
+        doubles the on-disk size of a store that has no human reader and
+        can grow into the tens of GB. save() must write compact JSON —
+        one line, no indentation.
+        """
+        fs_backend.save({"version": "1.0", "patterns": {"a": 1, "b": 2}})
+        with open(tmp_toin_path) as f:
+            raw = f.read()
+        assert "\n" not in raw
+        assert json.loads(raw) == {"version": "1.0", "patterns": {"a": 1, "b": 2}}
+
 
 class TestCustomTOINBackend:
     """Verify any dict-based backend satisfies the protocol."""

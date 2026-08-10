@@ -60,12 +60,16 @@ class FileSystemTOINBackend:
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
 
-            json_data = json.dumps(data, indent=2)
-
             fd, tmp_path = tempfile.mkstemp(dir=self._path.parent, prefix=".toin_", suffix=".tmp")
             try:
+                # Stream directly into the temp file rather than building the
+                # full JSON string in memory first (json.dumps(...) then
+                # f.write(...)) — on a large store that doubled peak RSS
+                # during every autosave. No `indent`: this file has no human
+                # reader, and pretty-printing roughly doubles its size for a
+                # multi-GB store (issue #2886).
                 with open(fd, "w") as f:
-                    f.write(json_data)
+                    json.dump(data, f)
                 Path(tmp_path).replace(self._path)
             except Exception:
                 try:

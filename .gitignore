@@ -18,6 +18,10 @@ scripts/*
 !scripts/changelog-gen.py
 !scripts/verify-versions.py
 !scripts/verify-ruff-version.py
+# Developer-facing helpers for trying this PR locally: an installer plus one
+# run script per client. No credentials -- they read auth from `copilot-auth`.
+!scripts/local-dev/
+!scripts/local-dev/*
 !scripts/check_copilot_wiring.py
 !scripts/verify_copilot_model_routing.py
 !scripts/pr-governance.py

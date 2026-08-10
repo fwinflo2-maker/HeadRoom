@@ -95,8 +95,16 @@ def test_wrap_grok_build_passes_xai_openai_api_url(monkeypatch, tmp_path: Path) 
 
     assert result.exit_code == 0, result.output
     assert captured.get("openai_api_url") == DEFAULT_API_URL
-    assert captured.get("openai_api_url") == "https://api.x.ai"
-    assert DEFAULT_API_URL in result.output
+    # Equality on the constant (not substring containment) keeps CodeQL
+    # incomplete-url-substring-sanitization quiet while pinning the host.
+    assert DEFAULT_API_URL == "https://api.x.ai"
+    expected_upstream = f"  Proxy upstream (OpenAI-compatible): {DEFAULT_API_URL}"
+    upstream_lines = [
+        line
+        for line in result.output.splitlines()
+        if line.startswith("  Proxy upstream (OpenAI-compatible): ")
+    ]
+    assert upstream_lines == [expected_upstream]
 
 
 def test_wrap_rejects_retired_context_tool_flag(monkeypatch, tmp_path: Path) -> None:

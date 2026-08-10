@@ -113,8 +113,27 @@ _TOKENS_ANNOTATION_PATTERN = re.compile(r"\*~([\d,]+) tokens/session saved\*\n?"
 _PATTERN_ID_PATTERN = re.compile(r"<!--\s*headroom:pattern-id:([^\s>]+)\s*-->\s*$")
 
 
-def _merge_markdown_items(new_content: str, prior_content: str) -> str | None:
-    """Merge simple markdown bullets, preferring new text for stable IDs."""
+def _merge_markdown_items(
+    new_content: str,
+    prior_content: str,
+    active_item_ids: frozenset[str] | None = None,
+) -> str | None:
+    """Merge simple markdown bullets, preferring new text for stable IDs.
+
+    ``active_item_ids`` is the producing learner's authoritative set of ids
+    that are still alive — it must include the items that this batch omitted
+    only because of ranking or top-N capping, otherwise still-active advice
+    is deleted. When it is supplied, a prior item is carried forward only
+    while its `headroom:pattern-id` is in the set, so an expired or
+    tombstoned item is genuinely removed instead of being pinned forever.
+    Prior items with no id predate id tagging: a still-active one is
+    re-emitted by the current run with an id and collapses into that line by
+    visible text, so dropping the untagged leftovers removes only items the
+    learner no longer considers active.
+
+    Passing ``None`` means the producer exposes no lifecycle signal, and the
+    merge degrades to a plain union of new and prior items.
+    """
 
     def _items(content: str) -> list[tuple[str | None, str, str]] | None:
         lines = [line.strip() for line in content.splitlines() if line.strip()]
@@ -132,6 +151,11 @@ def _merge_markdown_items(new_content: str, prior_content: str) -> str | None:
     prior_items = _items(prior_content)
     if new_items is None or prior_items is None:
         return None
+
+    if active_item_ids is not None:
+        prior_items = [
+            item for item in prior_items if item[0] is not None and item[0] in active_item_ids
+        ]
 
     merged: list[str] = []
     seen_ids: set[str] = set()
@@ -205,6 +229,10 @@ def _merge_recommendations(
     whose headings do not reappear in the new run are carried forward so
     a re-run doesn't silently drop accumulated learnings. To fully rebuild
     the block, delete it manually and re-run.
+
+    Recommendations that opt into ``preserve_prior_items`` are merged at the
+    item level instead, bounded by their ``active_item_ids`` lifecycle signal
+    so prior items can still expire out of the file.
     """
     if not file_path.exists():
         return new_recommendations
@@ -219,6 +247,7 @@ def _merge_recommendations(
             merged_content = _merge_markdown_items(
                 recommendation.content,
                 prior_recommendation.content,
+                recommendation.active_item_ids,
             )
             if merged_content is not None:
                 recommendation = replace(recommendation, content=merged_content)

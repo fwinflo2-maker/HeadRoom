@@ -469,6 +469,75 @@ def test_unknown_identity_never_counts_as_a_match(
     assert _proxy_serves_same_copilot_seed(running_config, token) is False, why
 
 
+def test_anthropic_key_is_never_forwarded_to_another_vendor() -> None:
+    """The backstop that makes one shared proxy safe for Claude Code.
+
+    The Anthropic handler forwards the client's own ``x-api-key`` unchanged, and
+    the shared proxy's ``/v1/messages`` upstream is the Copilot host so the
+    Copilot CLI can drive Claude models. Without this check, a Claude Code
+    request that lost its upstream pin would hand the user's Anthropic key to
+    GitHub (reproduced live: Copilot answers ``missing required Authorization
+    header``, having already received it).
+    """
+    from headroom.proxy.handlers.anthropic import _is_anthropic_upstream
+
+    assert _is_anthropic_upstream("https://api.anthropic.com") is True
+    assert _is_anthropic_upstream(None) is True  # unset means the default
+    assert _is_anthropic_upstream("https://api.githubcopilot.com") is False
+    # Host-based, so a lookalike cannot smuggle the real host into a path or
+    # userinfo segment and be mistaken for Anthropic.
+    assert _is_anthropic_upstream("https://evil.example.com/api.anthropic.com") is False
+    assert _is_anthropic_upstream("https://api.anthropic.com.evil.example") is False
+    assert _is_anthropic_upstream("https://api.anthropic.com@evil.example") is False
+
+
+def test_claude_upstream_pin_only_fires_when_the_proxy_points_elsewhere(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pin Claude Code's own upstream, but only when sharing needs it.
+
+    Injecting the header unconditionally would put a redundant override on every
+    ordinary single-client session; never injecting it makes the shared proxy
+    unusable for Claude Code. It must key off what the running proxy actually
+    reports.
+    """
+    import headroom.cli.wrap as wrap_mod
+
+    def fake_proxy(config: dict | None):
+        monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda port: {"config": config})
+        monkeypatch.setattr(wrap_mod, "_proxy_health_config", lambda payload: config)
+
+    # Shared proxy pinned at Copilot -> pin this client back to Anthropic.
+    fake_proxy({"anthropic_api_url": "https://api.githubcopilot.com"})
+    env: dict[str, str] = {}
+    assert wrap_mod._apply_anthropic_upstream_pin_env(env, port=8970) == "https://api.anthropic.com"
+    assert "X-Headroom-Base-Url: https://api.anthropic.com" in env["ANTHROPIC_CUSTOM_HEADERS"]
+
+    # An ordinary Anthropic-pointed proxy needs no override.
+    fake_proxy({"anthropic_api_url": "https://api.anthropic.com"})
+    env = {}
+    assert wrap_mod._apply_anthropic_upstream_pin_env(env, port=8970) is None
+    assert env == {}
+
+    # No proxy running, nothing to share with.
+    fake_proxy(None)
+    env = {}
+    assert wrap_mod._apply_anthropic_upstream_pin_env(env, port=8970) is None
+    assert env == {}
+
+    # A user's own override always wins, and existing headers are preserved.
+    fake_proxy({"anthropic_api_url": "https://api.githubcopilot.com"})
+    env = {"ANTHROPIC_CUSTOM_HEADERS": "X-Headroom-Base-Url: https://my-gateway.example"}
+    assert wrap_mod._apply_anthropic_upstream_pin_env(env, port=8970) is None
+    assert env["ANTHROPIC_CUSTOM_HEADERS"] == "X-Headroom-Base-Url: https://my-gateway.example"
+
+    fake_proxy({"anthropic_api_url": "https://api.githubcopilot.com"})
+    env = {"ANTHROPIC_CUSTOM_HEADERS": "X-Headroom-Project: demo"}
+    assert wrap_mod._apply_anthropic_upstream_pin_env(env, port=8970) == "https://api.anthropic.com"
+    assert "X-Headroom-Project: demo" in env["ANTHROPIC_CUSTOM_HEADERS"]
+    assert "X-Headroom-Base-Url: https://api.anthropic.com" in env["ANTHROPIC_CUSTOM_HEADERS"]
+
+
 def test_schema_required_fields_are_always_present(payload: dict) -> None:
     """A model missing these yields NaN token limits rather than a visible error."""
     for entry in build_model_entries(payload, BASE):

@@ -2699,6 +2699,56 @@ def _apply_project_header_env(env: dict[str, str]) -> None:
         env["ANTHROPIC_CUSTOM_HEADERS"] = header_line
 
 
+#: Anthropic's real API host — what Claude Code's traffic must reach.
+_ANTHROPIC_DEFAULT_UPSTREAM = "https://api.anthropic.com"
+#: Per-request upstream override honoured by the proxy's ``/v1/messages`` route.
+_ANTHROPIC_UPSTREAM_PIN_HEADER = "X-Headroom-Base-Url"
+
+
+def _apply_anthropic_upstream_pin_env(env: dict[str, str], *, port: int) -> str | None:
+    """Let Claude Code share a proxy whose Anthropic upstream points elsewhere.
+
+    A proxy has exactly one destination for ``/v1/messages``. ``wrap copilot
+    --native`` pins that at the Copilot host so the CLI can drive Claude models,
+    which is also what makes that proxy unsafe for Claude Code by default: the
+    Anthropic handler forwards the client's own ``x-api-key`` unchanged, so
+    sharing would hand the user's Anthropic key to GitHub (reproduced: Copilot
+    answers ``missing required Authorization header``).
+
+    Claude Code attaches custom headers to every API request, and the proxy's
+    ``/v1/messages`` route honours a per-request upstream override. Setting it
+    routes this client's traffic to Anthropic regardless of where the shared
+    proxy points (reproduced: the same request then reaches Anthropic and is
+    answered by Anthropic's own error shape). That is what makes one proxy for
+    the Copilot CLI, VS Code *and* Claude Code safe rather than merely possible.
+
+    No-ops when the proxy is absent or already Anthropic-pinned, so the ordinary
+    single-client setup is untouched. A user-supplied override always wins.
+    Returns the pinned upstream when one was written, for the caller to report.
+    """
+    try:
+        helpers = _live_wrap_module()
+        running = helpers._proxy_health_config(helpers._query_proxy_health(port))
+    except Exception:  # noqa: BLE001 — never block a launch on this probe
+        return None
+    if not running:
+        return None
+    current = _normalize_proxy_api_url(running.get("anthropic_api_url"))
+    if current is None or current == _normalize_proxy_api_url(_ANTHROPIC_DEFAULT_UPSTREAM):
+        return None
+
+    header_line = f"{_ANTHROPIC_UPSTREAM_PIN_HEADER}: {_ANTHROPIC_DEFAULT_UPSTREAM}"
+    existing = env.get("ANTHROPIC_CUSTOM_HEADERS")
+    if existing:
+        for line in existing.splitlines():
+            if line.split(":", 1)[0].strip().lower() == _ANTHROPIC_UPSTREAM_PIN_HEADER.lower():
+                return None  # user override wins
+        env["ANTHROPIC_CUSTOM_HEADERS"] = f"{existing}\n{header_line}"
+    else:
+        env["ANTHROPIC_CUSTOM_HEADERS"] = header_line
+    return _ANTHROPIC_DEFAULT_UPSTREAM
+
+
 # Codex's own built-in providers plus Headroom's injected one — never treated
 # as a "custom upstream to preserve" by _detect_custom_codex_upstream_base_url.
 _CODEX_BUILTIN_PROVIDER_NAMES = frozenset({"openai", "anthropic", "azure", "headroom"})
@@ -5188,6 +5238,15 @@ def claude(
         # Per-project savings attribution: tag every request with the launch
         # directory's name via X-Headroom-Project (user override wins).
         _apply_project_header_env(env)
+
+        # Sharing a Copilot-pinned proxy (the CLI + VS Code central proxy) is
+        # only safe once this client's own upstream is pinned per request.
+        _pinned_upstream = _apply_anthropic_upstream_pin_env(env, port=port)
+        if _pinned_upstream:
+            click.echo(
+                f"  Sharing a proxy pinned elsewhere; this session's Anthropic "
+                f"traffic is pinned to {_pinned_upstream}"
+            )
 
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.

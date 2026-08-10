@@ -58,8 +58,11 @@ if (-not (Test-Path $Path)) { Write-Bad "Path not found: $Path"; exit 1 }
 Push-Location $Path
 try { $branch = (git rev-parse --abbrev-ref HEAD 2>$null) } catch { $branch = $null }
 Pop-Location
-if ($branch -eq 'feat/vscode-copilot-chat-byok') { Write-Ok "on branch $branch" }
-elseif ($branch)                                 { Write-Warn "on branch '$branch' (expected feat/vscode-copilot-chat-byok)" }
+# The VS Code work now lives on the PR branch; the old feature branch still
+# works for anyone who has not merged.
+$expectedBranches = @('fix/copilot-responses-mixed-model-routing', 'feat/vscode-copilot-chat-byok')
+if ($expectedBranches -contains $branch) { Write-Ok "on branch $branch" }
+elseif ($branch) { Write-Warn "on branch '$branch' (expected $($expectedBranches[0]))" }
 
 if (-not (& headroom wrap vscode-chat --help 2>&1 | Select-String -Quiet 'vscode-chat|Usage')) {
     Write-Bad "'headroom wrap vscode-chat' is unavailable - wrong branch or stale install."
@@ -137,10 +140,30 @@ if (-not $ready) {
 }
 Write-Ok "proxy healthy on http://127.0.0.1:$Port"
 
+# Health is NOT the condition this script needs. When attaching to a proxy that
+# is already up, /health answers immediately while the wrap session is still
+# resolving the model catalog and writing the config -- so reading the file here
+# found nothing, and the script gave up before it ever opened VS Code. Wait for
+# the models themselves, which is the thing step 4 actually checks.
+$modelsFile = Join-Path $userDir 'chatLanguageModels.json'
+Write-Host "    waiting for the chat models to be registered..." -ForegroundColor DarkGray
+$deadline = (Get-Date).AddSeconds(120)
+$registered = $false
+while ((Get-Date) -lt $deadline) {
+    $raw = Get-Content $modelsFile -Raw -ErrorAction SilentlyContinue
+    if ($raw -and $raw -match 'Headroom') { $registered = $true; break }
+    Start-Sleep -Milliseconds 1000
+}
+
 # --- 4. Verify what actually landed in the config --------------------------
 Write-Step "[4] Verifying VS Code config"
 
-$modelsFile = Join-Path $userDir 'chatLanguageModels.json'
+if (-not $registered) {
+    Write-Bad "the chat models were not registered within 2 minutes."
+    Write-Host "        Look at the 'HEADROOM - VS Code chat models' window - it prints" -ForegroundColor DarkGray
+    Write-Host "        the reason (auth, an unparseable config, or a BYOK entitlement)." -ForegroundColor DarkGray
+    exit 1
+}
 if (-not (Test-Path $modelsFile)) {
     Write-Bad "chatLanguageModels.json was not written. Check the proxy window."
     exit 1
@@ -229,10 +252,10 @@ Write-Host @"
 
    6. Watch the dashboard - savings should climb as you chat.
 
-  RUNNING BOTH AT ONCE:
-     Open another terminal and run .\Start-HeadroomCopilotCli.ps1
-     It attaches to the same proxy on port $Port - one dashboard, one total.
-     (Claude Code is separate on port 8972 - see Start-HeadroomClaudeCode.ps1)
+  RUNNING ALL THREE AT ONCE:
+     In other terminals: .\Start-HeadroomCopilotCli.ps1
+                         .\Start-HeadroomClaudeCode.ps1
+     Both attach to this same proxy on port $Port - one dashboard, one total.
 
   EXPECTED DIFFERENCES from stock Copilot Chat (not bugs):
    - Headroom models are a separate group, suffixed "(Headroom)".

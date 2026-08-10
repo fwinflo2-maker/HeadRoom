@@ -363,9 +363,10 @@ def test_generated_config_contains_no_credential_material(payload: dict, tmp_pat
 def test_responses_models_declare_zero_data_retention(payload: dict) -> None:
     """Without this, every /responses model 400s on first use.
 
-    VS Code sets `store: !zeroDataRetentionEnabled` on each /responses request and
-    Copilot's API rejects the field outright (`400 store is not supported`,
-    reproduced live). 8 of the 24 live models are served only on that wire.
+    VS Code sets `store: !zeroDataRetentionEnabled` on each /responses request.
+    Measured against the live API: `store: true` returns
+    `400 store is not supported`, while `store: false` and an absent `store`
+    both return 200 — so it is the `true` case that must be prevented.
     """
     entries = build_model_entries(payload, BASE)
     responses = [e for e in entries if e["apiType"] == "responses"]
@@ -374,6 +375,98 @@ def test_responses_models_declare_zero_data_retention(payload: dict) -> None:
         assert entry.get("zeroDataRetentionEnabled") is True, entry["id"]
     for entry in (e for e in entries if e["apiType"] == "chat-completions"):
         assert "zeroDataRetentionEnabled" not in entry, "only the responses wire needs it"
+
+
+def test_forced_store_false_is_lost_unless_the_body_is_marked_mutated() -> None:
+    """Pins the forwarder contract the `store` rewrite depends on.
+
+    The forwarder replays `original_body_bytes` verbatim for an unmutated body,
+    so mutating `payload` in place is not enough on its own — the handler must
+    also mark the body mutated or the rewrite is silently discarded and the
+    request 400s.
+
+    Scope: this constrains the forwarder, not the handler's call site. The
+    end-to-end property (a `store: true` request actually reaching Copilot as
+    `false`) is verified against the live API, not here.
+    """
+    from headroom.proxy.body_forwarding import select_outbound_body
+    from headroom.proxy.handlers.openai import _ensure_chatgpt_responses_store_false
+
+    body = {"model": "gpt-5.5", "store": True}
+    original = json.dumps(body).encode()
+    assert _ensure_chatgpt_responses_store_false(
+        body, is_chatgpt_auth=False, is_copilot_upstream=True
+    )
+    assert body["store"] is False
+
+    unmarked = select_outbound_body(
+        body=body, original_body_bytes=original, body_mutated=False, forwarder_mode="canonical"
+    )
+    assert json.loads(unmarked.content)["store"] is True  # the rewrite is lost
+
+    marked = select_outbound_body(
+        body=body, original_body_bytes=original, body_mutated=True, forwarder_mode="canonical"
+    )
+    assert json.loads(marked.content)["store"] is False
+
+
+def test_store_rewrite_is_scoped_to_the_upstreams_that_need_it() -> None:
+    """A plain OpenAI/custom upstream must keep whatever the client sent."""
+    from headroom.proxy.handlers.openai import _ensure_chatgpt_responses_store_false
+
+    untouched = {"model": "gpt-5.5", "store": True}
+    assert not _ensure_chatgpt_responses_store_false(
+        untouched, is_chatgpt_auth=False, is_copilot_upstream=False
+    )
+    assert untouched["store"] is True
+
+
+# ---------------------------------------------------------------------------
+# Sharing one proxy between the Copilot CLI and VS Code
+# ---------------------------------------------------------------------------
+
+
+def test_same_account_shares_a_proxy_but_a_different_one_never_does() -> None:
+    """`wrap copilot --native` and `wrap vscode-chat` are one user, one proxy.
+
+    Copilot seeds are per-session, so any running proxy used to force a wrap
+    session onto its own port — which split a single account's two surfaces
+    across two proxies, two dashboards and two halves of the savings. Sharing is
+    now allowed, but *only* on a proven identity match.
+    """
+    from headroom.cli.wrap import _proxy_serves_same_copilot_seed
+    from headroom.copilot_auth import token_fingerprint
+
+    mine = "gho_my_oauth_token"
+    running = {"copilot_token_fingerprint": token_fingerprint(mine)}
+
+    assert _proxy_serves_same_copilot_seed(running, mine) is True
+    assert _proxy_serves_same_copilot_seed(running, "gho_someone_elses_token") is False
+
+
+@pytest.mark.parametrize(
+    ("running_config", "token", "why"),
+    [
+        (None, "gho_tok", "no config could be read"),
+        ({}, "gho_tok", "proxy predates the fingerprint field"),
+        ({"copilot_token_fingerprint": None}, "gho_tok", "proxy has no seed"),
+        ({"copilot_token_fingerprint": ""}, "gho_tok", "empty fingerprint"),
+        ({"copilot_token_fingerprint": 123}, "gho_tok", "non-string fingerprint"),
+        ({"copilot_token_fingerprint": "sha256:abc"}, None, "no oauth token to compare"),
+        ({"copilot_token_fingerprint": "sha256:abc"}, "", "empty oauth token"),
+    ],
+)
+def test_unknown_identity_never_counts_as_a_match(
+    running_config: dict | None, token: str | None, why: str
+) -> None:
+    """Fails closed: anything short of a proven match keeps sessions isolated.
+
+    Guessing wrong here would send one account's traffic upstream under
+    another's credential, so "unknown" must behave exactly like "different".
+    """
+    from headroom.cli.wrap import _proxy_serves_same_copilot_seed
+
+    assert _proxy_serves_same_copilot_seed(running_config, token) is False, why
 
 
 def test_schema_required_fields_are_always_present(payload: dict) -> None:

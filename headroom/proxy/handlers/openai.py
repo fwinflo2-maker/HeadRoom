@@ -832,13 +832,16 @@ def _ensure_chatgpt_responses_store_false(
 ) -> bool:
     """Force ``store: false`` where the upstream refuses server-side storage.
 
-    ChatGPT auth has always needed this. GitHub Copilot's hosted API needs it too:
-    it rejects the field outright with ``400 store is not supported``, and VS
-    Code's BYOK client sends ``store: true`` on every ``/responses`` request
-    unless the model is declared zero-data-retention. Without this rewrite every
-    ``/responses``-served model would fail on first use behind that client.
+    ChatGPT auth has always needed this. GitHub Copilot's hosted API needs it
+    too, though only for the *true* case -- measured against the live API:
+    ``store: true`` returns ``400 store is not supported`` while ``store: false``
+    and an absent ``store`` both return 200. VS Code's BYOK client sends
+    ``store: true`` on every ``/responses`` request unless the model is declared
+    zero-data-retention, so without this rewrite those models fail on first use.
 
-    Returns True when a rewrite happened, so the caller can log it.
+    Returns True when a rewrite happened, so the caller can log it **and mark the
+    body mutated**: the forwarder replays the original bytes verbatim for an
+    unmutated body, so a body nothing else touched would lose this rewrite.
     """
 
     if (is_chatgpt_auth or is_copilot_upstream) and payload.get("store") is not False:
@@ -5311,6 +5314,11 @@ class OpenAIHandlerMixin:
             is_copilot_upstream=is_copilot_api_url(self._resolved_openai_upstream_base(request)),
         ):
             logger.info(f"[{request_id}] Responses: forced store=false (upstream rejects it)")
+            # Belt and braces: today other mutations happen to mark this body,
+            # so the rewrite survives by accident. Marking it here means the
+            # request stops depending on that accident.
+            if body_mutation_tracker is not None:
+                body_mutation_tracker.mark_mutated("responses_store_false")
         responses_memory_tools_allowed = _allow_responses_memory_tools(is_chatgpt_auth)
 
         # PR-A6 (P5-50, preps P0-6): session-sticky `OpenAI-Beta` merge

@@ -3358,6 +3358,39 @@ def _proxy_anthropic_upstream_mismatch(
     return running != _normalize_proxy_api_url(requested) if requested else True
 
 
+def _proxy_serves_same_copilot_seed(
+    running_config: dict[str, object] | None, requested_oauth_token: str | None
+) -> bool:
+    """True only when a running proxy is provably seeded with *this* credential.
+
+    Copilot seeds are per-session, so historically any running proxy forced a
+    wrap session onto a dedicated port. That is the right default when the
+    credentials differ -- sharing would send one account's traffic upstream
+    under another's token -- but it also split the two surfaces of a *single*
+    account: `wrap copilot --native` and `wrap vscode-chat` are the same user,
+    the same token and the same upstream, yet ended up on two proxies, two
+    dashboards and two halves of the savings.
+
+    Identity is the long-lived OAuth token, digested. The Copilot *API* token is
+    re-minted by every exchange, so comparing that would report "different user"
+    for two sessions of the same account and never share anything. No token is
+    exchanged to make the decision -- only the same non-secret digest
+    ``headroom copilot-auth`` already prints.
+
+    Fails closed: an absent or unreadable fingerprint (older proxy, no seed,
+    OAuth token not available) is "unknown", which keeps the isolating behaviour
+    rather than guessing that sharing is safe.
+    """
+    if not requested_oauth_token or not running_config:
+        return False
+    running = running_config.get("copilot_token_fingerprint")
+    if not isinstance(running, str) or not running:
+        return False
+    from headroom.copilot_auth import token_fingerprint
+
+    return running == token_fingerprint(requested_oauth_token)
+
+
 def _normalize_proxy_api_url(url: object) -> str | None:
     """Normalize configured upstream URLs for running-proxy comparisons."""
     if not isinstance(url, str):
@@ -3847,6 +3880,18 @@ def _ensure_proxy(
         isolated_copilot_subscription_proxy = copilot_subscription_seed_requested and (
             manifest is not None or helpers._check_proxy(port)
         )
+        # ...unless the proxy already there is serving this very credential, in
+        # which case it is this user's own session on another surface (Copilot
+        # CLI alongside VS Code) and sharing is both safe and wanted: one proxy,
+        # one dashboard, one savings total.
+        shared_copilot_seed = False
+        if isolated_copilot_subscription_proxy:
+            shared_copilot_seed = _proxy_serves_same_copilot_seed(
+                helpers._proxy_health_config(helpers._query_proxy_health(port)),
+                copilot_refresh_oauth_token,
+            )
+            if shared_copilot_seed:
+                isolated_copilot_subscription_proxy = False
         if isolated_copilot_subscription_proxy:
             click.echo(
                 "  Copilot subscription seeds are session-specific; "
@@ -3897,7 +3942,11 @@ def _ensure_proxy(
                         missing.append("learn")
                     if code_graph and not running_config.get("code_graph"):
                         missing.append("code_graph")
-                    if copilot_subscription_seed_requested:
+                    # Not "missing" when the proxy already carries this exact
+                    # credential: it is this user's own session on another
+                    # surface, and re-seeding would restart a proxy that is
+                    # already correct.
+                    if copilot_subscription_seed_requested and not shared_copilot_seed:
                         missing.append("copilot-subscription-auth")
                     if openai_api_url:
                         running_openai_url = _normalize_proxy_api_url(
@@ -3969,7 +4018,11 @@ def _ensure_proxy(
                         missing.append("learn")
                     if code_graph and not running_config.get("code_graph"):
                         missing.append("code-graph")
-                    if copilot_subscription_seed_requested:
+                    # Not "missing" when the proxy already carries this exact
+                    # credential: it is this user's own session on another
+                    # surface, and re-seeding would restart a proxy that is
+                    # already correct.
+                    if copilot_subscription_seed_requested and not shared_copilot_seed:
                         missing.append("copilot-subscription-auth")
                     if openai_api_url:
                         running_openai_url = _normalize_proxy_api_url(
@@ -4058,7 +4111,7 @@ def _ensure_proxy(
                     missing.append("learn")
                 if code_graph and not running_config.get("code_graph"):
                     missing.append("code_graph")
-                if copilot_subscription_seed_requested:
+                if copilot_subscription_seed_requested and not shared_copilot_seed:
                     missing.append("copilot-subscription-auth")
                 expected_savings_profile = helpers._wrap_agent_savings_profile(agent_type)
                 if (
@@ -5934,7 +5987,20 @@ def vscode_chat(
         # picker advertising a Headroom provider that 1.132+ then hides anyway,
         # because the visibility gate never got set. This ordering means a failure
         # leaves nothing half-configured.
-        setting_action = enable_byok_setting(target_settings)
+        # Guarded for the same reason the models write below is: a hand-edited
+        # or unreadable settings.json must not take the proxy down with it.
+        # `enable_byok_setting` raises on JSONC this parser cannot validate, and
+        # `vscode_settings_path()` raises when APPDATA is unset -- neither is a
+        # reason to end a session that is otherwise working.
+        try:
+            setting_action = enable_byok_setting(target_settings)
+        except click.ClickException as exc:
+            click.echo(f"  Warning: could not update {target_settings}: {exc.format_message()}")
+            click.echo(
+                f"    Set {BYOK_ENABLED_SETTING} to true by hand, or VS Code 1.132+ "
+                "will hide every Headroom model."
+            )
+            return
         if setting_action == "set to false by user":
             click.echo(
                 f"  Warning: {BYOK_ENABLED_SETTING} is set to false in {target_settings}. "

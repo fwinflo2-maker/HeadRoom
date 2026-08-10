@@ -2471,8 +2471,21 @@ def inject_tool_search_deferral_openai(
         # Deferrable: a non-core function, or an MCP server (OpenAI models are
         # trained to search namespaces / MCP servers). Everything else — core
         # coding tools and other hosted tools — stays resident.
+        # A deferred function's own name becomes its namespace, and namespaces may
+        # not contain "." -- so deferring a dotted name makes the whole request
+        # invalid, taking every other tool down with it. VS Code Copilot Chat
+        # names tools that way (`file_search.file_search`), and the upstream
+        # rejects it two different ways depending on the prefix:
+        #   "User-defined namespace 'file_search.file_search' must not contain '.'"
+        #   "Function 'file_search.file_search' is not allowed in reserved
+        #    namespace 'file_search'"
+        # Both reproduced live at >= the deferral threshold, and both disappear
+        # below it -- which is why this only ever showed up on tool-rich clients.
+        # Keeping such tools resident costs a little context and keeps the request
+        # valid; deferring them saves nothing because the call 400s.
+        name = str(tool.get("name") or "")
         deferrable = (
-            ttype == "function" and str(tool.get("name") or "").lower() not in resident_lower
+            ttype == "function" and name.lower() not in resident_lower and "." not in name
         ) or ttype == "mcp"
         if deferrable and not tool.get("defer_loading"):
             new_tool = dict(tool)

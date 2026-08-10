@@ -474,6 +474,36 @@ def test_unknown_identity_never_counts_as_a_match(
 # ---------------------------------------------------------------------------
 
 
+def test_dotted_tool_names_are_never_deferred() -> None:
+    """A deferred function's name becomes its namespace, and namespaces reject '.'.
+
+    VS Code Copilot Chat names tools that way (`file_search.file_search`), so
+    deferring one invalidated the entire request and every other tool went down
+    with it -- reproduced live as both
+    "User-defined namespace '...' must not contain '.'" and
+    "Function '...' is not allowed in reserved namespace 'file_search'".
+
+    Only tool-rich clients ever saw it: below the deferral threshold nothing is
+    deferred, which is why the same name succeeds in a small request.
+    """
+    from headroom.proxy.helpers import inject_tool_search_deferral_openai
+
+    def tool(name: str) -> dict:
+        return {"type": "function", "name": name, "parameters": {"type": "object"}}
+
+    plain = [tool(f"vscode_tool_{i}") for i in range(20)]
+    dotted = [tool("file_search.file_search"), tool("mcp.server.do_thing")]
+
+    out = inject_tool_search_deferral_openai(plain + dotted, "gpt-5.5", client=None)
+    assert out is not (plain + dotted), "deferral should still apply to the undotted tools"
+
+    by_name = {t.get("name"): t for t in out if isinstance(t, dict) and t.get("name")}
+    for name in ("file_search.file_search", "mcp.server.do_thing"):
+        assert not by_name[name].get("defer_loading"), f"{name} would break the whole request"
+    # The point of the feature still holds for names that can be a namespace.
+    assert by_name["vscode_tool_0"].get("defer_loading") is True
+
+
 def test_tool_search_deferral_is_scoped_to_a_real_anthropic_upstream() -> None:
     """Deferring tools against Copilot silently disarms the client's whole toolset.
 

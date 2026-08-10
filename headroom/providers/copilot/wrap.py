@@ -222,6 +222,22 @@ def resolve_wire_api_for_model(
 #: while every request still travels through Headroom.
 COPILOT_NATIVE_API_URL_ENV = "COPILOT_API_URL"
 
+#: Prefix on every model id the VS Code chat-model config registers.
+#:
+#: VS Code's chat model picker keys a model on its **bare id**, ignoring which
+#: provider contributed it. A BYOK entry that reuses Copilot's own id is
+#: therefore treated as the same model as Copilot's native one, and the picker
+#: renders that identity exactly once -- as the native entry. Every model the
+#: user has recently used or GitHub has featured is already shown that way, so
+#: precisely those models lost their Headroom twin: the compressed route was
+#: invisible for the models people reach for most.
+#:
+#: Registering ``headroom--claude-opus-5`` keeps the two identities distinct in
+#: the picker. The prefix is stripped again in the proxy
+#: (``resolve_copilot_model_id``) so the id that reaches Copilot is the real one,
+#: and savings are still attributed to the real model.
+VSCODE_MODEL_ID_PREFIX = "headroom--"
+
 #: Paths the native CLI drives that are *not* inference and must pass through
 #: untouched. Recorded here for documentation; the proxy's catch-all already
 #: forwards them.

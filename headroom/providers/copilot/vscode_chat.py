@@ -42,6 +42,7 @@ from headroom.providers.copilot.vscode import (
     _validate_settings,
     vscode_user_dir,
 )
+from headroom.providers.copilot.wrap import VSCODE_MODEL_ID_PREFIX
 from headroom.proxy.project_context import with_project_prefix
 
 #: Provider display name. Also how a human recognises the block in the file.
@@ -56,10 +57,13 @@ BYOK_ENABLED_SETTING = "chat.agentHost.byokModels.enabled"
 #: Endpoint suffix per API shape. VS Code resolves a model's URL from its
 #: ``apiType`` when the path is omitted; we always write it explicitly so the
 #: mapping is visible in the file rather than inferred.
+#:
+#: Only the two wires ``_api_type_for`` can actually choose are listed. Carrying
+#: a ``messages`` entry as well would advertise support for a path this module
+#: never emits, so a reader could not tell which mappings are live.
 _API_TYPE_PATHS = {
     "chat-completions": "/v1/chat/completions",
     "responses": "/v1/responses",
-    "messages": "/v1/messages",
 }
 
 
@@ -154,7 +158,12 @@ def build_model_entries(payload: Any, base_url: str) -> list[dict[str, Any]]:
         api_type = _api_type_for(model.get("supported_endpoints") or [])
         display = model.get("name") if isinstance(model.get("name"), str) else model_id
         entry: dict[str, Any] = {
-            "id": model_id,
+            # Prefixed so VS Code's picker keeps this distinct from Copilot's
+            # native entry for the same model; the proxy strips it back off
+            # before the request leaves for Copilot. Without the prefix, every
+            # recently-used or GitHub-featured model silently lost its Headroom
+            # twin -- exactly the models a user reaches for most.
+            "id": f"{VSCODE_MODEL_ID_PREFIX}{model_id}",
             "name": f"{display} (Headroom)",
             "url": f"{base_url.rstrip('/')}{_API_TYPE_PATHS[api_type]}",
             "apiType": api_type,

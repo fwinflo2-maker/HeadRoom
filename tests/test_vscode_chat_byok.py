@@ -14,6 +14,7 @@ from pathlib import Path
 import click
 import pytest
 
+from headroom.providers.copilot import VSCODE_MODEL_ID_PREFIX
 from headroom.providers.copilot.vscode_chat import (
     BYOK_ENABLED_SETTING,
     HEADROOM_PROVIDER_NAME,
@@ -33,6 +34,15 @@ BASE = "http://127.0.0.1:8787/p/proj"
 @pytest.fixture(scope="module")
 def payload() -> dict:
     return json.loads(FIXTURE.read_text(encoding="utf-8"))
+
+
+def by_catalog_id(entries: list[dict]) -> dict[str, dict]:
+    """Index entries by the *Copilot* model id, undoing the registration prefix.
+
+    Tests care about which catalog model an entry describes; the prefix is a
+    picker-visibility concern covered on its own below.
+    """
+    return {e["id"].removeprefix(VSCODE_MODEL_ID_PREFIX): e for e in entries}
 
 
 # ---------------------------------------------------------------------------
@@ -66,17 +76,65 @@ def test_byok_entitlement_is_read_from_the_token(token: str, expected: bool | No
 def test_entries_cover_every_selectable_chat_model(payload: dict) -> None:
     entries = build_model_entries(payload, BASE)
     assert len(entries) == 22
-    ids = {e["id"] for e in entries}
+    ids = set(by_catalog_id(entries))
     assert "claude-opus-4.8" in ids
     assert "gpt-5.4" in ids
 
 
 def test_non_chat_and_unselectable_models_are_excluded(payload: dict) -> None:
     """Embeddings in a chat picker would be user-visible nonsense."""
-    ids = {e["id"] for e in build_model_entries(payload, BASE)}
+    ids = set(by_catalog_id(build_model_entries(payload, BASE)))
     assert "text-embedding-3-small" not in ids
     assert "trajectory-compaction" not in ids  # picker-disabled
     assert "gpt-4o" not in ids  # picker-disabled
+
+
+def test_registered_ids_never_collide_with_copilots_own(payload: dict) -> None:
+    """The whole reason the prefix exists.
+
+    VS Code's picker keys a model on its bare id and ignores the contributing
+    provider, so an entry registered as ``claude-opus-5`` is treated as the same
+    model as Copilot's native one and rendered once -- as the native entry. That
+    silently removed the Headroom twin of every recently-used or GitHub-featured
+    model, i.e. exactly the ones a user selects most.
+    """
+    catalog_ids = {m["id"] for m in payload["data"]}
+    registered = {e["id"] for e in build_model_entries(payload, BASE)}
+    assert registered.isdisjoint(catalog_ids)
+    assert all(i.startswith(VSCODE_MODEL_ID_PREFIX) for i in registered)
+
+
+def test_prefixed_ids_survive_the_round_trip_to_a_real_model(payload: dict) -> None:
+    """A registered id must resolve back to the catalog id Copilot accepts.
+
+    Asserted against the proxy's own resolver rather than by re-implementing the
+    strip here: the two must not be able to drift apart.
+    """
+    from headroom.proxy.handlers.openai import resolve_copilot_model_id
+
+    for entry in build_model_entries(payload, BASE):
+        resolved = resolve_copilot_model_id(
+            entry["id"], upstream_base_url="https://api.githubcopilot.com", cards=None
+        )
+        assert resolved == entry["id"].removeprefix(VSCODE_MODEL_ID_PREFIX)
+
+
+def test_prefix_is_only_stripped_for_copilot_upstreams() -> None:
+    """The strip is Copilot-gated, so no other upstream sees a rewritten model."""
+    from headroom.proxy.handlers.openai import resolve_copilot_model_id
+
+    prefixed = f"{VSCODE_MODEL_ID_PREFIX}claude-opus-5"
+    assert (
+        resolve_copilot_model_id(prefixed, upstream_base_url="https://api.openai.com", cards=None)
+        == prefixed
+    )
+    # A bare prefix names no model; guessing one would send junk upstream.
+    assert (
+        resolve_copilot_model_id(
+            VSCODE_MODEL_ID_PREFIX, upstream_base_url="https://api.githubcopilot.com", cards=None
+        )
+        == VSCODE_MODEL_ID_PREFIX
+    )
 
 
 def test_api_type_never_selects_messages(payload: dict) -> None:
@@ -90,7 +148,7 @@ def test_api_type_never_selects_messages(payload: dict) -> None:
 
 
 def test_responses_only_models_get_the_responses_wire(payload: dict) -> None:
-    entries = {e["id"]: e for e in build_model_entries(payload, BASE)}
+    entries = by_catalog_id(build_model_entries(payload, BASE))
     assert entries["mai-code-1-flash-picker"]["apiType"] == "responses"
     assert entries["mai-code-1-flash-picker"]["url"].endswith("/v1/responses")
     assert entries["claude-opus-4.8"]["apiType"] == "chat-completions"
@@ -105,7 +163,7 @@ def test_capabilities_come_from_the_payload_not_hardcoded(payload: dict) -> None
     advertises both tool calling and vision, so a fixture-value assertion would
     pass even if the fields were hardcoded.
     """
-    entries = {e["id"]: e for e in build_model_entries(payload, BASE)}
+    entries = by_catalog_id(build_model_entries(payload, BASE))
     assert entries["claude-opus-4.8"]["toolCalling"] is True
     assert entries["claude-opus-4.8"]["vision"] is True
     assert entries["claude-opus-4.8"]["maxOutputTokens"] == 64000
@@ -118,7 +176,7 @@ def test_capabilities_come_from_the_payload_not_hardcoded(payload: dict) -> None
             model["capabilities"]["supports"]["tool_calls"] = False
             model["capabilities"]["supports"]["vision"] = False
             model["capabilities"]["limits"]["max_output_tokens"] = 1234
-    changed = {e["id"]: e for e in build_model_entries(mutated, BASE)}
+    changed = by_catalog_id(build_model_entries(mutated, BASE))
     assert changed["claude-opus-4.8"]["toolCalling"] is False
     assert changed["claude-opus-4.8"]["vision"] is False
     assert changed["claude-opus-4.8"]["maxOutputTokens"] == 1234
@@ -335,12 +393,12 @@ def test_required_limits_survive_a_catalog_without_them(payload: dict) -> None:
     for model in mutated["data"]:
         if model.get("id") == "claude-opus-4.8":
             model["capabilities"]["limits"] = {}
-    entry = {e["id"]: e for e in build_model_entries(mutated, BASE)}["claude-opus-4.8"]
+    entry = by_catalog_id(build_model_entries(mutated, BASE))["claude-opus-4.8"]
     assert entry["maxInputTokens"] > 0
     assert entry["maxOutputTokens"] > 0
 
 
 def test_context_window_is_written_from_the_catalog(payload: dict) -> None:
     """VS Code otherwise derives it as input+output, which understates some models."""
-    entries = {e["id"]: e for e in build_model_entries(payload, BASE)}
+    entries = by_catalog_id(build_model_entries(payload, BASE))
     assert entries["gpt-5-mini"]["contextWindow"] == 264000

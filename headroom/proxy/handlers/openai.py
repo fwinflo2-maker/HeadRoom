@@ -64,7 +64,7 @@ from headroom.providers.codex.runtime import (
 from headroom.providers.codex.runtime import (
     resolve_codex_routing_headers as _resolve_codex_routing_headers,
 )
-from headroom.providers.copilot import model_prefers_responses_api
+from headroom.providers.copilot import VSCODE_MODEL_ID_PREFIX, model_prefers_responses_api
 from headroom.proxy.auth_mode import (
     classify_auth_mode,
     classify_client,
@@ -263,6 +263,16 @@ def resolve_copilot_model_id(
         return model
     if not upstream_base_url or not is_copilot_api_url(upstream_base_url):
         return model
+    # VS Code registers chat models under a prefixed id so its picker does not
+    # collapse them into Copilot's native entry (see `VSCODE_MODEL_ID_PREFIX`).
+    # Undo that here -- ahead of catalog lookup and of transport planning, both
+    # of which match on the real id -- so a prefixed model routes and bills
+    # exactly like the unprefixed one. Copilot-gated above, and no other client
+    # sends this prefix, so every existing caller is untouched.
+    if model.startswith(VSCODE_MODEL_ID_PREFIX):
+        unprefixed = model[len(VSCODE_MODEL_ID_PREFIX) :]
+        if unprefixed:
+            model = unprefixed
     if cards:
         from headroom.models.copilot_catalog import resolve_model_id
 

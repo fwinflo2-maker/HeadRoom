@@ -14,6 +14,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 
 log = logging.getLogger("headroom_oauth2")
@@ -130,8 +131,8 @@ class OAuth2ClientCredentials:
         except HTTPError as e:
             try:
                 e.read()  # drain; do NOT surface the IdP body (may echo sensitive context)
-            except Exception:
-                pass
+            except (HTTPException, OSError, ValueError) as drain_error:
+                log.debug("oauth2: failed to drain token endpoint error body: %s", drain_error)
             raise OAuth2Error(f"token endpoint returned HTTP {e.code}") from None
         except (URLError, OSError) as e:
             raise OAuth2Error(f"token endpoint unreachable: {e}") from None

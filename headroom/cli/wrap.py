@@ -1717,6 +1717,33 @@ rather than substituting a similar-sounding name.
 """
 
 
+def _live_copilot_models_payload(api_url: str | None, token: str | None) -> dict:
+    """Raw ``GET /models`` body, or ``{}`` on any failure.
+
+    Returns the payload rather than parsed cards because VS Code needs
+    per-model capabilities (tool calling, vision) that ``ModelCard`` does not
+    carry, and that dataclass belongs to a separate change.
+    """
+    if not api_url or not token:
+        return {}
+    try:
+        import httpx
+
+        from headroom.copilot_auth import _copilot_chat_header_defaults
+
+        response = httpx.get(
+            f"{api_url.rstrip('/')}/models",
+            headers={"Authorization": f"Bearer {token}", **_copilot_chat_header_defaults()},
+            timeout=10,
+        )
+        if response.status_code != 200:
+            return {}
+        payload = response.json()
+    except Exception:  # noqa: BLE001 — discovery is best-effort, never fatal
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _live_copilot_model_ids(api_url: str | None, token: str | None) -> list[str]:
     """Selectable Copilot chat model IDs, live. Empty list on any failure."""
     if not api_url or not token:
@@ -5805,6 +5832,167 @@ def unwrap_vscode_copilot(settings_file: Path | None) -> None:
         click.echo(f"Removed Headroom Copilot proxy settings from {target_settings}")
     else:
         click.echo(f"No Headroom Copilot proxy settings found in {target_settings}")
+
+
+# =============================================================================
+# GitHub Copilot Chat in VS Code (BYOK Custom Endpoint)
+# =============================================================================
+
+
+@wrap.command("vscode-chat")
+@click.option("--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--models-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Override chatLanguageModels.json path (Insiders, VSCodium, custom profiles)",
+)
+@click.option(
+    "--settings-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Override settings.json path",
+)
+@click.option(
+    "--configure/--no-configure",
+    default=True,
+    help="Write the Headroom model provider into VS Code's chat model config",
+)
+def vscode_chat(
+    port: int,
+    memory: bool,
+    models_file: Path | None,
+    settings_file: Path | None,
+    configure: bool,
+) -> None:
+    """Route GitHub Copilot **Chat** in VS Code through Headroom.
+
+    \b
+    Registers every model your Copilot subscription is entitled to as a BYOK
+    "Custom Endpoint" provider pointed at the local proxy, so chat and agent
+    traffic is compressed and you can still switch models mid-session from the
+    normal picker.
+
+    \b
+    Not covered: inline (ghost-text) completions, semantic search and embeddings
+    always go straight to GitHub, whatever model is selected. VS Code routes
+    those outside the BYOK path, so Headroom cannot see or compress them.
+    """
+    from headroom.providers.copilot.vscode_chat import (
+        BYOK_ENABLED_SETTING,
+        build_model_entries,
+        build_provider_block,
+        byok_entitlement_enabled,
+        chat_models_path,
+        configure_chat_models,
+        enable_byok_setting,
+        proxy_base_url,
+    )
+
+    resolution = _require_copilot_subscription_resolution()
+
+    # Fail fast when the org has BYOK switched off: VS Code gates the whole
+    # Custom Endpoint feature on this entitlement, so configuration written here
+    # would never appear in the picker and the user would have nothing to debug.
+    entitled = byok_entitlement_enabled(resolution.token)
+    if entitled is False:
+        raise click.ClickException(
+            "This GitHub Copilot seat does not permit bring-your-own-key models "
+            "(client_byok=0), so VS Code will not show a Custom Endpoint provider. "
+            "That is an organization policy; ask your Copilot admin to enable "
+            "'Bring Your Own Language Model Key in VS Code'."
+        )
+    if entitled is None:
+        click.echo(
+            "  Note: could not confirm the BYOK entitlement on this token; continuing. "
+            "If no Headroom models appear in the picker, your org may have it disabled."
+        )
+
+    target_models = models_file or chat_models_path()
+    target_settings = settings_file or vscode_settings_path()
+
+    def _print_setup(actual_port: int) -> None:
+        base = proxy_base_url(actual_port, _project_name_from_cwd())
+        if not configure:
+            click.echo("  Add a Custom Endpoint provider in VS Code pointing at:")
+            click.echo(f"    {base}/v1/chat/completions")
+            click.echo(f"  and set {BYOK_ENABLED_SETTING} to true.")
+            return
+
+        entries = build_model_entries(
+            _live_copilot_models_payload(resolution.api_url, resolution.token), base
+        )
+        if not entries:
+            click.echo(
+                "  Note: could not read the model catalog, so no models were written. "
+                "Check `headroom models`, then re-run."
+            )
+            return
+        action = configure_chat_models(target_models, build_provider_block(entries))
+        click.echo(f"  VS Code chat models {action}: {target_models} ({len(entries)} models)")
+        setting_action = enable_byok_setting(target_settings)
+        click.echo(f"  {BYOK_ENABLED_SETTING} {setting_action}: {target_settings}")
+        click.echo(
+            "  Pick a model named '… (Headroom)' in the chat model picker. "
+            "Restart VS Code if they do not appear yet."
+        )
+        click.echo(
+            "  Inline completions are NOT routed through Headroom (VS Code sends "
+            "those to GitHub directly), so they are neither compressed nor counted."
+        )
+
+    _run_proxy_only_watcher(
+        agent_label="VS CODE COPILOT CHAT",
+        port=port,
+        no_proxy=False,
+        learn=False,
+        memory=memory,
+        agent_type="copilot",
+        print_setup_lines=_print_setup,
+        openai_api_url=resolution.api_url,
+        # The Custom Endpoint provider can address Claude models, which ride the
+        # Anthropic wire; both upstreams must resolve to the Copilot host or that
+        # traffic would be forwarded to api.anthropic.com.
+        anthropic_api_url=resolution.api_url,
+        copilot_api_token=resolution.token,
+        copilot_refresh_oauth_token=resolution.refresh_oauth_token,
+        copilot_api_token_expires_at=resolution.api_token_expires_at,
+    )
+
+
+@unwrap.command("vscode-chat")
+@click.option(
+    "--models-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Override chatLanguageModels.json path",
+)
+@click.option(
+    "--settings-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Override settings.json path",
+)
+def unwrap_vscode_chat(models_file: Path | None, settings_file: Path | None) -> None:
+    """Remove only Headroom's VS Code chat model provider."""
+    from headroom.providers.copilot.vscode_chat import (
+        chat_models_path,
+        disable_byok_setting,
+        remove_chat_models,
+    )
+
+    target_models = models_file or chat_models_path()
+    target_settings = settings_file or vscode_settings_path()
+    try:
+        if remove_chat_models(target_models):
+            click.echo(f"Removed Headroom chat models from {target_models}")
+        else:
+            click.echo(f"No Headroom chat models found in {target_models}")
+        if disable_byok_setting(target_settings):
+            click.echo(f"Removed {target_settings} BYOK setting block")
+    except OSError as exc:
+        click.echo(f"Note: could not update VS Code config ({exc}); continuing.")
 
 
 # =============================================================================

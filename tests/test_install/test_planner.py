@@ -274,9 +274,7 @@ def test_build_manifest_grok_build_only_sets_xai_upstream() -> None:
     """Persistent install for Grok Build alone must route proxy upstream to xAI."""
     from headroom.providers.grok import DEFAULT_API_URL
 
-    manifest = build_manifest(
-        **_base_manifest_kwargs(targets=["grok_build"], backend="openai")
-    )
+    manifest = build_manifest(**_base_manifest_kwargs(targets=["grok_build"], backend="openai"))
 
     assert manifest.base_env.get("OPENAI_TARGET_API_URL") == DEFAULT_API_URL
     idx = manifest.proxy_args.index("--openai-api-url")

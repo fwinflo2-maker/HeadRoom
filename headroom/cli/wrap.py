@@ -5935,9 +5935,23 @@ def vscode_chat(
         # because the visibility gate never got set. This ordering means a failure
         # leaves nothing half-configured.
         setting_action = enable_byok_setting(target_settings)
-        click.echo(f"  {BYOK_ENABLED_SETTING} {setting_action}: {target_settings}")
-        action = configure_chat_models(target_models, build_provider_block(entries))
-        click.echo(f"  VS Code chat models {action}: {target_models} ({len(entries)} models)")
+        if setting_action == "set to false by user":
+            click.echo(
+                f"  Warning: {BYOK_ENABLED_SETTING} is set to false in {target_settings}. "
+                "VS Code will hide every Headroom model until you set it to true."
+            )
+        else:
+            click.echo(f"  {BYOK_ENABLED_SETTING} {setting_action}: {target_settings}")
+        # Config failure must not take the proxy down with it: the session is
+        # still usable via the CLI wrappers, and an existing config from a
+        # previous run may well still be valid.
+        try:
+            action = configure_chat_models(target_models, build_provider_block(entries))
+            click.echo(f"  VS Code chat models {action}: {target_models} ({len(entries)} models)")
+        except click.ClickException as exc:
+            click.echo(f"  Warning: could not update {target_models}: {exc.format_message()}")
+            click.echo("    The proxy is still running; fix the file and re-run to refresh.")
+            return
         click.echo(
             "  Pick a model named '… (Headroom)' in the chat model picker. "
             "Restart VS Code if they do not appear yet."

@@ -98,10 +98,12 @@ def _api_type_for(endpoints: list[str] | tuple[str, ...]) -> str:
     most families on it. ``responses`` is used for models served only there
     (``gpt-5.6-*``, ``mai-code-1-flash-picker``).
 
-    ``messages`` is deliberately never chosen. The proxy's Anthropic path does not
-    substitute the Copilot token, so VS Code's placeholder ``x-api-key`` reaches
-    GitHub and is rejected -- and Claude models are reachable on
-    ``chat-completions`` anyway, so nothing is lost by avoiding it.
+    ``messages`` is deliberately never chosen, but not because it cannot work:
+    review found that the streaming ``/v1/messages`` path VS Code actually uses
+    returns 200 (only the non-streaming path 400s, and independently of the key).
+    It is avoided because every Claude model is also served on
+    ``chat-completions``, which is the wire verified end-to-end here -- one wire
+    is one less thing to keep working, and nothing is lost by preferring it.
     """
     if not endpoints:
         return "chat-completions"
@@ -159,24 +161,45 @@ def build_model_entries(payload: Any, base_url: str) -> list[dict[str, Any]]:
             "toolCalling": bool(supports.get("tool_calls")),
             "vision": bool(supports.get("vision")),
         }
+        if api_type == "responses":
+            # VS Code's BYOK client sets `store: !zeroDataRetentionEnabled` on
+            # every /responses request, and Copilot's API rejects the field with
+            # `400 store is not supported` -- so without this flag every
+            # responses-served model fails on first use. Declaring ZDR also
+            # suppresses `previous_response_id`, which Copilot would not honour
+            # either. The proxy forces `store: false` as well, so a stale config
+            # written before this fix still works.
+            entry["zeroDataRetentionEnabled"] = True
+        # Required by the provider schema, so always emit them: a model missing
+        # either field yields NaN token limits rather than a visible error.
         max_input = limits.get("max_prompt_tokens") or limits.get("max_context_window_tokens")
-        if isinstance(max_input, int) and max_input > 0:
-            entry["maxInputTokens"] = max_input
+        entry["maxInputTokens"] = (
+            max_input if isinstance(max_input, int) and max_input > 0 else 128000
+        )
         max_output = limits.get("max_output_tokens")
-        if isinstance(max_output, int) and max_output > 0:
-            entry["maxOutputTokens"] = max_output
+        entry["maxOutputTokens"] = (
+            max_output if isinstance(max_output, int) and max_output > 0 else 4096
+        )
+        context_window = limits.get("max_context_window_tokens")
+        if isinstance(context_window, int) and context_window > 0:
+            # Written explicitly rather than left to VS Code's
+            # `maxInputTokens + maxOutputTokens` derivation, which is wrong
+            # whenever the provider publishes a real window (e.g. gpt-5-mini).
+            entry["contextWindow"] = context_window
         entries.append(entry)
 
     entries.sort(key=lambda e: e["name"].lower())
     return entries
 
 
-#: Sent by VS Code as the endpoint's API key and then ignored: the proxy
-#: substitutes the real Copilot credential itself. A fixed, obviously-inert
-#: literal is used rather than an ``${input:...}`` variable on purpose -- an input
-#: variable is the one form that can prompt the user to type a key, and a user who
-#: pastes a real Copilot or OpenAI key in response would be putting a live
-#: credential somewhere it is not needed and never read.
+#: Placeholder API key. The proxy substitutes the real Copilot credential itself,
+#: so whatever VS Code sends here is never read upstream.
+#:
+#: A plain literal is used rather than ``${input:...}`` because that syntax is not
+#: a user prompt -- it is VS Code's pointer into its own secret storage, which
+#: only its *Manage Language Models* UI ever writes. An unresolved pointer yields
+#: an empty key, so the value on the wire is the same either way; the literal is
+#: simply honest about being inert instead of implying a secret exists.
 PLACEHOLDER_API_KEY = "headroom-local-unused"
 
 
@@ -350,7 +373,20 @@ def enable_byok_setting(path: Path) -> str:
     if _BYOK_MARKER_START in raw:
         return "already set"
     if BYOK_ENABLED_SETTING in raw:
-        # The user already configured it themselves; leave their value alone.
+        # Never overwrite the user's own value -- but `false` is the one value
+        # that silently produces zero visible models, and it is also the default,
+        # so passing it off as "already configured" would send someone hunting for
+        # models that cannot appear. Distinguish it so the caller can warn.
+        from headroom.providers.copilot.vscode import _strip_jsonc_comments
+
+        try:
+            import re as _re
+
+            parsed = json.loads(_re.sub(r",\s*([}\]])", r"\1", _strip_jsonc_comments(raw)))
+            if isinstance(parsed, dict) and parsed.get(BYOK_ENABLED_SETTING) is False:
+                return "set to false by user"
+        except (ValueError, TypeError):
+            pass
         return "already set by user"
 
     close = raw.rfind("}")

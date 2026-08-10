@@ -242,12 +242,23 @@ def test_byok_setting_is_added_and_removed(tmp_path: Path) -> None:
     assert '"editor.fontSize": 14' in after
 
 
-def test_byok_setting_respects_a_user_value(tmp_path: Path) -> None:
-    """If the user already set it, leave their choice alone."""
+def test_a_user_false_value_is_reported_distinctly(tmp_path: Path) -> None:
+    """`false` is the one value that silently yields zero visible models.
+
+    It is also the setting's default and it is not in the Settings UI, so
+    reporting it as "already configured" would send someone hunting for models
+    that cannot appear. The user's value is still never overwritten.
+    """
     p = tmp_path / "settings.json"
     p.write_text(f'{{\n\t"{BYOK_ENABLED_SETTING}": false\n}}\n', encoding="utf-8")
+    assert enable_byok_setting(p) == "set to false by user"
+    assert "false" in p.read_text(encoding="utf-8"), "the user's value was overwritten"
+
+
+def test_byok_setting_respects_a_user_true_value(tmp_path: Path) -> None:
+    p = tmp_path / "settings.json"
+    p.write_text(f'{{\n\t"{BYOK_ENABLED_SETTING}": true\n}}\n', encoding="utf-8")
     assert enable_byok_setting(p) == "already set by user"
-    assert "false" in p.read_text(encoding="utf-8")
 
 
 def test_byok_setting_is_idempotent(tmp_path: Path) -> None:
@@ -289,3 +300,47 @@ def test_generated_config_contains_no_credential_material(payload: dict, tmp_pat
     text = p.read_text(encoding="utf-8")
     for pattern in ("gho_", "ghs_", "ghu_", "github_pat_", "sk-", "Bearer ", "tid=", "sku="):
         assert pattern not in text, f"{pattern!r} leaked into the generated config"
+
+
+def test_responses_models_declare_zero_data_retention(payload: dict) -> None:
+    """Without this, every /responses model 400s on first use.
+
+    VS Code sets `store: !zeroDataRetentionEnabled` on each /responses request and
+    Copilot's API rejects the field outright (`400 store is not supported`,
+    reproduced live). 8 of the 24 live models are served only on that wire.
+    """
+    entries = build_model_entries(payload, BASE)
+    responses = [e for e in entries if e["apiType"] == "responses"]
+    assert responses, "fixture should contain responses-only models"
+    for entry in responses:
+        assert entry.get("zeroDataRetentionEnabled") is True, entry["id"]
+    for entry in (e for e in entries if e["apiType"] == "chat-completions"):
+        assert "zeroDataRetentionEnabled" not in entry, "only the responses wire needs it"
+
+
+def test_schema_required_fields_are_always_present(payload: dict) -> None:
+    """A model missing these yields NaN token limits rather than a visible error."""
+    for entry in build_model_entries(payload, BASE):
+        for field in ("id", "name", "url", "apiType", "toolCalling", "vision"):
+            assert field in entry, f"{entry.get('id')} missing {field}"
+        assert isinstance(entry["maxInputTokens"], int) and entry["maxInputTokens"] > 0
+        assert isinstance(entry["maxOutputTokens"], int) and entry["maxOutputTokens"] > 0
+
+
+def test_required_limits_survive_a_catalog_without_them(payload: dict) -> None:
+    """Emit defaults rather than omitting a schema-required field."""
+    import copy
+
+    mutated = copy.deepcopy(payload)
+    for model in mutated["data"]:
+        if model.get("id") == "claude-opus-4.8":
+            model["capabilities"]["limits"] = {}
+    entry = {e["id"]: e for e in build_model_entries(mutated, BASE)}["claude-opus-4.8"]
+    assert entry["maxInputTokens"] > 0
+    assert entry["maxOutputTokens"] > 0
+
+
+def test_context_window_is_written_from_the_catalog(payload: dict) -> None:
+    """VS Code otherwise derives it as input+output, which understates some models."""
+    entries = {e["id"]: e for e in build_model_entries(payload, BASE)}
+    assert entries["gpt-5-mini"]["contextWindow"] == 264000

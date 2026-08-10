@@ -818,10 +818,20 @@ def _ensure_chatgpt_responses_store_false(
     payload: dict[str, Any],
     *,
     is_chatgpt_auth: bool,
+    is_copilot_upstream: bool = False,
 ) -> bool:
-    """Return True when ChatGPT auth requires and receives a store rewrite."""
+    """Force ``store: false`` where the upstream refuses server-side storage.
 
-    if is_chatgpt_auth and payload.get("store") is not False:
+    ChatGPT auth has always needed this. GitHub Copilot's hosted API needs it too:
+    it rejects the field outright with ``400 store is not supported``, and VS
+    Code's BYOK client sends ``store: true`` on every ``/responses`` request
+    unless the model is declared zero-data-retention. Without this rewrite every
+    ``/responses``-served model would fail on first use behind that client.
+
+    Returns True when a rewrite happened, so the caller can log it.
+    """
+
+    if (is_chatgpt_auth or is_copilot_upstream) and payload.get("store") is not False:
         payload["store"] = False
         return True
     return False
@@ -5285,8 +5295,12 @@ class OpenAIHandlerMixin:
         headers, is_chatgpt_auth = _resolve_codex_routing_headers(headers)
         if is_chatgpt_auth:
             client = "codex"
-        if _ensure_chatgpt_responses_store_false(body, is_chatgpt_auth=is_chatgpt_auth):
-            logger.info(f"[{request_id}] Responses: forced store=false for ChatGPT auth")
+        if _ensure_chatgpt_responses_store_false(
+            body,
+            is_chatgpt_auth=is_chatgpt_auth,
+            is_copilot_upstream=is_copilot_api_url(self._resolved_openai_upstream_base(request)),
+        ):
+            logger.info(f"[{request_id}] Responses: forced store=false (upstream rejects it)")
         responses_memory_tools_allowed = _allow_responses_memory_tools(is_chatgpt_auth)
 
         # PR-A6 (P5-50, preps P0-6): session-sticky `OpenAI-Beta` merge

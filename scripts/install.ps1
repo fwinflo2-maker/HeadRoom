@@ -346,6 +346,27 @@ function Get-PersistentDockerArgs {
     return ,$args.ToArray()
 }
 
+function Add-DashboardGatewayEnv {
+    param([System.Collections.Generic.List[string]]$ArgsList)
+
+    # A host request published through Docker's default bridge reaches the
+    # container from the bridge gateway (for example, 172.17.0.1), not from
+    # 127.0.0.1. Trust only that exact gateway by default so the dashboard's
+    # metadata gate works for the first-party persistent Docker preset while
+    # preserving an explicitly configured allowlist.
+    if (Test-Path Env:HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS) {
+        return
+    }
+
+    $gateway = (& docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -eq 0 -and $gateway) {
+        $ArgsList.Add('--env')
+        $ArgsList.Add("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS=$gateway/32")
+    } else {
+        Write-Warning 'Could not determine Docker bridge gateway; dashboard metadata remains restricted'
+    }
+}
+
 function Get-ManifestProxyArgs {
     param(
         [int]$Port,
@@ -494,6 +515,7 @@ function Start-PersistentDockerInstall {
     $dockerArgs = New-Object System.Collections.Generic.List[string]
     $dockerArgs.AddRange([string[]]@('run','-d','--restart','unless-stopped','--name',$containerName,'-p',"$Port`:$Port"))
     $dockerArgs.AddRange((Get-PersistentDockerArgs))
+    Add-DashboardGatewayEnv -ArgsList $dockerArgs
     $dockerArgs.AddRange([string[]]@(
         '--env',"HEADROOM_DEPLOYMENT_PROFILE=$Profile",
         '--env','HEADROOM_DEPLOYMENT_PRESET=persistent-docker',

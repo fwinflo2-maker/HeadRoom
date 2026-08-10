@@ -105,6 +105,13 @@ def main() -> int:
     if command == "pull":
         return 0
 
+    if command == "network" and len(args) > 1 and args[1] == "inspect":
+        # Match the default bridge gateway used by the native installer when
+        # it configures the dashboard metadata allowlist.
+        if "--format" in args:
+            print("172.17.0.1")
+        return 0
+
     if command == "run":
         detached = "-d" in args
         if not detached:
@@ -407,6 +414,7 @@ def test_bash_native_installer_supports_persistent_docker_lifecycle(tmp_path: Pa
         # the container so the proxy resolves state/config to the bind mount.
         assert "HEADROOM_WORKSPACE_DIR=/tmp/headroom-home/.headroom" in install_call
         assert "HEADROOM_CONFIG_DIR=/tmp/headroom-home/.headroom/config" in install_call
+        assert "HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS=172.17.0.1/32" in install_call
 
         status_result = _run(
             [str(wrapper), "install", "status", "--profile", "smoke"],
@@ -658,6 +666,7 @@ def test_powershell_native_installer_supports_persistent_docker_lifecycle(tmp_pa
         # Canonical filesystem contract env vars (issue #175).
         assert "HEADROOM_WORKSPACE_DIR=/tmp/headroom-home/.headroom" in install_call
         assert "HEADROOM_CONFIG_DIR=/tmp/headroom-home/.headroom/config" in install_call
+        assert "HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS=172.17.0.1/32" in install_call
 
         status_result = _run(
             [

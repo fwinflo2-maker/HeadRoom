@@ -2477,35 +2477,6 @@ class AnthropicHandlerMixin:
                         f"{_ts_saved_tokens}tok"
                     )
 
-            # Tool-search history repair (#2805). Once deferral is on, the client
-            # stores Anthropic's server_tool_use / tool_search_tool_result blocks in
-            # its transcript forever, and upstream validates every tool_reference in
-            # that history against THIS request's tools array. Claude Code replays
-            # the same transcript on side-requests carrying a different, smaller
-            # tools array (the prompt-type Stop hook evaluator, /compact), which the
-            # proxy cannot predict — so upstream 400s with "Tool reference 'X' not
-            # found in available tools". Drop the blocks such a request cannot
-            # support. Runs AFTER the injection above so the tool we just added
-            # counts as present: on the main loop nothing is stripped and the prefix
-            # is untouched. Unconditional (not gated on the flag) so transcripts
-            # poisoned before the flag was turned off still recover.
-            from headroom.proxy.helpers import strip_unsupported_tool_search_blocks
-
-            _ts_repaired, _ts_stripped = strip_unsupported_tool_search_blocks(
-                body.get("messages"), body.get("tools")
-            )
-            if _ts_stripped:
-                body["messages"] = _ts_repaired
-                optimized_messages = _ts_repaired
-                body_mutation_tracker.mark_mutated("tool_search_history_repair")
-                transforms_applied.append(f"router:tool_search_repair:{_ts_stripped}blocks")
-                logger.info(
-                    "[%s] Tool search: dropped %d unsupportable history block(s) "
-                    "(tools array cannot resolve their tool_reference entries)",
-                    request_id,
-                    _ts_stripped,
-                )
-
             # Turn hooks (opt-in extensions): a registered hook may inspect or
             # rewrite the outbound tools/messages before we send upstream — the
             # extensible counterpart to the built-in deferral above. A single
@@ -2551,6 +2522,40 @@ class AnthropicHandlerMixin:
                     tags["turn_hook_tools_saved_tokens"] = (
                         int(tags.get("turn_hook_tools_saved_tokens", 0) or 0) + _th_saved
                     )
+
+            # Tool-search history repair (#2805). Once deferral is on, the client
+            # stores Anthropic's server_tool_use / tool_search_tool_result blocks in
+            # its transcript forever, and upstream validates every tool_reference in
+            # that history against THIS request's tools array. Claude Code replays
+            # the same transcript on side-requests carrying a different, smaller
+            # tools array (the prompt-type Stop hook evaluator, /compact), which the
+            # proxy cannot predict — so upstream 400s with "Tool reference 'X' not
+            # found in available tools". Drop the blocks such a request cannot
+            # support. Unconditional (not gated on the flag) so transcripts poisoned
+            # before the flag was turned off still recover.
+            #
+            # ORDERING (#2888): this must be the LAST stage that can invalidate a
+            # tool_reference, so it runs after BOTH the deferral injection above (the
+            # tool we just added counts as present, so the main loop strips nothing
+            # and the prefix is untouched) AND the turn hooks (a hook may rewrite the
+            # tools array, and repairing before it validated against a stale view).
+            # Nothing past this point mutates `body["tools"]` on the outbound path.
+            from headroom.proxy.helpers import strip_unsupported_tool_search_blocks
+
+            _ts_repaired, _ts_stripped = strip_unsupported_tool_search_blocks(
+                body.get("messages"), body.get("tools")
+            )
+            if _ts_stripped:
+                body["messages"] = _ts_repaired
+                optimized_messages = _ts_repaired
+                body_mutation_tracker.mark_mutated("tool_search_history_repair")
+                transforms_applied.append(f"router:tool_search_repair:{_ts_stripped}blocks")
+                logger.info(
+                    "[%s] Tool search: dropped %d unsupportable history block(s) "
+                    "(tools array cannot resolve their tool_reference entries)",
+                    request_id,
+                    _ts_stripped,
+                )
 
             # Consistency: report tok_before/tok_after with ONE tokenizer. The pipeline
             # and the handler use different token estimators, and cache-mode branches

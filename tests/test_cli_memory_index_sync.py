@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -284,3 +286,77 @@ def test_purge_command_clears_vector_index(tmp_path):
 
     assert _fts_count(db_path) == 0
     assert _vector_ids(db_path) == set()
+
+
+# ---------------------------------------------------------------------------
+# Failure-path: return value and exit-code impact
+# ---------------------------------------------------------------------------
+
+
+def test_remove_from_search_indexes_fts_failure_returns_false(tmp_path):
+    """When FTS5 delete raises, the function returns False (not True)."""
+    db_path = tmp_path / "memory.db"
+    _seed_fts(db_path, [_make_memory("id-0")])
+
+    # sqlite3 is imported locally inside the helper so we patch the global module.
+    original_connect = sqlite3.connect
+    call_count = [0]
+
+    def failing_connect(path, **kwargs):
+        call_count[0] += 1
+        if call_count[0] == 1:  # first call is the FTS5 db open
+            raise sqlite3.OperationalError("simulated FTS5 failure")
+        return original_connect(path, **kwargs)
+
+    with patch("sqlite3.connect", side_effect=failing_connect):
+        result = _remove_from_search_indexes(str(db_path), ["id-0"])
+
+    assert result is False
+
+
+def test_remove_from_search_indexes_sqlite_vec_missing_returns_false(tmp_path):
+    """When sqlite_vec is absent and a vector DB exists, returns False."""
+    db_path = tmp_path / "memory.db"
+    _seed_fts(db_path, [])
+    # Create a non-empty vector DB file so the code doesn't short-circuit.
+    vector_db = tmp_path / "memory_vectors.db"
+    vector_db.write_bytes(b"placeholder")
+
+    # Remove sqlite_vec from sys.modules so `import sqlite_vec` raises ImportError.
+    with patch.dict(sys.modules, {"sqlite_vec": None}):
+        result = _remove_from_search_indexes(str(db_path), ["id-0"])
+
+    assert result is False
+
+
+def test_clear_all_search_indexes_fts_failure_returns_false(tmp_path):
+    """When FTS5 DELETE raises, _clear_all_search_indexes returns False."""
+    db_path = tmp_path / "memory.db"
+    _seed_fts(db_path, [_make_memory("id-0")])
+
+    original_connect = sqlite3.connect
+    call_count = [0]
+
+    def failing_connect(path, **kwargs):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            raise sqlite3.OperationalError("simulated FTS5 failure")
+        return original_connect(path, **kwargs)
+
+    with patch("sqlite3.connect", side_effect=failing_connect):
+        result = _clear_all_search_indexes(str(db_path))
+
+    assert result is False
+
+
+def test_clear_all_search_indexes_sqlite_vec_missing_returns_false(tmp_path):
+    """When sqlite_vec is absent and a vector DB exists, returns False."""
+    db_path = tmp_path / "memory.db"
+    _seed_fts(db_path, [])
+    vector_db = tmp_path / "memory_vectors.db"
+    vector_db.write_bytes(b"placeholder")
+
+    with patch.dict(sys.modules, {"sqlite_vec": None}):
+        result = _clear_all_search_indexes(str(db_path))
+
+    assert result is False

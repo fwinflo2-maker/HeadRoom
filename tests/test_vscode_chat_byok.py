@@ -474,17 +474,18 @@ def test_unknown_identity_never_counts_as_a_match(
 # ---------------------------------------------------------------------------
 
 
-def test_dotted_tool_names_are_never_deferred() -> None:
-    """A deferred function's name becomes its namespace, and namespaces reject '.'.
+def test_deferral_is_skipped_when_any_name_cannot_be_a_namespace() -> None:
+    """Injecting the search tool namespaces the WHOLE array, not just deferred tools.
 
-    VS Code Copilot Chat names tools that way (`file_search.file_search`), so
-    deferring one invalidated the entire request and every other tool went down
-    with it -- reproduced live as both
-    "User-defined namespace '...' must not contain '.'" and
-    "Function '...' is not allowed in reserved namespace 'file_search'".
+    In that mode a function name is read as ``namespace.function``: it may not
+    contain a second "." and may not occupy a namespace reserved for a built-in
+    tool type. VS Code Copilot Chat names tools ``file_search.file_search``,
+    which breaks both rules, and the upstream rejects the entire request --
+    every tool lost, whether or not that tool was the one deferred.
 
-    Only tool-rich clients ever saw it: below the deferral threshold nothing is
-    deferred, which is why the same name succeeds in a small request.
+    So leaving the offending tool merely resident is not enough; the mode itself
+    is what validates. The optimisation has to be skipped wholesale, which keeps
+    the request byte-identical to what the client would have sent alone.
     """
     from headroom.proxy.helpers import inject_tool_search_deferral_openai
 
@@ -492,16 +493,18 @@ def test_dotted_tool_names_are_never_deferred() -> None:
         return {"type": "function", "name": name, "parameters": {"type": "object"}}
 
     plain = [tool(f"vscode_tool_{i}") for i in range(20)]
-    dotted = [tool("file_search.file_search"), tool("mcp.server.do_thing")]
 
-    out = inject_tool_search_deferral_openai(plain + dotted, "gpt-5.5", client=None)
-    assert out is not (plain + dotted), "deferral should still apply to the undotted tools"
+    # Untouched: returning the caller's own list is the signal that nothing was
+    # injected, so the request goes upstream exactly as the client built it.
+    for offender in ("file_search.file_search", "mcp.server.do_thing", "file_search"):
+        tools = [*plain, tool(offender)]
+        assert inject_tool_search_deferral_openai(tools, "gpt-5.5", client=None) is tools, offender
 
-    by_name = {t.get("name"): t for t in out if isinstance(t, dict) and t.get("name")}
-    for name in ("file_search.file_search", "mcp.server.do_thing"):
-        assert not by_name[name].get("defer_loading"), f"{name} would break the whole request"
-    # The point of the feature still holds for names that can be a namespace.
-    assert by_name["vscode_tool_0"].get("defer_loading") is True
+    # Still applies when every name can legally be a namespace.
+    out = inject_tool_search_deferral_openai(plain, "gpt-5.5", client=None)
+    assert out is not plain
+    assert any(t.get("type") == "tool_search" for t in out if isinstance(t, dict))
+    assert any(t.get("defer_loading") for t in out if isinstance(t, dict))
 
 
 def test_tool_search_deferral_is_scoped_to_a_real_anthropic_upstream() -> None:

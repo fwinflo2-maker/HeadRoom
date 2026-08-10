@@ -2389,6 +2389,12 @@ def inject_tool_search_deferral(
 _OPENAI_TOOL_SEARCH_TYPE = "tool_search"
 _OPENAI_TOOL_SEARCH_MIN_TOOLS = 12
 _OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset({"terminal"})
+#: Namespaces the upstream reserves for its own built-in tool types. In
+#: namespaced-tools mode a user function may not occupy one, so a client that
+#: names a tool after a built-in makes the whole request invalid.
+_OPENAI_TOOL_SEARCH_RESERVED_NAMESPACES = frozenset(
+    {"file_search", "web_search", "web_search_preview", "code_interpreter", "computer", "image_gen"}
+)
 _OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex"})
 # gpt-5.4 is the first model with Responses tool_search (OpenAI docs). Version-
 # gated by default; overridable per deployment via a regex in
@@ -2456,6 +2462,26 @@ def inject_tool_search_deferral_openai(
         if isinstance(tool, dict) and tool.get("type") == _OPENAI_TOOL_SEARCH_TYPE:
             return tools  # client already uses tool search — leave it alone
 
+    # Injecting the search tool switches the upstream into namespaced-tools mode
+    # for the WHOLE array, and there a function name is read as
+    # `namespace.function`: it may not contain a second "." and may not sit in a
+    # namespace reserved for a built-in tool type. VS Code Copilot Chat names
+    # tools `file_search.file_search`, which violates both, so the request is
+    # rejected outright -- 400, every tool lost, whether or not that particular
+    # tool was the one deferred.
+    #
+    # Leaving such a tool merely resident is not enough; the mode is what
+    # validates. So the whole optimisation is skipped when any name cannot be a
+    # namespace, which keeps the request byte-identical to what the client would
+    # have sent on its own. Losing some context saving is strictly better than
+    # losing the request.
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        name = str(tool.get("name") or "")
+        if "." in name or name.lower() in _OPENAI_TOOL_SEARCH_RESERVED_NAMESPACES:
+            return tools
+
     out: list[Any] = [{"type": _OPENAI_TOOL_SEARCH_TYPE}]
     deferred = 0
     # Case-insensitive for the same reason as the Anthropic path above: the
@@ -2471,21 +2497,8 @@ def inject_tool_search_deferral_openai(
         # Deferrable: a non-core function, or an MCP server (OpenAI models are
         # trained to search namespaces / MCP servers). Everything else — core
         # coding tools and other hosted tools — stays resident.
-        # A deferred function's own name becomes its namespace, and namespaces may
-        # not contain "." -- so deferring a dotted name makes the whole request
-        # invalid, taking every other tool down with it. VS Code Copilot Chat
-        # names tools that way (`file_search.file_search`), and the upstream
-        # rejects it two different ways depending on the prefix:
-        #   "User-defined namespace 'file_search.file_search' must not contain '.'"
-        #   "Function 'file_search.file_search' is not allowed in reserved
-        #    namespace 'file_search'"
-        # Both reproduced live at >= the deferral threshold, and both disappear
-        # below it -- which is why this only ever showed up on tool-rich clients.
-        # Keeping such tools resident costs a little context and keeps the request
-        # valid; deferring them saves nothing because the call 400s.
-        name = str(tool.get("name") or "")
         deferrable = (
-            ttype == "function" and name.lower() not in resident_lower and "." not in name
+            ttype == "function" and str(tool.get("name") or "").lower() not in resident_lower
         ) or ttype == "mcp"
         if deferrable and not tool.get("defer_loading"):
             new_tool = dict(tool)

@@ -46,7 +46,7 @@ Write-Host "===============================================================" -Fo
 # --- 1. Preflight ----------------------------------------------------------
 Write-Step "[1] Preflight"
 
-$headroom = (Get-Command headroom -ErrorAction SilentlyContinue)?.Source
+$headroom = (Get-Command headroom -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
 if (-not $headroom) {
     Write-Bad "'headroom' is not on PATH. Activate the venv or reinstall, then retry."
     exit 1
@@ -120,7 +120,8 @@ Write-Host ''
 Set-Location '$Path'
 headroom wrap vscode-chat --port $Port
 "@
-Start-Process powershell -ArgumentList '-NoExit', '-Command', $cmd
+$shell = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
+Start-Process $shell -ArgumentList '-NoExit', '-Command', $cmd
 
 Write-Host "    waiting for the proxy..." -ForegroundColor DarkGray
 $deadline = (Get-Date).AddSeconds(90)

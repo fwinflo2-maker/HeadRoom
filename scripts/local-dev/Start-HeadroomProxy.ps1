@@ -1,11 +1,12 @@
 <#
 .SYNOPSIS
-    Start the central local Headroom proxy that Copilot CLI and VS Code share.
+    Start the central local Headroom proxy that all three clients share.
 
 .DESCRIPTION
     One proxy, one dashboard, one savings total. Start this first and leave it
-    running; Start-HeadroomCopilotCli.ps1 and Start-HeadroomVSCode.ps1 then
-    attach to it instead of each starting their own.
+    running; Start-HeadroomCopilotCli.ps1, Start-HeadroomVSCode.ps1 and
+    Start-HeadroomClaudeCode.ps1 then attach to it instead of each starting
+    their own.
 
     It runs `headroom wrap vscode-chat --no-configure`, which is the
     proxy-only watcher: it pins BOTH upstreams at the GitHub Copilot host and
@@ -17,9 +18,11 @@
     serving the same GitHub account. A different account is moved to its own
     port automatically.
 
-    NOT for Claude Code. Because both upstreams point at Copilot, an Anthropic
-    client attaching here would have its own API key forwarded to GitHub.
-    Start-HeadroomClaudeCode.ps1 therefore uses its own port - by design.
+    Claude Code attaches here too. Because both upstreams point at Copilot,
+    `wrap claude` pins its own upstream per request
+    (X-Headroom-Base-Url: https://api.anthropic.com) so its traffic still
+    reaches Anthropic, and the proxy refuses to forward an x-api-key to a
+    non-Anthropic host at all.
 
 .EXAMPLE
     .\Start-HeadroomProxy.ps1
@@ -28,7 +31,7 @@
 #>
 [CmdletBinding()]
 param(
-    # Shared by the Copilot CLI and VS Code scripts - keep all three the same.
+    # Shared by all the client scripts - keep them the same.
     [ValidateRange(1, 65535)]
     [int]$Port = 8970,
 
@@ -50,12 +53,12 @@ function Write-Step { param($m) Write-Host "`n$m" -ForegroundColor Cyan }
 
 Write-Host "`n===============================================================" -ForegroundColor Magenta
 Write-Host " Headroom CENTRAL PROXY  (port $Port)" -ForegroundColor Magenta
-Write-Host " Shared by the Copilot CLI and VS Code Copilot Chat" -ForegroundColor Magenta
+Write-Host " Shared by the Copilot CLI, VS Code Copilot Chat and Claude Code" -ForegroundColor Magenta
 Write-Host "===============================================================" -ForegroundColor Magenta
 
 Write-Step "[1] Preflight"
 
-$headroom = (Get-Command headroom -ErrorAction SilentlyContinue)?.Source
+$headroom = (Get-Command headroom -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
 if (-not $headroom) { Write-Bad "'headroom' is not on PATH."; exit 1 }
 Write-Ok "headroom found: $headroom"
 if (-not (Test-Path $Path)) { Write-Bad "Path not found: $Path"; exit 1 }
@@ -86,12 +89,13 @@ $cmd = @"
 `$Host.UI.RawUI.WindowTitle = 'HEADROOM CENTRAL PROXY - port $Port'
 Write-Host ''
 Write-Host ' HEADROOM CENTRAL PROXY' -ForegroundColor Magenta
-Write-Host ' Shared by the Copilot CLI and VS Code. Leave this window open.' -ForegroundColor DarkGray
+Write-Host ' Shared by the Copilot CLI, VS Code and Claude Code. Leave open.' -ForegroundColor DarkGray
 Write-Host ' Closing it detaches every client.' -ForegroundColor DarkGray
 Write-Host ''
 $inner
 "@
-Start-Process powershell -ArgumentList '-NoExit', '-Command', $cmd
+$shell = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
+Start-Process $shell -ArgumentList '-NoExit', '-Command', $cmd
 
 Write-Host "    waiting for the proxy..." -ForegroundColor DarkGray
 $deadline = (Get-Date).AddSeconds(90); $ready = $false
@@ -121,12 +125,10 @@ Write-Host @"
      .\Start-HeadroomCopilotCli.ps1     # Copilot CLI, --native mode
      .\Start-HeadroomVSCode.ps1         # VS Code Copilot Chat
 
-  Both attach to this proxy on port $Port. Everything shows up on the one
-  dashboard above.
+     .\Start-HeadroomClaudeCode.ps1     # Claude Code
 
-     .\Start-HeadroomClaudeCode.ps1     # Claude Code - SEPARATE port, on purpose
-                                        # (this proxy would send an Anthropic
-                                        #  key to GitHub; see that script)
+  All three attach to this proxy on port $Port. Everything shows up on the
+  one dashboard above.
 
   TO STOP: Ctrl+C in the proxy window.
 

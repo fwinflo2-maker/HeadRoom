@@ -50,14 +50,14 @@ Write-Host "===============================================================" -Fo
 # --- 1. Preflight ----------------------------------------------------------
 Write-Step "[1] Preflight"
 
-$headroom = (Get-Command headroom -ErrorAction SilentlyContinue)?.Source
+$headroom = (Get-Command headroom -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
 if (-not $headroom) {
     Write-Bad "'headroom' is not on PATH. Activate the venv or reinstall, then retry."
     exit 1
 }
 Write-Ok "headroom found: $headroom"
 
-$copilot = (Get-Command copilot -ErrorAction SilentlyContinue)?.Source
+$copilot = (Get-Command copilot -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
 if ($copilot) { Write-Ok "copilot CLI found: $copilot" }
 else { Write-Warn "'copilot' was not found on PATH - headroom will report it if it cannot launch" }
 

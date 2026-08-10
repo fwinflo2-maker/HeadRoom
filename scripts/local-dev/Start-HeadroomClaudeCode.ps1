@@ -52,11 +52,11 @@ Write-Host "===============================================================" -Fo
 
 Write-Step "[1] Preflight"
 
-$headroom = (Get-Command headroom -ErrorAction SilentlyContinue)?.Source
+$headroom = (Get-Command headroom -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
 if (-not $headroom) { Write-Bad "'headroom' is not on PATH."; exit 1 }
 Write-Ok "headroom found: $headroom"
 
-$claude = (Get-Command claude -ErrorAction SilentlyContinue)?.Source
+$claude = (Get-Command claude -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
 if ($claude) { Write-Ok "claude CLI found: $claude" }
 else { Write-Warn "'claude' was not found on PATH - headroom will report it if it cannot launch" }
 

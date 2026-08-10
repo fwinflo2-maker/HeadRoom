@@ -2434,9 +2434,20 @@ class AnthropicHandlerMixin:
             # (``anthropic_backend``) and Vertex/gateway providers gate tool search
             # differently, so scope the injection to provider "anthropic" over the
             # direct API and leave those paths untouched.
+            #
+            # The upstream has to be checked, not just the route name. Pointing
+            # this wire at GitHub Copilot -- what `wrap copilot --native` and the
+            # VS Code CAPI redirect both do, so Claude models work there -- still
+            # arrives as provider "anthropic", and the deferral then fired against
+            # an API that does not implement it, for a client that cannot search.
+            # VS Code Copilot Chat lost every tool it had: the core-tool allowlist
+            # is Claude Code's names (`bash`, `read`, `edit`), which match none of
+            # VS Code's, so all ~60k tokens of tool schemas were deferred and the
+            # agent truthfully reported it had no subagent tool to call.
             if (
                 provider_name == "anthropic"
                 and getattr(self, "anthropic_backend", None) is None
+                and _is_anthropic_upstream(upstream_base_url or self.ANTHROPIC_API_URL)
                 and os.environ.get("HEADROOM_TOOL_SEARCH", "").strip().lower()
                 in ("1", "true", "yes", "on", "auto")
             ):

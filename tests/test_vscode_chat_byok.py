@@ -474,6 +474,28 @@ def test_unknown_identity_never_counts_as_a_match(
 # ---------------------------------------------------------------------------
 
 
+def test_tool_search_deferral_is_scoped_to_a_real_anthropic_upstream() -> None:
+    """Deferring tools against Copilot silently disarms the client's whole toolset.
+
+    Anthropic's tool-search protocol is first-party only. Both `wrap copilot
+    --native` and the VS Code CAPI redirect point this wire at the Copilot host
+    so Claude models work there, and such requests still arrive as provider
+    "anthropic" -- so gating on the route name alone fired the deferral against
+    an API that does not implement it.
+
+    The damage is not partial: the core-tool allowlist is Claude Code's names,
+    which match none of VS Code's, so every tool was marked `defer_loading` and
+    the agent correctly reported it had no subagent tool to call.
+    """
+    from headroom.proxy.handlers.anthropic import _is_anthropic_upstream
+
+    assert _is_anthropic_upstream("https://api.anthropic.com") is True
+    assert _is_anthropic_upstream(None) is True
+    # The configurations this bug was reported from:
+    assert _is_anthropic_upstream("https://api.githubcopilot.com") is False
+    assert _is_anthropic_upstream("https://copilot-api.enterprise.ghe.com") is False
+
+
 def test_capi_override_round_trips_and_leaves_other_settings_alone(tmp_path: Path) -> None:
     """Redirecting Copilot Chat's own API is what makes subagents compressed.
 

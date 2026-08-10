@@ -16,6 +16,7 @@ import errno
 import json
 import os
 import signal
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -726,6 +727,144 @@ def test_resolve_1m_model_falls_back_to_default_when_unset() -> None:
     """With no model selected, fall back to the default Opus carrying [1m]."""
     assert wrap_mod._resolve_1m_model(None) == "claude-opus-4-8[1m]"
     assert wrap_mod._resolve_1m_model("  ") == "claude-opus-4-8[1m]"
+
+
+# ---------------------------------------------------------------------------
+# _run_resolved_launcher — direct launch plus Windows `.cmd` / `.bat` fallback.
+# ---------------------------------------------------------------------------
+
+
+def test_run_resolved_launcher_uses_direct_execution_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A regular launcher is executed directly without probing Windows fallbacks."""
+    calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def fake_run(
+        cmd: list[str], *, env: dict[str, str], **kwargs: Any
+    ) -> subprocess.CompletedProcess:
+        calls.append((cmd, env))
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(wrap_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        wrap_mod.shutil,
+        "which",
+        lambda name: pytest.fail(f"fallback should not be queried for direct success: {name!r}"),
+    )
+
+    env = {"HEADROOM_TEST": "1"}
+    result = wrap_mod._run_resolved_launcher("codex", ("--help",), env, "CODEX")
+
+    assert result.returncode == 0
+    assert calls == [(["codex", "--help"], env)]
+
+
+def test_run_resolved_launcher_windows_permission_error_uses_cmd_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows PermissionError falls back to a real `.cmd` shim when one exists."""
+    direct = str(
+        Path("C:/Program Files/WindowsApps")
+        / "OpenAI.Codex_26.803.5235.0_x64__2p2nqsd0c76g0"
+        / "app"
+        / "resources"
+        / "codex.exe"
+    )
+    fallback = str(Path("C:/Users/dorts/AppData/Roaming/npm") / "codex.cmd")
+    calls: list[list[str]] = []
+
+    def fake_run(
+        cmd: list[str], *, env: dict[str, str], **kwargs: Any
+    ) -> subprocess.CompletedProcess:
+        calls.append(cmd)
+        if cmd[0] == direct:
+            raise PermissionError(5, "Zugriff verweigert", direct)
+        if cmd[0] == fallback:
+            return subprocess.CompletedProcess(cmd, 0)
+        raise AssertionError(f"unexpected launcher: {cmd!r}")
+
+    def fake_which(name: str) -> str | None:
+        if name == "codex.cmd":
+            return fallback
+        if name == "codex.bat":
+            return None
+        raise AssertionError(f"unexpected fallback lookup: {name!r}")
+
+    monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
+    monkeypatch.setattr(wrap_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(wrap_mod.shutil, "which", fake_which)
+
+    result = wrap_mod._run_resolved_launcher(direct, ("--help",), {"HEADROOM_TEST": "1"}, "CODEX")
+
+    assert result.returncode == 0
+    assert calls == [[direct, "--help"], [fallback, "--help"]]
+
+
+def test_run_resolved_launcher_windows_fallback_failure_mentions_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the fallback launcher also fails, the error must keep the command context."""
+    direct = str(
+        Path("C:/Program Files/WindowsApps")
+        / "OpenAI.Codex_26.803.5235.0_x64__2p2nqsd0c76g0"
+        / "app"
+        / "resources"
+        / "codex.exe"
+    )
+    fallback = str(Path("C:/Users/dorts/AppData/Roaming/npm") / "codex.cmd")
+
+    def fake_run(
+        cmd: list[str], *, env: dict[str, str], **kwargs: Any
+    ) -> subprocess.CompletedProcess:
+        if cmd[0] == direct:
+            raise PermissionError(5, "Zugriff verweigert", direct)
+        if cmd[0] == fallback:
+            raise PermissionError(5, "Zugriff verweigert", fallback)
+        raise AssertionError(f"unexpected launcher: {cmd!r}")
+
+    def fake_which(name: str) -> str | None:
+        if name == "codex.cmd":
+            return fallback
+        if name == "codex.bat":
+            return None
+        raise AssertionError(f"unexpected fallback lookup: {name!r}")
+
+    monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
+    monkeypatch.setattr(wrap_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(wrap_mod.shutil, "which", fake_which)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        wrap_mod._run_resolved_launcher(direct, ("--help",), {}, "CODEX")
+
+    message = str(excinfo.value)
+    assert "WindowsApps" in message
+    assert Path(direct).name in message
+    assert Path(fallback).name in message
+    assert "codex" in message
+    assert "could not be executed directly on Windows" in message
+
+
+def test_run_resolved_launcher_non_windows_does_not_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-Windows behavior stays unchanged: the direct PermissionError propagates."""
+
+    def fake_run(
+        cmd: list[str], *, env: dict[str, str], **kwargs: Any
+    ) -> subprocess.CompletedProcess:
+        raise PermissionError(13, "Permission denied", cmd[0])
+
+    monkeypatch.setattr(wrap_mod.sys, "platform", "linux")
+    monkeypatch.setattr(wrap_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        wrap_mod.shutil,
+        "which",
+        lambda name: pytest.fail(f"non-Windows code should not query fallbacks: {name!r}"),
+    )
+
+    with pytest.raises(PermissionError):
+        wrap_mod._run_resolved_launcher("codex", (), {}, "CODEX")
 
 
 class TestFindAvailablePort:

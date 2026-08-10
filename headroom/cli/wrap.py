@@ -3987,6 +3987,65 @@ def _ignore_child_sigint(signum: int | None = None, frame: Any = None) -> None:
     return None
 
 
+def _windows_launcher_fallbacks(binary: str) -> list[str]:
+    """Return alternate direct-launchable Windows wrappers for ``binary``.
+
+    ``shutil.which()`` can resolve a Windows Store / App Execution Alias that
+    looks executable but raises ``PermissionError`` when launched directly.
+    If a real wrapper script such as ``<name>.cmd`` or ``<name>.bat`` also
+    exists on PATH, retry that instead without going through a shell.
+    """
+
+    if sys.platform != "win32":
+        return []
+
+    stem = Path(binary).stem
+    fallbacks: list[str] = []
+    for suffix in (".cmd", ".bat"):
+        candidate = shutil.which(f"{stem}{suffix}")
+        if candidate and candidate != binary and candidate not in fallbacks:
+            fallbacks.append(candidate)
+    return fallbacks
+
+
+def _run_resolved_launcher(
+    binary: str,
+    args: tuple,
+    env: dict[str, str],
+    tool_label: str,
+) -> subprocess.CompletedProcess[Any]:
+    """Run a resolved launcher directly, with a Windows-specific fallback."""
+
+    command_name = Path(binary).stem
+    try:
+        return subprocess.run([binary, *args], env=env)
+    except PermissionError as exc:
+        if sys.platform != "win32":
+            raise
+
+        fallbacks = _windows_launcher_fallbacks(binary)
+        if not fallbacks:
+            raise click.ClickException(
+                f"{tool_label} launcher {binary!r} could not be executed directly on Windows. "
+                f"No alternate {command_name!r}.cmd or .bat launcher was found on PATH."
+            ) from exc
+
+        fallback_errors: list[str] = []
+        for fallback in fallbacks:
+            try:
+                return subprocess.run([fallback, *args], env=env)
+            except OSError as fallback_exc:
+                fallback_errors.append(f"{fallback!r}: {fallback_exc}")
+
+        fallback_display = ", ".join(map(repr, fallbacks))
+        failure_display = "; ".join(fallback_errors)
+        raise click.ClickException(
+            f"{tool_label} launcher {binary!r} could not be executed directly on Windows. "
+            f"Tried fallback launcher(s) {fallback_display} for {command_name!r}, "
+            f"but they also failed: {failure_display}"
+        ) from exc
+
+
 def _launch_tool(
     binary: str,
     args: tuple,
@@ -4076,11 +4135,14 @@ def _launch_tool(
         _print_telemetry_notice()
         click.echo()
 
-        result = subprocess.run([binary, *args], env=env)
+        result = _run_resolved_launcher(binary, args, env, tool_label)
         raise SystemExit(result.returncode)
 
     except SystemExit:
         raise
+    except click.ClickException as e:
+        click.echo(f"  Error: {e}")
+        raise SystemExit(1) from e
     except Exception as e:
         click.echo(f"  Error: {e}")
         raise SystemExit(1) from e

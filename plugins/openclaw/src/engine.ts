@@ -7,6 +7,8 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+import { readFile, rename, rm, writeFile } from "node:fs/promises";
+
 import { compress } from "headroom-ai";
 import { ProxyManager, defaultLogger, type ProxyManagerConfig, type ProxyManagerLogger } from "./proxy-manager.js";
 import { agentToOpenAI, normalizeAgentMessages, openAIToAgent } from "./convert.js";
@@ -101,7 +103,8 @@ export class HeadroomContextEngine {
       // Convert AgentMessage → OpenAI format
       const openaiMessages = agentToOpenAI(params.messages);
 
-      // Compress via proxy — pass tokenBudget so RollingWindow enforces it
+      // Compress via proxy — pass tokenBudget so the pipeline can tune its
+      // context-pressure decisions for the target model.
       const result = await compress(openaiMessages, {
         model: params.model ?? "claude-sonnet-4-5",
         baseUrl: this.proxyUrl,
@@ -149,10 +152,11 @@ export class HeadroomContextEngine {
    * Calls compress() with the token budget, which triggers:
    * - SmartCrusher: aggressive JSON compression (70-90% on tool outputs)
    * - Kompress: ModernBERT text compression (40-60% on assistant text)
-   * - RollingWindow: drops oldest messages if still over budget
+   * - Pipeline: compresses message content in place without dropping history
    * - CCR: stores originals for retrieval via headroom_retrieve tool
    *
-   * Zero LLM calls. All algorithmic.
+   * Zero LLM calls. All algorithmic. The compacted message records are written
+   * back to the supplied OpenClaw JSONL session file.
    */
   async compact(params: {
     sessionId: string;
@@ -173,24 +177,114 @@ export class HeadroomContextEngine {
       return { ok: false, compacted: false, reason: "Proxy not available" };
     }
 
-    // Read current messages from session file if available
-    // For now, compact() works in tandem with assemble() — the next assemble()
-    // call will compress with the token budget. When compact() is called
-    // independently, we report success since our pipeline handles it.
-    //
-    // TODO: Read session file, extract messages, call compress() with tokenBudget,
-    //       write back compacted messages.
+    try {
+      const sessionContent = await readFile(params.sessionFile, "utf8");
+      const lineEnding = sessionContent.includes("\r\n") ? "\r\n" : "\n";
+      const lines = sessionContent.split(/\r?\n/);
+      const records: Array<{ index: number; value: Record<string, any> }> = [];
 
-    this.stats.compactions++;
-    this.logger.info(
-      `Compact called (budget: ${params.tokenBudget ?? "none"}, force: ${params.force ?? false})`,
-    );
+      for (const [index, line] of lines.entries()) {
+        if (!line.trim()) continue;
 
-    return {
-      ok: true,
-      compacted: true,
-      reason: "Headroom applies SmartCrusher + Kompress + RollingWindow on next assemble()",
-    };
+        let value: Record<string, any>;
+        try {
+          value = JSON.parse(line) as Record<string, any>;
+        } catch (error) {
+          throw new Error(`Invalid JSONL record at line ${index + 1}: ${error}`);
+        }
+
+        if (
+          value.type === "message" &&
+          value.message !== null &&
+          typeof value.message === "object" &&
+          !Array.isArray(value.message)
+        ) {
+          records.push({ index, value });
+        }
+      }
+
+      if (records.length === 0) {
+        return { ok: true, compacted: false, reason: "Session contains no messages" };
+      }
+
+      const result = await compress(
+        agentToOpenAI(records.map(({ value }) => value.message)),
+        {
+          model: "claude-sonnet-4-5",
+          baseUrl: this.proxyUrl,
+          fallback: true,
+          tokenBudget: params.tokenBudget,
+        } as any,
+      );
+
+      const compactedMessages = openAIToAgent(result.messages);
+      if (!result.compressed || result.tokensSaved === 0) {
+        return {
+          ok: true,
+          compacted: false,
+          reason: "Session did not need compression",
+          result: {
+            tokensBefore: result.tokensBefore,
+            tokensAfter: result.tokensAfter,
+          },
+        };
+      }
+
+      // The transcript is append-only and can contain non-message records.
+      // Refuse to rewrite if compression changes the message count, because
+      // there is no safe way to preserve the transcript's record envelopes.
+      if (compactedMessages.length !== records.length) {
+        return {
+          ok: false,
+          compacted: false,
+          reason: "Compression changed the session message count",
+          result: {
+            tokensBefore: result.tokensBefore,
+            tokensAfter: result.tokensAfter,
+          },
+        };
+      }
+
+      const outputLines = [...lines];
+      records.forEach(({ index, value }, messageIndex) => {
+        outputLines[index] = JSON.stringify({
+          ...value,
+          message: {
+            ...value.message,
+            ...compactedMessages[messageIndex],
+          },
+        });
+      });
+
+      // Replace the transcript atomically so a failed write cannot leave a
+      // partially compacted session that OpenClaw can no longer parse.
+      const temporaryFile = `${params.sessionFile}.headroom.tmp`;
+      try {
+        await writeFile(temporaryFile, outputLines.join(lineEnding), "utf8");
+        await rename(temporaryFile, params.sessionFile);
+      } finally {
+        await rm(temporaryFile, { force: true }).catch(() => undefined);
+      }
+
+      this.stats.compactions++;
+      this.logger.info(
+        `Compacted session (budget: ${params.tokenBudget ?? "none"}, ` +
+          `force: ${params.force ?? false}, saved: ${result.tokensSaved} tokens)`,
+      );
+
+      return {
+        ok: true,
+        compacted: true,
+        reason: "Compacted session with Headroom",
+        result: {
+          tokensBefore: result.tokensBefore,
+          tokensAfter: result.tokensAfter,
+        },
+      };
+    } catch (error) {
+      this.logger.error(`Compact failed: ${error}`);
+      return { ok: false, compacted: false, reason: `Compaction failed: ${error}` };
+    }
   }
 
   async afterTurn?(params: {

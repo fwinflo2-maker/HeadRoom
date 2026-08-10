@@ -171,18 +171,21 @@ def build_model_entries(payload: Any, base_url: str) -> list[dict[str, Any]]:
     return entries
 
 
-def build_provider_block(entries: list[dict[str, Any]]) -> dict[str, Any]:
-    """The single provider object Headroom owns in ``chatLanguageModels.json``.
+#: Sent by VS Code as the endpoint's API key and then ignored: the proxy
+#: substitutes the real Copilot credential itself. A fixed, obviously-inert
+#: literal is used rather than an ``${input:...}`` variable on purpose -- an input
+#: variable is the one form that can prompt the user to type a key, and a user who
+#: pastes a real Copilot or OpenAI key in response would be putting a live
+#: credential somewhere it is not needed and never read.
+PLACEHOLDER_API_KEY = "headroom-local-unused"
 
-    ``apiKey`` is an ``${input:...}`` variable rather than a literal. The proxy
-    substitutes the real Copilot credential itself, so the value is never used
-    upstream -- but VS Code always sends *something*, and an input variable keeps
-    a placeholder out of a file users may share.
-    """
+
+def build_provider_block(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """The single provider object Headroom owns in ``chatLanguageModels.json``."""
     return {
         "name": HEADROOM_PROVIDER_NAME,
         "vendor": CUSTOM_ENDPOINT_VENDOR,
-        "apiKey": "${input:headroomProxyKey}",
+        "apiKey": PLACEHOLDER_API_KEY,
         "models": entries,
     }
 

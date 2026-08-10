@@ -5929,10 +5929,15 @@ def vscode_chat(
                 "Check `headroom models`, then re-run."
             )
             return
-        action = configure_chat_models(target_models, build_provider_block(entries))
-        click.echo(f"  VS Code chat models {action}: {target_models} ({len(entries)} models)")
+        # Settings first, models second. Both writes can fail (unparseable file,
+        # read-only), and failing after the models are written would leave the
+        # picker advertising a Headroom provider that 1.132+ then hides anyway,
+        # because the visibility gate never got set. This ordering means a failure
+        # leaves nothing half-configured.
         setting_action = enable_byok_setting(target_settings)
         click.echo(f"  {BYOK_ENABLED_SETTING} {setting_action}: {target_settings}")
+        action = configure_chat_models(target_models, build_provider_block(entries))
+        click.echo(f"  VS Code chat models {action}: {target_models} ({len(entries)} models)")
         click.echo(
             "  Pick a model named '… (Headroom)' in the chat model picker. "
             "Restart VS Code if they do not appear yet."

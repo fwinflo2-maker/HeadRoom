@@ -264,3 +264,28 @@ def _strip(text: str) -> str:
     from headroom.providers.copilot.vscode import _strip_jsonc_comments
 
     return re.sub(r",\s*([}\]])", r"\1", _strip_jsonc_comments(text))
+
+
+def test_api_key_is_an_inert_literal_not_an_input_prompt(payload: dict) -> None:
+    """An ``${input:...}`` variable can prompt the user to type a key.
+
+    The proxy substitutes the real Copilot credential itself, so the value is
+    never read — but a user who pastes a live key in response to that prompt would
+    be putting a credential somewhere it serves no purpose. A fixed inert literal
+    removes the prompt path entirely.
+    """
+    from headroom.providers.copilot.vscode_chat import PLACEHOLDER_API_KEY
+
+    block = build_provider_block(build_model_entries(payload, BASE))
+    assert block["apiKey"] == PLACEHOLDER_API_KEY
+    assert "${input:" not in block["apiKey"]
+    assert "unused" in PLACEHOLDER_API_KEY
+
+
+def test_generated_config_contains_no_credential_material(payload: dict, tmp_path: Path) -> None:
+    """Nothing token-shaped may reach a file the user might share."""
+    p = tmp_path / "chatLanguageModels.json"
+    configure_chat_models(p, build_provider_block(build_model_entries(payload, BASE)))
+    text = p.read_text(encoding="utf-8")
+    for pattern in ("gho_", "ghs_", "ghu_", "github_pat_", "sk-", "Bearer ", "tid=", "sku="):
+        assert pattern not in text, f"{pattern!r} leaked into the generated config"

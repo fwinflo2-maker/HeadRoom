@@ -51,9 +51,7 @@ def test_grok_build_setup_lines_include_proxy_url() -> None:
     # CodeQL does not flag incomplete URL substring sanitization.
     expected_upstream = f"  Proxy upstream (OpenAI-compatible): {DEFAULT_API_URL}"
     upstream_lines = [
-        line
-        for line in lines
-        if line.startswith("  Proxy upstream (OpenAI-compatible): ")
+        line for line in lines if line.startswith("  Proxy upstream (OpenAI-compatible): ")
     ]
     assert upstream_lines == [expected_upstream]
 

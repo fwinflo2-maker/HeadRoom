@@ -550,6 +550,99 @@ def test_capi_override_never_overwrites_the_users_own_value(tmp_path: Path) -> N
     assert settings.read_text(encoding="utf-8") == theirs
 
 
+@pytest.mark.parametrize(
+    "seed",
+    [
+        None,  # absent: a fresh VS Code has no settings.json until you change a setting
+        "{}\n",
+        "{\n}\n",
+        '{\n\t"editor.fontSize": 14,\n}\n',  # a legal JSONC trailing comma
+    ],
+    ids=["absent", "empty-object", "empty-multiline", "trailing-comma"],
+)
+def test_unwrap_recovers_from_any_starting_file(tmp_path: Path, seed: str | None) -> None:
+    """Unwrap is the recovery path, so it must never be the thing that is stuck.
+
+    Appending into an object with no properties gives the first block no
+    separator and the second one a leading comma. Removing the first then
+    promoted that comma to the object's first token: invalid JSON, so the write
+    was refused -- and because the CLI aborted on the first failing step, nothing
+    was removed and every later unwrap failed the same way. VS Code stayed
+    pointed at a dead port with no way back but hand-editing.
+    """
+    from headroom.providers.copilot.vscode_chat import (
+        CAPI_OVERRIDE_SETTING,
+        disable_byok_setting,
+        disable_capi_override,
+        enable_byok_setting,
+        enable_capi_override,
+    )
+
+    settings = tmp_path / "settings.json"
+    if seed is not None:
+        settings.write_text(seed, encoding="utf-8")
+
+    enable_capi_override(settings, "http://127.0.0.1:8787/p/proj")
+    enable_byok_setting(settings)
+
+    # Removal in the order `unwrap` actually uses: routing first.
+    assert disable_capi_override(settings) is True
+    assert disable_byok_setting(settings) is True
+
+    remaining = settings.read_text(encoding="utf-8")
+    assert CAPI_OVERRIDE_SETTING not in remaining
+    assert BYOK_ENABLED_SETTING not in remaining
+    json.loads(remaining.replace(",\n}", "\n}"))  # still parses
+
+
+def test_rerunning_with_a_different_url_rewrites_it(tmp_path: Path) -> None:
+    """A stale URL is worse than no URL: chat points at a port nothing serves.
+
+    The block outlives the session that wrote it, while the URL can change
+    between runs -- the proxy may land on another port, and the `/p/<project>`
+    prefix follows the launch directory. Matching on the marker alone left the
+    old value in place while the caller reported the new one.
+    """
+    from headroom.providers.copilot.vscode_chat import enable_capi_override
+
+    settings = tmp_path / "settings.json"
+    settings.write_text('{\n\t"editor.fontSize": 14\n}\n', encoding="utf-8")
+
+    assert enable_capi_override(settings, "http://127.0.0.1:8787/p/a") == "added"
+    assert enable_capi_override(settings, "http://127.0.0.1:8787/p/a") == "already set"
+    assert enable_capi_override(settings, "http://127.0.0.1:9999/p/b") == "updated"
+
+    written = settings.read_text(encoding="utf-8")
+    assert "http://127.0.0.1:9999/p/b" in written
+    assert "8787" not in written, "the superseded URL is still in the file"
+    assert '"editor.fontSize": 14' in written
+    assert written.count("overrideCapiUrl") == 1, "the rewrite duplicated the setting"
+
+
+def test_duplicate_blocks_are_refused_not_half_removed(tmp_path: Path) -> None:
+    """Removing one of two copies reports success while the setting stays live.
+
+    Settings Sync merges and profile copies can duplicate a block, and a partial
+    removal is the worst outcome: the user is told Copilot Chat was restored
+    while it is still routed at a proxy that is about to stop.
+    """
+    from headroom.providers.copilot.vscode_chat import (
+        _CAPI_MARKER_END,
+        _CAPI_MARKER_START,
+        disable_capi_override,
+        enable_capi_override,
+    )
+
+    settings = tmp_path / "settings.json"
+    enable_capi_override(settings, "http://127.0.0.1:8787")
+    raw = settings.read_text(encoding="utf-8")
+    block = raw[raw.find(_CAPI_MARKER_START) : raw.find(_CAPI_MARKER_END) + len(_CAPI_MARKER_END)]
+    settings.write_text(raw.replace(block, f"{block}\n\t{block}"), encoding="utf-8")
+
+    with pytest.raises(click.ClickException, match="copies of the Headroom block"):
+        disable_capi_override(settings)
+
+
 def test_capi_and_byok_blocks_are_independent(tmp_path: Path) -> None:
     """Both can be present; removing one must not disturb the other."""
     from headroom.providers.copilot.vscode_chat import (

@@ -165,10 +165,6 @@ if (-not $registered) {
     Write-Host "        the reason (auth, an unparseable config, or a BYOK entitlement)." -ForegroundColor DarkGray
     exit 1
 }
-if (-not (Test-Path $modelsFile)) {
-    Write-Bad "chatLanguageModels.json was not written. Check the proxy window."
-    exit 1
-}
 $settings = Get-Content (Join-Path $userDir 'settings.json') -Raw -ErrorAction SilentlyContinue
 if ($settings -match 'overrideCapiUrl') {
     Write-Ok "Copilot Chat routing points at the proxy"

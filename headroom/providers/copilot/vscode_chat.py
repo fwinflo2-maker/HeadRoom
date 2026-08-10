@@ -373,15 +373,30 @@ _BYOK_MARKER_END = "// --- end Headroom VS Code chat models ---"
 #: ``COPILOT_API_URL`` redirects for the CLI.
 #:
 #: This is what makes VS Code behave like the CLI's ``--native`` mode: Copilot's
-#: own models flow through Headroom, so a model chosen by the *agent* (a
-#: subagent, or auto model selection) is compressed too. BYOK could never do
-#: that -- it adds a parallel provider the agent does not pick from, so a
-#: subagent silently ran on Copilot's uncompressed endpoint.
+#: own models flow through Headroom, so a model chosen by the *agent* -- a
+#: subagent, or auto model selection -- is compressed too. BYOK could never do
+#: that: it adds a parallel provider the agent does not pick from, so a subagent
+#: silently ran on Copilot's uncompressed endpoint.
+#:
+#: Coverage is broad but **not** total. Two paths resolve a different base and
+#: are unaffected, so callers must not claim everything is captured:
+#:
+#: * The *execution* subagent, when the ``ExecutionSubagentUseAgenticProxy``
+#:   experiment is on and the terminal is not PowerShell, uses
+#:   ``proxyBaseURL`` (``copilot-proxy.githubusercontent.com``), which only
+#:   ``advanced.debug.overrideProxyUrl`` moves -- the *completions* knob, which
+#:   this module deliberately does not write. On PowerShell the same code takes
+#:   the ordinary chat endpoint and is routed.
+#: * The agent host (``chat.agentHost.enabled``) spawns the Copilot CLI binary
+#:   and reads ``COPILOT_API_URL``; nothing here sets it for that process.
 #:
 #: It is an undocumented debug setting and user-scope only: written into a
-#: workspace ``settings.json`` it is ignored. Verified working against Copilot
-#: Chat 0.58.0 on VS Code 1.132 -- ``/models``, ``/models/session`` and
-#: ``/chat/completions`` all arrived at the proxy and compressed.
+#: workspace ``settings.json`` it is ignored. Verified end to end against the
+#: shipped Copilot Chat extension on VS Code 1.132 -- ``/models``,
+#: ``/models/session`` and ``/chat/completions`` all arrived at the proxy and
+#: compressed. A newer ``internal.capiUrl`` key exists in the bundle but is
+#: never read today; if chat adopts the completions-side resolver ordering, the
+#: new key would win and this setting would stop taking effect silently.
 CAPI_OVERRIDE_SETTING = "github.copilot.advanced.debug.overrideCapiUrl"
 
 _CAPI_MARKER_START = "// --- Headroom Copilot Chat routing ---"
@@ -427,19 +442,31 @@ def _append_settings_block(path: Path, body_lines: list[str], start: str, end: s
 def enable_capi_override(path: Path, base_url: str) -> str:
     """Point Copilot Chat's CAPI at the proxy, so every model is compressed.
 
-    Returns ``"added"``, ``"already set"``, or ``"already set by user"`` when the
-    user has their own value -- which is never overwritten, because someone
-    pointing Copilot Chat at their own gateway means it deliberately.
+    Returns ``"added"``, ``"updated"``, ``"already set"``, or
+    ``"already set by user"`` when the user has their own value -- which is never
+    overwritten, because someone pointing Copilot Chat at their own gateway means
+    it deliberately.
+
+    Idempotent on the **value**, not merely on the marker. The block outlives the
+    session that wrote it (nothing withdraws it on exit), while the URL it
+    carries can change between runs: the proxy may land on a different port, and
+    the ``/p/<project>`` prefix follows the launch directory. Matching on the
+    marker alone left a stale URL in place while the caller reported the new one
+    -- so chat pointed at a dead port, or attributed every saving to the wrong
+    project, and the terminal said otherwise.
     """
     raw = _read_settings(path) if path.exists() else ""
     if _CAPI_MARKER_START not in raw and CAPI_OVERRIDE_SETTING in raw:
         return "already set by user"
-    return _append_settings_block(
-        path,
-        [f"{json.dumps(CAPI_OVERRIDE_SETTING)}: {json.dumps(base_url)}"],
-        _CAPI_MARKER_START,
-        _CAPI_MARKER_END,
-    )
+
+    body = [f"{json.dumps(CAPI_OVERRIDE_SETTING)}: {json.dumps(base_url)}"]
+    if _CAPI_MARKER_START in raw:
+        if any(line.strip().lstrip(",") == body[0] for line in raw.splitlines()):
+            return "already set"
+        _remove_settings_block(path, _CAPI_MARKER_START, _CAPI_MARKER_END)
+        _append_settings_block(path, body, _CAPI_MARKER_START, _CAPI_MARKER_END)
+        return "updated"
+    return _append_settings_block(path, body, _CAPI_MARKER_START, _CAPI_MARKER_END)
 
 
 def disable_capi_override(path: Path) -> bool:
@@ -493,11 +520,47 @@ def disable_byok_setting(path: Path) -> bool:
     return _remove_settings_block(path, _BYOK_MARKER_START, _BYOK_MARKER_END)
 
 
+def _drop_orphan_leading_comma(text: str) -> str:
+    """Delete a separator comma left stranded as the object's first token.
+
+    Removing the *first* of two appended blocks promotes the second block's
+    leading comma to the front of the root object, which is invalid JSON. The
+    scan skips whitespace and JSONC comments so the comma is found even though
+    our own end-marker comment sits between it and the brace.
+    """
+    brace = text.find("{")
+    if brace < 0:
+        return text
+    i = brace + 1
+    while i < len(text):
+        if text[i].isspace():
+            i += 1
+        elif text.startswith("//", i):
+            nl = text.find("\n", i)
+            i = len(text) if nl < 0 else nl + 1
+        elif text.startswith("/*", i):
+            close = text.find("*/", i)
+            i = len(text) if close < 0 else close + 2
+        elif text[i] == ",":
+            return text[:i] + text[i + 1 :]
+        else:
+            return text
+    return text
+
+
 def _remove_settings_block(path: Path, start_marker: str, end_marker: str) -> bool:
     """Cut one marker-delimited block out of ``settings.json``, and nothing else."""
     if not path.exists():
         return False
     raw = _read_settings(path)
+    if raw.count(start_marker) > 1:
+        # Settings Sync merges and profile copies can duplicate a block. Removing
+        # only the first would report success while leaving the setting live, so
+        # say so instead of half-doing it.
+        raise click.ClickException(
+            f"{path} contains {raw.count(start_marker)} copies of the Headroom "
+            f"block {start_marker!r}. Remove the duplicates by hand, then re-run."
+        )
     start = raw.find(start_marker)
     end = raw.find(end_marker)
     if start < 0 or end < 0 or end < start:
@@ -510,7 +573,7 @@ def _remove_settings_block(path: Path, start_marker: str, end_marker: str) -> bo
     trimmed = prefix.rstrip()
     if trimmed.endswith(","):
         prefix = trimmed[:-1] + prefix[len(trimmed) :]
-    updated = prefix + suffix
+    updated = _drop_orphan_leading_comma(prefix + suffix)
     _validate_settings(updated, path)
     fsutil.write_text(path, updated)
     return True

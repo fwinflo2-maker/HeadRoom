@@ -5989,9 +5989,14 @@ def vscode_chat(
     \b
     Redirects the Chat extension's whole API surface at the local proxy, the way
     `wrap copilot --native` does for the CLI. Copilot's own model picker is
-    unchanged and every model it offers is compressed -- including the models
+    unchanged and the models it offers are compressed -- including the models
     the *agent* picks for itself, which is what subagents and auto model
     selection do.
+
+    \b
+    Two paths still bypass it: the execution subagent when it uses the agentic
+    proxy (a different base URL, only on non-PowerShell terminals), and agent
+    host sessions, which run the Copilot CLI binary in a separate process.
 
     \b
     --byok-models additionally registers duplicate "(Headroom)" entries as a
@@ -6068,8 +6073,17 @@ def vscode_chat(
             click.echo(f"  Copilot Chat routing {capi_action}: {target_settings}")
             click.echo(f"    {CAPI_OVERRIDE_SETTING} -> {base}")
             click.echo(
-                "  Restart VS Code, then use Copilot's normal model picker -- every "
-                "model it offers now flows through Headroom."
+                "  Restart VS Code, then use Copilot's normal model picker -- the "
+                "models it offers now flow through Headroom."
+            )
+            # Measured in the extension: on a dead base it pings, waits
+            # 1s/10s/10s and retries the same base -- there is no failover to
+            # api.githubcopilot.com. So a stopped proxy reads as VS Code hanging
+            # for ~20s a request, with nothing on screen naming the cause.
+            click.echo(
+                "  While this is set, Copilot Chat needs this proxy: stopping it "
+                "makes chat hang ~20s per request with no error naming Headroom. "
+                "Run `headroom unwrap vscode-chat` and restart VS Code to undo."
             )
         click.echo(
             "  Inline completions are NOT routed through Headroom (VS Code sends "
@@ -6176,19 +6190,29 @@ def unwrap_vscode_chat(models_file: Path | None, settings_file: Path | None) -> 
 
     target_models = models_file or chat_models_path()
     target_settings = settings_file or vscode_settings_path()
-    try:
-        # Routing first: leaving Copilot Chat pointed at a proxy that is about to
-        # stop is the one failure that breaks chat outright, whereas a leftover
-        # model entry merely looks untidy.
-        if disable_capi_override(target_settings):
-            click.echo(f"Restored Copilot Chat routing to GitHub in {target_settings}")
-        if remove_chat_models(target_models):
-            click.echo(f"Removed Headroom chat models from {target_models}")
-        if disable_byok_setting(target_settings):
-            click.echo(f"Removed {target_settings} BYOK setting block")
+    removed = False
+    # Each step is attempted independently. Unwrap is the recovery path -- if one
+    # write cannot be made safely, the others must still run, or a single
+    # unparseable section would leave Copilot Chat pointed at a dead port with no
+    # way back except hand-editing the file.
+    for label, action in (
+        # Routing first: a proxy pointed at nothing breaks chat outright, whereas
+        # a leftover model entry merely looks untidy.
+        ("Copilot Chat routing restored to GitHub", lambda: disable_capi_override(target_settings)),
+        ("Headroom chat models removed", lambda: remove_chat_models(target_models)),
+        ("BYOK setting block removed", lambda: disable_byok_setting(target_settings)),
+    ):
+        try:
+            if action():
+                click.echo(f"{label}.")
+                removed = True
+        except (OSError, click.ClickException) as exc:
+            message = exc.format_message() if isinstance(exc, click.ClickException) else str(exc)
+            click.echo(f"Could not complete '{label.lower()}': {message}")
+    if removed:
         click.echo("Restart VS Code for it to take effect.")
-    except OSError as exc:
-        click.echo(f"Note: could not update VS Code config ({exc}); continuing.")
+    else:
+        click.echo("Nothing to remove; VS Code was not routed through Headroom.")
 
 
 # =============================================================================

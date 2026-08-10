@@ -2561,9 +2561,17 @@ class AnthropicHandlerMixin:
             # the handler tokenizer so the delta is meaningful. This also captures any
             # turn-hook fold (optimized_messages is post-hook). Runs unconditionally.
             try:
+                from headroom.proxy.token_counting import recount_messages_offloaded
+
                 _orig_snapshot = original_client_messages  # noqa: F821 (bound at request start)
-                original_tokens = tokenizer.count_messages(_orig_snapshot)
-                optimized_tokens = tokenizer.count_messages(optimized_messages)
+                # Off the event loop: with a real BPE tokenizer these two counts
+                # can block the loop for ~1s on a multi-MB body and stall every
+                # other in-flight request on a shared proxy (#2810). Both counts
+                # share the one handler tokenizer so the delta stays on a single
+                # scale; fails open to an inline count.
+                original_tokens, optimized_tokens = await recount_messages_offloaded(
+                    self, tokenizer, _orig_snapshot, optimized_messages
+                )
                 # Fold the tool-schema/desc compaction delta into BOTH endpoints so
                 # tok_before - tok_after == tok_saved stays coherent in the PERF line
                 # (count_messages never sees tool bytes). Same shape as the OpenAI chat

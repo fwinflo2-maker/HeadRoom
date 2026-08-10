@@ -3720,9 +3720,15 @@ class OpenAIHandlerMixin:
         # branch may have left original_tokens in the pipeline's char-estimator scale
         # (result.tokens_before), which mismatches optimized_tokens (provider tokenizer)
         # and yields impossible tok_after>tok_before. Recount original from the
-        # pre-compression snapshot so the message delta is on one scale.
-        original_tokens = tokenizer.count_messages(original_client_messages)
-        optimized_tokens = tokenizer.count_messages(body["messages"])
+        # pre-compression snapshot so the message delta is on one scale. Off the event
+        # loop: with a real BPE tokenizer these counts can block the loop for ~1s on a
+        # multi-MB body and stall every other in-flight request (#2810); both share the
+        # one tokenizer so the delta stays on a single scale, and it fails open inline.
+        from headroom.proxy.token_counting import recount_messages_offloaded
+
+        original_tokens, optimized_tokens = await recount_messages_offloaded(
+            self, tokenizer, original_client_messages, body["messages"]
+        )
         if tool_tokens_before_compaction > 0:
             try:
                 tool_tokens_after_compaction = tokenizer.count_text(_json_debug_dumps(tools))

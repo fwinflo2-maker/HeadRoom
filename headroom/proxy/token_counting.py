@@ -79,6 +79,39 @@ async def count_texts_offloaded(owner: Any, model: Any, texts: Any) -> tuple[Any
     )
 
 
+async def recount_messages_offloaded(
+    owner: Any, tokenizer: Any, *message_lists: Any
+) -> tuple[int, ...]:
+    """Count several message lists on an ALREADY-resolved tokenizer, off the loop.
+
+    Unlike :func:`count_tokens_offloaded`, this reuses a caller-provided
+    tokenizer instead of resolving a new one, so several counts stay on one
+    scale for a consistency delta (tok_before vs tok_after). All counts run in a
+    single executor hop. With a real BPE tokenizer, counting a multi-MB body is
+    CPU-bound and blocks the event loop for up to ~1s -- stalling every other
+    in-flight request on a shared proxy (GH #2810) -- so it must not run inline.
+
+    Fails open to a synchronous count when the owner exposes no compression
+    executor, or on timeout/error, matching :func:`_count_offloaded`.
+    """
+
+    def _count_all() -> tuple[int, ...]:
+        return tuple(tokenizer.count_messages(messages) for messages in message_lists)
+
+    runner = getattr(owner, "_run_compression_in_executor", None)
+    if runner is None:
+        return _count_all()
+
+    from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
+
+    try:
+        result = await runner(_count_all, timeout=float(COMPRESSION_TIMEOUT_SECONDS))
+        return cast("tuple[int, ...]", result)
+    except Exception as e:  # fail open — includes asyncio.TimeoutError
+        logger.debug("Offloaded re-count failed (%s); counting inline", e.__class__.__name__)
+        return _count_all()
+
+
 def gemini_output_tokens(usage_meta: dict[str, Any]) -> int:
     """Output-token count for a Gemini ``usageMetadata``, including thinking tokens.
 

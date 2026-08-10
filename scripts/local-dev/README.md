@@ -9,7 +9,7 @@ VS Code Copilot Chat and Claude Code at the same time.
 | Feature | Command |
 | --- | --- |
 | Route Copilot's own API through Headroom, keeping native model routing and mid-session model switching | `headroom wrap copilot --native` |
-| Register every entitled Copilot model in VS Code's chat picker (Custom Endpoint BYOK) | `headroom wrap vscode-chat` |
+| The same for VS Code Copilot Chat: Copilot's normal picker, every model compressed — including models the *agent* picks for a subagent | `headroom wrap vscode-chat` |
 | Catalog-driven model routing and wire selection | `headroom models` |
 
 ## Install
@@ -45,6 +45,25 @@ All three attach to the proxy on 8970, so everything lands on one dashboard at
 
 Each script also works standalone — if no central proxy is running it starts its
 own, which is fine for testing a single client.
+
+## Why VS Code needed more than BYOK
+
+The first attempt registered duplicate "(Headroom)" models as a Custom Endpoint
+BYOK provider. That only ever covered models a **human** picked from the picker.
+When the agent chose a model itself — a subagent, or auto model selection — it
+picked from Copilot's own list and ran on Copilot's uncompressed endpoint.
+
+`wrap vscode-chat` now redirects the Chat extension's whole API surface at the
+proxy instead, via `github.copilot.advanced.debug.overrideCapiUrl` (user-scope
+only). Every endpoint the extension uses derives from that one base URL, so the
+picker is unchanged and everything through it is compressed — the same thing
+`COPILOT_API_URL` does for the CLI in `--native` mode.
+
+The BYOK provider is still available behind `--byok-models`, but it is redundant.
+
+One consequence worth knowing: while VS Code is routed at the proxy, stopping
+the proxy stops Copilot Chat. Run `headroom unwrap vscode-chat` and restart VS
+Code to hand it back to GitHub.
 
 ## How one proxy serves all three
 

@@ -366,6 +366,86 @@ def remove_chat_models(path: Path) -> bool:
 _BYOK_MARKER_START = "// --- Headroom VS Code chat models ---"
 _BYOK_MARKER_END = "// --- end Headroom VS Code chat models ---"
 
+#: Redirects the Copilot Chat extension's whole CAPI surface at a chosen base
+#: URL. Every endpoint the extension uses is derived from it --
+#: ``{base}/chat/completions``, ``/responses``, ``/v1/messages``, ``/models``,
+#: ``/models/session``, ``/embeddings`` -- which is the same surface
+#: ``COPILOT_API_URL`` redirects for the CLI.
+#:
+#: This is what makes VS Code behave like the CLI's ``--native`` mode: Copilot's
+#: own models flow through Headroom, so a model chosen by the *agent* (a
+#: subagent, or auto model selection) is compressed too. BYOK could never do
+#: that -- it adds a parallel provider the agent does not pick from, so a
+#: subagent silently ran on Copilot's uncompressed endpoint.
+#:
+#: It is an undocumented debug setting and user-scope only: written into a
+#: workspace ``settings.json`` it is ignored. Verified working against Copilot
+#: Chat 0.58.0 on VS Code 1.132 -- ``/models``, ``/models/session`` and
+#: ``/chat/completions`` all arrived at the proxy and compressed.
+CAPI_OVERRIDE_SETTING = "github.copilot.advanced.debug.overrideCapiUrl"
+
+_CAPI_MARKER_START = "// --- Headroom Copilot Chat routing ---"
+_CAPI_MARKER_END = "// --- end Headroom Copilot Chat routing ---"
+
+
+def _append_settings_block(path: Path, body_lines: list[str], start: str, end: str) -> str:
+    """Append a marker-delimited block of settings, preserving everything else.
+
+    Returns ``"added"``, or ``"already set"`` when our own block is already
+    there. Raises rather than editing a file this parser cannot validate.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = _read_settings(path) if path.exists() else "{}\n"
+    _validate_settings(raw, path)
+    if start in raw:
+        return "already set"
+
+    close = raw.rfind("}")
+    if close < 0:
+        raise click.ClickException(f"Could not locate the root object in {path}.")
+    before = raw[:close].rstrip()
+    after = raw[close:]
+    from headroom.providers.copilot.vscode import _strip_jsonc_comments
+
+    inner = _strip_jsonc_comments(before).rstrip()
+    separator = "" if inner.endswith("{") or inner.endswith(",") else ","
+    line_sep = "\r\n" if "\r\n" in raw else "\n"
+    # The separator goes on the first *setting* line, not after `before`.
+    # `before` may end with a `//` comment -- our own end-marker does, once a
+    # second block is appended -- and a comment runs to end of line, so a comma
+    # placed there is swallowed and the file becomes invalid JSON.
+    body = list(body_lines)
+    if separator and body:
+        body[0] = f"{separator}{body[0]}"
+    block = line_sep.join([f"\t{start}", *(f"\t{line}" for line in body), f"\t{end}"])
+    updated = before + line_sep + block + line_sep + after
+    _validate_settings(updated, path)
+    fsutil.write_text(path, updated)
+    return "added"
+
+
+def enable_capi_override(path: Path, base_url: str) -> str:
+    """Point Copilot Chat's CAPI at the proxy, so every model is compressed.
+
+    Returns ``"added"``, ``"already set"``, or ``"already set by user"`` when the
+    user has their own value -- which is never overwritten, because someone
+    pointing Copilot Chat at their own gateway means it deliberately.
+    """
+    raw = _read_settings(path) if path.exists() else ""
+    if _CAPI_MARKER_START not in raw and CAPI_OVERRIDE_SETTING in raw:
+        return "already set by user"
+    return _append_settings_block(
+        path,
+        [f"{json.dumps(CAPI_OVERRIDE_SETTING)}: {json.dumps(base_url)}"],
+        _CAPI_MARKER_START,
+        _CAPI_MARKER_END,
+    )
+
+
+def disable_capi_override(path: Path) -> bool:
+    """Remove only the CAPI routing block this module added."""
+    return _remove_settings_block(path, _CAPI_MARKER_START, _CAPI_MARKER_END)
+
 
 def enable_byok_setting(path: Path) -> str:
     """Turn on ``chat.agentHost.byokModels.enabled`` in ``settings.json``.
@@ -398,34 +478,28 @@ def enable_byok_setting(path: Path) -> str:
             pass
         return "already set by user"
 
-    close = raw.rfind("}")
-    if close < 0:
-        raise click.ClickException(f"Could not locate the root object in {path}.")
-    before = raw[:close].rstrip()
-    after = raw[close:]
-    from headroom.providers.copilot.vscode import _strip_jsonc_comments
-
-    inner = _strip_jsonc_comments(before).rstrip()
-    separator = "" if inner.endswith("{") or inner.endswith(",") else ","
-    line_sep = "\r\n" if "\r\n" in raw else "\n"
-    block = (
-        f"\t{_BYOK_MARKER_START}{line_sep}"
-        f"\t{json.dumps(BYOK_ENABLED_SETTING)}: true{line_sep}"
-        f"\t{_BYOK_MARKER_END}"
+    # Shares the writer with the routing block so both get the same
+    # separator handling; they are routinely written into the same file.
+    return _append_settings_block(
+        path,
+        [f"{json.dumps(BYOK_ENABLED_SETTING)}: true"],
+        _BYOK_MARKER_START,
+        _BYOK_MARKER_END,
     )
-    updated = before + separator + line_sep + block + line_sep + after
-    _validate_settings(updated, path)
-    fsutil.write_text(path, updated)
-    return "added"
 
 
 def disable_byok_setting(path: Path) -> bool:
     """Remove only the marker block this module added to ``settings.json``."""
+    return _remove_settings_block(path, _BYOK_MARKER_START, _BYOK_MARKER_END)
+
+
+def _remove_settings_block(path: Path, start_marker: str, end_marker: str) -> bool:
+    """Cut one marker-delimited block out of ``settings.json``, and nothing else."""
     if not path.exists():
         return False
     raw = _read_settings(path)
-    start = raw.find(_BYOK_MARKER_START)
-    end = raw.find(_BYOK_MARKER_END)
+    start = raw.find(start_marker)
+    end = raw.find(end_marker)
     if start < 0 or end < 0 or end < start:
         return False
     line_start = raw.rfind("\n", 0, start) + 1

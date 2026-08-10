@@ -469,6 +469,88 @@ def test_unknown_identity_never_counts_as_a_match(
     assert _proxy_serves_same_copilot_seed(running_config, token) is False, why
 
 
+# ---------------------------------------------------------------------------
+# CAPI routing — the mechanism that also covers agent-chosen models
+# ---------------------------------------------------------------------------
+
+
+def test_capi_override_round_trips_and_leaves_other_settings_alone(tmp_path: Path) -> None:
+    """Redirecting Copilot Chat's own API is what makes subagents compressed.
+
+    BYOK only ever covered models a *human* picked from the picker, so a model
+    the agent chose for a subagent silently ran on Copilot's uncompressed
+    endpoint. Pointing the CAPI at the proxy covers both, because every endpoint
+    the extension uses is derived from that one base URL.
+    """
+    from headroom.providers.copilot.vscode_chat import (
+        CAPI_OVERRIDE_SETTING,
+        disable_capi_override,
+        enable_capi_override,
+    )
+
+    settings = tmp_path / "settings.json"
+    original = '{\n\t"editor.fontSize": 14,\n\t"telemetry.telemetryLevel": "off"\n}\n'
+    settings.write_text(original, encoding="utf-8")
+
+    assert enable_capi_override(settings, "http://127.0.0.1:8970/p/proj") == "added"
+    written = settings.read_text(encoding="utf-8")
+    assert f'"{CAPI_OVERRIDE_SETTING}": "http://127.0.0.1:8970/p/proj"' in written
+    assert '"editor.fontSize": 14' in written
+    assert '"telemetry.telemetryLevel": "off"' in written
+
+    assert enable_capi_override(settings, "http://127.0.0.1:8970/p/proj") == "already set"
+
+    assert disable_capi_override(settings) is True
+    # Byte-for-byte restoration: this file is the user's, not ours.
+    assert settings.read_text(encoding="utf-8") == original
+    assert disable_capi_override(settings) is False
+
+
+def test_capi_override_never_overwrites_the_users_own_value(tmp_path: Path) -> None:
+    """Someone pointing Copilot Chat at their own gateway means it.
+
+    Silently repointing it would send their traffic somewhere they did not
+    choose, and removing it on unwrap would break a setup Headroom never owned.
+    """
+    from headroom.providers.copilot.vscode_chat import (
+        CAPI_OVERRIDE_SETTING,
+        disable_capi_override,
+        enable_capi_override,
+    )
+
+    settings = tmp_path / "settings.json"
+    theirs = f'{{\n\t"{CAPI_OVERRIDE_SETTING}": "https://my-gateway.example"\n}}\n'
+    settings.write_text(theirs, encoding="utf-8")
+
+    assert enable_capi_override(settings, "http://127.0.0.1:8970") == "already set by user"
+    assert settings.read_text(encoding="utf-8") == theirs
+    assert disable_capi_override(settings) is False
+    assert settings.read_text(encoding="utf-8") == theirs
+
+
+def test_capi_and_byok_blocks_are_independent(tmp_path: Path) -> None:
+    """Both can be present; removing one must not disturb the other."""
+    from headroom.providers.copilot.vscode_chat import (
+        disable_byok_setting,
+        disable_capi_override,
+        enable_byok_setting,
+        enable_capi_override,
+    )
+
+    settings = tmp_path / "settings.json"
+    settings.write_text('{\n\t"editor.fontSize": 14\n}\n', encoding="utf-8")
+    assert enable_capi_override(settings, "http://127.0.0.1:8970") == "added"
+    assert enable_byok_setting(settings) == "added"
+
+    assert disable_capi_override(settings) is True
+    after = settings.read_text(encoding="utf-8")
+    assert BYOK_ENABLED_SETTING in after, "removing CAPI routing took the BYOK block with it"
+    assert '"editor.fontSize": 14' in after
+
+    assert disable_byok_setting(settings) is True
+    assert settings.read_text(encoding="utf-8") == '{\n\t"editor.fontSize": 14\n}\n'
+
+
 def test_anthropic_key_is_never_forwarded_to_another_vendor() -> None:
     """The backstop that makes one shared proxy safe for Claude Code.
 

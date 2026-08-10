@@ -145,13 +145,14 @@ Write-Ok "proxy healthy on http://127.0.0.1:$Port"
 # resolving the model catalog and writing the config -- so reading the file here
 # found nothing, and the script gave up before it ever opened VS Code. Wait for
 # the models themselves, which is the thing step 4 actually checks.
-$modelsFile = Join-Path $userDir 'chatLanguageModels.json'
-Write-Host "    waiting for the chat models to be registered..." -ForegroundColor DarkGray
+$modelsFile   = Join-Path $userDir 'chatLanguageModels.json'
+$settingsFile = Join-Path $userDir 'settings.json'
+Write-Host "    waiting for the routing settings to be written..." -ForegroundColor DarkGray
 $deadline = (Get-Date).AddSeconds(120)
 $registered = $false
 while ((Get-Date) -lt $deadline) {
-    $raw = Get-Content $modelsFile -Raw -ErrorAction SilentlyContinue
-    if ($raw -and $raw -match 'Headroom') { $registered = $true; break }
+    $raw = Get-Content $settingsFile -Raw -ErrorAction SilentlyContinue
+    if ($raw -and $raw -match 'overrideCapiUrl') { $registered = $true; break }
     Start-Sleep -Milliseconds 1000
 }
 
@@ -159,7 +160,7 @@ while ((Get-Date) -lt $deadline) {
 Write-Step "[4] Verifying VS Code config"
 
 if (-not $registered) {
-    Write-Bad "the chat models were not registered within 2 minutes."
+    Write-Bad "the routing settings were not written within 2 minutes."
     Write-Host "        Look at the 'HEADROOM - VS Code chat models' window - it prints" -ForegroundColor DarkGray
     Write-Host "        the reason (auth, an unparseable config, or a BYOK entitlement)." -ForegroundColor DarkGray
     exit 1
@@ -168,23 +169,26 @@ if (-not (Test-Path $modelsFile)) {
     Write-Bad "chatLanguageModels.json was not written. Check the proxy window."
     exit 1
 }
-$providers = Get-Content $modelsFile -Raw | ConvertFrom-Json
-$mine  = $providers | Where-Object { $_.name -like '*Headroom*' }
-$other = $providers | Where-Object { $_.name -notlike '*Headroom*' } | ForEach-Object { $_.name }
-
-if (-not $mine) { Write-Bad "no Headroom provider found in $modelsFile"; exit 1 }
-Write-Ok "$(@($mine.models).Count) Headroom models registered"
-if ($other) { Write-Ok "your other providers preserved: $($other -join ', ')" }
-
-# Ids must be prefixed, or VS Code's picker collapses them into Copilot's own
-# entry and the models you use most silently lose their Headroom twin.
-$unprefixed = @($mine.models | Where-Object { $_.id -notlike 'headroom--*' })
-if ($unprefixed.Count) { Write-Warn "$($unprefixed.Count) model(s) are missing the headroom-- id prefix" }
-else                   { Write-Ok "model ids are prefixed (so they stay visible next to Copilot's own)" }
-
 $settings = Get-Content (Join-Path $userDir 'settings.json') -Raw -ErrorAction SilentlyContinue
-if ($settings -match 'chat\.agentHost\.byokModels\.enabled') { Write-Ok "chat.agentHost.byokModels.enabled is set (required on VS Code 1.132+)" }
-else { Write-Warn "chat.agentHost.byokModels.enabled is NOT set - VS Code 1.132+ will hide every Headroom model" }
+if ($settings -match 'overrideCapiUrl') {
+    Write-Ok "Copilot Chat routing points at the proxy"
+    if ($settings -match "overrideCapiUrl`"\s*:\s*`"([^`"]+)`"") {
+        Write-Host "        $($Matches[1])" -ForegroundColor DarkGray
+    }
+} else {
+    Write-Bad "the Copilot Chat routing setting was not written."
+    Write-Host "        Look at the 'HEADROOM - VS Code chat models' window for the reason." -ForegroundColor DarkGray
+    exit 1
+}
+
+# Optional: only present when wrap was run with --byok-models.
+if (Test-Path $modelsFile) {
+    $providers = Get-Content $modelsFile -Raw | ConvertFrom-Json
+    $mine = $providers | Where-Object { $_.name -like '*Headroom*' }
+    if ($mine) { Write-Ok "$(@($mine.models).Count) duplicate '(Headroom)' BYOK models also registered" }
+    $other = $providers | Where-Object { $_.name -notlike '*Headroom*' } | ForEach-Object { $_.name }
+    if ($other) { Write-Ok "your other providers preserved: $($other -join ', ')" }
+}
 
 # --- 5. Open the dashboard and VS Code -------------------------------------
 Write-Step "[5] Opening dashboard and VS Code"
@@ -231,26 +235,26 @@ Write-Host " Ready - here is what to test" -ForegroundColor Magenta
 Write-Host "=============================================" -ForegroundColor Magenta
 Write-Host @"
 
-  In VS Code, open Copilot Chat and use the MODEL PICKER.
-  Headroom models are under: Other Models > Headroom (GitHub Copilot)
+  RESTART VS CODE FIRST - the routing setting is read at startup.
 
-   1. Pick any model ending "(Headroom)" and ask anything.
-        -> confirms chat traffic flows through the proxy
+  Then use Copilot Chat's NORMAL model picker. There are no "(Headroom)"
+  entries any more, and that is the point: Copilot's own models now go
+  through Headroom.
 
-   2. Check the models you actually use are there - Claude Opus 5,
-      Claude Sonnet 5, Claude Opus 4.8, GPT-5.6 Sol, GPT-5.6 Terra.
-        -> these five used to be missing; that was the id-collision bug
+   1. Ask anything with any model. Watch the dashboard - savings climb.
 
-   3. SWITCH model mid-session to another "(Headroom)" model and ask again.
-        -> model switching without restarting
+   2. Switch model mid-session and ask again.
 
-   4. Pick a /responses model, e.g. "GPT-5.5 (Headroom)" or
-      "MAI-Code-1-Flash (Headroom)", and ask something.
+   3. Ask the agent to use a different vendor's model ("use gemini").
+        -> the SUBAGENT's traffic should now appear on the dashboard too.
+           This is what BYOK could not do: the agent picks from Copilot's
+           list, so a subagent used to bypass Headroom entirely.
 
-   5. Try AGENT mode with a tool-using request ("read README.md and
+   4. Try AGENT mode with a tool-using request ("read README.md and
       summarise it").
 
-   6. Watch the dashboard - savings should climb as you chat.
+   5. Sanity check in the proxy window / log: you should see
+      /models, /models/session and /chat/completions arriving.
 
   RUNNING ALL THREE AT ONCE:
      In other terminals: .\Start-HeadroomCopilotCli.ps1
@@ -258,12 +262,11 @@ Write-Host @"
      Both attach to this same proxy on port $Port - one dashboard, one total.
 
   EXPECTED DIFFERENCES from stock Copilot Chat (not bugs):
-   - Headroom models are a separate group, suffixed "(Headroom)".
-   - Built-in Copilot models still appear and BYPASS Headroom if selected.
+   - The picker looks exactly as it always did. That is intentional.
    - Inline (ghost-text) completions always go straight to GitHub - never
      compressed or counted, whatever model you pick.
-   - If no Headroom models appear: restart VS Code once (the agent host has
-     to restart), then check the proxy window for warnings.
+   - If the proxy is stopped while VS Code is routed at it, chat stops
+     working until you `headroom unwrap vscode-chat` and restart VS Code.
 
   WHEN DONE:
      headroom unwrap vscode-chat     # removes the models + setting

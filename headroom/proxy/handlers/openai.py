@@ -979,6 +979,18 @@ def _should_buffer_openai_responses_stream_ccr(
     )
 
 
+def _should_inject_openai_chat_ccr_tool(*, ccr_inject_tool: bool, stream: bool) -> bool:
+    """Return whether chat-completions can redeem an injected CCR tool.
+
+    The chat streaming path forwards SSE events immediately and deliberately
+    does not run the response continuation loop. Injecting ``headroom_retrieve``
+    there makes OpenAI-compatible clients attempt an unknown tool call. The
+    non-streaming path can intercept and resolve it; Responses streaming has a
+    separate buffered-CCR path and is unaffected by this predicate.
+    """
+    return bool(ccr_inject_tool and not stream)
+
+
 def _responses_input_to_items(input_data: Any) -> list[dict[str, Any]]:
     """Normalize a Responses ``input`` field into an item list for CCR continuation.
 
@@ -3410,19 +3422,34 @@ class OpenAIHandlerMixin:
         # anchored on the previous turn's tool list never busts.
         tools = body.get("tools")
         _original_tools = tools  # Preserve for diagnostic / future retry
+        can_inject_ccr_tool = _should_inject_openai_chat_ccr_tool(
+            ccr_inject_tool=self.config.ccr_inject_tool,
+            stream=stream,
+        )
         if (
             self.config.ccr_inject_tool or self.config.ccr_inject_system_instructions
         ) and not _bypass:
+            if self.config.ccr_inject_tool and stream:
+                logger.info(
+                    f"[{request_id}] CCR: skipping retrieval-tool injection for "
+                    "OpenAI chat streaming; this path cannot intercept tool calls"
+                )
             injector = CCRToolInjector(
                 provider="openai",
                 inject_tool=False,  # routed through sticky helper below
-                inject_system_instructions=self.config.ccr_inject_system_instructions,
+                inject_system_instructions=(
+                    self.config.ccr_inject_system_instructions and not stream
+                ),
             )
             injector.scan_for_markers(optimized_messages)
-            if self.config.ccr_inject_system_instructions and injector.has_compressed_content:
+            if (
+                self.config.ccr_inject_system_instructions
+                and not stream
+                and injector.has_compressed_content
+            ):
                 optimized_messages = injector.inject_into_system_message(optimized_messages)
 
-            if self.config.ccr_inject_tool:
+            if can_inject_ccr_tool:
                 from headroom.proxy.helpers import (
                     apply_session_sticky_ccr_tool,
                     has_new_ccr_markers,

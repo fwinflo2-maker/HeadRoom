@@ -19,7 +19,10 @@ from unittest.mock import patch
 
 import numpy as np
 import pytest
+from click.testing import CliRunner
 
+import headroom.cli.memory as memory_cli
+from headroom.cli.main import main
 from headroom.cli.memory import (
     _clear_all_search_indexes,
     _remove_from_search_indexes,
@@ -79,7 +82,9 @@ def _seed_vector(db_path: Path, memory_ids: list[str]) -> None:
     vector_db = db_path.parent / f"{db_path.stem}_vectors.db"
     index = SQLiteVectorIndex(dimension=_VEC_DIM, db_path=str(vector_db))
     for mid in memory_ids:
-        embedding = list(np.random.default_rng(abs(hash(mid))).standard_normal(_VEC_DIM).astype(float))
+        embedding = list(
+            np.random.default_rng(abs(hash(mid))).standard_normal(_VEC_DIM).astype(float)
+        )
         mem = Memory(id=mid, content="test", user_id="u", embedding=embedding)
         asyncio.run(index.index(mem))
 
@@ -140,6 +145,27 @@ def test_remove_from_search_indexes_empty_list_is_noop(tmp_path):
     _remove_from_search_indexes(str(db_path), [])
 
     assert _fts_count(db_path) == 1
+
+
+def test_remove_from_search_indexes_absent_optional_indexes_is_noop(tmp_path):
+    """A primary-only store must not fail after its mutation already succeeded."""
+    db_path = tmp_path / "memory.db"
+    store = SQLiteMemoryStore(str(db_path))
+    asyncio.run(store.save(_make_memory("id-0")))
+
+    assert _remove_from_search_indexes(str(db_path), ["id-0"]) is True
+    assert _clear_all_search_indexes(str(db_path)) is True
+
+
+def test_empty_uninitialized_vector_database_is_noop_without_sqlite_vec(tmp_path, monkeypatch):
+    db_path = tmp_path / "memory.db"
+    store = SQLiteMemoryStore(str(db_path))
+    asyncio.run(store.save(_make_memory("id-0")))
+    (tmp_path / "memory_vectors.db").touch()
+    monkeypatch.setitem(sys.modules, "sqlite_vec", None)
+
+    assert _remove_from_search_indexes(str(db_path), ["id-0"]) is True
+    assert _clear_all_search_indexes(str(db_path)) is True
 
 
 # ---------------------------------------------------------------------------
@@ -360,3 +386,123 @@ def test_clear_all_search_indexes_sqlite_vec_missing_returns_false(tmp_path):
         result = _clear_all_search_indexes(str(db_path))
 
     assert result is False
+
+
+def test_reindex_pages_through_complete_store(tmp_path, monkeypatch):
+    """Records beyond the first page remain represented in rebuilt FTS."""
+    db_path = tmp_path / "memory.db"
+    store = SQLiteMemoryStore(str(db_path))
+    memories = [_make_memory(f"id-{i}", f"content {i}") for i in range(5)]
+    for memory in memories:
+        asyncio.run(store.save(memory))
+    _seed_fts(db_path, memories[:2])
+    monkeypatch.setattr(memory_cli, "_REINDEX_PAGE_SIZE", 2)
+
+    result = CliRunner().invoke(main, ["memory", "reindex", "--db-path", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    assert _fts_ids(db_path) == {memory.id for memory in memories}
+    assert "Re-indexed 5/5 memories" in result.output
+
+
+@requires_sqlite_vec
+def test_reindex_keeps_valid_vectors_beyond_first_page(tmp_path, monkeypatch):
+    """Complete primary IDs, not one page, determine vector orphans."""
+    db_path = tmp_path / "memory.db"
+    store = SQLiteMemoryStore(str(db_path))
+    memories = [_make_memory(f"id-{i}", f"content {i}") for i in range(5)]
+    for memory in memories:
+        asyncio.run(store.save(memory))
+    _seed_vector(db_path, [memory.id for memory in memories] + ["orphan"])
+    monkeypatch.setattr(memory_cli, "_REINDEX_PAGE_SIZE", 2)
+
+    result = CliRunner().invoke(main, ["memory", "reindex", "--db-path", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    assert _vector_ids(db_path) == {memory.id for memory in memories}
+
+
+def test_delete_command_exits_nonzero_when_index_sync_fails(tmp_path, monkeypatch):
+    """The real Click command must not report a partially synced delete as success."""
+    db_path = tmp_path / "memory.db"
+    store = SQLiteMemoryStore(str(db_path))
+    memory = _make_memory("abc123")
+    asyncio.run(store.save(memory))
+    monkeypatch.setattr(memory_cli, "_remove_from_search_indexes", lambda *_args: False)
+
+    result = CliRunner().invoke(
+        main,
+        ["memory", "delete", memory.id, "--force", "--db-path", str(db_path)],
+    )
+
+    assert result.exit_code == 1
+    assert asyncio.run(store.get(memory.id)) is None
+    assert "index sync incomplete" in result.output
+
+
+def test_edit_command_exits_nonzero_when_index_sync_fails(tmp_path, monkeypatch):
+    db_path = tmp_path / "memory.db"
+    store = SQLiteMemoryStore(str(db_path))
+    memory = _make_memory("abc123", "before")
+    asyncio.run(store.save(memory))
+    monkeypatch.setattr(memory_cli, "_remove_from_search_indexes", lambda *_args: False)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "memory",
+            "edit",
+            memory.id,
+            "--content",
+            "after",
+            "--db-path",
+            str(db_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert asyncio.run(store.get(memory.id)).content == "after"
+    assert "index sync incomplete" in result.output
+
+
+def test_prune_command_exits_nonzero_when_index_sync_fails(tmp_path, monkeypatch):
+    db_path = tmp_path / "memory.db"
+    store = SQLiteMemoryStore(str(db_path))
+    memory = _make_memory("abc123")
+    asyncio.run(store.save(memory))
+    monkeypatch.setattr(memory_cli, "_remove_from_search_indexes", lambda *_args: False)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "memory",
+            "prune",
+            "--low-importance",
+            "1.0",
+            "--force",
+            "--db-path",
+            str(db_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert asyncio.run(store.get(memory.id)) is None
+    assert "index sync incomplete" in result.output
+
+
+def test_purge_command_exits_nonzero_when_index_sync_fails(tmp_path, monkeypatch):
+    db_path = tmp_path / "memory.db"
+    store = SQLiteMemoryStore(str(db_path))
+    memory = _make_memory("abc123")
+    asyncio.run(store.save(memory))
+    monkeypatch.setattr(memory_cli, "_clear_all_search_indexes", lambda *_args: False)
+
+    result = CliRunner().invoke(
+        main,
+        ["memory", "purge", "--confirm", "--db-path", str(db_path)],
+        input="y\n",
+    )
+
+    assert result.exit_code == 1
+    assert asyncio.run(store.get(memory.id)) is None
+    assert "index sync incomplete" in result.output

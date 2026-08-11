@@ -106,7 +106,13 @@ class SessionExpansionDedupTracker:
         self._sessions: OrderedDict[str, set[str]] = OrderedDict()
 
     def filter_new(self, session_id: str, hash_keys: list[str]) -> list[str]:
-        """Return the subset of hash_keys not yet injected for this session."""
+        """Return the subset of hash_keys not yet injected for this session.
+
+        Counts as a use: an active session that keeps being *asked* about
+        without recording anything new must not age out behind other
+        sessions, or its already-seen hashes come back and get proactively
+        expanded a second time.
+        """
 
         if not session_id:
             raise ValueError("session_id must be non-empty")
@@ -114,6 +120,7 @@ class SessionExpansionDedupTracker:
             seen = self._sessions.get(session_id)
             if seen is None:
                 return list(hash_keys)
+            self._sessions.move_to_end(session_id)
             return [h for h in hash_keys if h not in seen]
 
     def record_injected(self, session_id: str, hash_keys: list[str]) -> None:

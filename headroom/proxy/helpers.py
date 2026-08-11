@@ -379,39 +379,78 @@ def log_memory_injection(
     )
 
 
+def latest_user_chat_message_index(messages: list[dict[str, Any]]) -> int:
+    """Index ``append_text_to_latest_user_chat_message`` will mutate, or -1.
+
+    OpenAI chat histories routinely end on a non-user message (``assistant``
+    prefill, trailing ``role="tool"`` results), so the append target is the
+    latest USER message — not necessarily the tail. Injection guards must ask
+    about that exact index, so the finder lives here and the append helper
+    uses it too; the two can then never disagree.
+    """
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "user":
+            return idx
+    return -1
+
+
+def latest_non_frozen_user_turn_index(
+    messages: list[dict[str, Any]],
+    *,
+    frozen_message_count: int,
+) -> int:
+    """Index Anthropic's ``_append_context_to_latest_non_frozen_user_turn``
+    will mutate, or -1.
+
+    Only the live-zone tail is eligible: the final message, and only when it
+    is a user turn outside the frozen prefix. An assistant prefill or a
+    tool_result tail therefore has no target at all (-1), which is also why
+    the guard must not assume ``messages[-1]`` is what gets mutated.
+    """
+    index = len(messages) - 1
+    if index < 0 or index < frozen_message_count:
+        return -1
+    msg = messages[index]
+    if not isinstance(msg, dict) or msg.get("role") != "user":
+        return -1
+    return index
+
+
 def injection_target_already_forwarded(
     messages: list[dict[str, Any]],
     *,
     prefix_tracker: Any,
-    current_original_messages: list[dict[str, Any]],
+    target_index: int,
 ) -> bool:
-    """True when appending to ``messages[-1]`` would double-inject.
+    """True when appending to ``messages[target_index]`` would double-inject.
 
     Shared guard for CCR proactive-expansion and memory-context injection on
-    both the Anthropic and OpenAI paths: all of them append to the tail
-    message via a provider-specific "append to latest user turn" helper. On a
-    same-messages re-request (or any turn whose tail position was already
-    part of last turn's forwarded output), ``overlay_cached_prefix`` has
-    already replayed that position's bytes byte-identical — including
-    whatever was injected into it last turn. Injecting again there would
-    append a second copy and bust the cache from that point on (#2186).
+    both the Anthropic and OpenAI paths. Each appends through a
+    provider-specific "append to latest user turn" helper whose target is NOT
+    always the tail message, so callers pass the exact index that helper will
+    mutate (``latest_non_frozen_user_turn_index`` /
+    ``latest_user_chat_message_index``). ``target_index < 0`` means the helper
+    would not mutate anything, so the guard is a no-op.
 
-    "Already forwarded" = the tail index falls within last turn's forwarded
-    message count AND this turn's originals are a full append-only extension
-    of last turn's originals — the same condition under which the overlay
-    actually replayed that position (see
-    ``headroom.cache.prefix_tracker.is_append_only_extension``).
+    Every caller runs after ``overlay_cached_prefix``, which replays last
+    turn's forwarded bytes into the leading positions it proved stable —
+    including whatever was injected into them last turn. Appending into such
+    a position adds a second copy and changes bytes the provider already
+    hashed, busting the cache from that point on (#2186). See
+    ``headroom.cache.prefix_tracker.position_already_forwarded``.
     """
-    from headroom.cache.prefix_tracker import is_append_only_extension
+    from headroom.cache.prefix_tracker import position_already_forwarded
 
-    target_index = len(messages) - 1
     if target_index < 0:
         return False
-    previous_forwarded = prefix_tracker.get_last_forwarded_messages()
-    if target_index >= len(previous_forwarded):
-        return False
-    previous_original = prefix_tracker.get_last_original_messages()
-    return is_append_only_extension(current_original_messages, previous_original)
+    return position_already_forwarded(
+        messages,
+        target_index,
+        prefix_tracker.get_last_forwarded_messages(),
+    )
 
 
 def append_text_to_latest_user_chat_message(
@@ -435,43 +474,36 @@ def append_text_to_latest_user_chat_message(
     if not messages or not context_text:
         return messages, 0
 
-    new_messages = list(messages)
-    for idx in range(len(new_messages) - 1, -1, -1):
-        msg = new_messages[idx]
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("role") != "user":
-            continue
-
-        content = msg.get("content")
-        if isinstance(content, str):
-            updated_msg = {**msg, "content": content + "\n\n" + context_text}
-            new_messages[idx] = updated_msg
-            return new_messages, len(context_text)
-
-        if isinstance(content, list) and content:
-            new_content: list[dict[str, Any]] = []
-            appended = False
-            for part in content:
-                if (
-                    not appended
-                    and isinstance(part, dict)
-                    and part.get("type") in ("text", "input_text")
-                ):
-                    existing_text = part.get("text", "")
-                    new_part = {**part, "text": existing_text + "\n\n" + context_text}
-                    new_content.append(new_part)
-                    appended = True
-                else:
-                    new_content.append(part)
-            if appended:
-                updated_msg = {**msg, "content": new_content}
-                new_messages[idx] = updated_msg
-                return new_messages, len(context_text)
-
-        # User message but no eligible text block — leave untouched and stop.
+    idx = latest_user_chat_message_index(messages)
+    if idx < 0:
         return messages, 0
 
+    new_messages = list(messages)
+    msg = new_messages[idx]
+    content = msg.get("content")
+    if isinstance(content, str):
+        new_messages[idx] = {**msg, "content": content + "\n\n" + context_text}
+        return new_messages, len(context_text)
+
+    if isinstance(content, list) and content:
+        new_content: list[dict[str, Any]] = []
+        appended = False
+        for part in content:
+            if (
+                not appended
+                and isinstance(part, dict)
+                and part.get("type") in ("text", "input_text")
+            ):
+                existing_text = part.get("text", "")
+                new_content.append({**part, "text": existing_text + "\n\n" + context_text})
+                appended = True
+            else:
+                new_content.append(part)
+        if appended:
+            new_messages[idx] = {**msg, "content": new_content}
+            return new_messages, len(context_text)
+
+    # User message but no eligible text block — leave untouched.
     return messages, 0
 
 

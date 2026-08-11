@@ -31,7 +31,11 @@ from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
-from headroom.proxy.helpers import extract_tags, injection_target_already_forwarded
+from headroom.proxy.helpers import (
+    extract_tags,
+    injection_target_already_forwarded,
+    latest_non_frozen_user_turn_index,
+)
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
@@ -270,12 +274,10 @@ class AnthropicHandlerMixin:
         if not messages or not context_text:
             return messages
 
-        i = len(messages) - 1
-        if i < frozen_message_count:
+        i = latest_non_frozen_user_turn_index(messages, frozen_message_count=frozen_message_count)
+        if i < 0:
             return messages
         msg = messages[i]
-        if msg.get("role") != "user":
-            return messages
 
         content = msg.get("content", "")
         if isinstance(content, str):
@@ -2051,11 +2053,14 @@ class AnthropicHandlerMixin:
                             elif injection_target_already_forwarded(
                                 optimized_messages,
                                 prefix_tracker=prefix_tracker,
-                                current_original_messages=original_client_messages,
+                                target_index=latest_non_frozen_user_turn_index(
+                                    optimized_messages,
+                                    frozen_message_count=frozen_message_count,
+                                ),
                             ):
                                 logger.info(
                                     f"[{request_id}] CCR: skipping proactive expansion append — "
-                                    "tail position already forwarded last turn "
+                                    "target position already forwarded last turn "
                                     "(would double-inject, #2186)"
                                 )
                             else:
@@ -2165,9 +2170,12 @@ class AnthropicHandlerMixin:
                             elif injection_target_already_forwarded(
                                 optimized_messages,
                                 prefix_tracker=prefix_tracker,
-                                current_original_messages=original_client_messages,
+                                target_index=latest_non_frozen_user_turn_index(
+                                    optimized_messages,
+                                    frozen_message_count=frozen_message_count,
+                                ),
                             ):
-                                # Tail position already forwarded last turn; the
+                                # Target position already forwarded last turn; the
                                 # overlay replayed it byte-identical, so appending
                                 # here would double-inject (#2186).
                                 log_memory_injection(

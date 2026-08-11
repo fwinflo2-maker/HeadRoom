@@ -147,7 +147,7 @@ from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
 # Data models (extracted to headroom/proxy/models.py for maintainability)
-from headroom.proxy.model_router import ModelRouter, ModelRouterConfig
+from headroom.proxy.model_router import ModelRoute, ModelRouter, ModelRouterConfig
 from headroom.proxy.models import CacheEntry, ProxyConfig, RateLimitState, RequestLog  # noqa: F401
 from headroom.proxy.modes import (
     PROXY_MODE_CACHE,
@@ -4894,7 +4894,17 @@ def _proxy_config_from_env() -> ProxyConfig:
     raw_config = os.environ.get(_MULTI_WORKER_CONFIG_ENV)
     if raw_config:
         try:
-            return ProxyConfig(**json.loads(raw_config))
+            parsed = json.loads(raw_config)
+            mr = parsed.get("model_router")
+            if isinstance(mr, dict):
+                parsed["model_router"] = ModelRouterConfig(
+                    enabled=bool(mr.get("enabled", False)),
+                    routes=tuple(
+                        ModelRoute(**{**route, "from_models": tuple(route.get("from_models", ()))})
+                        for route in mr.get("routes", ())
+                    ),
+                )
+            return ProxyConfig(**parsed)
         except (TypeError, ValueError, json.JSONDecodeError):
             logger.warning(
                 "Invalid %s; falling back to HEADROOM_* env vars", _MULTI_WORKER_CONFIG_ENV

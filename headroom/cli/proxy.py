@@ -1019,6 +1019,7 @@ def proxy(
     """
     # Import here to avoid slow startup
     try:
+        from headroom.proxy.model_router import ModelRouterConfig
         from headroom.proxy.server import (
             ProxyConfig,
             _parse_csv_tools,
@@ -1195,6 +1196,10 @@ def proxy(
         tool_profiles=_parse_tool_profiles([]) or None,
         smart_crusher_with_compaction=_get_env_bool_optional("HEADROOM_SMART_CRUSHER_COMPACTION"),
         savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or "coding",
+        model_router=ModelRouterConfig.from_env(
+            os.environ.get("HEADROOM_MODEL_ROUTER_ENABLED"),
+            os.environ.get("HEADROOM_MODEL_ROUTES"),
+        ),
         target_ratio=target_ratio,
         compress_system_messages=_get_env_bool_optional("HEADROOM_COMPRESS_SYSTEM_MESSAGES"),
         protect_recent=_get_env_int_optional("HEADROOM_PROTECT_RECENT"),

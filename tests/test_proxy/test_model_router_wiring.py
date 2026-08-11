@@ -264,3 +264,82 @@ def test_vertex_raw_predict_model_is_not_rewritten_in_body() -> None:
         )
     assert resp.status_code == 200
     assert "model" not in _forwarded_body(http)
+
+
+def test_cli_proxy_wires_model_router_from_env(monkeypatch) -> None:
+    """The default `headroom proxy` (single-worker) path must honor the
+
+    HEADROOM_MODEL_ROUTER_ENABLED / HEADROOM_MODEL_ROUTES env vars, like the
+    multi-worker `_proxy_config_from_env` path does. Regression for #2764.
+    """
+    from click.testing import CliRunner
+
+    import headroom.proxy.server as server_mod
+    from headroom.cli.main import main
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        server_mod, "run_server", lambda config, **kwargs: captured.__setitem__("config", config)
+    )
+    monkeypatch.setenv("HEADROOM_MODEL_ROUTER_ENABLED", "true")
+    monkeypatch.setenv(
+        "HEADROOM_MODEL_ROUTES",
+        '[{"name":"small","max_input_tokens":4000,"require_no_tools":true,'
+        '"to_model":"claude-haiku-4-5"}]',
+    )
+
+    result = CliRunner().invoke(main, ["proxy"])
+
+    assert result.exit_code == 0, result.output
+    config = captured.get("config")
+    assert config is not None, "run_server was not reached"
+    assert config.model_router is not None and config.model_router.enabled
+    assert config.model_router.routes[0].to_model == "claude-haiku-4-5"
+
+
+def test_cli_proxy_model_router_disabled_when_unset(monkeypatch) -> None:
+    """With the env vars unset, the CLI path leaves the router disabled."""
+    from click.testing import CliRunner
+
+    import headroom.proxy.server as server_mod
+    from headroom.cli.main import main
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        server_mod, "run_server", lambda config, **kwargs: captured.__setitem__("config", config)
+    )
+    monkeypatch.delenv("HEADROOM_MODEL_ROUTER_ENABLED", raising=False)
+    monkeypatch.delenv("HEADROOM_MODEL_ROUTES", raising=False)
+
+    result = CliRunner().invoke(main, ["proxy"])
+
+    assert result.exit_code == 0, result.output
+    config = captured.get("config")
+    assert config is not None, "run_server was not reached"
+    assert config.model_router is None or not config.model_router.enabled
+
+
+def test_multi_worker_json_roundtrip_reconstructs_model_router(monkeypatch) -> None:
+    """The workers>1 JSON round-trip must rebuild model_router as a dataclass,
+
+    not leave it a raw dict (which crashes `ModelRouter(...).enabled`). #2764.
+    """
+    from headroom.proxy.model_router import ModelRouter
+    from headroom.proxy.server import (
+        _MULTI_WORKER_CONFIG_ENV,
+        ProxyConfig,
+        _proxy_config_from_env,
+        _proxy_config_payload,
+    )
+
+    source = ProxyConfig(model_router=_router_config())
+    payload = _proxy_config_payload(source)
+    monkeypatch.setenv(_MULTI_WORKER_CONFIG_ENV, json.dumps(payload))
+
+    rebuilt = _proxy_config_from_env()
+
+    assert isinstance(rebuilt.model_router, ModelRouterConfig)
+    assert rebuilt.model_router.enabled
+    assert rebuilt.model_router.routes[0].to_model == "claude-haiku-4-5"
+    # The crash surface: constructing a ModelRouter and reading .enabled must not raise.
+    assert ModelRouter(rebuilt.model_router).enabled is True

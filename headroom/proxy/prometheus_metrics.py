@@ -849,6 +849,7 @@ class PrometheusMetrics:
                 total_input_tokens=total_input_tokens,
                 total_input_cost_usd=total_input_cost_usd,
                 output_tokens_saved=output_tokens_saved,
+                output_tokens=output_tokens,
             )
 
         # Also append to the durable, multi-process savings ledger so

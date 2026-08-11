@@ -678,6 +678,21 @@ class TestCogneeBackendDispatch:
     so dispatch can be verified without cognee installed.
     """
 
+    @pytest.fixture(autouse=True)
+    def _cognee_isolation(self, monkeypatch, tmp_path):
+        """Per-test tmp metadata DB + fresh process-wide cognee state.
+
+        cognee's import/config is process-wide and immutable; resetting the
+        module state simulates a fresh process per test. The metadata DB env
+        var keeps the durable registry out of ``~/.headroom``.
+        """
+        from headroom.memory.backends import cognee as cognee_backend_module
+
+        monkeypatch.setenv("HEADROOM_COGNEE_METADATA_DB", str(tmp_path / "cognee_meta.db"))
+        cognee_backend_module._reset_process_state_for_testing()
+        yield
+        cognee_backend_module._reset_process_state_for_testing()
+
     def test_backend_type_property(self):
         """backend_type reports 'cognee' before initialization."""
         mem = Memory(backend="cognee")

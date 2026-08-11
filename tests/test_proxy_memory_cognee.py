@@ -22,6 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from headroom.memory.backends import cognee as cognee_backend_module
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 from headroom.proxy.models import ProxyConfig
 
@@ -31,13 +32,19 @@ _COGNEE_ENV_VARS = (
     "HEADROOM_COGNEE_DATA_ROOT",
     "HEADROOM_COGNEE_SEARCH_TYPE",
     "HEADROOM_COGNEE_AUTO_COGNIFY",
+    "HEADROOM_COGNEE_METADATA_DB",
 )
 
 
 @pytest.fixture(autouse=True)
-def _clear_cognee_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def _cognee_test_isolation(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    """Clean env, per-test tmp metadata DB, fresh process-wide cognee state."""
     for var in _COGNEE_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HEADROOM_COGNEE_METADATA_DB", str(tmp_path / "cognee_meta.db"))
+    cognee_backend_module._reset_process_state_for_testing()
+    yield
+    cognee_backend_module._reset_process_state_for_testing()
 
 
 def _install_fake_cognee(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
@@ -81,13 +88,15 @@ class TestProxyMemoryConfig:
         cfg = MemoryConfig(enabled=True, backend="cognee")
         assert cfg.backend == "cognee"
 
-    def test_cognee_defaults_when_no_env(self) -> None:
+    def test_cognee_defaults_when_no_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("HEADROOM_COGNEE_METADATA_DB", raising=False)
         cfg = MemoryConfig(backend="cognee")
         assert cfg.cognee_dataset == "headroom_memories"
         assert cfg.cognee_system_root is None
         assert cfg.cognee_data_root is None
         assert cfg.cognee_search_type == "CHUNKS"
         assert cfg.cognee_auto_cognify is True
+        assert cfg.cognee_metadata_db_path is None
 
     def test_cognee_fields_read_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HEADROOM_COGNEE_DATASET", "proxy_env_ds")
@@ -95,6 +104,7 @@ class TestProxyMemoryConfig:
         monkeypatch.setenv("HEADROOM_COGNEE_DATA_ROOT", "/data/root")
         monkeypatch.setenv("HEADROOM_COGNEE_SEARCH_TYPE", "GRAPH_COMPLETION")
         monkeypatch.setenv("HEADROOM_COGNEE_AUTO_COGNIFY", "false")
+        monkeypatch.setenv("HEADROOM_COGNEE_METADATA_DB", "/var/cognee/meta.db")
 
         cfg = MemoryConfig(backend="cognee")
         assert cfg.cognee_dataset == "proxy_env_ds"
@@ -102,6 +112,7 @@ class TestProxyMemoryConfig:
         assert cfg.cognee_data_root == "/data/root"
         assert cfg.cognee_search_type == "GRAPH_COMPLETION"
         assert cfg.cognee_auto_cognify is False
+        assert cfg.cognee_metadata_db_path == "/var/cognee/meta.db"
 
     def test_explicit_values_win_over_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HEADROOM_COGNEE_DATASET", "env_ds")
@@ -127,7 +138,8 @@ class TestProxyConfigCogneeFields:
         cfg = ProxyConfig(memory_backend="cognee")
         assert cfg.memory_backend == "cognee"
 
-    def test_cognee_defaults_when_no_env(self) -> None:
+    def test_cognee_defaults_when_no_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("HEADROOM_COGNEE_METADATA_DB", raising=False)
         cfg = ProxyConfig()
         assert cfg.memory_backend == "local"
         assert cfg.memory_cognee_dataset == "headroom_memories"
@@ -135,6 +147,7 @@ class TestProxyConfigCogneeFields:
         assert cfg.memory_cognee_data_root is None
         assert cfg.memory_cognee_search_type == "CHUNKS"
         assert cfg.memory_cognee_auto_cognify is True
+        assert cfg.memory_cognee_metadata_db_path is None
 
     def test_cognee_fields_read_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HEADROOM_COGNEE_DATASET", "shared_ds")
@@ -142,6 +155,7 @@ class TestProxyConfigCogneeFields:
         monkeypatch.setenv("HEADROOM_COGNEE_DATA_ROOT", "/data/px")
         monkeypatch.setenv("HEADROOM_COGNEE_SEARCH_TYPE", "GRAPH_COMPLETION")
         monkeypatch.setenv("HEADROOM_COGNEE_AUTO_COGNIFY", "no")
+        monkeypatch.setenv("HEADROOM_COGNEE_METADATA_DB", "/var/cognee/meta.db")
 
         cfg = ProxyConfig(memory_backend="cognee")
         assert cfg.memory_cognee_dataset == "shared_ds"
@@ -149,6 +163,7 @@ class TestProxyConfigCogneeFields:
         assert cfg.memory_cognee_data_root == "/data/px"
         assert cfg.memory_cognee_search_type == "GRAPH_COMPLETION"
         assert cfg.memory_cognee_auto_cognify is False
+        assert cfg.memory_cognee_metadata_db_path == "/var/cognee/meta.db"
 
     def test_auto_cognify_fail_soft_on_garbage_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A typo'd env var must not crash unrelated ProxyConfig construction."""
@@ -163,10 +178,13 @@ class TestProxyConfigCogneeFields:
 
 
 class TestMemoryHandlerCogneeSelection:
-    async def test_init_backend_selects_cognee(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_init_backend_selects_cognee(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
         from headroom.memory.backends.cognee import CogneeBackend
 
         _install_fake_cognee(monkeypatch)
+        metadata_db = str(tmp_path / "proxy_cognee_meta.db")
 
         config = MemoryConfig(
             enabled=True,
@@ -174,6 +192,7 @@ class TestMemoryHandlerCogneeSelection:
             cognee_dataset="proxy_ds",
             cognee_search_type="GRAPH_COMPLETION",
             cognee_auto_cognify=False,
+            cognee_metadata_db_path=metadata_db,
         )
         handler = MemoryHandler(config)
         await handler._ensure_initialized()
@@ -184,6 +203,7 @@ class TestMemoryHandlerCogneeSelection:
         assert handler._backend._config.dataset_name == "proxy_ds"
         assert handler._backend._config.search_type == "GRAPH_COMPLETION"
         assert handler._backend._config.auto_cognify is False
+        assert handler._backend._config.metadata_db_path == metadata_db
 
     async def test_init_backend_applies_isolation_roots(
         self, monkeypatch: pytest.MonkeyPatch

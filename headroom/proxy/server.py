@@ -1282,6 +1282,7 @@ class HeadroomProxy(
                 cognee_data_root=config.memory_cognee_data_root,
                 cognee_search_type=config.memory_cognee_search_type,
                 cognee_auto_cognify=config.memory_cognee_auto_cognify,
+                cognee_metadata_db_path=config.memory_cognee_metadata_db_path,
                 bridge_enabled=config.memory_bridge_enabled,
                 bridge_md_paths=config.memory_bridge_md_paths,
                 bridge_md_format=config.memory_bridge_md_format,

@@ -809,6 +809,17 @@ def dashboard(port: int, no_open: bool) -> None:
         "(default: enabled, also reads HEADROOM_COGNEE_AUTO_COGNIFY)"
     ),
 )
+@click.option(
+    "--memory-cognee-metadata-db",
+    default=None,
+    help=(
+        "Path to the SQLite file holding the cognee backend's durable memory "
+        "registry and delete/update tombstones. Instances sharing memories must "
+        "point at the same file. Default: headroom_cognee_meta.db under the "
+        "cognee data root (or system root, or ~/.headroom). "
+        "Also reads HEADROOM_COGNEE_METADATA_DB."
+    ),
+)
 # Traffic Learning (live pattern extraction from proxy traffic)
 @click.option(
     "--learn",
@@ -1034,6 +1045,7 @@ def proxy(
     memory_cognee_data_root: str | None,
     memory_cognee_search_type: str | None,
     memory_cognee_auto_cognify: bool | None,
+    memory_cognee_metadata_db: str | None,
     learn: bool,
     no_learn: bool,
     min_evidence: int | None,
@@ -1239,6 +1251,8 @@ def proxy(
         cognee_overrides["memory_cognee_search_type"] = memory_cognee_search_type
     if memory_cognee_auto_cognify is not None:
         cognee_overrides["memory_cognee_auto_cognify"] = memory_cognee_auto_cognify
+    if memory_cognee_metadata_db is not None:
+        cognee_overrides["memory_cognee_metadata_db_path"] = memory_cognee_metadata_db
 
     config = ProxyConfig(
         host=host,

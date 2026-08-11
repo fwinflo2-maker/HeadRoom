@@ -5,15 +5,32 @@ knowledge-graph engine. This backend stores headroom memories as cognee data
 items tagged via ``node_set`` for user/session/entity scoping, builds a
 knowledge graph via ``cognee.cognify()``, and searches via ``cognee.search()``.
 
-Import of the ``cognee`` package is deferred until the backend is first used
-and runs in a worker thread (the import takes seconds and must not block the
-event loop). cognee's import has side effects — notably
-``dotenv.load_dotenv(override=True)``, which would overwrite already-set
-process environment variables with values from a ``.env`` in the cwd. This
-backend snapshots the environment around the import and restores any
-pre-existing variables the import changed, preserving the normal
-env-over-``.env`` precedence (keys newly added by cognee's ``.env`` load are
-kept so cognee's own configuration keeps working).
+Durable metadata store:
+    cognee has no per-item fetch/update API for raw memories, so this backend
+    keeps a small SQLite metadata store (WAL mode) next to cognee's data. It
+    holds the memory registry (canonical memory IDs keyed by
+    ``(user_id, content)``) and per-user tombstones for deleted/superseded
+    content. Because this state is durable and shared, deletions and updates
+    survive proxy restarts and are visible immediately to other backend
+    instances pointed at the same ``metadata_db_path``.
+
+Process-wide, immutable cognee configuration:
+    ``import cognee`` and cognee's root-directory configuration
+    (``cognee.config.system_root_directory`` / ``data_root_directory``) are
+    process-global. The import runs at most once per process, guarded by a
+    module-level lock, and the effective ``(system_root, data_root)`` pair is
+    recorded in module state. A later backend instance initializing with the
+    SAME roots reuses the configured module; one initializing with DIFFERENT
+    roots fails closed with ``RuntimeError`` (one tenant must never redirect
+    another tenant's cognee storage).
+
+    cognee's import has side effects — notably
+    ``dotenv.load_dotenv(override=True)``, which would overwrite already-set
+    process environment variables with values from a ``.env`` in the cwd. The
+    first (and only) import snapshots the environment and restores any
+    pre-existing variables the import changed, preserving the normal
+    env-over-``.env`` precedence (keys newly added by cognee's ``.env`` load
+    are kept so cognee's own configuration keeps working).
 
 Usage:
     from headroom.memory.backends.cognee import CogneeBackend, CogneeConfig
@@ -29,23 +46,28 @@ Usage:
     )
 
 Known limitations (cognee v1.x):
-    - cognee has no per-item update API. ``update_memory`` is implemented
-      best-effort as tombstone + re-add: the new content is added to cognee,
-      the old content is filtered out of future search results from this
-      backend instance, but the old data remains in cognee's stores until the
-      dataset is pruned.
-    - ``delete_memory`` tombstones the memory (excluded from this backend's
-      search results) but cannot remove already-cognified graph nodes.
-    - Tombstones are scoped per user and matched against search-result chunk
-      text by exact equality or substring containment (a chunk that is a
-      piece of the deleted content is filtered). This is best-effort: if
-      cognee normalizes or rewrites the text during cognify, transformed
-      chunks may still surface after a delete/update.
-    - Memory IDs are stable content-derived UUIDs (``uuid5(user_id, content)``),
-      so IDs returned by ``search_memories`` can be passed to ``update_memory``
-      / ``delete_memory``. ``get_memory`` resolves memories saved or searched
-      through this backend instance (cognee has no fetch-by-id for raw
-      memories).
+    - cognee has no per-item update API. ``update_memory`` updates the durable
+      registry row in place (same ID, new content), adds the new content to
+      cognee, and tombstones the old content so it stops surfacing in search.
+    - ``delete_memory`` removes the registry row and tombstones the content.
+      In addition, a best-effort hard delete runs against cognee's dataset API
+      (``cognee.datasets.list_data`` / ``delete_data``, matched by content
+      hash); when it fails or the data cannot be matched, the underlying
+      cognee data persists and the durable tombstones are the enforcement
+      layer that keeps it out of results.
+    - Tombstones are scoped per user and matched against search-result text
+      by exact equality or substring containment (a chunk that is a piece of
+      the deleted content is filtered). The filter applies to every search
+      type this backend can be configured with, but it is text-based:
+      non-CHUNKS, graph-synthesized search results (or text cognee rewrote
+      during cognify) may still reflect deleted content when the emitted text
+      no longer matches the tombstoned original.
+    - Memory IDs are stable content-derived UUIDs (``uuid5(user_id, content)``)
+      resolved through the durable registry, so IDs returned by
+      ``search_memories`` remain valid inputs to ``update_memory`` /
+      ``delete_memory`` across restarts and across backend instances sharing
+      the same ``metadata_db_path``. After an update, search keeps returning
+      the ORIGINAL memory ID for the new content.
     - cognee search results carry no similarity score; scores returned here
       are rank-based, mapped into ``(0.5, 1.0]`` so they always clear the
       proxy's default ``min_similarity`` floor (0.3). ``min_similarity``
@@ -56,14 +78,20 @@ Known limitations (cognee v1.x):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
+import json
 import logging
 import os
+import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
+from headroom import paths
 from headroom.memory import cognee_env
 from headroom.memory.models import Memory
 from headroom.memory.ports import MemorySearchResult
@@ -71,6 +99,10 @@ from headroom.memory.ports import MemorySearchResult
 logger = logging.getLogger(__name__)
 
 _IMPORT_ERROR_MSG = 'cognee package not installed. Install with: pip install "headroom-ai[cognee]"'
+
+# Filename used for the default metadata DB location (under data_root,
+# system_root, or the headroom workspace dir, in that order).
+_METADATA_DB_FILENAME = "headroom_cognee_meta.db"
 
 
 def _utcnow() -> datetime:
@@ -109,6 +141,99 @@ def _entity_tag(entity: str) -> str:
     return f"entity:{entity}"
 
 
+# ---------------------------------------------------------------------------
+# Process-wide cognee import + configuration (immutable per process)
+# ---------------------------------------------------------------------------
+# ``import cognee`` and cognee.config root directories are process-global, so
+# per-instance guards cannot protect them: two instances racing the import
+# could snapshot/restore os.environ over each other, and a later instance
+# could silently redirect an earlier tenant's root directories. The state
+# below is module-level and mutated only under ``_process_lock`` (a threading
+# lock, safe across event loops because the work runs in ``asyncio.to_thread``
+# worker threads).
+
+_process_lock = threading.Lock()
+_process_cognee: Any = None
+_process_search_type_cls: Any = None
+# The (system_root, data_root) pair applied by the first successful
+# initialization. Any later attempt with a different pair fails closed.
+_process_roots: tuple[str | None, str | None] | None = None
+
+
+def _import_and_configure_cognee(system_root: str | None, data_root: str | None) -> tuple[Any, Any]:
+    """Import cognee once per process and apply root-directory config.
+
+    Runs in a worker thread (see ``CogneeBackend._ensure_initialized``).
+    Serialized process-wide by ``_process_lock``. On the first call the
+    environment is snapshotted before the import and any pre-existing
+    variable the import changed is restored (cognee's import executes
+    ``dotenv.load_dotenv(override=True)``); variables newly added by the
+    ``.env`` load are kept so cognee's own configuration (e.g.
+    ``LLM_API_KEY``) keeps working. Subsequent calls with the same roots
+    return the already-configured module without touching the environment.
+
+    Returns:
+        ``(cognee_module, SearchType_class)``.
+
+    Raises:
+        ImportError: If the cognee package is not installed.
+        RuntimeError: If cognee was already configured in this process with
+            different root directories (fail closed: the configuration is
+            process-wide and immutable).
+    """
+    global _process_cognee, _process_search_type_cls, _process_roots
+
+    requested = (system_root, data_root)
+    with _process_lock:
+        if _process_roots is not None:
+            if requested != _process_roots:
+                raise RuntimeError(
+                    "cognee configuration is process-wide and immutable; already "
+                    f"configured with system_root={_process_roots[0]!r}, "
+                    f"data_root={_process_roots[1]!r}; refusing to reconfigure with "
+                    f"system_root={system_root!r}, data_root={data_root!r}"
+                )
+            return _process_cognee, _process_search_type_cls
+
+        env_before = dict(os.environ)
+        try:
+            cognee = importlib.import_module("cognee")
+        except ImportError:
+            raise ImportError(_IMPORT_ERROR_MSG) from None
+        finally:
+            for key, value in env_before.items():
+                if os.environ.get(key) != value:
+                    os.environ[key] = value
+
+        search_type_cls = getattr(cognee, "SearchType", None)
+        if search_type_cls is None:
+            raise ImportError(_IMPORT_ERROR_MSG)
+
+        if system_root:
+            cognee.config.system_root_directory(system_root)
+        if data_root:
+            cognee.config.data_root_directory(data_root)
+
+        _process_cognee = cognee
+        _process_search_type_cls = search_type_cls
+        _process_roots = requested
+        return cognee, search_type_cls
+
+
+def _reset_process_state_for_testing() -> None:
+    """Reset the process-wide cognee import/config state. TESTS ONLY.
+
+    Production code must never call this: the whole point of the module
+    state is that cognee's process-global configuration is applied at most
+    once per process. Tests use it to simulate fresh processes.
+    """
+    global _process_cognee, _process_search_type_cls, _process_roots
+    with _process_lock:
+        _process_cognee = None
+        _process_search_type_cls = None
+        _process_roots = None
+
+
 @dataclass
 class CogneeConfig:
     """Configuration for the cognee memory backend.
@@ -116,6 +241,11 @@ class CogneeConfig:
     Fields default to values read from ``HEADROOM_COGNEE_*`` environment
     variables (see :mod:`headroom.memory.cognee_env`). Passing an explicit
     value to the constructor always wins over the environment.
+
+    Note: ``system_root`` / ``data_root`` configure process-global cognee
+    state. The first backend initialized in a process fixes them for every
+    later instance; initializing another instance with different roots
+    raises ``RuntimeError`` (see module docstring).
 
     Attributes:
         dataset_name: cognee dataset that holds all headroom memories.
@@ -134,6 +264,13 @@ class CogneeConfig:
         background_cognify: Whether ``cognify`` runs in the background.
             ``cognify`` is LLM-bound and slow; in a proxy request path this
             should stay ``True``.
+        metadata_db_path: Path to the SQLite file holding the durable memory
+            registry and tombstones. ``None`` (default) resolves to
+            ``headroom_cognee_meta.db`` under ``data_root`` when set, else
+            under ``system_root`` when set, else under the headroom
+            workspace dir (``~/.headroom``). Instances that must share
+            delete/update state (multiple workers, restarts) must point at
+            the same file.
     """
 
     dataset_name: str = field(default_factory=cognee_env.cognee_env_dataset)
@@ -142,6 +279,259 @@ class CogneeConfig:
     search_type: str = field(default_factory=cognee_env.cognee_env_search_type)
     auto_cognify: bool = field(default_factory=cognee_env.cognee_env_auto_cognify)
     background_cognify: bool = True
+    metadata_db_path: str | None = field(default_factory=cognee_env.cognee_env_metadata_db)
+
+
+def _resolve_metadata_db_path(config: CogneeConfig) -> Path:
+    """Resolve the metadata DB location for a config (see CogneeConfig docs)."""
+    if config.metadata_db_path:
+        return Path(config.metadata_db_path).expanduser()
+    if config.data_root:
+        return Path(config.data_root).expanduser() / _METADATA_DB_FILENAME
+    if config.system_root:
+        return Path(config.system_root).expanduser() / _METADATA_DB_FILENAME
+    return paths.workspace_dir() / _METADATA_DB_FILENAME
+
+
+class _CogneeMetadataStore:
+    """Durable SQLite store for the memory registry and tombstones.
+
+    Two tables:
+
+    - ``memories``: canonical registry of memories saved or surfaced through
+      this backend. The canonical-ID lookup is by ``(user_id, content)``, so
+      after ``update_memory`` rewrites a row's content in place the next
+      search resolves the new content back to the ORIGINAL memory ID.
+    - ``tombstones``: per-user deleted/superseded contents, filtered out of
+      every search result.
+
+    All methods are synchronous; the backend calls them via
+    ``asyncio.to_thread`` to stay off the event loop. A fresh connection is
+    opened per operation (cheap for this workload) so calls are safe from any
+    worker thread, and WAL mode keeps concurrent readers/writers across
+    processes consistent.
+    """
+
+    def __init__(self, db_path: Path) -> None:
+        self._db_path = db_path
+        self._schema_lock = threading.Lock()
+        self._schema_ready = False
+
+    def _connect(self) -> sqlite3.Connection:
+        """Open a connection, creating the schema on first use."""
+        if not self._schema_ready:
+            with self._schema_lock:
+                if not self._schema_ready:
+                    self._db_path.parent.mkdir(parents=True, exist_ok=True)
+                    conn = sqlite3.connect(str(self._db_path))
+                    try:
+                        conn.execute("PRAGMA journal_mode=WAL")
+                        conn.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS memories (
+                                id TEXT PRIMARY KEY,
+                                user_id TEXT NOT NULL,
+                                content TEXT NOT NULL,
+                                importance REAL,
+                                metadata_json TEXT,
+                                created_at TEXT,
+                                updated_at TEXT
+                            )
+                            """
+                        )
+                        conn.execute(
+                            "CREATE INDEX IF NOT EXISTS idx_memories_user_content "
+                            "ON memories(user_id, content)"
+                        )
+                        conn.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS tombstones (
+                                user_id TEXT NOT NULL,
+                                content TEXT NOT NULL,
+                                created_at TEXT,
+                                PRIMARY KEY (user_id, content)
+                            )
+                            """
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    self._schema_ready = True
+        conn = sqlite3.connect(str(self._db_path))
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
+    # -- serialization ------------------------------------------------------
+
+    @staticmethod
+    def _memory_to_row(memory: Memory, updated_at: datetime) -> tuple[Any, ...]:
+        extra = {
+            "session_id": memory.session_id,
+            "entity_refs": list(memory.entity_refs or []),
+            "metadata": memory.metadata or {},
+            "valid_from": memory.valid_from.isoformat() if memory.valid_from else None,
+        }
+        return (
+            memory.id,
+            memory.user_id,
+            memory.content,
+            memory.importance,
+            json.dumps(extra, default=str),
+            memory.created_at.isoformat() if memory.created_at else _utcnow().isoformat(),
+            updated_at.isoformat(),
+        )
+
+    @staticmethod
+    def _row_to_memory(row: tuple[Any, ...]) -> Memory:
+        memory_id, user_id, content, importance, metadata_json, created_at, _updated_at = row
+        extra = json.loads(metadata_json) if metadata_json else {}
+        created = datetime.fromisoformat(created_at) if created_at else _utcnow()
+        raw_valid_from = extra.get("valid_from")
+        valid_from = datetime.fromisoformat(raw_valid_from) if raw_valid_from else created
+        return Memory(
+            id=memory_id,
+            content=content,
+            user_id=user_id,
+            session_id=extra.get("session_id"),
+            importance=0.5 if importance is None else float(importance),
+            entity_refs=list(extra.get("entity_refs") or []),
+            metadata=dict(extra.get("metadata") or {}),
+            created_at=created,
+            valid_from=valid_from,
+        )
+
+    _SELECT_COLUMNS = "id, user_id, content, importance, metadata_json, created_at, updated_at"
+
+    # -- memory registry -----------------------------------------------------
+
+    def upsert_memory(self, memory: Memory, clear_tombstone: bool = False) -> None:
+        """Insert or update a registry row (keyed by memory ID).
+
+        With ``clear_tombstone`` (used on explicit saves and updates), a
+        tombstone for the memory's ``(user_id, content)`` is removed — saving
+        content again is an explicit request to make it live.
+        """
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO memories (id, user_id, content, importance, metadata_json,
+                                      created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    user_id = excluded.user_id,
+                    content = excluded.content,
+                    importance = excluded.importance,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at
+                """,
+                self._memory_to_row(memory, _utcnow()),
+            )
+            if clear_tombstone:
+                conn.execute(
+                    "DELETE FROM tombstones WHERE user_id = ? AND content = ?",
+                    (memory.user_id, memory.content),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_memory(self, memory_id: str) -> Memory | None:
+        """Fetch a memory by canonical ID, or None."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                f"SELECT {self._SELECT_COLUMNS} FROM memories WHERE id = ?",  # noqa: S608
+                (memory_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        return self._row_to_memory(row) if row else None
+
+    def find_by_user_content(self, user_id: str, content: str) -> Memory | None:
+        """Fetch the canonical memory for ``(user_id, content)``, or None.
+
+        This is the lookup that keeps IDs stable across updates: an updated
+        row keeps its original ID but carries the new content, so a search
+        hit on the new content resolves back to the original ID.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                f"SELECT {self._SELECT_COLUMNS} FROM memories "  # noqa: S608
+                "WHERE user_id = ? AND content = ? "
+                "ORDER BY updated_at DESC, id LIMIT 1",
+                (user_id, content),
+            ).fetchone()
+        finally:
+            conn.close()
+        return self._row_to_memory(row) if row else None
+
+    def apply_update(self, updated: Memory, tombstone_contents: list[str]) -> None:
+        """Atomically apply an update: rewrite the row, tombstone old content.
+
+        The updated memory keeps its original ID. The old content (and old
+        pre-extracted facts) are tombstoned; any tombstone on the NEW content
+        is cleared (updating to some content is an explicit request to make
+        it live).
+        """
+        now_iso = _utcnow().isoformat()
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO memories (id, user_id, content, importance, metadata_json,
+                                      created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    user_id = excluded.user_id,
+                    content = excluded.content,
+                    importance = excluded.importance,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at
+                """,
+                self._memory_to_row(updated, _utcnow()),
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO tombstones (user_id, content, created_at) VALUES (?, ?, ?)",
+                [(updated.user_id, content, now_iso) for content in tombstone_contents],
+            )
+            conn.execute(
+                "DELETE FROM tombstones WHERE user_id = ? AND content = ?",
+                (updated.user_id, updated.content),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def delete_and_tombstone(
+        self, memory_id: str, user_id: str, tombstone_contents: list[str]
+    ) -> None:
+        """Atomically delete a registry row and tombstone its contents."""
+        now_iso = _utcnow().isoformat()
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+            conn.executemany(
+                "INSERT OR IGNORE INTO tombstones (user_id, content, created_at) VALUES (?, ?, ?)",
+                [(user_id, content, now_iso) for content in tombstone_contents],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    # -- tombstones ----------------------------------------------------------
+
+    def get_tombstones(self, user_id: str) -> set[str]:
+        """Return all tombstoned contents for a user."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT content FROM tombstones WHERE user_id = ?", (user_id,)
+            ).fetchall()
+        finally:
+            conn.close()
+        return {row[0] for row in rows}
 
 
 class CogneeBackend:
@@ -152,11 +542,12 @@ class CogneeBackend:
     - ``save_memory`` -> ``cognee.add`` (tagged via ``node_set``) followed by
       an optional ``cognee.cognify`` to build/extend the knowledge graph.
     - ``search_memories`` -> ``cognee.search`` scoped via ``node_name``.
-    - ``update_memory`` / ``delete_memory`` -> best-effort tombstone semantics
-      (see module docstring for limitations).
+    - ``update_memory`` / ``delete_memory`` -> durable registry update +
+      tombstones in the SQLite metadata store, plus a best-effort hard delete
+      against cognee's dataset API (see module docstring for limitations).
 
-    The cognee package is imported lazily on first use; construction never
-    imports cognee.
+    The cognee package is imported lazily on first use (once per process —
+    see module docstring); construction never imports cognee.
     """
 
     def __init__(self, config: CogneeConfig | None = None) -> None:
@@ -170,82 +561,36 @@ class CogneeBackend:
         self._cognee: Any = None
         self._search_type_cls: Any = None
         self._initialized = False
-        # Singleflight guard for the (slow) lazy import. Created lazily so
-        # construction never requires a running event loop.
-        self._init_lock: asyncio.Lock | None = None
-        # Process-local registry of memories saved or searched through this
-        # instance. cognee has no fetch-by-id API for raw memories, so
-        # get/update/delete resolve against this registry. Keys are the
-        # stable content-derived IDs (see _stable_memory_id).
-        self._memories: dict[str, Memory] = {}
-        # Per-user tombstones: user_id -> contents of deleted/superseded
-        # memories (and their pre-extracted facts), used to filter stale
-        # chunks out of search results (cognee cannot hard-delete graph
-        # data). Scoped per user so deleting one user's memory never hides
-        # byte-identical content saved by another user.
-        self._tombstoned: dict[str, set[str]] = {}
+        # Durable metadata store: memory registry + tombstones. Shared
+        # across instances/restarts that point at the same file, so deletes
+        # and updates are visible everywhere immediately. Construction is
+        # cheap; the schema is created lazily on first use.
+        self._store = _CogneeMetadataStore(_resolve_metadata_db_path(self._config))
 
     async def _ensure_initialized(self) -> None:
-        """Import cognee lazily (off-loop) and apply directory isolation.
+        """Import cognee lazily (off-loop, once per process) and configure it.
 
         The import runs in a worker thread via ``asyncio.to_thread`` because
         ``import cognee`` takes seconds and would otherwise stall the entire
         event loop (every in-flight proxy request, not just the memory one)
-        when initialization happens lazily inside a live request.
+        when initialization happens lazily inside a live request. The actual
+        import/configuration is serialized process-wide by a module-level
+        threading lock and happens at most once per process; see
+        ``_import_and_configure_cognee``.
+
+        Raises:
+            RuntimeError: If cognee was already configured in this process
+                with different root directories.
         """
         if self._initialized:
             return
 
-        if self._init_lock is None:
-            self._init_lock = asyncio.Lock()
-
-        async with self._init_lock:
-            if self._initialized:
-                return
-            cognee, search_type_cls = await asyncio.to_thread(self._import_and_configure)
-            self._cognee = cognee
-            self._search_type_cls = search_type_cls
-            self._initialized = True
-
-    def _import_and_configure(self) -> tuple[Any, Any]:
-        """Synchronously import cognee and apply directory isolation config.
-
-        Runs in a worker thread (see ``_ensure_initialized``). cognee's
-        import executes ``dotenv.load_dotenv(override=True)``, which would
-        silently overwrite already-set process env vars with values from a
-        ``.env`` in the cwd — after the caller's configuration was resolved.
-        The environment is snapshotted before the import and any
-        pre-existing variable the import changed is restored, preserving
-        normal env-over-``.env`` precedence. Variables newly added by the
-        ``.env`` load are kept so cognee's own configuration (e.g.
-        ``LLM_API_KEY``) keeps working.
-
-        Returns:
-            ``(cognee_module, SearchType_class)``.
-
-        Raises:
-            ImportError: If the cognee package is not installed.
-        """
-        env_before = dict(os.environ)
-        try:
-            cognee = importlib.import_module("cognee")
-        except ImportError:
-            raise ImportError(_IMPORT_ERROR_MSG) from None
-        finally:
-            for key, value in env_before.items():
-                if os.environ.get(key) != value:
-                    os.environ[key] = value
-
-        search_type_cls = getattr(cognee, "SearchType", None)
-        if search_type_cls is None:
-            raise ImportError(_IMPORT_ERROR_MSG)
-
-        if self._config.system_root:
-            cognee.config.system_root_directory(self._config.system_root)
-        if self._config.data_root:
-            cognee.config.data_root_directory(self._config.data_root)
-
-        return cognee, search_type_cls
+        cognee, search_type_cls = await asyncio.to_thread(
+            _import_and_configure_cognee, self._config.system_root, self._config.data_root
+        )
+        self._cognee = cognee
+        self._search_type_cls = search_type_cls
+        self._initialized = True
 
     async def ensure_initialized(self) -> None:
         """Public initialization hook for callers that need readiness guarantees."""
@@ -314,7 +659,8 @@ class CogneeBackend:
         configured cognee dataset, tagged via ``node_set`` with user/session/
         entity tags so searches can be scoped. When ``auto_cognify`` is on,
         ``cognee.cognify`` then builds/extends the knowledge graph (in the
-        background by default).
+        background by default). The memory is also recorded in the durable
+        metadata store so its ID resolves across restarts and instances.
 
         Note: cognee performs its own LLM-based entity/relationship extraction
         during ``cognify``, so ``relationships``, ``extracted_entities``, and
@@ -380,7 +726,9 @@ class CogneeBackend:
             created_at=now,
             valid_from=now,
         )
-        self._memories[memory.id] = memory
+        # clear_tombstone: re-saving previously deleted content is an
+        # explicit request to make it live again.
+        await asyncio.to_thread(self._store.upsert_memory, memory, clear_tombstone=True)
         logger.info("Saved memory %s to cognee dataset %s", memory.id, self._config.dataset_name)
         return memory
 
@@ -402,6 +750,11 @@ class CogneeBackend:
         entity filters narrow (never broaden) the result set. Without ``AND``
         cognee defaults to ``OR``, which would match ANY tag and leak other
         users' memories that share an entity tag.
+
+        Results are filtered against the durable per-user tombstones (deleted
+        or superseded content, exact or substring match) and resolved to
+        canonical memory IDs through the durable registry, so deletes/updates
+        made by other instances or before a restart are honored.
 
         Args:
             query: Natural language search query.
@@ -457,36 +810,27 @@ class CogneeBackend:
 
         # Tombstone-filter BEFORE ranking so surviving results keep top
         # ranks (and therefore high scores) when leading chunks were
-        # deleted/superseded.
-        user_tombstones = self._tombstoned.get(user_id, set())
+        # deleted/superseded. Tombstones are read from the durable store so
+        # deletions made by other instances / before a restart apply. The
+        # filter runs on every configured search type (text-match based —
+        # see module docstring for graph-synthesized caveats).
+        user_tombstones = await asyncio.to_thread(self._store.get_tombstones, user_id)
         visible = [
             (text, res_meta)
             for text, res_meta in texts
             if not self._is_tombstoned(text, user_tombstones)
         ]
 
+        # Resolve canonical IDs through the durable registry; unmatched
+        # results are inserted so later update/delete round-trips durably.
         now = _utcnow()
+        memories = await asyncio.to_thread(
+            self._resolve_search_rows, user_id, session_id, visible[:top_k], now
+        )
+
         results: list[MemorySearchResult] = []
         total = len(visible)
-        for rank, (text, res_meta) in enumerate(visible[:top_k]):
-            # Stable content-derived ID, registered so the model can pass
-            # it straight to update_memory / delete_memory. A memory saved
-            # through this instance with identical content resolves to the
-            # same ID and is reused (preserving its importance/metadata).
-            memory_id = _stable_memory_id(user_id, text)
-            memory = self._memories.get(memory_id)
-            if memory is None:
-                memory = Memory(
-                    id=memory_id,
-                    content=text,
-                    user_id=user_id,
-                    session_id=session_id,
-                    importance=0.5,
-                    metadata=res_meta,
-                    created_at=now,
-                    valid_from=now,
-                )
-                self._memories[memory_id] = memory
+        for rank, memory in enumerate(memories):
             results.append(
                 MemorySearchResult(
                     memory=memory,
@@ -500,6 +844,39 @@ class CogneeBackend:
             )
 
         return results
+
+    def _resolve_search_rows(
+        self,
+        user_id: str,
+        session_id: str | None,
+        items: list[tuple[str, dict[str, Any]]],
+        now: datetime,
+    ) -> list[Memory]:
+        """Resolve search-result texts to canonical Memory rows (sync).
+
+        Runs in a worker thread. A result whose content matches a stored
+        memory row for this user returns that row's canonical ID (which is
+        how an updated memory keeps its original ID); unmatched results get
+        stable content-derived IDs AND are inserted into the registry so a
+        later update/delete round-trips durably.
+        """
+        resolved: list[Memory] = []
+        for text, res_meta in items:
+            memory = self._store.find_by_user_content(user_id, text)
+            if memory is None:
+                memory = Memory(
+                    id=_stable_memory_id(user_id, text),
+                    content=text,
+                    user_id=user_id,
+                    session_id=session_id,
+                    importance=0.5,
+                    metadata=res_meta,
+                    created_at=now,
+                    valid_from=now,
+                )
+                self._store.upsert_memory(memory)
+            resolved.append(memory)
+        return resolved
 
     @staticmethod
     def _is_tombstoned(text: str, tombstones: set[str]) -> bool:
@@ -516,14 +893,6 @@ class CogneeBackend:
             return True
         return any(text in tombstoned for tombstoned in tombstones)
 
-    def _tombstone(self, memory: Memory) -> None:
-        """Tombstone a memory's content (and its facts) for its user."""
-        tombstones = self._tombstoned.setdefault(memory.user_id, set())
-        tombstones.add(memory.content)
-        for fact in memory.metadata.get("_cognee_facts") or []:
-            if isinstance(fact, str) and fact:
-                tombstones.add(fact)
-
     @staticmethod
     def _extract_text(item: Any) -> str:
         """Extract display text from a single cognee search result item."""
@@ -537,6 +906,57 @@ class CogneeBackend:
             return str(item)
         return str(item) if item is not None else ""
 
+    async def _try_hard_delete(self, contents: list[str]) -> None:
+        """Best-effort hard delete of data items from cognee's stores.
+
+        cognee identifies text data items by an MD5 content hash. This maps
+        each content to its hash and removes matching items via
+        ``cognee.datasets.list_datasets`` / ``list_data`` / ``delete_data``
+        (which also removes related graph nodes/edges). Every failure is
+        swallowed and logged: the durable tombstones are the enforcement
+        layer, this only reclaims the underlying storage when possible.
+        """
+        try:
+            await self._ensure_initialized()
+        except Exception:
+            logger.debug(
+                "cognee unavailable for best-effort hard delete; "
+                "durable tombstones still filter the content",
+                exc_info=True,
+            )
+            return
+
+        datasets_api = getattr(self._cognee, "datasets", None)
+        if datasets_api is None or not hasattr(datasets_api, "list_datasets"):
+            return
+
+        try:
+            hashes = {
+                hashlib.md5(content.encode("utf-8"), usedforsecurity=False).hexdigest()
+                for content in contents
+            }
+            for dataset in await datasets_api.list_datasets() or []:
+                if getattr(dataset, "name", None) != self._config.dataset_name:
+                    continue
+                for data_item in await datasets_api.list_data(dataset.id) or []:
+                    item_hashes = {
+                        getattr(data_item, "content_hash", None),
+                        getattr(data_item, "raw_content_hash", None),
+                    }
+                    if item_hashes & hashes:
+                        await datasets_api.delete_data(dataset_id=dataset.id, data_id=data_item.id)
+                        logger.info(
+                            "Hard-deleted cognee data item %s from dataset %s",
+                            data_item.id,
+                            self._config.dataset_name,
+                        )
+        except Exception:
+            logger.warning(
+                "Best-effort cognee hard delete failed; "
+                "durable tombstones still filter the content",
+                exc_info=True,
+            )
+
     async def update_memory(
         self,
         memory_id: str,
@@ -544,41 +964,47 @@ class CogneeBackend:
         reason: str | None = None,
         user_id: str | None = None,
     ) -> Memory:
-        """Update a memory (best-effort: tombstone old content + re-add).
+        """Update a memory, keeping its original ID.
 
-        cognee has no per-item update API, so this tombstones the old content
-        (excluded from this backend's future search results for this user;
-        best-effort — see module docstring) and adds the new content as a
-        fresh cognee data item with the same scoping tags. The old data
-        remains in cognee's stores until the dataset is pruned.
+        cognee has no per-item update API, so this rewrites the durable
+        registry row in place (new content, SAME id), tombstones the old
+        content (excluded from every instance's future search results for
+        this user), and adds the new content as a fresh cognee data item with
+        the same scoping tags. Because search resolves canonical IDs by
+        ``(user_id, content)``, the next search returns this same memory ID
+        for the new content. A best-effort hard delete of the old cognee data
+        runs afterwards (see ``_try_hard_delete``).
 
         Args:
-            memory_id: ID of the memory to update. Must have been saved or
-                returned by a search through this backend instance.
+            memory_id: ID of the memory to update. Must exist in the durable
+                registry (i.e. was saved or surfaced by a search through a
+                backend sharing this metadata store).
             new_content: New content to replace existing.
             reason: Reason for the update (for audit trail).
             user_id: User ID for validation (optional).
 
         Returns:
-            The updated Memory object.
+            The updated Memory object (same ID, new content).
 
         Raises:
             ValueError: If the memory is not found or belongs to another user.
         """
         await self._ensure_initialized()
 
-        existing = self._memories.get(memory_id)
+        existing = await asyncio.to_thread(self._store.get_memory, memory_id)
         if existing is None:
             raise ValueError(
                 f"Memory not found: {memory_id}. The cognee backend can only "
-                "update memories saved or searched through this backend instance."
+                "update memories recorded in its metadata store (saved or "
+                "returned by a search)."
             )
         if user_id and existing.user_id and existing.user_id != user_id:
             raise ValueError("Cannot update memories belonging to other users")
 
-        # Tombstone the old content (and its facts) so search stops
-        # returning it for this user.
-        self._tombstone(existing)
+        old_contents = [existing.content]
+        for fact in existing.metadata.get("_cognee_facts") or []:
+            if isinstance(fact, str) and fact:
+                old_contents.append(fact)
 
         node_set = list(existing.metadata.get("_cognee_node_set") or []) or self._build_node_set(
             existing.user_id, existing.session_id, existing.entity_refs
@@ -613,8 +1039,11 @@ class CogneeBackend:
             created_at=existing.created_at,
             valid_from=now,
         )
-        self._memories[memory_id] = updated
-        logger.info("Updated memory %s (tombstone + re-add)", memory_id)
+        # Row rewritten in place (same id) + old content tombstoned, in one
+        # transaction against the shared durable store.
+        await asyncio.to_thread(self._store.apply_update, updated, old_contents)
+        await self._try_hard_delete(old_contents)
+        logger.info("Updated memory %s in place (old content tombstoned)", memory_id)
         return updated
 
     async def delete_memory(
@@ -623,42 +1052,53 @@ class CogneeBackend:
         reason: str | None = None,
         user_id: str | None = None,
     ) -> bool:
-        """Delete a memory (best-effort: tombstone).
+        """Delete a memory (durable tombstone + best-effort hard delete).
 
-        Removes the memory from this backend's registry and excludes its
-        content (and pre-extracted facts) from future search results for
-        this user. Already-cognified graph data remains in cognee's stores
-        until the dataset is pruned — cognee has no per-memory hard delete.
+        Removes the memory from the durable registry and tombstones its
+        content (and pre-extracted facts) so it is excluded from future
+        search results for this user — across restarts and across every
+        backend instance sharing this metadata store. A best-effort hard
+        delete against cognee's dataset API then tries to remove the
+        underlying data items; when that fails, already-cognified data
+        remains in cognee's stores and the tombstones keep filtering it.
 
         Args:
-            memory_id: ID of the memory to delete. Must have been saved or
-                returned by a search through this backend instance.
+            memory_id: ID of the memory to delete. Must exist in the durable
+                registry (saved or surfaced by a search).
             reason: Reason for deletion (for audit trail; logged only).
             user_id: User ID for validation (optional).
 
         Returns:
-            True if tombstoned, False if not found or owned by another user.
+            True if deleted, False if not found or owned by another user.
         """
-        existing = self._memories.get(memory_id)
+        existing = await asyncio.to_thread(self._store.get_memory, memory_id)
         if existing is None:
             return False
         if user_id and existing.user_id and existing.user_id != user_id:
             return False
 
-        self._tombstone(existing)
-        del self._memories[memory_id]
+        contents = [existing.content]
+        for fact in existing.metadata.get("_cognee_facts") or []:
+            if isinstance(fact, str) and fact:
+                contents.append(fact)
+
+        await asyncio.to_thread(
+            self._store.delete_and_tombstone, memory_id, existing.user_id, contents
+        )
+        await self._try_hard_delete(contents)
         logger.info(
-            "Tombstoned memory %s (reason: %s); underlying cognee data persists",
+            "Deleted memory %s (reason: %s); durable tombstone recorded",
             memory_id,
             reason or "unspecified",
         )
         return True
 
     async def get_memory(self, memory_id: str) -> Memory | None:
-        """Retrieve a specific memory by ID.
+        """Retrieve a specific memory by ID from the durable registry.
 
-        Only resolves memories saved or searched through this backend
-        instance (cognee has no fetch-by-id API for raw memories).
+        Resolves any memory saved or surfaced by a search through a backend
+        sharing this metadata store (cognee itself has no fetch-by-id API
+        for raw memories).
 
         Args:
             memory_id: The memory identifier.
@@ -666,7 +1106,7 @@ class CogneeBackend:
         Returns:
             The Memory if found, None otherwise.
         """
-        return self._memories.get(memory_id)
+        return await asyncio.to_thread(self._store.get_memory, memory_id)
 
     @property
     def supports_graph(self) -> bool:
@@ -679,7 +1119,12 @@ class CogneeBackend:
         return True
 
     async def close(self) -> None:
-        """Close the backend and release resources."""
+        """Close the backend and release resources.
+
+        Only clears instance references; the process-wide cognee module and
+        configuration are immutable (see module docstring), and the metadata
+        store opens connections per-operation, so there is nothing to close.
+        """
         self._cognee = None
         self._search_type_cls = None
         self._initialized = False

@@ -163,6 +163,7 @@ class MemoryConfig:
     cognee_data_root: str | None = field(default_factory=cognee_env.cognee_env_data_root)
     cognee_search_type: str = field(default_factory=cognee_env.cognee_env_search_type)
     cognee_auto_cognify: bool = field(default_factory=cognee_env.cognee_env_auto_cognify)
+    cognee_metadata_db_path: str | None = field(default_factory=cognee_env.cognee_env_metadata_db)
     # Memory Bridge (bidirectional markdown <-> Headroom sync)
     bridge_enabled: bool = False
     bridge_md_paths: list[str] = field(default_factory=list)
@@ -462,6 +463,7 @@ class MemoryHandler:
                     data_root=self.config.cognee_data_root,
                     search_type=self.config.cognee_search_type,
                     auto_cognify=self.config.cognee_auto_cognify,
+                    metadata_db_path=self.config.cognee_metadata_db_path,
                 )
                 self._backend = CogneeBackend(cognee_config)
                 await self._backend.ensure_initialized()

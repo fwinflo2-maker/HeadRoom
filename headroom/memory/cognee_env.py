@@ -18,6 +18,11 @@ Supported environment variables:
 - ``HEADROOM_COGNEE_AUTO_COGNIFY``  ``true``/``false``. Whether to run
                                      ``cognee.cognify()`` after each save.
                                      Default: ``true``.
+- ``HEADROOM_COGNEE_METADATA_DB``   Path to the SQLite file holding the cognee
+                                     backend's durable memory registry and
+                                     delete/update tombstones. Unset means
+                                     ``headroom_cognee_meta.db`` under the data
+                                     root (or system root, or ``~/.headroom``).
 
 Explicit constructor arguments always win over environment values; the env
 vars only fill in defaults when the caller omits the argument (dataclasses
@@ -83,3 +88,8 @@ def cognee_env_auto_cognify() -> bool:
     """Return ``HEADROOM_COGNEE_AUTO_COGNIFY`` parsed as bool. Default: ``True``."""
     parsed = _parse_bool(_strip_env("HEADROOM_COGNEE_AUTO_COGNIFY"))
     return True if parsed is None else parsed
+
+
+def cognee_env_metadata_db() -> str | None:
+    """Return ``HEADROOM_COGNEE_METADATA_DB`` or ``None`` if unset."""
+    return _strip_env("HEADROOM_COGNEE_METADATA_DB")

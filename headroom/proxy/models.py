@@ -423,6 +423,9 @@ class ProxyConfig:
     memory_cognee_data_root: str | None = field(default_factory=cognee_env.cognee_env_data_root)
     memory_cognee_search_type: str = field(default_factory=cognee_env.cognee_env_search_type)
     memory_cognee_auto_cognify: bool = field(default_factory=_cognee_env_auto_cognify_or_default)
+    memory_cognee_metadata_db_path: str | None = field(
+        default_factory=cognee_env.cognee_env_metadata_db
+    )
     memory_bridge_enabled: bool = False
     memory_bridge_md_paths: list[str] = field(default_factory=list)
     memory_bridge_md_format: str = "auto"

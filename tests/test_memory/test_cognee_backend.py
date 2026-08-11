@@ -7,7 +7,9 @@ Covers:
   ``cognee.cognify`` trigger per config
 - ``search_memories`` mapping to ``cognee.search`` (node_name scoping, top_k,
   GRAPH_COMPLETION only_context) and result -> MemorySearchResult conversion
-- Tombstone semantics for update/delete
+- Durable tombstone/registry semantics for update/delete (restart + multiple
+  live instances sharing one metadata DB)
+- Process-wide immutable cognee configuration (conflicting roots fail closed)
 - ImportError guard message when cognee is not installed
 - ``supports_graph`` / ``supports_vector_search`` capability flags
 
@@ -17,7 +19,9 @@ cognee is NOT a test dependency: a fake module is injected into
 
 from __future__ import annotations
 
+import asyncio
 import os
+import sqlite3
 import sys
 import types
 from enum import Enum
@@ -27,13 +31,19 @@ from typing import Any
 import pytest
 
 from headroom.memory import cognee_env
-from headroom.memory.backends.cognee import CogneeBackend, CogneeConfig
+from headroom.memory.backends import cognee as cognee_backend_module
+from headroom.memory.backends.cognee import (
+    CogneeBackend,
+    CogneeConfig,
+    _resolve_metadata_db_path,
+)
 from headroom.memory.cognee_env import (
     DEFAULT_COGNEE_DATASET,
     DEFAULT_COGNEE_SEARCH_TYPE,
     cognee_env_auto_cognify,
     cognee_env_data_root,
     cognee_env_dataset,
+    cognee_env_metadata_db,
     cognee_env_search_type,
     cognee_env_system_root,
 )
@@ -47,13 +57,25 @@ _COGNEE_ENV_VARS = (
     "HEADROOM_COGNEE_DATA_ROOT",
     "HEADROOM_COGNEE_SEARCH_TYPE",
     "HEADROOM_COGNEE_AUTO_COGNIFY",
+    "HEADROOM_COGNEE_METADATA_DB",
 )
 
 
 @pytest.fixture(autouse=True)
-def _clear_cognee_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def _cognee_test_isolation(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Any:
+    """Isolate every test: clean env, tmp metadata DB, fresh process state.
+
+    The metadata DB env var is pointed at a per-test tmp file so no test can
+    write to ``~/.headroom``. The module-level cognee import/config state is
+    reset before and after each test (cognee configuration is process-wide
+    and immutable; tests simulate fresh processes).
+    """
     for var in _COGNEE_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HEADROOM_COGNEE_METADATA_DB", str(tmp_path / "cognee_meta.db"))
+    cognee_backend_module._reset_process_state_for_testing()
+    yield
+    cognee_backend_module._reset_process_state_for_testing()
 
 
 # =============================================================================
@@ -177,12 +199,21 @@ class TestCogneeEnvReaders:
         with pytest.raises(ValueError, match="Invalid boolean value"):
             cognee_env_auto_cognify()
 
+    def test_metadata_db_none_when_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("HEADROOM_COGNEE_METADATA_DB", raising=False)
+        assert cognee_env_metadata_db() is None
+
+    def test_metadata_db_reads_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HEADROOM_COGNEE_METADATA_DB", "/var/cognee/meta.db")
+        assert cognee_env_metadata_db() == "/var/cognee/meta.db"
+
     def test_module_exports_readers(self) -> None:
         assert callable(cognee_env.cognee_env_dataset)
         assert callable(cognee_env.cognee_env_system_root)
         assert callable(cognee_env.cognee_env_data_root)
         assert callable(cognee_env.cognee_env_search_type)
         assert callable(cognee_env.cognee_env_auto_cognify)
+        assert callable(cognee_env.cognee_env_metadata_db)
 
 
 # =============================================================================
@@ -191,7 +222,8 @@ class TestCogneeEnvReaders:
 
 
 class TestCogneeConfig:
-    def test_defaults_when_no_env(self) -> None:
+    def test_defaults_when_no_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("HEADROOM_COGNEE_METADATA_DB", raising=False)
         cfg = CogneeConfig()
         assert cfg.dataset_name == "headroom_memories"
         assert cfg.system_root is None
@@ -199,6 +231,7 @@ class TestCogneeConfig:
         assert cfg.search_type == "CHUNKS"
         assert cfg.auto_cognify is True
         assert cfg.background_cognify is True
+        assert cfg.metadata_db_path is None
 
     def test_defaults_read_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HEADROOM_COGNEE_DATASET", "env_dataset")
@@ -206,6 +239,7 @@ class TestCogneeConfig:
         monkeypatch.setenv("HEADROOM_COGNEE_DATA_ROOT", "/data/root")
         monkeypatch.setenv("HEADROOM_COGNEE_SEARCH_TYPE", "GRAPH_COMPLETION")
         monkeypatch.setenv("HEADROOM_COGNEE_AUTO_COGNIFY", "false")
+        monkeypatch.setenv("HEADROOM_COGNEE_METADATA_DB", "/var/cognee/meta.db")
 
         cfg = CogneeConfig()
         assert cfg.dataset_name == "env_dataset"
@@ -213,6 +247,7 @@ class TestCogneeConfig:
         assert cfg.data_root == "/data/root"
         assert cfg.search_type == "GRAPH_COMPLETION"
         assert cfg.auto_cognify is False
+        assert cfg.metadata_db_path == "/var/cognee/meta.db"
 
     def test_explicit_wins_over_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HEADROOM_COGNEE_DATASET", "env_dataset")
@@ -221,6 +256,29 @@ class TestCogneeConfig:
         cfg = CogneeConfig(dataset_name="explicit_dataset", auto_cognify=True)
         assert cfg.dataset_name == "explicit_dataset"
         assert cfg.auto_cognify is True
+
+
+class TestMetadataDbPathResolution:
+    """Default location of the durable metadata DB (see CogneeConfig docs)."""
+
+    def test_explicit_path_wins(self) -> None:
+        cfg = CogneeConfig(
+            metadata_db_path="/explicit/meta.db", data_root="/data", system_root="/sys"
+        )
+        assert str(_resolve_metadata_db_path(cfg)) == "/explicit/meta.db"
+
+    def test_defaults_under_data_root(self) -> None:
+        cfg = CogneeConfig(metadata_db_path=None, data_root="/data", system_root="/sys")
+        assert str(_resolve_metadata_db_path(cfg)) == "/data/headroom_cognee_meta.db"
+
+    def test_falls_back_to_system_root(self) -> None:
+        cfg = CogneeConfig(metadata_db_path=None, data_root=None, system_root="/sys")
+        assert str(_resolve_metadata_db_path(cfg)) == "/sys/headroom_cognee_meta.db"
+
+    def test_falls_back_to_workspace_dir(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "ws"))
+        cfg = CogneeConfig(metadata_db_path=None)
+        assert _resolve_metadata_db_path(cfg) == tmp_path / "ws" / "headroom_cognee_meta.db"
 
 
 # =============================================================================
@@ -364,7 +422,10 @@ class TestSaveMemory:
 
         assert len(calls.add) == 1
         assert memory.content == "kept"
-        assert await backend.get_memory(memory.id) is memory
+        fetched = await backend.get_memory(memory.id)
+        assert fetched is not None
+        assert fetched.id == memory.id
+        assert fetched.content == "kept"
 
     async def test_relationships_and_extractions_recorded_in_metadata(self, fake_cognee) -> None:
         backend = CogneeBackend(CogneeConfig(dataset_name="ds"))
@@ -460,7 +521,9 @@ class TestSearchMemories:
         second = await backend.search_memories(query="q", user_id="alice")
 
         assert first[0].memory.id == second[0].memory.id
-        assert await backend.get_memory(first[0].memory.id) is first[0].memory
+        registered = await backend.get_memory(first[0].memory.id)
+        assert registered is not None
+        assert registered.content == first[0].memory.content
 
         # Same content under a different user gets a different ID.
         other = await backend.search_memories(query="q", user_id="bob")
@@ -548,7 +611,12 @@ class TestUpdateDeleteGet:
     async def test_get_memory_roundtrip(self, fake_cognee) -> None:
         backend = CogneeBackend(CogneeConfig())
         memory = await backend.save_memory(content="c", user_id="alice", importance=0.5)
-        assert await backend.get_memory(memory.id) is memory
+        fetched = await backend.get_memory(memory.id)
+        assert fetched is not None
+        assert fetched.id == memory.id
+        assert fetched.content == "c"
+        assert fetched.user_id == "alice"
+        assert fetched.importance == 0.5
         assert await backend.get_memory("nonexistent") is None
 
     async def test_update_tombstones_and_readds(self, fake_cognee) -> None:
@@ -567,7 +635,10 @@ class TestUpdateDeleteGet:
         assert len(fake_cognee.add) == 2
         assert fake_cognee.add[1]["data"] == "new fact"
         assert fake_cognee.add[1]["node_set"] == fake_cognee.add[0]["node_set"]
-        assert await backend.get_memory(memory.id) is updated
+        fetched = await backend.get_memory(memory.id)
+        assert fetched is not None
+        assert fetched.id == memory.id
+        assert fetched.content == "new fact"
 
     async def test_update_unknown_id_raises(self, fake_cognee) -> None:
         backend = CogneeBackend(CogneeConfig())
@@ -594,7 +665,9 @@ class TestUpdateDeleteGet:
         backend = CogneeBackend(CogneeConfig())
         memory = await backend.save_memory(content="c", user_id="alice", importance=0.5)
         assert await backend.delete_memory(memory.id, user_id="bob") is False
-        assert await backend.get_memory(memory.id) is memory
+        fetched = await backend.get_memory(memory.id)
+        assert fetched is not None
+        assert fetched.id == memory.id
 
     async def test_deleted_content_filtered_from_search(
         self, monkeypatch: pytest.MonkeyPatch
@@ -693,6 +766,259 @@ class TestUpdateDeleteGet:
 
 
 # =============================================================================
+# Best-effort hard delete via cognee.datasets
+# =============================================================================
+
+
+def _attach_fake_datasets_api(
+    module: types.ModuleType,
+    dataset_name: str,
+    data_items: list[SimpleNamespace],
+    delete_error: Exception | None = None,
+) -> SimpleNamespace:
+    """Attach a fake ``cognee.datasets`` namespace; returns a call recorder."""
+    calls = SimpleNamespace(deleted=[])
+    dataset = SimpleNamespace(name=dataset_name, id="dataset-uuid")
+
+    class _Datasets:
+        @staticmethod
+        async def list_datasets():
+            return [dataset]
+
+        @staticmethod
+        async def list_data(dataset_id):
+            assert dataset_id == "dataset-uuid"
+            return list(data_items)
+
+        @staticmethod
+        async def delete_data(dataset_id=None, data_id=None):
+            if delete_error is not None:
+                raise delete_error
+            calls.deleted.append({"dataset_id": dataset_id, "data_id": data_id})
+
+    module.datasets = _Datasets
+    return calls
+
+
+def _md5(content: str) -> str:
+    import hashlib
+
+    return hashlib.md5(content.encode("utf-8"), usedforsecurity=False).hexdigest()
+
+
+class TestBestEffortHardDelete:
+    async def test_delete_hard_deletes_matching_data_by_content_hash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        module, _ = _make_fake_cognee()
+        data_items = [
+            SimpleNamespace(id="data-1", content_hash=_md5("doomed fact"), raw_content_hash=None),
+            SimpleNamespace(id="data-2", content_hash=_md5("other fact"), raw_content_hash=None),
+        ]
+        calls = _attach_fake_datasets_api(module, "ds", data_items)
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds"))
+        memory = await backend.save_memory(content="doomed fact", user_id="alice", importance=0.5)
+        assert await backend.delete_memory(memory.id) is True
+
+        assert calls.deleted == [{"dataset_id": "dataset-uuid", "data_id": "data-1"}]
+
+    async def test_hard_delete_failure_does_not_break_delete(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The durable tombstone wins even when cognee's delete API fails."""
+        module, _ = _make_fake_cognee(search_results=[_fake_hit(["doomed fact"])])
+        data_items = [
+            SimpleNamespace(id="data-1", content_hash=_md5("doomed fact"), raw_content_hash=None),
+        ]
+        _attach_fake_datasets_api(module, "ds", data_items, delete_error=RuntimeError("boom"))
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds"))
+        memory = await backend.save_memory(content="doomed fact", user_id="alice", importance=0.5)
+        assert await backend.delete_memory(memory.id) is True
+        assert await backend.search_memories(query="q", user_id="alice") == []
+
+
+# =============================================================================
+# Durable state: restarts and multiple live instances share one metadata DB
+# =============================================================================
+
+
+class TestDurableState:
+    def _backend(self, db_path: str) -> CogneeBackend:
+        return CogneeBackend(CogneeConfig(metadata_db_path=db_path))
+
+    async def test_delete_survives_restart(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        """A new instance (simulated restart) still sees the deletion."""
+        module, _ = _make_fake_cognee(search_results=[_fake_hit(["doomed fact", "kept fact"])])
+        monkeypatch.setitem(sys.modules, "cognee", module)
+        db_path = str(tmp_path / "shared_meta.db")
+
+        instance_a = self._backend(db_path)
+        memory = await instance_a.save_memory(
+            content="doomed fact", user_id="alice", importance=0.5
+        )
+        assert await instance_a.delete_memory(memory.id) is True
+
+        # Simulate a proxy restart: fresh process-wide state, same DB file.
+        cognee_backend_module._reset_process_state_for_testing()
+        instance_b = self._backend(db_path)
+        results = await instance_b.search_memories(query="q", user_id="alice")
+        assert [r.memory.content for r in results] == ["kept fact"]
+        assert await instance_b.get_memory(memory.id) is None
+
+    async def test_two_live_instances_share_deletions(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """A second concurrent instance cannot resurrect deleted content."""
+        module, _ = _make_fake_cognee(search_results=[_fake_hit(["doomed fact", "kept fact"])])
+        monkeypatch.setitem(sys.modules, "cognee", module)
+        db_path = str(tmp_path / "shared_meta.db")
+
+        instance_a = self._backend(db_path)
+        instance_b = self._backend(db_path)
+
+        memory = await instance_a.save_memory(
+            content="doomed fact", user_id="alice", importance=0.5
+        )
+        before = await instance_b.search_memories(query="q", user_id="alice")
+        assert [r.memory.content for r in before] == ["doomed fact", "kept fact"]
+
+        assert await instance_a.delete_memory(memory.id) is True
+        after = await instance_b.search_memories(query="q", user_id="alice")
+        assert [r.memory.content for r in after] == ["kept fact"]
+
+    async def test_update_roundtrip_across_instances_keeps_id(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """save -> update -> (new instance) search/get/delete, all on the old ID."""
+        module, _ = _make_fake_cognee(search_results=[_fake_hit(["old fact", "new fact"])])
+        monkeypatch.setitem(sys.modules, "cognee", module)
+        db_path = str(tmp_path / "shared_meta.db")
+
+        instance_a = self._backend(db_path)
+        saved = await instance_a.save_memory(content="old fact", user_id="alice", importance=0.8)
+        old_id = saved.id
+        updated = await instance_a.update_memory(old_id, "new fact")
+        assert updated.id == old_id
+
+        # Simulate a restart / second worker.
+        cognee_backend_module._reset_process_state_for_testing()
+        instance_b = self._backend(db_path)
+
+        results = await instance_b.search_memories(query="q", user_id="alice")
+        assert [r.memory.content for r in results] == ["new fact"]
+        assert results[0].memory.id == old_id
+
+        fetched = await instance_b.get_memory(old_id)
+        assert fetched is not None
+        assert fetched.content == "new fact"
+        assert fetched.importance == 0.8
+
+        assert await instance_b.delete_memory(old_id) is True
+        assert await instance_b.search_memories(query="q", user_id="alice") == []
+        assert await instance_b.get_memory(old_id) is None
+
+    async def test_update_keeps_id_stable_within_one_instance(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """Search after update returns the old ID; no duplicate registry row."""
+        module, _ = _make_fake_cognee(search_results=[_fake_hit(["old fact", "new fact"])])
+        monkeypatch.setitem(sys.modules, "cognee", module)
+        db_path = str(tmp_path / "meta.db")
+
+        backend = self._backend(db_path)
+        saved = await backend.save_memory(content="old fact", user_id="alice", importance=0.5)
+        await backend.update_memory(saved.id, "new fact")
+
+        results = await backend.search_memories(query="q", user_id="alice")
+        assert [r.memory.id for r in results] == [saved.id]
+        assert results[0].memory.content == "new fact"
+
+        # The durable registry holds exactly one row for alice (updated in
+        # place) — the search did not mint a second object for the new
+        # content under a fresh content-derived ID.
+        conn = sqlite3.connect(db_path)
+        try:
+            rows = conn.execute(
+                "SELECT id, content FROM memories WHERE user_id = ?", ("alice",)
+            ).fetchall()
+        finally:
+            conn.close()
+        assert rows == [(saved.id, "new fact")]
+
+
+# =============================================================================
+# Process-wide immutable cognee configuration
+# =============================================================================
+
+
+class TestProcessWideConfiguration:
+    async def test_conflicting_roots_fail_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A second instance with different roots must not reconfigure cognee."""
+        module, calls = _make_fake_cognee()
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        first = CogneeBackend(CogneeConfig(system_root="/sys/x", data_root="/data/x"))
+        await first.ensure_initialized()
+
+        second = CogneeBackend(CogneeConfig(system_root="/sys/y", data_root="/data/y"))
+        with pytest.raises(RuntimeError, match="process-wide and immutable"):
+            await second.ensure_initialized()
+
+        # The first tenant's configuration was never overwritten.
+        assert calls.system_root == ["/sys/x"]
+        assert calls.data_root == ["/data/x"]
+
+    async def test_same_roots_second_instance_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same roots reuse the configured module without reconfiguring."""
+        module, calls = _make_fake_cognee()
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        first = CogneeBackend(CogneeConfig(system_root="/sys/x", data_root="/data/x"))
+        await first.ensure_initialized()
+        second = CogneeBackend(CogneeConfig(system_root="/sys/x", data_root="/data/x"))
+        await second.ensure_initialized()
+
+        # Configured exactly once, shared by both instances.
+        assert calls.system_root == ["/sys/x"]
+        assert calls.data_root == ["/data/x"]
+        assert second._cognee is first._cognee
+
+    async def test_concurrent_instances_with_different_roots(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Concurrent init with different roots: exactly one wins, one fails."""
+        module, calls = _make_fake_cognee()
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        instance_a = CogneeBackend(CogneeConfig(system_root="/sys/a", data_root="/data/a"))
+        instance_b = CogneeBackend(CogneeConfig(system_root="/sys/b", data_root="/data/b"))
+
+        outcomes = await asyncio.gather(
+            instance_a.ensure_initialized(),
+            instance_b.ensure_initialized(),
+            return_exceptions=True,
+        )
+
+        errors = [outcome for outcome in outcomes if isinstance(outcome, Exception)]
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeError)
+        assert "process-wide and immutable" in str(errors[0])
+        # Exactly one configuration was applied (never both, never a mix).
+        assert calls.system_root in (["/sys/a"], ["/sys/b"])
+        assert calls.data_root in (["/data/a"], ["/data/b"])
+        assert (calls.system_root, calls.data_root) in (
+            (["/sys/a"], ["/data/a"]),
+            (["/sys/b"], ["/data/b"]),
+        )
+
+
+# =============================================================================
 # Environment isolation around the deferred import
 # =============================================================================
 
@@ -756,6 +1082,19 @@ class config:
             assert os.environ["HEADROOM_TEST_PREEXISTING"] == "original"
             # Newly added key kept (cognee's own .env config still works).
             assert os.environ["HEADROOM_TEST_NEW_FROM_DOTENV"] == "added-by-dotenv"
+
+            # The snapshot/restore runs exactly once per process: a second
+            # instance initializing with the same roots reuses the already
+            # imported module and never re-runs the import side effects.
+            os.environ["HEADROOM_TEST_PREEXISTING"] = "changed-after-first-init"
+            os.environ.pop("HEADROOM_TEST_NEW_FROM_DOTENV", None)
+
+            second = CogneeBackend(CogneeConfig())
+            await second.ensure_initialized()
+
+            assert os.environ["HEADROOM_TEST_PREEXISTING"] == "changed-after-first-init"
+            assert "HEADROOM_TEST_NEW_FROM_DOTENV" not in os.environ
+            assert second._cognee is backend._cognee
         finally:
             sys.modules.pop("cognee", None)
             os.environ.pop("HEADROOM_TEST_NEW_FROM_DOTENV", None)

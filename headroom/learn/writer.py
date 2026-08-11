@@ -170,6 +170,64 @@ def _merge_markdown_items(
     return "\n".join(merged)
 
 
+def _authoritative_item_ids(
+    recommendations: list[Recommendation],
+) -> frozenset[str] | None:
+    """Union every lifecycle signal the current run carries, or None.
+
+    A section the new run did not re-emit cannot be judged by its own
+    recommendation — that recommendation is exactly what is missing. The
+    sets the run *does* carry stand in for it: a producer publishes one set
+    per run covering all of its live items, so an id absent from every set
+    in the run is one no producer still claims. Returns ``None`` when no
+    recommendation carries a signal, which keeps the historical
+    carry-everything behaviour for runs that cannot speak to lifecycle.
+    """
+    signals = [r.active_item_ids for r in recommendations if r.active_item_ids is not None]
+    if not signals:
+        return None
+    return frozenset().union(*signals)
+
+
+def _prune_carried_section(
+    content: str,
+    active_item_ids: frozenset[str],
+) -> str | None:
+    """Drop expired id-tagged bullets from a section the new run did not re-emit.
+
+    This is the deletion path for a heading whose last item expired: the
+    producer stops emitting the section entirely, so the same-section merge
+    never runs and the heading would otherwise be carried forward forever.
+
+    Only bullets carrying a `headroom:pattern-id` are removable — they come
+    from a lifecycle-tracked producer, so their absence from
+    ``active_item_ids`` means that producer dropped them. Untagged bullets
+    are kept: unlike the same-section merge, where a still-active legacy
+    item is re-emitted with an id by the same run and collapses by visible
+    text, nothing in this path would bring an untagged bullet back, so
+    deleting it would discard content on no evidence.
+
+    Returns the pruned content, or ``None`` when the section carries no
+    tagged bullets at all and is therefore not a tracked section to prune.
+    """
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    if not lines or any(not line.startswith("- ") for line in lines):
+        return None
+    kept: list[str] = []
+    saw_tracked_item = False
+    for line in lines:
+        id_match = _PATTERN_ID_PATTERN.search(line)
+        if id_match is None:
+            kept.append(line)
+            continue
+        saw_tracked_item = True
+        if id_match.group(1) in active_item_ids:
+            kept.append(line)
+    if not saw_tracked_item:
+        return None
+    return "\n".join(kept)
+
+
 def extract_marker_block(file_content: str) -> str | None:
     """Return the raw text of the headroom:learn marker block, or None.
 
@@ -233,6 +291,12 @@ def _merge_recommendations(
     Recommendations that opt into ``preserve_prior_items`` are merged at the
     item level instead, bounded by their ``active_item_ids`` lifecycle signal
     so prior items can still expire out of the file.
+
+    That signal also reaches the carried-forward sections. A category whose
+    last item expires stops producing a recommendation at all, so its
+    heading never enters the same-section merge; without pruning the carry
+    path too, those bullets would be pinned in the file forever. Sections
+    holding no id-tagged items are carried untouched, as before.
     """
     if not file_path.exists():
         return new_recommendations
@@ -254,7 +318,20 @@ def _merge_recommendations(
         merged_new.append(recommendation)
 
     new_sections = {r.section for r in merged_new}
-    carried = [p for p in prior if p.section not in new_sections]
+    run_active_item_ids = _authoritative_item_ids(merged_new)
+    carried: list[Recommendation] = []
+    for prior_recommendation in prior:
+        if prior_recommendation.section in new_sections:
+            continue
+        if run_active_item_ids is not None:
+            pruned = _prune_carried_section(prior_recommendation.content, run_active_item_ids)
+            if pruned is not None:
+                if not pruned:
+                    # Every tracked item under this heading is gone; the
+                    # heading goes with them rather than outliving them.
+                    continue
+                prior_recommendation = replace(prior_recommendation, content=pruned)
+        carried.append(prior_recommendation)
     return merged_new + carried
 
 

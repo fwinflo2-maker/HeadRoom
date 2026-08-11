@@ -86,26 +86,16 @@ class LeanContext:
     def find_signals(self, lines: list[str]) -> set[int]:
         """Find line indices that match signal patterns."""
         signals: set[int] = set()
-        # Check each line and its neighbors (for multi-line patterns)
+        # Every signal expression identifies a single line.  Patterns compiled
+        # with MULTILINE merely anchor that line; none require neighboring text.
+        # Re-running the full pattern set over overlapping two- and three-line
+        # windows tripled the hot loop and made the documented 10k-line bound
+        # fail on CI without finding any additional signal locations.
         for i, line in enumerate(lines):
-            # Check single line
             for pattern in SIGNAL_PATTERNS:
                 if pattern.search(line):
                     signals.add(i)
                     break
-            # Check 2-line windows (e.g. rustc error location + code)
-            if i + 1 < len(lines):
-                window2 = lines[i] + "\n" + lines[i + 1]
-                for pattern in SIGNAL_PATTERNS:
-                    if pattern.search(window2):
-                        signals.add(i)
-                        signals.add(i + 1)
-            # Check 3-line windows (e.g. diff hunks)
-            if i + 2 < len(lines):
-                window3 = "\n".join(lines[i : i + 3])
-                for pattern in SIGNAL_PATTERNS:
-                    if pattern.search(window3):
-                        signals.update(range(i, i + 3))
         return signals
 
     def truncate(self, text: str) -> TruncationResult:

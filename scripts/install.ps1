@@ -349,7 +349,9 @@ function Get-PersistentDockerArgs {
 function Add-DashboardGatewayEnv {
     param([System.Collections.Generic.List[string]]$ArgsList)
 
-    # A host request published through Docker's default bridge reaches the
+    # This default is safe only because the published dashboard port is bound
+    # to the host loopback interface below. A host request published through
+    # Docker's default bridge reaches the
     # container from the bridge gateway (for example, 172.17.0.1), not from
     # 127.0.0.1. Trust only that exact gateway by default so the dashboard's
     # metadata gate works for the first-party persistent Docker preset while
@@ -513,7 +515,7 @@ function Start-PersistentDockerInstall {
     docker rm -f $containerName | Out-Null 2>$null
 
     $dockerArgs = New-Object System.Collections.Generic.List[string]
-    $dockerArgs.AddRange([string[]]@('run','-d','--restart','unless-stopped','--name',$containerName,'-p',"$Port`:$Port"))
+    $dockerArgs.AddRange([string[]]@('run','-d','--restart','unless-stopped','--name',$containerName,'-p',"127.0.0.1`:$Port`:$Port"))
     $dockerArgs.AddRange((Get-PersistentDockerArgs))
     Add-DashboardGatewayEnv -ArgsList $dockerArgs
     $dockerArgs.AddRange([string[]]@(

@@ -295,7 +295,9 @@ append_persistent_container_args() {
 append_dashboard_gateway_env() {
   local -n ref=$1
 
-  # A host request published through Docker's default bridge reaches the
+  # This default is safe only because the published dashboard port is bound
+  # to the host loopback interface below. A host request published through
+  # Docker's default bridge reaches the
   # container from the bridge gateway (for example, 172.17.0.1), not from
   # 127.0.0.1. Trust only that exact gateway by default so the dashboard's
   # metadata gate works for the first-party persistent Docker preset while
@@ -487,7 +489,7 @@ start_persistent_docker_install() {
 
   docker rm -f "${container_name}" >/dev/null 2>&1 || true
 
-  args=(docker run -d --restart unless-stopped --name "${container_name}" -p "${port}:${port}")
+  args=(docker run -d --restart unless-stopped --name "${container_name}" -p "127.0.0.1:${port}:${port}")
   append_persistent_container_args args
   append_dashboard_gateway_env args
   args+=(

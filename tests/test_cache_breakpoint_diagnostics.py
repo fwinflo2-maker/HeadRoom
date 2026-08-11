@@ -160,3 +160,21 @@ def test_append_context_no_eligible_block_returns_unchanged() -> None:
         messages, "CTX", frozen_message_count=0
     )
     assert result == messages
+
+
+def test_count_cache_breakpoints_tolerates_malformed_shapes() -> None:
+    messages = [
+        "not-a-dict",
+        {"role": "user", "content": ["scalar-block", {"type": "text", "text": "x", **_CC}]},
+        {"role": "user", "content": "plain string"},
+    ]
+    stats = count_cache_breakpoints("system-as-string", messages, "tools-as-string")
+    assert stats["system"] == 0
+    assert stats["tools"] == 0
+    assert stats["messages"] == 1
+    assert stats["message_count"] == 3
+    assert stats["last_marker_tail"] == 1
+
+    empty = count_cache_breakpoints(None, None, None)
+    assert empty["total"] == 0
+    assert empty["message_count"] == 0

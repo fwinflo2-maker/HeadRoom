@@ -366,3 +366,35 @@ def test_normalize_mirror_clamps_out_of_range_block_index():
     assert _markers(out) == 2
     assert "cache_control" in out[0]["content"][-1]
     assert "cache_control" in out[1]["content"][-1]
+
+
+def test_normalize_mirror_scalar_only_content_is_left_unchanged():
+    """Client marks a message whose forwarded counterpart carries only scalar
+    blocks: nothing can hold a marker and nothing was stripped, so the input
+    comes back unchanged (identity, not a copy)."""
+    client = [B("user", "a", cc=True)]
+    merged = [{"role": "user", "content": ["scalar-only"]}]
+    out = normalize_message_cache_control(merged, client_messages=client)
+    assert out is merged
+    assert _markers(out) == 0
+
+
+def test_normalize_mirror_scalar_target_still_strips_leftovers():
+    # Message 0's forwarded content is scalar-only (marker unplaceable) but a
+    # replay leftover on message 1 still gets stripped, and message 1 keeps
+    # its client marker.
+    client = [B("user", "a", cc=True), B("user", "b", cc=True)]
+    merged = [
+        {"role": "user", "content": ["scalar-only"]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "left-over", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "b"},
+            ],
+        },
+    ]
+    out = normalize_message_cache_control(merged, client_messages=client)
+    assert _markers(out) == 1
+    assert "cache_control" not in out[1]["content"][0]
+    assert "cache_control" in out[1]["content"][-1]

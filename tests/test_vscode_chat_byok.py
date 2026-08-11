@@ -652,6 +652,245 @@ def test_rerunning_with_a_different_url_rewrites_it(tmp_path: Path) -> None:
     assert written.count("overrideCapiUrl") == 1, "the rewrite duplicated the setting"
 
 
+def test_a_lone_start_marker_is_never_claimed(tmp_path: Path) -> None:
+    """A half-applied Settings Sync merge leaves exactly this shape.
+
+    Marker presence was treated as proof of ownership, so the update path ran
+    remove-then-append: remove found no closing marker and did nothing, append
+    saw the start marker and did nothing, both return values were discarded, and
+    the caller reported "updated". The stale URL stayed live while the CLI told
+    the user the new proxy was installed.
+    """
+    from headroom.providers.copilot.vscode_chat import (
+        _CAPI_MARKER_START,
+        CAPI_OVERRIDE_SETTING,
+        disable_capi_override,
+        enable_capi_override,
+    )
+
+    settings = tmp_path / "settings.json"
+    original = (
+        "{\n\t"
+        + _CAPI_MARKER_START
+        + '\n\t"'
+        + CAPI_OVERRIDE_SETTING
+        + '": "http://127.0.0.1:1111"\n}\n'
+    )
+    settings.write_text(original, encoding="utf-8")
+
+    assert enable_capi_override(settings, "http://127.0.0.1:9999/p/new") == "not ours"
+    assert settings.read_text(encoding="utf-8") == original, "an unowned block was rewritten"
+
+    with pytest.raises(click.ClickException, match="cannot prove it wrote"):
+        disable_capi_override(settings)
+    assert settings.read_text(encoding="utf-8") == original
+
+
+def test_a_user_authored_marker_pair_is_never_touched(tmp_path: Path) -> None:
+    """Marker text is not proof: anyone can paste it, and Settings Sync copies it.
+
+    Deleting between a pair we did not write removes whatever the user put
+    there — verified before the fix: `editor.fontSize` and `my.setting` were
+    both silently destroyed and the command reported success.
+    """
+    from headroom.providers.copilot.vscode_chat import (
+        _CAPI_MARKER_END,
+        _CAPI_MARKER_START,
+        disable_capi_override,
+        enable_capi_override,
+    )
+
+    settings = tmp_path / "settings.json"
+    theirs = (
+        "{\n\t"
+        + _CAPI_MARKER_START
+        + '\n\t"editor.fontSize": 14,\n\t"my.setting": true\n\t'
+        + _CAPI_MARKER_END
+        + "\n}\n"
+    )
+    settings.write_text(theirs, encoding="utf-8")
+
+    assert enable_capi_override(settings, "http://127.0.0.1:9999") == "not ours"
+    with pytest.raises(click.ClickException, match="cannot prove it wrote"):
+        disable_capi_override(settings)
+    assert settings.read_text(encoding="utf-8") == theirs, "user settings were destroyed"
+
+
+@pytest.mark.parametrize(
+    ("shape", "body"),
+    [
+        # Our key sharing a physical line with the user's. A line-based check
+        # passed this, so the whole line -- their settings included -- was
+        # rewritten or deleted.
+        ("keys sharing our line", '"{key}": "http://mine:1", "editor.fontSize": 14'),
+        # A trailing comment is content we would have destroyed.
+        ("trailing comment", '"{key}": "http://mine:1" // corporate gateway'),
+        # Two keys, ours first.
+        ("two keys", '"{key}": "http://mine:1",\n\t"my.setting": true'),
+    ],
+    ids=["keys-sharing-a-line", "trailing-comment", "two-keys"],
+)
+def test_a_block_holding_anything_else_is_refused(tmp_path: Path, shape: str, body: str) -> None:
+    """Adoption must prove the body is *only* our setting, parsed as JSON.
+
+    Asking "does a line start with our key" is not that: it accepts a line that
+    also carries the user's settings, and a trailing comment. Both were then
+    rewritten or deleted -- the exact loss the marker-ownership work exists to
+    prevent, reached by a different route.
+    """
+    from headroom.providers.copilot.vscode_chat import (
+        _CAPI_MARKER_END,
+        _CAPI_MARKER_START,
+        CAPI_OVERRIDE_SETTING,
+        disable_capi_override,
+        enable_capi_override,
+    )
+
+    settings = tmp_path / "settings.json"
+    original = (
+        "{\n\t"
+        + _CAPI_MARKER_START
+        + "\n\t"
+        + body.format(key=CAPI_OVERRIDE_SETTING)
+        + "\n\t"
+        + _CAPI_MARKER_END
+        + "\n}\n"
+    )
+    settings.write_text(original, encoding="utf-8")
+
+    assert enable_capi_override(settings, "http://127.0.0.1:9999") == "not ours", shape
+    with pytest.raises(click.ClickException, match="cannot prove it wrote"):
+        disable_capi_override(settings)
+    assert settings.read_text(encoding="utf-8") == original, f"{shape}: user content was destroyed"
+
+
+def test_marker_text_inside_a_string_value_is_not_a_block(tmp_path: Path) -> None:
+    """The PR comment said "quoted" markers, and quoting is the dangerous case.
+
+    A substring scan finds our marker inside a setting's *value* and treats
+    everything between the two occurrences as our block -- so a user storing the
+    marker text as data lost every setting in between.
+    """
+    from headroom.providers.copilot.vscode_chat import (
+        _CAPI_MARKER_END,
+        _CAPI_MARKER_START,
+        CAPI_OVERRIDE_SETTING,
+        disable_capi_override,
+        enable_capi_override,
+    )
+
+    settings = tmp_path / "settings.json"
+    original = (
+        "{\n"
+        f'\t"myext.header": "{_CAPI_MARKER_START}",\n'
+        f'\t"{CAPI_OVERRIDE_SETTING}": "https://my-own-gateway:1234",\n'
+        f'\t"myext.footer": "{_CAPI_MARKER_END}"\n'
+        "}\n"
+    )
+    settings.write_text(original, encoding="utf-8")
+
+    assert enable_capi_override(settings, "http://127.0.0.1:9999") == "not ours"
+    with pytest.raises(click.ClickException, match="cannot prove it wrote"):
+        disable_capi_override(settings)
+    assert settings.read_text(encoding="utf-8") == original
+
+
+def test_a_recorded_digest_is_authoritative(tmp_path: Path) -> None:
+    """Once we have a record, a mismatch refuses instead of falling back.
+
+    Structural adoption exists only to migrate blocks written before provenance.
+    Letting it also catch a *mismatched* record would make the digest decorative:
+    an edited block would be silently overwritten, which is precisely what the
+    reviewer asked us to fail closed on.
+    """
+    from headroom.providers.copilot.vscode_chat import (
+        disable_capi_override,
+        enable_capi_override,
+    )
+
+    settings = tmp_path / "settings.json"
+    settings.write_text('{\n\t"editor.fontSize": 14\n}\n', encoding="utf-8")
+    assert enable_capi_override(settings, "http://127.0.0.1:8970") == "added"
+
+    edited = settings.read_text(encoding="utf-8").replace("8970", "1234")
+    settings.write_text(edited, encoding="utf-8")
+
+    assert enable_capi_override(settings, "http://127.0.0.1:8970") == "not ours"
+    with pytest.raises(click.ClickException, match="cannot prove it wrote"):
+        disable_capi_override(settings)
+    assert settings.read_text(encoding="utf-8") == edited
+
+
+def test_byok_markers_are_not_claimed_by_the_routing_key(tmp_path: Path) -> None:
+    """Each marker pair may carry only its own setting.
+
+    Accepting either key for either pair let a BYOK-marked block be claimed on
+    the strength of the routing key: `enable_byok_setting` then reported
+    "already set" when the setting was absent, leaving every model hidden.
+    """
+    from headroom.providers.copilot.vscode_chat import (
+        _BYOK_MARKER_END,
+        _BYOK_MARKER_START,
+        CAPI_OVERRIDE_SETTING,
+        disable_byok_setting,
+        enable_byok_setting,
+    )
+
+    settings = tmp_path / "settings.json"
+    original = (
+        "{\n\t"
+        + _BYOK_MARKER_START
+        + f'\n\t"{CAPI_OVERRIDE_SETTING}": "http://x:1"\n\t'
+        + _BYOK_MARKER_END
+        + "\n}\n"
+    )
+    settings.write_text(original, encoding="utf-8")
+
+    assert enable_byok_setting(settings) == "not ours"
+    with pytest.raises(click.ClickException, match="cannot prove it wrote"):
+        disable_byok_setting(settings)
+    assert settings.read_text(encoding="utf-8") == original
+
+
+def test_a_block_holding_only_our_setting_is_adopted(tmp_path: Path) -> None:
+    """Where the ownership line is drawn, and deliberately not stricter.
+
+    A digest alone would lock out every install that predates provenance: their
+    block is genuinely ours but unrecorded, so update and unwrap would both
+    refuse forever. Structural proof closes that gap — an intact pair whose body
+    is *only* the single setting our writer emits is adopted and its digest
+    recorded.
+
+    That also covers a hand-edited URL, which is the same shape. Rewriting it is
+    the command's whole purpose and touches no key but ours, so it is not the
+    risk the digest exists to prevent — destroying a user's *own* settings is,
+    and that case still refuses (see the tests above).
+    """
+    from headroom.providers.copilot.vscode_chat import (
+        _CAPI_MARKER_START,
+        _settings_provenance_path,
+        disable_capi_override,
+        enable_capi_override,
+    )
+
+    settings = tmp_path / "settings.json"
+    settings.write_text('{\n\t"editor.fontSize": 14\n}\n', encoding="utf-8")
+    assert enable_capi_override(settings, "http://127.0.0.1:1234") == "added"
+
+    # A block written before provenance existed: our bytes, no record of them.
+    # Deleting the record is the whole point — with one present, a changed block
+    # must refuse instead (see test_a_recorded_digest_is_authoritative).
+    _settings_provenance_path(settings, _CAPI_MARKER_START).unlink(missing_ok=True)
+
+    assert enable_capi_override(settings, "http://127.0.0.1:8970") == "updated"
+    written = settings.read_text(encoding="utf-8")
+    assert "8970" in written and "1234" not in written
+    assert '"editor.fontSize": 14' in written
+
+    assert disable_capi_override(settings) is True
+    assert settings.read_text(encoding="utf-8") == '{\n\t"editor.fontSize": 14\n}\n'
+
+
 def test_duplicate_blocks_are_refused_not_half_removed(tmp_path: Path) -> None:
     """Removing one of two copies reports success while the setting stays live.
 

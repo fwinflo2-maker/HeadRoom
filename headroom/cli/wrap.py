@@ -6078,6 +6078,19 @@ def vscode_chat(
                 f"{target_settings}; leaving it alone. Chat traffic will not reach "
                 "Headroom unless it points at this proxy."
             )
+        elif capi_action == "not ours":
+            # Marker text is there but unproven, so nothing was written and the
+            # OLD value is still what VS Code will use. Saying "updated" here
+            # would send the user off to test a proxy they are not pointed at.
+            click.echo(
+                f"  Warning: {target_settings} contains Headroom routing markers that "
+                "Headroom cannot prove it wrote (an incomplete marker pair, or a block "
+                "edited since). Nothing was changed and the existing value is still live."
+            )
+            click.echo(
+                f"    Remove those lines by hand, or set "
+                f'"{CAPI_OVERRIDE_SETTING}": "{base}" yourself, then restart VS Code.'
+            )
         else:
             click.echo(f"  Copilot Chat routing {capi_action}: {target_settings}")
             click.echo(f"    {CAPI_OVERRIDE_SETTING} -> {base}")
@@ -6134,6 +6147,12 @@ def vscode_chat(
             click.echo(
                 f"  Warning: {BYOK_ENABLED_SETTING} is set to false in {target_settings}. "
                 "VS Code will hide every Headroom model until you set it to true."
+            )
+        elif setting_action == "not ours":
+            click.echo(
+                f"  Warning: {target_settings} contains Headroom BYOK markers that Headroom "
+                "cannot prove it wrote; nothing was changed. Remove those lines by hand, or "
+                f"set {BYOK_ENABLED_SETTING} to true yourself."
             )
         else:
             click.echo(f"  {BYOK_ENABLED_SETTING} {setting_action}: {target_settings}")
@@ -6200,6 +6219,7 @@ def unwrap_vscode_chat(models_file: Path | None, settings_file: Path | None) -> 
     target_models = models_file or chat_models_path()
     target_settings = settings_file or vscode_settings_path()
     removed = False
+    refused = False
     # Each step is attempted independently. Unwrap is the recovery path -- if one
     # write cannot be made safely, the others must still run, or a single
     # unparseable section would leave Copilot Chat pointed at a dead port with no
@@ -6218,8 +6238,16 @@ def unwrap_vscode_chat(models_file: Path | None, settings_file: Path | None) -> 
         except (OSError, click.ClickException) as exc:
             message = exc.format_message() if isinstance(exc, click.ClickException) else str(exc)
             click.echo(f"Could not complete '{label.lower()}': {message}")
+            refused = True
     if removed:
         click.echo("Restart VS Code for it to take effect.")
+    elif refused:
+        # Never say "not routed" after refusing to touch something: whatever is
+        # in the file is still live, and that is the opposite of reassuring.
+        click.echo(
+            "Nothing was changed. VS Code may still be routed through Headroom -- "
+            "check the settings named above by hand."
+        )
     else:
         click.echo("Nothing to remove; VS Code was not routed through Headroom.")
 

@@ -402,17 +402,199 @@ CAPI_OVERRIDE_SETTING = "github.copilot.advanced.debug.overrideCapiUrl"
 _CAPI_MARKER_START = "// --- Headroom Copilot Chat routing ---"
 _CAPI_MARKER_END = "// --- end Headroom Copilot Chat routing ---"
 
+#: Which single setting each marker pair may carry. Consulted when adopting a
+#: block written before provenance existed, so a block marked for one feature can
+#: never be claimed on the strength of the other's key.
+_BLOCK_KEYS: dict[str, str] = {
+    _CAPI_MARKER_START: CAPI_OVERRIDE_SETTING,
+    _BYOK_MARKER_START: BYOK_ENABLED_SETTING,
+}
+
+
+def _mask_quoted_regions(raw: str) -> str:
+    """Same-length copy with JSON string bodies and block comments blanked out.
+
+    Marker text only counts where a marker can actually live -- a line comment.
+    A user who stores our marker *inside a setting's value* (``"myext.header":
+    "// --- Headroom ... ---"``) has written data, not a block, and treating it
+    as one deletes every setting between the two quotes. Offsets are preserved
+    so spans found here index straight back into the original text.
+    """
+    out: list[str] = []
+    i, n = 0, len(raw)
+    blank = lambda text: "".join("\n" if ch == "\n" else " " for ch in text)  # noqa: E731
+    while i < n:
+        ch = raw[i]
+        if ch == '"':
+            out.append('"')
+            i += 1
+            while i < n:
+                if raw[i] == "\\" and i + 1 < n:
+                    out.append("  ")
+                    i += 2
+                    continue
+                if raw[i] == '"':
+                    out.append('"')
+                    i += 1
+                    break
+                out.append("\n" if raw[i] == "\n" else " ")
+                i += 1
+            continue
+        if raw.startswith("/*", i):
+            close = raw.find("*/", i + 2)
+            close = n if close < 0 else close + 2
+            out.append(blank(raw[i:close]))
+            i = close
+            continue
+        if raw.startswith("//", i):
+            # Line comments are kept verbatim: this is where our markers live.
+            nl = raw.find("\n", i)
+            nl = n if nl < 0 else nl
+            out.append(raw[i:nl])
+            i = nl
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _settings_block_span(raw: str, start: str, end: str) -> tuple[int, int] | None:
+    """Line span of one intact marker pair, or ``None``.
+
+    ``None`` covers every shape we must not touch: no markers, a lone start or
+    end (a half-applied Settings Sync merge leaves exactly that), markers in the
+    wrong order, more than one pair, or marker text that is really string data.
+    """
+    masked = _mask_quoted_regions(raw)
+    if masked.count(start) != 1 or masked.count(end) != 1:
+        return None
+    start_at = masked.find(start)
+    end_at = masked.find(end)
+    if end_at < start_at:
+        return None
+    line_start = raw.rfind("\n", 0, start_at) + 1
+    line_end = raw.find("\n", end_at)
+    return line_start, (len(raw) if line_end < 0 else line_end + 1)
+
+
+def _settings_block_text(raw: str, start: str, end: str) -> str | None:
+    span = _settings_block_span(raw, start, end)
+    return None if span is None else raw[span[0] : span[1]]
+
+
+def _settings_provenance_path(path: Path, start: str) -> Path:
+    from headroom import paths
+
+    key = hashlib.sha256(f"{path.resolve()}|{start}".encode("utf-8", "replace")).hexdigest()[:16]
+    return paths.workspace_dir() / "vscode_settings_blocks" / f"{key}.json"
+
+
+def _record_settings_block(path: Path, start: str, block_text: str | None) -> None:
+    """Remember the exact bytes we wrote, so a later run can prove ownership.
+
+    Ownership is deliberately not inferred from the marker text. A user can
+    legitimately copy a marker -- Settings Sync merges do it, and so does anyone
+    pasting a config snippet -- and a text match alone would then license
+    rewriting or deleting their settings.
+    """
+    try:
+        # Inside the try: resolving the workspace dir can raise when HOME and
+        # USERPROFILE are both unset, and this runs *after* settings.json was
+        # written -- reporting a failure for a write that succeeded would be
+        # worse than losing the record.
+        record = _settings_provenance_path(path, start)
+        if block_text is None:
+            record.unlink(missing_ok=True)
+            return
+        record.parent.mkdir(parents=True, exist_ok=True)
+        fsutil.write_text(
+            record,
+            json.dumps(
+                {
+                    "path": str(path),
+                    "sha256": hashlib.sha256(block_text.encode("utf-8")).hexdigest(),
+                }
+            ),
+        )
+    except (OSError, RuntimeError, ValueError):
+        # Losing the record only downgrades us to "not ours": the next run
+        # refuses to touch the block rather than risking someone else's text.
+        pass
+
+
+def _block_body_is_exactly(block: str, start: str, end: str, key: str) -> bool:
+    """Whether the block's body is exactly ``{key: value}`` and nothing else.
+
+    Parsed as JSON rather than matched line-by-line. A line test asked only
+    "does a line start with our key", which is satisfied by
+    ``"ourKey": "v", "editor.fontSize": 14`` -- so the user's settings sat inside
+    a block we then rewrote or deleted. It also let a trailing comment through,
+    and let a BYOK-marked block be claimed by the CAPI key.
+
+    Anything the parser rejects (a trailing comment, two keys, a stray brace) is
+    not ours, which is the safe answer.
+    """
+    body = "\n".join(
+        line for line in block.splitlines() if start not in line and end not in line
+    ).strip()
+    body = body.lstrip(",").rstrip(",").strip()
+    if not body:
+        return False
+    try:
+        parsed = json.loads("{" + body + "}")
+    except ValueError:
+        return False
+    return isinstance(parsed, dict) and list(parsed) == [key]
+
+
+def _owns_settings_block(path: Path, raw: str, start: str, end: str) -> bool:
+    """True only when this exact block is one we wrote and nobody has edited.
+
+    The recorded digest is authoritative **once it exists**: a mismatch means the
+    block changed under us, and we refuse rather than overwrite whatever it now
+    holds.
+
+    Structural adoption applies only when there is *no* record, which is the
+    one-time migration for blocks written before provenance existed -- otherwise
+    every such install would be permanently unable to update or unwrap its own
+    block. Adoption still demands that the body be exactly the one setting this
+    marker pair is allowed to carry, so a pair holding the user's own settings is
+    never claimed.
+    """
+    block = _settings_block_text(raw, start, end)
+    if block is None:
+        return False
+    digest = hashlib.sha256(block.encode("utf-8")).hexdigest()
+
+    recorded: str | None = None
+    try:
+        record = json.loads(fsutil.read_text(_settings_provenance_path(path, start)))
+        if isinstance(record, dict) and isinstance(record.get("sha256"), str):
+            recorded = record["sha256"]
+    except (OSError, ValueError):
+        recorded = None
+
+    if recorded is not None:
+        return recorded == digest
+
+    key = _BLOCK_KEYS.get(start)
+    if key and _block_body_is_exactly(block, start, end, key):
+        _record_settings_block(path, start, block)
+        return True
+    return False
+
 
 def _append_settings_block(path: Path, body_lines: list[str], start: str, end: str) -> str:
     """Append a marker-delimited block of settings, preserving everything else.
 
-    Returns ``"added"``, or ``"already set"`` when our own block is already
-    there. Raises rather than editing a file this parser cannot validate.
+    Returns ``"added"``, or ``"already set"`` when either marker is already
+    present -- the caller is responsible for having proved ownership first.
+    Raises rather than editing a file this parser cannot validate.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     raw = _read_settings(path) if path.exists() else "{}\n"
     _validate_settings(raw, path)
-    if start in raw:
+    if start in raw or end in raw:
         return "already set"
 
     close = raw.rfind("}")
@@ -436,6 +618,7 @@ def _append_settings_block(path: Path, body_lines: list[str], start: str, end: s
     updated = before + line_sep + block + line_sep + after
     _validate_settings(updated, path)
     fsutil.write_text(path, updated)
+    _record_settings_block(path, start, _settings_block_text(updated, start, end))
     return "added"
 
 
@@ -454,19 +637,40 @@ def enable_capi_override(path: Path, base_url: str) -> str:
     marker alone left a stale URL in place while the caller reported the new one
     -- so chat pointed at a dead port, or attributed every saving to the wrong
     project, and the terminal said otherwise.
+
+    Ownership is proved out of band, never from the marker text. ``"not ours"``
+    means marker text is present that we cannot prove we wrote -- a lone marker
+    from a half-applied Settings Sync merge, a user-authored pair, or a block
+    someone has since edited. Nothing is written in that case, and the caller
+    must not report success: the previous value stays live.
     """
     raw = _read_settings(path) if path.exists() else ""
-    if _CAPI_MARKER_START not in raw and CAPI_OVERRIDE_SETTING in raw:
-        return "already set by user"
+    has_marker = _CAPI_MARKER_START in raw or _CAPI_MARKER_END in raw
+    if not has_marker:
+        if CAPI_OVERRIDE_SETTING in raw:
+            return "already set by user"
+        return _append_settings_block(
+            path,
+            [f"{json.dumps(CAPI_OVERRIDE_SETTING)}: {json.dumps(base_url)}"],
+            _CAPI_MARKER_START,
+            _CAPI_MARKER_END,
+        )
+
+    if not _owns_settings_block(path, raw, _CAPI_MARKER_START, _CAPI_MARKER_END):
+        return "not ours"
 
     body = [f"{json.dumps(CAPI_OVERRIDE_SETTING)}: {json.dumps(base_url)}"]
-    if _CAPI_MARKER_START in raw:
-        if any(line.strip().lstrip(",") == body[0] for line in raw.splitlines()):
-            return "already set"
-        _remove_settings_block(path, _CAPI_MARKER_START, _CAPI_MARKER_END)
-        _append_settings_block(path, body, _CAPI_MARKER_START, _CAPI_MARKER_END)
-        return "updated"
-    return _append_settings_block(path, body, _CAPI_MARKER_START, _CAPI_MARKER_END)
+    block = _settings_block_text(raw, _CAPI_MARKER_START, _CAPI_MARKER_END) or ""
+    if any(line.strip().lstrip(",") == body[0] for line in block.splitlines()):
+        return "already set"
+
+    # Owned and stale: replace it. Both halves are checked, so a refusal cannot
+    # be mistaken for a rewrite.
+    if not _remove_settings_block(path, _CAPI_MARKER_START, _CAPI_MARKER_END):
+        return "not ours"
+    if _append_settings_block(path, body, _CAPI_MARKER_START, _CAPI_MARKER_END) != "added":
+        return "not ours"
+    return "updated"
 
 
 def disable_capi_override(path: Path) -> bool:
@@ -481,12 +685,17 @@ def enable_byok_setting(path: Path) -> str:
     surfaced in the Settings UI -- so a user who upgrades sees their models vanish
     with no explanation. Writing it is necessary but not sufficient: the agent
     host process must restart before the models reappear.
+
+    Returns ``"not ours"`` when marker text is present that we cannot prove we
+    wrote; nothing is written, and the caller must not report success.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     raw = _read_settings(path) if path.exists() else "{}\n"
     _validate_settings(raw, path)
 
-    if _BYOK_MARKER_START in raw:
+    if _BYOK_MARKER_START in raw or _BYOK_MARKER_END in raw:
+        if not _owns_settings_block(path, raw, _BYOK_MARKER_START, _BYOK_MARKER_END):
+            return "not ours"
         return "already set"
     if BYOK_ENABLED_SETTING in raw:
         # Never overwrite the user's own value -- but `false` is the one value
@@ -549,33 +758,60 @@ def _drop_orphan_leading_comma(text: str) -> str:
 
 
 def _remove_settings_block(path: Path, start_marker: str, end_marker: str) -> bool:
-    """Cut one marker-delimited block out of ``settings.json``, and nothing else."""
+    """Cut out one marker block **we can prove we wrote**, and nothing else.
+
+    Returns False when there is nothing of ours to remove. Raises when marker
+    text is present that we cannot claim -- deleting between a marker pair we
+    did not write removes whatever the user happened to put there, and the text
+    alone is no proof: Settings Sync merges copy markers, and so does anyone
+    pasting a config snippet.
+    """
     if not path.exists():
         return False
     raw = _read_settings(path)
-    if raw.count(start_marker) > 1:
+    if start_marker not in raw and end_marker not in raw:
+        return False
+    if raw.count(start_marker) > 1 or raw.count(end_marker) > 1:
         # Settings Sync merges and profile copies can duplicate a block. Removing
         # only the first would report success while leaving the setting live, so
         # say so instead of half-doing it.
         raise click.ClickException(
-            f"{path} contains {raw.count(start_marker)} copies of the Headroom "
-            f"block {start_marker!r}. Remove the duplicates by hand, then re-run."
+            f"{path} contains {max(raw.count(start_marker), raw.count(end_marker))} copies of "
+            f"the Headroom block {start_marker!r}. Remove the duplicates by hand, then re-run."
         )
-    start = raw.find(start_marker)
-    end = raw.find(end_marker)
-    if start < 0 or end < 0 or end < start:
-        return False
-    line_start = raw.rfind("\n", 0, start) + 1
-    line_end = raw.find("\n", end)
-    line_end = len(raw) if line_end < 0 else line_end + 1
+    if not _owns_settings_block(path, raw, start_marker, end_marker):
+        raise click.ClickException(
+            f"{path} contains {start_marker!r} text that Headroom cannot prove it wrote "
+            "(an incomplete marker pair, or a block that has been edited since). "
+            "Refusing to touch it -- remove those lines by hand if they are stale."
+        )
+    span = _settings_block_span(raw, start_marker, end_marker)
+    assert span is not None  # guaranteed by _owns_settings_block
+    line_start, line_end = span
     prefix = raw[:line_start]
     suffix = raw[line_end:]
     trimmed = prefix.rstrip()
     if trimmed.endswith(","):
         prefix = trimmed[:-1] + prefix[len(trimmed) :]
+    # Which of our other blocks did we own before this edit? Removing one block
+    # can rewrite a sibling's text -- dropping an orphaned separator comma moves
+    # the comma off the next block's first line -- and a stale digest would then
+    # disown a block we do own, leaving `unwrap` unable to finish.
+    others = [
+        (start, end)
+        for start, end in (
+            (_CAPI_MARKER_START, _CAPI_MARKER_END),
+            (_BYOK_MARKER_START, _BYOK_MARKER_END),
+        )
+        if start != start_marker and _owns_settings_block(path, raw, start, end)
+    ]
+
     updated = _drop_orphan_leading_comma(prefix + suffix)
     _validate_settings(updated, path)
     fsutil.write_text(path, updated)
+    _record_settings_block(path, start_marker, None)
+    for start, end in others:
+        _record_settings_block(path, start, _settings_block_text(updated, start, end))
     return True
 
 

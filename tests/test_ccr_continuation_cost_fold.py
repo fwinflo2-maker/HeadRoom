@@ -506,10 +506,18 @@ def test_batch_two_ccr_items_both_reach_cost_view():
     item2 = (100_000, 50_000, 5_000, 500)
 
     outcome = RequestOutcome(
-        request_id="req-batch", provider="anthropic", model="m", status_code=200,
-        original_tokens=base_uin, optimized_tokens=base_uin, output_tokens=base_out,
-        tokens_saved=0, attempted_input_tokens=base_uin,
-        uncached_input_tokens=base_uin, cache_read_tokens=base_cr, cache_write_tokens=base_cw,
+        request_id="req-batch",
+        provider="anthropic",
+        model="m",
+        status_code=200,
+        original_tokens=base_uin,
+        optimized_tokens=base_uin,
+        output_tokens=base_out,
+        tokens_saved=0,
+        attempted_input_tokens=base_uin,
+        uncached_input_tokens=base_uin,
+        cache_read_tokens=base_cr,
+        cache_write_tokens=base_cw,
     )
 
     async def main():

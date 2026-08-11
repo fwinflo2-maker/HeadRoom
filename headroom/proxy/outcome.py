@@ -70,9 +70,9 @@ def consume_pending_proactive_retrieval() -> tuple[int, int] | None:
 # The payload is cache-split (uncached_input, cache_read, cache_write, output) so
 # cost_with_headroom prices continuation cache at the right rate rather than
 # folding cached tokens into uncached input at full list price.
-_pending_ccr_continuation_usage: ContextVar[
-    list[tuple[int, int, int, int]] | None
-] = ContextVar("headroom_ccr_continuation_pending", default=None)
+_pending_ccr_continuation_usage: ContextVar[list[tuple[int, int, int, int]] | None] = ContextVar(
+    "headroom_ccr_continuation_pending", default=None
+)
 
 
 def set_pending_ccr_continuation_usage(

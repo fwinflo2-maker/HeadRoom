@@ -7,7 +7,7 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-import { readFile, rename, rm, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 
 import { compress } from "headroom-ai";
 import { ProxyManager, defaultLogger, type ProxyManagerConfig, type ProxyManagerLogger } from "./proxy-manager.js";
@@ -17,11 +17,30 @@ export interface HeadroomEngineConfig extends ProxyManagerConfig {
   enabled?: boolean;
 }
 
+type TranscriptRewriteResult = {
+  changed: boolean;
+  bytesFreed: number;
+  rewrittenEntries: number;
+  reason?: string;
+};
+
+type HeadroomRuntimeContext = Record<string, unknown> & {
+  /**
+   * OpenClaw owns transcript persistence and serializes this operation with
+   * its session writer. Directly replacing the append-only JSONL file cannot
+   * be made race-safe by a third-party plugin.
+   */
+  rewriteTranscriptEntries?: (request: {
+    replacements: Array<{ entryId: string; message: any }>;
+  }) => Promise<TranscriptRewriteResult>;
+};
+
 export class HeadroomContextEngine {
   readonly info = {
     id: "headroom",
     name: "Headroom Context Compression",
     version: "0.1.0",
+    acceptedHostParams: ["runtimeContext"],
     ownsCompaction: true,
   };
 
@@ -155,15 +174,16 @@ export class HeadroomContextEngine {
    * - Pipeline: compresses message content in place without dropping history
    * - CCR: stores originals for retrieval via headroom_retrieve tool
    *
-   * Zero LLM calls. All algorithmic. The compacted message records are written
-   * back to the supplied OpenClaw JSONL session file.
+   * Zero LLM calls. All algorithmic. Persistence is delegated to OpenClaw's
+   * runtime-owned transcript rewrite operation so it remains serialized with
+   * concurrent session appends.
    */
   async compact(params: {
     sessionId: string;
     sessionFile: string;
     tokenBudget?: number;
     force?: boolean;
-    runtimeContext?: any;
+    runtimeContext?: HeadroomRuntimeContext;
   }): Promise<{
     ok: boolean;
     compacted: boolean;
@@ -177,11 +197,20 @@ export class HeadroomContextEngine {
       return { ok: false, compacted: false, reason: "Proxy not available" };
     }
 
+    const rewriteTranscriptEntries = params.runtimeContext?.rewriteTranscriptEntries;
+    if (!rewriteTranscriptEntries) {
+      return {
+        ok: false,
+        compacted: false,
+        reason:
+          "OpenClaw did not provide its serialized transcript rewrite capability; refusing an unsafe file replacement",
+      };
+    }
+
     try {
       const sessionContent = await readFile(params.sessionFile, "utf8");
-      const lineEnding = sessionContent.includes("\r\n") ? "\r\n" : "\n";
       const lines = sessionContent.split(/\r?\n/);
-      const records: Array<{ index: number; value: Record<string, any> }> = [];
+      const records: Array<{ entryId: string; value: Record<string, any> }> = [];
 
       for (const [index, line] of lines.entries()) {
         if (!line.trim()) continue;
@@ -199,7 +228,12 @@ export class HeadroomContextEngine {
           typeof value.message === "object" &&
           !Array.isArray(value.message)
         ) {
-          records.push({ index, value });
+          if (typeof value.id !== "string" || value.id.trim().length === 0) {
+            throw new Error(
+              `Message record at line ${index + 1} has no stable entry id; refusing transcript rewrite`,
+            );
+          }
+          records.push({ entryId: value.id, value });
         }
       }
 
@@ -245,25 +279,27 @@ export class HeadroomContextEngine {
         };
       }
 
-      const outputLines = [...lines];
-      records.forEach(({ index, value }, messageIndex) => {
-        outputLines[index] = JSON.stringify({
-          ...value,
+      const rewriteResult = await rewriteTranscriptEntries({
+        replacements: records.map(({ entryId, value }, messageIndex) => ({
+          entryId,
           message: {
             ...value.message,
             ...compactedMessages[messageIndex],
           },
-        });
+        })),
       });
-
-      // Replace the transcript atomically so a failed write cannot leave a
-      // partially compacted session that OpenClaw can no longer parse.
-      const temporaryFile = `${params.sessionFile}.headroom.tmp`;
-      try {
-        await writeFile(temporaryFile, outputLines.join(lineEnding), "utf8");
-        await rename(temporaryFile, params.sessionFile);
-      } finally {
-        await rm(temporaryFile, { force: true }).catch(() => undefined);
+      if (!rewriteResult.changed || rewriteResult.rewrittenEntries !== records.length) {
+        return {
+          ok: false,
+          compacted: rewriteResult.changed,
+          reason:
+            rewriteResult.reason ??
+            `OpenClaw rewrote ${rewriteResult.rewrittenEntries} of ${records.length} message records`,
+          result: {
+            tokensBefore: result.tokensBefore,
+            tokensAfter: rewriteResult.changed ? result.tokensAfter : result.tokensBefore,
+          },
+        };
       }
 
       this.stats.compactions++;

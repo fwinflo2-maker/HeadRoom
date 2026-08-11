@@ -4,10 +4,361 @@ var __export = (target, all) => {
     __defProp(target, name, { get: all[name], enumerable: true });
 };
 
+// src/urls.ts
+function stripTrailingSlashes(url2) {
+  let end = url2.length;
+  while (end > 0 && url2.charCodeAt(end - 1) === 47) {
+    end -= 1;
+  }
+  return url2.slice(0, end);
+}
+
+// src/retrieve.ts
+var _proxyUrlCache = null;
+function setDefaultProxyUrl(url2) {
+  _proxyUrlCache = url2;
+}
+function getDefaultProxyUrl() {
+  return _proxyUrlCache ?? process.env.HEADROOM_BASE_URL ?? "http://localhost:8787";
+}
+function createHeadroomRetrieveTool(config2) {
+  const origin = stripTrailingSlashes(config2.proxyBaseUrl);
+  return {
+    name: "headroom_retrieve",
+    description: "Retrieve original uncompressed content from Headroom's compression store. Use when compressed context mentions a hash and you need the full details. Pass the hash from the compression marker (24 hex characters). Retrieval is by hash and always returns the full original content.",
+    parameters: {
+      type: "object",
+      properties: {
+        hash: {
+          type: "string",
+          description: "The 24-character hex hash from the compression marker"
+        }
+      },
+      required: ["hash"]
+    },
+    execute: async (args) => {
+      const { hash: hash2 } = args;
+      if (!/^[a-f0-9]{24}$/i.test(hash2)) {
+        return JSON.stringify({
+          error: "Invalid hash format. Expected 24 hex characters."
+        });
+      }
+      try {
+        const url2 = `${origin}/v1/retrieve/${hash2}`;
+        const resp = await fetch(url2, {
+          signal: AbortSignal.timeout(1e4)
+        });
+        if (!resp.ok) {
+          const body = await resp.text().catch(() => "");
+          return JSON.stringify({
+            error: `Retrieval failed: HTTP ${resp.status}`,
+            details: body
+          });
+        }
+        const data = await resp.json();
+        return typeof data === "string" ? data : JSON.stringify(data);
+      } catch (error45) {
+        return JSON.stringify({
+          error: `Retrieval failed: ${error45}`,
+          hint: "The compressed content may have expired (default TTL: 5 minutes)"
+        });
+      }
+    }
+  };
+}
+async function compressWithHeadroom(messages, options = {}) {
+  const { compress } = await import("headroom-ai");
+  return compress(messages, {
+    baseUrl: options.proxyUrl ?? getDefaultProxyUrl(),
+    model: options.model ?? "gpt-4o",
+    tokenBudget: options.tokenBudget,
+    stack: "opencode"
+  });
+}
+
+// src/transport.ts
+import { createRequire, syncBuiltinESMExports } from "module";
+var nodeRequire = createRequire(import.meta.url);
+var http = nodeRequire("node:http");
+var https = nodeRequire("node:https");
+var http2 = nodeRequire("node:http2");
+var BASE_URL_HEADER = "x-headroom-base-url";
+var ORIGINAL_PATH_HEADER = "x-headroom-original-path";
+var STATE_KEY = /* @__PURE__ */ Symbol.for("headroom.opencode.transport");
+function getState() {
+  return globalThis[STATE_KEY];
+}
+function setState(state) {
+  globalThis[STATE_KEY] = state;
+}
+function normalizeProxyUrl(proxyUrl) {
+  return new URL(proxyUrl);
+}
+function isLoopback(hostname3) {
+  const normalized = hostname3.toLowerCase().replace(/^\[|\]$/g, "");
+  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+}
+function shouldRoute(url2, proxy) {
+  if (url2.protocol !== "http:" && url2.protocol !== "https:") {
+    return false;
+  }
+  if (isLoopback(url2.hostname)) {
+    return false;
+  }
+  if (url2.origin === proxy.origin) {
+    return false;
+  }
+  return true;
+}
+function routedUrl(upstream, proxy) {
+  return new URL(`${upstream.pathname}${upstream.search}`, proxy.origin);
+}
+function normalizedOpenAiProxyPath(pathname) {
+  if (pathname.endsWith("/chat/completions")) {
+    return "/v1/chat/completions";
+  }
+  if (pathname.endsWith("/responses")) {
+    return "/v1/responses";
+  }
+  return void 0;
+}
+function routedUrlForOpenCode(upstream, proxy) {
+  const normalizedPath = normalizedOpenAiProxyPath(upstream.pathname);
+  if (!normalizedPath) {
+    return {
+      url: routedUrl(upstream, proxy),
+      originalPath: void 0
+    };
+  }
+  return {
+    url: new URL(`${normalizedPath}${upstream.search}`, proxy.origin),
+    originalPath: upstream.pathname
+  };
+}
+function requestUrl(input) {
+  if (input instanceof Request) {
+    return new URL(input.url);
+  }
+  if (input instanceof URL) {
+    return input;
+  }
+  return new URL(String(input));
+}
+function mergeFetchHeaders(input, init, upstream, originalPath = void 0) {
+  const headers = new Headers(input instanceof Request ? input.headers : void 0);
+  if (init?.headers) {
+    new Headers(init.headers).forEach((value, key) => headers.set(key, value));
+  }
+  if (upstream) {
+    headers.set(BASE_URL_HEADER, upstream.origin);
+    headers.delete("host");
+  }
+  if (originalPath) {
+    headers.set(ORIGINAL_PATH_HEADER, originalPath);
+  }
+  return headers;
+}
+function withRoutedFetchInput(input, init, proxy) {
+  const upstream = requestUrl(input);
+  if (!shouldRoute(upstream, proxy)) {
+    return [input, init];
+  }
+  const { url: nextUrl, originalPath } = routedUrlForOpenCode(upstream, proxy);
+  const nextInit = {
+    ...init,
+    headers: mergeFetchHeaders(input, init, upstream, originalPath)
+  };
+  if (input instanceof Request) {
+    return [new Request(nextUrl, input), nextInit];
+  }
+  return [nextUrl, nextInit];
+}
+function splitNodeArgs(args) {
+  const callback = typeof args.at(-1) === "function" ? args.at(-1) : void 0;
+  const withoutCallback = callback ? args.slice(0, -1) : args;
+  const [first, second] = withoutCallback;
+  const options = typeof second === "object" && second !== null ? { ...second } : {};
+  if (first instanceof URL) {
+    return { url: first, options, callback };
+  }
+  if (typeof first === "string") {
+    try {
+      return { url: new URL(first), options, callback };
+    } catch {
+      return { options, callback };
+    }
+  }
+  if (typeof first === "object" && first !== null) {
+    const requestOptions = { ...first, ...options };
+    return { url: urlFromRequestOptions(requestOptions), options: requestOptions, callback };
+  }
+  return { options, callback };
+}
+function urlFromRequestOptions(options) {
+  const protocol = String(options.protocol ?? "http:");
+  if (protocol !== "http:" && protocol !== "https:") {
+    return void 0;
+  }
+  const hostValue = options.hostname ?? options.host;
+  if (!hostValue) {
+    return void 0;
+  }
+  const hostname3 = String(hostValue).replace(/:\d+$/, "");
+  const port = options.port ? `:${String(options.port)}` : "";
+  const path2 = String(options.path ?? "/");
+  try {
+    return new URL(`${protocol}//${hostname3}${port}${path2}`);
+  } catch {
+    return void 0;
+  }
+}
+function headersForNodeRequest(options, upstream, originalPath) {
+  const headers = new Headers(options.headers);
+  headers.set(BASE_URL_HEADER, upstream.origin);
+  if (originalPath) {
+    headers.set(ORIGINAL_PATH_HEADER, originalPath);
+  }
+  headers.delete("host");
+  const result = {};
+  headers.forEach((value, key) => {
+    result[key] = value;
+  });
+  return result;
+}
+function routedNodeOptions(parts, proxy) {
+  if (!parts.url || !shouldRoute(parts.url, proxy)) {
+    return void 0;
+  }
+  const { url: nextUrl, originalPath } = routedUrlForOpenCode(parts.url, proxy);
+  const {
+    agent: _agent,
+    auth: _auth,
+    createConnection: _createConnection,
+    defaultPort: _defaultPort,
+    family: _family,
+    headers: _headers,
+    host: _host,
+    hostname: _hostname,
+    href: _href,
+    lookup: _lookup,
+    path: _path,
+    pathname: _pathname,
+    port: _port,
+    protocol: _protocol,
+    search: _search,
+    servername: _servername,
+    setHost: _setHost,
+    ...rest
+  } = parts.options;
+  return {
+    ...rest,
+    protocol: nextUrl.protocol,
+    hostname: nextUrl.hostname,
+    port: nextUrl.port || void 0,
+    path: `${nextUrl.pathname}${nextUrl.search}`,
+    headers: headersForNodeRequest(parts.options, parts.url, originalPath)
+  };
+}
+function wrapRequest(originalHttpRequest, originalHttpsRequest, originalRequest) {
+  return function headroomRequest(...args) {
+    const state = getState();
+    if (!state) {
+      return Reflect.apply(originalRequest, this, args);
+    }
+    const proxy = normalizeProxyUrl(state.proxyUrl);
+    const parts = splitNodeArgs(args);
+    const nextOptions = routedNodeOptions(parts, proxy);
+    if (!nextOptions) {
+      return Reflect.apply(originalRequest, this, args);
+    }
+    const targetRequest = proxy.protocol === "https:" ? originalHttpsRequest : originalHttpRequest;
+    const nextArgs = parts.callback ? [nextOptions, parts.callback] : [nextOptions];
+    return Reflect.apply(targetRequest, this, nextArgs);
+  };
+}
+function wrapGet(request) {
+  return function headroomGet(...args) {
+    const req = Reflect.apply(request, this, args);
+    req.end();
+    return req;
+  };
+}
+function wrapHttp2Connect(originalConnect) {
+  return function headroomHttp2Connect(authority, ...args) {
+    const state = getState();
+    if (state) {
+      const proxy = normalizeProxyUrl(state.proxyUrl);
+      const upstream = authority instanceof URL ? authority : new URL(String(authority));
+      if (shouldRoute(upstream, proxy)) {
+        throw new Error(
+          `Headroom OpenCode wrap blocked direct HTTP/2 connection to ${upstream.origin}. Use fetch, http, or https so traffic can be routed through Headroom.`
+        );
+      }
+    }
+    return Reflect.apply(originalConnect, this, [authority, ...args]);
+  };
+}
+function installHeadroomTransport(options) {
+  const existing = getState();
+  if (existing) {
+    existing.refs += 1;
+    existing.proxyUrl = options.proxyUrl;
+    existing.debug = Boolean(options.debug);
+    return () => uninstallHeadroomTransport();
+  }
+  const state = {
+    refs: 1,
+    proxyUrl: options.proxyUrl,
+    debug: Boolean(options.debug),
+    originalFetch: globalThis.fetch,
+    originalHttpRequest: http.request,
+    originalHttpGet: http.get,
+    originalHttpsRequest: https.request,
+    originalHttpsGet: https.get,
+    originalHttp2Connect: http2.connect
+  };
+  setState(state);
+  globalThis.fetch = async (...args) => {
+    const current = getState();
+    if (!current) {
+      return state.originalFetch(...args);
+    }
+    const proxy = normalizeProxyUrl(current.proxyUrl);
+    const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy);
+    return state.originalFetch(nextInput, nextInit);
+  };
+  http.request = wrapRequest(state.originalHttpRequest, state.originalHttpsRequest, state.originalHttpRequest);
+  https.request = wrapRequest(state.originalHttpRequest, state.originalHttpsRequest, state.originalHttpsRequest);
+  http.get = wrapGet(http.request);
+  https.get = wrapGet(https.request);
+  http2.connect = wrapHttp2Connect(state.originalHttp2Connect);
+  syncBuiltinESMExports();
+  return () => uninstallHeadroomTransport();
+}
+function uninstallHeadroomTransport() {
+  const state = getState();
+  if (!state) {
+    return;
+  }
+  state.refs -= 1;
+  if (state.refs > 0) {
+    return;
+  }
+  globalThis.fetch = state.originalFetch;
+  http.request = state.originalHttpRequest;
+  http.get = state.originalHttpGet;
+  https.request = state.originalHttpsRequest;
+  https.get = state.originalHttpsGet;
+  http2.connect = state.originalHttp2Connect;
+  syncBuiltinESMExports();
+  setState(void 0);
+}
+
 // src/plugin.ts
 import { mkdir, unlink, writeFile } from "fs/promises";
 import os from "os";
 import path from "path";
+import { tool } from "@opencode-ai/plugin";
 
 // node_modules/zod/v4/classic/external.js
 var external_exports = {};
@@ -2956,8 +3307,8 @@ var $ZodObjectJIT = /* @__PURE__ */ $constructor("$ZodObjectJIT", (inst, def) =>
             path: iss.path ? [${k}, ...iss.path] : [${k}]
           })));
         }
-        
-        
+
+
         if (${id}.value === undefined) {
           if (${k} in input) {
             newResult[${k}] = undefined;
@@ -2965,7 +3316,7 @@ var $ZodObjectJIT = /* @__PURE__ */ $constructor("$ZodObjectJIT", (inst, def) =>
         } else {
           newResult[${k}] = ${id}.value;
         }
-        
+
       `);
     }
     doc.write(`payload.value = newResult;`);
@@ -12425,350 +12776,6 @@ function date4(params) {
 // node_modules/zod/v4/classic/external.js
 config(en_default());
 
-// node_modules/@opencode-ai/plugin/dist/tool.js
-function tool(input) {
-  return input;
-}
-tool.schema = external_exports;
-
-// src/urls.ts
-function stripTrailingSlashes(url2) {
-  let end = url2.length;
-  while (end > 0 && url2.charCodeAt(end - 1) === 47) {
-    end -= 1;
-  }
-  return url2.slice(0, end);
-}
-
-// src/retrieve.ts
-var _proxyUrlCache = null;
-function getDefaultProxyUrl() {
-  return _proxyUrlCache ?? process.env.HEADROOM_BASE_URL ?? "http://localhost:8787";
-}
-function createHeadroomRetrieveTool(config2) {
-  const origin = stripTrailingSlashes(config2.proxyBaseUrl);
-  return {
-    name: "headroom_retrieve",
-    description: "Retrieve original uncompressed content from Headroom's compression store. Use when compressed context mentions a hash and you need the full details. Pass the hash from the compression marker (24 hex characters). Retrieval is by hash and always returns the full original content.",
-    parameters: {
-      type: "object",
-      properties: {
-        hash: {
-          type: "string",
-          description: "The 24-character hex hash from the compression marker"
-        }
-      },
-      required: ["hash"]
-    },
-    execute: async (args) => {
-      const { hash: hash2 } = args;
-      if (!/^[a-f0-9]{24}$/i.test(hash2)) {
-        return JSON.stringify({
-          error: "Invalid hash format. Expected 24 hex characters."
-        });
-      }
-      try {
-        const url2 = `${origin}/v1/retrieve/${hash2}`;
-        const resp = await fetch(url2, {
-          signal: AbortSignal.timeout(1e4)
-        });
-        if (!resp.ok) {
-          const body = await resp.text().catch(() => "");
-          return JSON.stringify({
-            error: `Retrieval failed: HTTP ${resp.status}`,
-            details: body
-          });
-        }
-        const data = await resp.json();
-        return typeof data === "string" ? data : JSON.stringify(data);
-      } catch (error45) {
-        return JSON.stringify({
-          error: `Retrieval failed: ${error45}`,
-          hint: "The compressed content may have expired (default TTL: 30 minutes)"
-        });
-      }
-    }
-  };
-}
-
-// src/transport.ts
-import { createRequire, syncBuiltinESMExports } from "module";
-var nodeRequire = createRequire(import.meta.url);
-var http = nodeRequire("node:http");
-var https = nodeRequire("node:https");
-var http2 = nodeRequire("node:http2");
-var BASE_URL_HEADER = "x-headroom-base-url";
-var ORIGINAL_PATH_HEADER = "x-headroom-original-path";
-var STATE_KEY = /* @__PURE__ */ Symbol.for("headroom.opencode.transport");
-function getState() {
-  return globalThis[STATE_KEY];
-}
-function setState(state) {
-  globalThis[STATE_KEY] = state;
-}
-function normalizeProxyUrl(proxyUrl) {
-  return new URL(proxyUrl);
-}
-function isLoopback(hostname3) {
-  const normalized = hostname3.toLowerCase().replace(/^\[|\]$/g, "");
-  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
-}
-function shouldRoute(url2, proxy) {
-  if (url2.protocol !== "http:" && url2.protocol !== "https:") {
-    return false;
-  }
-  if (isLoopback(url2.hostname)) {
-    return false;
-  }
-  if (url2.origin === proxy.origin) {
-    return false;
-  }
-  return true;
-}
-function routedUrl(upstream, proxy) {
-  return new URL(`${upstream.pathname}${upstream.search}`, proxy.origin);
-}
-function normalizedOpenAiProxyPath(pathname) {
-  if (pathname.endsWith("/chat/completions")) {
-    return "/v1/chat/completions";
-  }
-  if (pathname.endsWith("/responses")) {
-    return "/v1/responses";
-  }
-  return void 0;
-}
-function routedUrlForOpenCode(upstream, proxy) {
-  const normalizedPath = normalizedOpenAiProxyPath(upstream.pathname);
-  if (!normalizedPath) {
-    return {
-      url: routedUrl(upstream, proxy),
-      originalPath: void 0
-    };
-  }
-  return {
-    url: new URL(`${normalizedPath}${upstream.search}`, proxy.origin),
-    originalPath: upstream.pathname
-  };
-}
-function requestUrl(input) {
-  if (input instanceof Request) {
-    return new URL(input.url);
-  }
-  if (input instanceof URL) {
-    return input;
-  }
-  return new URL(String(input));
-}
-function mergeFetchHeaders(input, init, upstream, originalPath = void 0) {
-  const headers = new Headers(input instanceof Request ? input.headers : void 0);
-  if (init?.headers) {
-    new Headers(init.headers).forEach((value, key) => headers.set(key, value));
-  }
-  if (upstream) {
-    headers.set(BASE_URL_HEADER, upstream.origin);
-    headers.delete("host");
-  }
-  if (originalPath) {
-    headers.set(ORIGINAL_PATH_HEADER, originalPath);
-  }
-  return headers;
-}
-function withRoutedFetchInput(input, init, proxy) {
-  const upstream = requestUrl(input);
-  if (!shouldRoute(upstream, proxy)) {
-    return [input, init];
-  }
-  const { url: nextUrl, originalPath } = routedUrlForOpenCode(upstream, proxy);
-  const nextInit = {
-    ...init,
-    headers: mergeFetchHeaders(input, init, upstream, originalPath)
-  };
-  if (input instanceof Request) {
-    return [new Request(nextUrl, input), nextInit];
-  }
-  return [nextUrl, nextInit];
-}
-function splitNodeArgs(args) {
-  const callback = typeof args.at(-1) === "function" ? args.at(-1) : void 0;
-  const withoutCallback = callback ? args.slice(0, -1) : args;
-  const [first, second] = withoutCallback;
-  const options = typeof second === "object" && second !== null ? { ...second } : {};
-  if (first instanceof URL) {
-    return { url: first, options, callback };
-  }
-  if (typeof first === "string") {
-    try {
-      return { url: new URL(first), options, callback };
-    } catch {
-      return { options, callback };
-    }
-  }
-  if (typeof first === "object" && first !== null) {
-    const requestOptions = { ...first, ...options };
-    return { url: urlFromRequestOptions(requestOptions), options: requestOptions, callback };
-  }
-  return { options, callback };
-}
-function urlFromRequestOptions(options) {
-  const protocol = String(options.protocol ?? "http:");
-  if (protocol !== "http:" && protocol !== "https:") {
-    return void 0;
-  }
-  const hostValue = options.hostname ?? options.host;
-  if (!hostValue) {
-    return void 0;
-  }
-  const hostname3 = String(hostValue).replace(/:\d+$/, "");
-  const port = options.port ? `:${String(options.port)}` : "";
-  const path2 = String(options.path ?? "/");
-  try {
-    return new URL(`${protocol}//${hostname3}${port}${path2}`);
-  } catch {
-    return void 0;
-  }
-}
-function headersForNodeRequest(options, upstream, originalPath) {
-  const headers = new Headers(options.headers);
-  headers.set(BASE_URL_HEADER, upstream.origin);
-  if (originalPath) {
-    headers.set(ORIGINAL_PATH_HEADER, originalPath);
-  }
-  headers.delete("host");
-  const result = {};
-  headers.forEach((value, key) => {
-    result[key] = value;
-  });
-  return result;
-}
-function routedNodeOptions(parts, proxy) {
-  if (!parts.url || !shouldRoute(parts.url, proxy)) {
-    return void 0;
-  }
-  const { url: nextUrl, originalPath } = routedUrlForOpenCode(parts.url, proxy);
-  const {
-    agent: _agent,
-    auth: _auth,
-    createConnection: _createConnection,
-    defaultPort: _defaultPort,
-    family: _family,
-    headers: _headers,
-    host: _host,
-    hostname: _hostname,
-    href: _href,
-    lookup: _lookup,
-    path: _path,
-    pathname: _pathname,
-    port: _port,
-    protocol: _protocol,
-    search: _search,
-    servername: _servername,
-    setHost: _setHost,
-    ...rest
-  } = parts.options;
-  return {
-    ...rest,
-    protocol: nextUrl.protocol,
-    hostname: nextUrl.hostname,
-    port: nextUrl.port || void 0,
-    path: `${nextUrl.pathname}${nextUrl.search}`,
-    headers: headersForNodeRequest(parts.options, parts.url, originalPath)
-  };
-}
-function wrapRequest(originalHttpRequest, originalHttpsRequest, originalRequest) {
-  return function headroomRequest(...args) {
-    const state = getState();
-    if (!state) {
-      return Reflect.apply(originalRequest, this, args);
-    }
-    const proxy = normalizeProxyUrl(state.proxyUrl);
-    const parts = splitNodeArgs(args);
-    const nextOptions = routedNodeOptions(parts, proxy);
-    if (!nextOptions) {
-      return Reflect.apply(originalRequest, this, args);
-    }
-    const targetRequest = proxy.protocol === "https:" ? originalHttpsRequest : originalHttpRequest;
-    const nextArgs = parts.callback ? [nextOptions, parts.callback] : [nextOptions];
-    return Reflect.apply(targetRequest, this, nextArgs);
-  };
-}
-function wrapGet(request) {
-  return function headroomGet(...args) {
-    const req = Reflect.apply(request, this, args);
-    req.end();
-    return req;
-  };
-}
-function wrapHttp2Connect(originalConnect) {
-  return function headroomHttp2Connect(authority, ...args) {
-    const state = getState();
-    if (state) {
-      const proxy = normalizeProxyUrl(state.proxyUrl);
-      const upstream = authority instanceof URL ? authority : new URL(String(authority));
-      if (shouldRoute(upstream, proxy)) {
-        throw new Error(
-          `Headroom OpenCode wrap blocked direct HTTP/2 connection to ${upstream.origin}. Use fetch, http, or https so traffic can be routed through Headroom.`
-        );
-      }
-    }
-    return Reflect.apply(originalConnect, this, [authority, ...args]);
-  };
-}
-function installHeadroomTransport(options) {
-  const existing = getState();
-  if (existing) {
-    existing.refs += 1;
-    existing.proxyUrl = options.proxyUrl;
-    existing.debug = Boolean(options.debug);
-    return () => uninstallHeadroomTransport();
-  }
-  const state = {
-    refs: 1,
-    proxyUrl: options.proxyUrl,
-    debug: Boolean(options.debug),
-    originalFetch: globalThis.fetch,
-    originalHttpRequest: http.request,
-    originalHttpGet: http.get,
-    originalHttpsRequest: https.request,
-    originalHttpsGet: https.get,
-    originalHttp2Connect: http2.connect
-  };
-  setState(state);
-  globalThis.fetch = async (...args) => {
-    const current = getState();
-    if (!current) {
-      return state.originalFetch(...args);
-    }
-    const proxy = normalizeProxyUrl(current.proxyUrl);
-    const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy);
-    return state.originalFetch(nextInput, nextInit);
-  };
-  http.request = wrapRequest(state.originalHttpRequest, state.originalHttpsRequest, state.originalHttpRequest);
-  https.request = wrapRequest(state.originalHttpRequest, state.originalHttpsRequest, state.originalHttpsRequest);
-  http.get = wrapGet(http.request);
-  https.get = wrapGet(https.request);
-  http2.connect = wrapHttp2Connect(state.originalHttp2Connect);
-  syncBuiltinESMExports();
-  return () => uninstallHeadroomTransport();
-}
-function uninstallHeadroomTransport() {
-  const state = getState();
-  if (!state) {
-    return;
-  }
-  state.refs -= 1;
-  if (state.refs > 0) {
-    return;
-  }
-  globalThis.fetch = state.originalFetch;
-  http.request = state.originalHttpRequest;
-  http.get = state.originalHttpGet;
-  https.request = state.originalHttpsRequest;
-  https.get = state.originalHttpsGet;
-  http2.connect = state.originalHttp2Connect;
-  syncBuiltinESMExports();
-  setState(void 0);
-}
-
 // src/plugin.ts
 function normalizeProxyUrl2(url2) {
   return stripTrailingSlashes(url2);
@@ -12945,6 +12952,14 @@ var HeadroomPlugin = async (input, options = {}) => {
     }
   };
 };
+
 export {
-  HeadroomPlugin as default
+  stripTrailingSlashes,
+  setDefaultProxyUrl,
+  getDefaultProxyUrl,
+  createHeadroomRetrieveTool,
+  compressWithHeadroom,
+  installHeadroomTransport,
+  HeadroomPlugin
 };
+//# sourceMappingURL=chunk-O36TDGAF.js.map

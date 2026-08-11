@@ -1,5 +1,4 @@
 import childProcess from "node:child_process";
-import fs from "node:fs";
 import http from "node:http";
 import http2 from "node:http2";
 import https from "node:https";
@@ -297,68 +296,8 @@ describe("Headroom OpenCode transport", () => {
     );
   });
 
-  it("preloads the Headroom shim into child Node processes", () => {
+  it("does not poison the Node environment of the host or child processes", () => {
     const originalNodeOptions = process.env.NODE_OPTIONS;
-    const originalProxyUrl = process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL;
-
-    try {
-      process.env.NODE_OPTIONS = "--trace-warnings";
-      delete process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL;
-
-      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
-
-      expect(process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL).toBe("http://127.0.0.1:8787/v1");
-      expect(process.env.NODE_OPTIONS).toContain("--trace-warnings");
-      expect(process.env.NODE_OPTIONS).toContain("--import=file:");
-      expect(process.env.NODE_OPTIONS).toContain("/hook-shim/handler.js");
-
-      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
-      expect(process.env.NODE_OPTIONS?.match(/hook-shim\/handler\.js/g)).toHaveLength(1);
-    } finally {
-      if (originalNodeOptions === undefined) {
-        delete process.env.NODE_OPTIONS;
-      } else {
-        process.env.NODE_OPTIONS = originalNodeOptions;
-      }
-      if (originalProxyUrl === undefined) {
-        delete process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL;
-      } else {
-        process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL = originalProxyUrl;
-      }
-      uninstallHeadroomTransport();
-    }
-  });
-
-  it("skips the shim preload when the bundle ships without it (#2798)", () => {
-    const originalNodeOptions = process.env.NODE_OPTIONS;
-    const originalSpawn = childProcess.spawn;
-    const spawnMock = vi.fn(() => ({ on: vi.fn(), kill: vi.fn(), pid: 123 }));
-    childProcess.spawn = spawnMock as unknown as typeof childProcess.spawn;
-    vi.spyOn(fs, "existsSync").mockReturnValue(false);
-
-    try {
-      process.env.NODE_OPTIONS = "--trace-warnings";
-      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
-
-      // A missing --import target aborts the child before it speaks JSON-RPC,
-      // which OpenCode reports as `MCP error -32000: Connection closed`.
-      expect(process.env.NODE_OPTIONS).toBe("--trace-warnings");
-
-      childProcess.spawn("npx", ["-y", "firecrawl-mcp"]);
-      const options = (spawnMock.mock.calls[0] as unknown[])[2] as { env: NodeJS.ProcessEnv };
-      expect(options.env.NODE_OPTIONS).not.toContain("--import");
-    } finally {
-      if (originalNodeOptions === undefined) {
-        delete process.env.NODE_OPTIONS;
-      } else {
-        process.env.NODE_OPTIONS = originalNodeOptions;
-      }
-      childProcess.spawn = originalSpawn;
-      uninstallHeadroomTransport();
-    }
-  });
-
-  it("injects the Headroom shim into child processes with custom env", () => {
     const originalSpawn = childProcess.spawn;
     const spawnMock = vi.fn(() => ({
       on: vi.fn(),
@@ -368,19 +307,31 @@ describe("Headroom OpenCode transport", () => {
       killed: false,
       pid: 123,
     }));
-    childProcess.spawn = spawnMock as unknown as typeof childProcess.spawn;
 
     try {
-      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
-      childProcess.spawn("node", ["agent.js"], { env: { PATH: "/bin", NODE_OPTIONS: "--trace-warnings" } });
+      process.env.NODE_OPTIONS = "--trace-warnings";
+      childProcess.spawn = spawnMock as unknown as typeof childProcess.spawn;
 
+      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+
+      // The host process env must be left untouched: no --import shim, no proxy env leak.
+      expect(process.env.NODE_OPTIONS).toBe("--trace-warnings");
+      expect(process.env.NODE_OPTIONS).not.toContain("--import");
+      expect(process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL).toBeUndefined();
+
+      // child_process.spawn must not be patched, so children inherit a clean env.
+      expect(childProcess.spawn).toBe(spawnMock);
+      childProcess.spawn("node", ["agent.js"], { env: { PATH: "/bin", NODE_OPTIONS: "--trace-warnings" } });
       const options = (spawnMock.mock.calls[0] as unknown[])[2] as { env: NodeJS.ProcessEnv };
-      expect(options.env.PATH).toBe("/bin");
-      expect(options.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL).toBe("http://127.0.0.1:8787/v1");
-      expect(options.env.NODE_OPTIONS).toContain("--trace-warnings");
-      expect(options.env.NODE_OPTIONS).toContain("--import=file:");
-      expect(options.env.NODE_OPTIONS).toContain("/hook-shim/handler.js");
+      expect(options.env.NODE_OPTIONS).toBe("--trace-warnings");
+      expect(options.env.NODE_OPTIONS).not.toContain("--import");
+      expect(options.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL).toBeUndefined();
     } finally {
+      if (originalNodeOptions === undefined) {
+        delete process.env.NODE_OPTIONS;
+      } else {
+        process.env.NODE_OPTIONS = originalNodeOptions;
+      }
       uninstallHeadroomTransport();
       childProcess.spawn = originalSpawn;
     }

@@ -166,7 +166,7 @@ def test_error_on_bad_status_hides_body(idp):
 def test_error_body_drain_failure_is_sanitized(monkeypatch, caplog):
     class _UnreadableHTTPError(HTTPError):
         def read(self):
-            raise OSError("connection closed")
+            raise RuntimeError("SENSITIVE")
 
     def fail(*_args, **_kwargs):
         raise _UnreadableHTTPError("https://idp.example/token", 503, "unavailable", {}, None)
@@ -177,9 +177,10 @@ def test_error_body_drain_failure_is_sanitized(monkeypatch, caplog):
         token_url="https://idp.example/token", client_id="c", client_secret="s"
     )
 
-    with pytest.raises(OAuth2Error, match="HTTP 503"):
+    with pytest.raises(OAuth2Error, match="HTTP 503") as exc_info:
         p.token()
-    assert "connection closed" in caplog.text
+    assert "SENSITIVE" not in str(exc_info.value)
+    assert "SENSITIVE" not in caplog.text
 
 
 def test_malformed_200_no_token(idp):

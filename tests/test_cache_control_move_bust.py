@@ -308,3 +308,61 @@ def test_normalize_mirror_skips_string_content_positions():
     out = normalize_message_cache_control(merged, client_messages=client)
     assert _markers(out) == 1
     assert "cache_control" in out[1]["content"][-1]
+
+
+# ── fix-5: block-level mirroring (multiple client markers in one message) ────
+
+
+def test_normalize_mirrors_multiple_markers_within_one_message():
+    """A 2-message request where the client marks TWO blocks of message 0
+    (Claude Code's pattern on large first messages) keeps all three markers."""
+    big = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "part-1", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "part-2"},
+            {"type": "text", "text": "part-3", "cache_control": {"type": "ephemeral"}},
+        ],
+    }
+    client = [big, B("user", "follow-up", cc=True)]
+    # Forwarded form: an extra replay leftover on message 1's sibling... use
+    # identical structure with markers everywhere to prove selective stripping.
+    merged = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "part-1", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "part-2", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "part-3", "cache_control": {"type": "ephemeral"}},
+            ],
+        },
+        B("user", "follow-up", cc=True),
+    ]
+    out = normalize_message_cache_control(merged, client_messages=client)
+    assert _markers(out) == 3
+    assert "cache_control" in out[0]["content"][0]
+    assert "cache_control" not in out[0]["content"][1]
+    assert "cache_control" in out[0]["content"][2]
+    assert "cache_control" in out[1]["content"][-1]
+    assert _strip_cache_control(out) == _strip_cache_control(merged)
+
+
+def test_normalize_mirror_clamps_out_of_range_block_index():
+    # Client marked block 2; forwarded message only has 1 block (transform
+    # merged content) — marker falls back to the last block, not dropped.
+    client = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "a"},
+                {"type": "text", "text": "b"},
+                {"type": "text", "text": "c", "cache_control": {"type": "ephemeral"}},
+            ],
+        },
+        B("user", "tail", cc=True),
+    ]
+    merged = [B("user", "abc-merged"), B("user", "tail", cc=True)]
+    out = normalize_message_cache_control(merged, client_messages=client)
+    assert _markers(out) == 2
+    assert "cache_control" in out[0]["content"][-1]
+    assert "cache_control" in out[1]["content"][-1]

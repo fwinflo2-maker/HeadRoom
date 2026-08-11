@@ -635,23 +635,22 @@ def _breakpoint_index(
 
 def _client_marker_positions(
     client_messages: list[dict[str, Any]],
-) -> list[tuple[int, dict[str, Any]]]:
-    """Message indices where the CLIENT placed cache_control, with each marker.
+) -> list[tuple[int, int, dict[str, Any]]]:
+    """(message index, block index, marker) for every CLIENT cache_control.
 
-    One entry per marked message (the last marker in the message wins), in
-    message order. Only block-style content can carry markers.
+    Block-level, not one-per-message: clients mark multiple blocks within a
+    single long message (Claude Code does this on 1-2-message requests with a
+    large first message), and the ~20-block lookback applies within a message
+    just as it does across messages. Only block-style content carries markers.
     """
-    positions: list[tuple[int, dict[str, Any]]] = []
+    positions: list[tuple[int, int, dict[str, Any]]] = []
     for i, msg in enumerate(client_messages):
         content = msg.get("content") if isinstance(msg, dict) else None
         if not isinstance(content, list):
             continue
-        marker: dict[str, Any] | None = None
-        for b in content:
+        for bi, b in enumerate(content):
             if isinstance(b, dict) and isinstance(b.get("cache_control"), dict):
-                marker = b["cache_control"]
-        if marker is not None:
-            positions.append((i, marker))
+                positions.append((i, bi, b["cache_control"]))
     return positions
 
 
@@ -724,17 +723,30 @@ def normalize_message_cache_control(
         else:
             out.append(msg)
 
-    def _place(target_idx: int, marker: dict[str, Any], *, anchor: bool) -> bool:
+    def _place(
+        target_idx: int,
+        marker: dict[str, Any],
+        *,
+        anchor: bool,
+        block_idx: int | None = None,
+    ) -> bool:
         msg = out[target_idx]
         content = msg.get("content")
         if not isinstance(content, list) or not content:
             return False
         content = list(content)
-        breakpoint_index = (
-            _breakpoint_index(content, msg, target_idx, previous_forwarded_messages)
-            if anchor
-            else len(content) - 1
-        )
+        if block_idx is not None and 0 <= block_idx < len(content):
+            # Transforms can shift block indices (e.g. a dropped thinking
+            # block); a slightly-off placement still lands on a stable block
+            # in the same message, which is harmless — markers are not part
+            # of the provider's cache key.
+            breakpoint_index = block_idx
+        elif anchor:
+            breakpoint_index = _breakpoint_index(
+                content, msg, target_idx, previous_forwarded_messages
+            )
+        else:
+            breakpoint_index = len(content) - 1
         # Anthropic content blocks are dictionaries, but callers can still
         # supply mixed list content. Fall back to the newest block rather than
         # attempting ``**`` on a scalar stable-boundary element, and skip the
@@ -747,17 +759,30 @@ def normalize_message_cache_control(
         out[target_idx] = {**msg, "content": content}
         return True
 
-    # Preferred: mirror the client's marker positions 1:1. The transform
-    # pipeline preserves message count, so index alignment is the invariant;
-    # fall back to legacy consolidation if it ever does not hold, or when the
-    # client marked no messages (legacy still places one so the prefix caches).
+    # Preferred: mirror the client's marker positions 1:1, block-level. The
+    # transform pipeline preserves message count, so index alignment is the
+    # invariant; fall back to legacy consolidation if it ever does not hold,
+    # or when the client marked nothing (legacy still places one so the
+    # prefix caches). The newest client marker keeps stable-run anchoring
+    # when the client placed it on its message's final block (intent: "cache
+    # through the end"); an explicit mid-message marker is honored verbatim.
     if client_messages is not None and len(client_messages) == len(messages):
         positions = _client_marker_positions(client_messages)
         if positions:
             placed_any = False
-            newest_idx = positions[-1][0]
-            for idx, marker in positions:
-                placed_any = _place(idx, marker, anchor=(idx == newest_idx)) or placed_any
+            newest_mi, newest_bi, _ = positions[-1]
+            newest_client_content = client_messages[newest_mi].get("content")
+            newest_on_final_block = (
+                isinstance(newest_client_content, list)
+                and newest_bi == len(newest_client_content) - 1
+            )
+            for mi, bi, marker in positions:
+                is_newest = (mi, bi) == (newest_mi, newest_bi)
+                if is_newest and newest_on_final_block:
+                    placed = _place(mi, marker, anchor=True)
+                else:
+                    placed = _place(mi, marker, anchor=False, block_idx=bi)
+                placed_any = placed or placed_any
             if placed_any or changed:
                 return out
             return messages

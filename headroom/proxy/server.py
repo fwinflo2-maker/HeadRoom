@@ -4578,7 +4578,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         }
 
     # Telemetry endpoints (Data Flywheel)
-    @app.get("/v1/telemetry")
+    @app.get("/v1/telemetry", dependencies=[Depends(_require_loopback)])
     async def telemetry_stats():
         """Get telemetry statistics for the data flywheel.
 
@@ -4601,7 +4601,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         telemetry = get_telemetry_collector()
         return telemetry.get_stats()
 
-    @app.get("/v1/telemetry/export")
+    @app.get("/v1/telemetry/export", dependencies=[Depends(_require_loopback)])
     async def telemetry_export():
         """Export full telemetry data for aggregation.
 
@@ -4617,7 +4617,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         telemetry = get_telemetry_collector()
         return telemetry.export_stats()
 
-    @app.post("/v1/telemetry/import")
+    @app.post("/v1/telemetry/import", dependencies=[Depends(_require_loopback)])
     async def telemetry_import(request: Request):
         """Import telemetry data from another source.
 
@@ -4631,7 +4631,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         telemetry.import_stats(data)
         return {"status": "imported", "current_stats": telemetry.get_stats()}
 
-    @app.get("/v1/telemetry/tools")
+    @app.get("/v1/telemetry/tools", dependencies=[Depends(_require_loopback)])
     async def telemetry_tools():
         """Get telemetry statistics for all tracked tool signatures.
 
@@ -4647,7 +4647,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "tools": {sig_hash: stats.to_dict() for sig_hash, stats in all_stats.items()},
         }
 
-    @app.get("/v1/telemetry/tools/{signature_hash}")
+    @app.get("/v1/telemetry/tools/{signature_hash}", dependencies=[Depends(_require_loopback)])
     async def telemetry_tool_detail(signature_hash: str):
         """Get detailed telemetry for a specific tool signature.
 
@@ -4669,7 +4669,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         }
 
     # TOIN (Tool Output Intelligence Network) endpoints
-    @app.get("/v1/toin/stats")
+    @app.get("/v1/toin/stats", dependencies=[Depends(_require_loopback)])
     async def toin_stats():
         """Get overall TOIN statistics.
 
@@ -4687,7 +4687,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         toin = get_toin()
         return toin.get_stats()
 
-    @app.get("/v1/toin/patterns")
+    @app.get("/v1/toin/patterns", dependencies=[Depends(_require_loopback)])
     async def toin_patterns(limit: int = 20):
         """List TOIN patterns with most samples.
 
@@ -4742,7 +4742,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         return patterns_list[:limit]
 
-    @app.get("/v1/toin/pattern/{hash_prefix}")
+    @app.get("/v1/toin/pattern/{hash_prefix}", dependencies=[Depends(_require_loopback)])
     async def toin_pattern_detail(hash_prefix: str):
         """Get detailed TOIN pattern info by hash prefix.
 
@@ -4761,7 +4761,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # Search for pattern with matching hash prefix
         for sig_hash, pattern_dict in patterns_data.items():
             if sig_hash.startswith(hash_prefix):
-                return pattern_dict
+                # Keep this response aligned with /v1/toin/patterns while
+                # excluding query text, field semantics, and other internal
+                # learning state from the detail endpoint.
+                return {
+                    "compressions": pattern_dict.get("total_compressions", 0),
+                    "retrievals": pattern_dict.get("total_retrievals", 0),
+                    "retrieval_rate": pattern_dict.get("retrieval_rate", 0.0),
+                    "confidence": pattern_dict.get("confidence", 0.0),
+                    "skip_recommended": pattern_dict.get("skip_compression_recommended", False),
+                    "optimal_max_items": pattern_dict.get("optimal_max_items", 20),
+                }
 
         raise HTTPException(
             status_code=404, detail=f"No TOIN pattern found with hash starting with: {hash_prefix}"

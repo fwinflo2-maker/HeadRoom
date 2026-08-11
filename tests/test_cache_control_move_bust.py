@@ -224,3 +224,87 @@ def test_normalize_ttl_survives_many_turns():
         conv = normalize_message_cache_control(conv)
         assert _markers(conv) == 1
         assert conv[-1]["content"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+
+# ── fix-4: mirror the CLIENT's marker positions (20-block lookback chain) ────
+# Anthropic resolves each breakpoint by walking back at most ~20 content
+# blocks. Agentic clients keep a marker on the previous turn's newest message
+# as the read anchor; collapsing to a single newest-block marker breaks the
+# chain on tool-heavy turns. With client_messages provided, normalize must
+# keep exactly the client's positions.
+
+
+def test_normalize_mirrors_client_marker_positions():
+    client = [
+        B("user", "a", cc=True),
+        B("assistant", "b"),
+        B("user", "c", cc=True),  # read anchor (previous newest)
+        B("assistant", "d"),
+        B("user", "e", cc=True),  # newest
+    ]
+    # Forwarded form: replay leftovers piled markers onto other messages too.
+    merged = [
+        B("user", "a", cc=True),
+        B("assistant", "b", cc=True),
+        B("user", "c", cc=True),
+        B("assistant", "d", cc=True),
+        B("user", "e", cc=True),
+    ]
+    out = normalize_message_cache_control(merged, client_messages=client)
+    assert _markers(out) == 3  # exactly the client's three, not one
+    for idx in (0, 2, 4):
+        assert "cache_control" in out[idx]["content"][-1], idx
+    for idx in (1, 3):
+        assert _markers([out[idx]]) == 0, idx
+    assert _strip_cache_control(out) == _strip_cache_control(merged)
+
+
+def test_normalize_mirror_preserves_per_position_ttl():
+    client = [B_ttl("user", "a", "1h"), B("user", "b", cc=True)]
+    merged = [B("user", "a", cc=True), B("user", "b", cc=True)]
+    out = normalize_message_cache_control(merged, client_messages=client)
+    assert out[0]["content"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert out[1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_normalize_mirror_bounded_across_many_turns():
+    """Client moves its pair of markers forward; forwarded stays at client count."""
+    conv = []
+    for t in range(1, 12):
+        conv = conv + [B("user", f"turn-{t}")]
+        # Client marks the newest and second-newest marked position (CC pattern).
+        client = [dict(m) for m in conv]
+        client[-1] = B("user", f"turn-{t}", cc=True)
+        if len(client) >= 2:
+            client[-2] = B(client[-2]["role"], client[-2]["content"][0]["text"], cc=True)
+        # Forwarded side accumulated replay leftovers everywhere.
+        merged = [B(m["role"], m["content"][0]["text"], cc=True) for m in client]
+        out = normalize_message_cache_control(merged, client_messages=client)
+        assert _markers(out) == min(2, len(client))
+        assert "cache_control" in out[-1]["content"][-1]
+
+
+def test_normalize_falls_back_when_counts_mismatch():
+    client = [B("user", "a", cc=True)]  # transform changed message count
+    merged = [B("user", "a", cc=True), B("user", "b", cc=True)]
+    out = normalize_message_cache_control(merged, client_messages=client)
+    assert _markers(out) == 1  # legacy consolidation
+    assert "cache_control" in out[-1]["content"][-1]
+
+
+def test_normalize_falls_back_when_client_has_no_markers():
+    client = [B("user", "a"), B("user", "b")]
+    merged = [B("user", "a", cc=True), B("user", "b")]
+    out = normalize_message_cache_control(merged, client_messages=client)
+    assert _markers(out) == 1  # legacy: still place one so the prefix caches
+    assert "cache_control" in out[-1]["content"][-1]
+
+
+def test_normalize_mirror_skips_string_content_positions():
+    # Client marked message 0; forwarded counterpart is string-content (cannot
+    # carry a marker) — the position is skipped, the rest still mirror.
+    client = [B("user", "a", cc=True), B("user", "b", cc=True)]
+    merged = [{"role": "user", "content": "a"}, B("user", "b", cc=True)]
+    out = normalize_message_cache_control(merged, client_messages=client)
+    assert _markers(out) == 1
+    assert "cache_control" in out[1]["content"][-1]

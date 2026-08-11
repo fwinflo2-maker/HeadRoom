@@ -1680,12 +1680,19 @@ class AnthropicHandlerMixin:
 
             # Own cache_control placement: the client moves the breakpoint each
             # turn and the overlay replays past markers, so they accumulate ~1/turn
-            # and Anthropic hard-errors at >4. Strip message-level markers and keep
-            # one breakpoint. Pure appends advance it to the newest block; a
-            # proven rewritten tail anchors it at the byte-stable boundary so
-            # that the same prefix is readable next turn. Applied last so the
+            # and Anthropic hard-errors at >4. Strip message-level markers and
+            # re-place them at the CLIENT's current positions: Anthropic resolves
+            # each breakpoint with a ~20-content-block lookback, and the client's
+            # previous-message marker is the read anchor that lets a big turn's
+            # write chain to the prior entry. Collapsing to one newest-block
+            # marker breaks that chain on tool-heavy turns (silent full re-write)
+            # and can leave the tail billing uncached. Applied last so the
             # forwarded AND recorded (next_forwarded) messages stay bounded.
-            _norm = normalize_message_cache_control(optimized_messages, previous_forwarded_messages)
+            _norm = normalize_message_cache_control(
+                optimized_messages,
+                previous_forwarded_messages,
+                client_messages=original_client_messages,
+            )
             if _norm is not optimized_messages:
                 optimized_messages = _norm
 

@@ -37,8 +37,30 @@ _SIGLIP_ENCODER_REPO = "chopratejas/siglip-image-encoder-onnx"
 _CLASSIFIER_MAX_INTRA_OP_THREADS = 4
 
 
+def _available_cpu_count() -> int:
+    """CPUs this process may actually run on.
+
+    ``os.cpu_count()`` reports the host's cores even when a cgroup cpuset pins
+    the process to a subset, so a two-CPU container on a 64-core box would be
+    handed the full four-thread cap -- exactly the oversubscription the cap
+    exists to avoid. Prefer the affinity-aware counts where the platform has
+    them.
+    """
+    sched_getaffinity = getattr(os, "sched_getaffinity", None)
+    if sched_getaffinity is not None:
+        return max(1, len(sched_getaffinity(0)))
+
+    process_cpu_count = getattr(os, "process_cpu_count", None)  # Python 3.13+
+    if process_cpu_count is not None:
+        usable: int | None = process_cpu_count()
+        if usable:
+            return usable
+
+    return max(1, os.cpu_count() or 1)
+
+
 def _classifier_intra_op_threads() -> int:
-    return max(1, min(_CLASSIFIER_MAX_INTRA_OP_THREADS, os.cpu_count() or 1))
+    return min(_CLASSIFIER_MAX_INTRA_OP_THREADS, _available_cpu_count())
 
 
 # ImageSignals, RouteDecision, Technique imported from trained_router

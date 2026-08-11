@@ -19,6 +19,7 @@ import pytest
 from headroom.image.onnx_router import (
     _CLASSIFIER_MAX_INTRA_OP_THREADS,
     OnnxTechniqueRouter,
+    _available_cpu_count,
     _classifier_intra_op_threads,
 )
 
@@ -71,8 +72,7 @@ def _install_fake_tokenizers(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "tokenizers", types.SimpleNamespace(Tokenizer=_Tokenizer))
 
 
-@pytest.fixture
-def loaded_classifier(monkeypatch, tmp_path):
+def _load_classifier(monkeypatch, tmp_path):
     created = _install_fake_ort(monkeypatch)
     _install_fake_tokenizers(monkeypatch)
 
@@ -93,6 +93,11 @@ def loaded_classifier(monkeypatch, tmp_path):
     return created
 
 
+@pytest.fixture
+def loaded_classifier(monkeypatch, tmp_path):
+    return _load_classifier(monkeypatch, tmp_path)
+
+
 def test_classifier_session_caps_intra_op_threads(loaded_classifier):
     assert len(loaded_classifier) == 1
     options = loaded_classifier[0].sess_options
@@ -102,16 +107,77 @@ def test_classifier_session_caps_intra_op_threads(loaded_classifier):
     assert options.inter_op_num_threads == 1
 
 
+def _fake_cpu_topology(monkeypatch, *, host, affinity=None, process="absent"):
+    """Model a host/container CPU topology for the count helpers.
+
+    ``affinity`` is the CPU set ``sched_getaffinity`` reports (``None`` removes
+    the call, as on macOS/Windows); ``process`` is what ``process_cpu_count``
+    returns, or ``"absent"`` for pre-3.13 interpreters.
+    """
+    monkeypatch.setattr("headroom.image.onnx_router.os.cpu_count", lambda: host)
+
+    if affinity is None:
+        monkeypatch.delattr("os.sched_getaffinity", raising=False)
+    else:
+        monkeypatch.setattr("os.sched_getaffinity", lambda _pid: set(affinity), raising=False)
+
+    if process == "absent":
+        monkeypatch.delattr("os.process_cpu_count", raising=False)
+    else:
+        monkeypatch.setattr("os.process_cpu_count", lambda: process, raising=False)
+
+
 def test_classifier_thread_cap_never_exceeds_available_cores(monkeypatch):
     """A 2-core host must not be told to run 4 intra-op threads."""
-    monkeypatch.setattr("headroom.image.onnx_router.os.cpu_count", lambda: 2)
+    _fake_cpu_topology(monkeypatch, host=2)
     assert _classifier_intra_op_threads() == 2
 
-    monkeypatch.setattr("headroom.image.onnx_router.os.cpu_count", lambda: 64)
+    _fake_cpu_topology(monkeypatch, host=64)
     assert _classifier_intra_op_threads() == _CLASSIFIER_MAX_INTRA_OP_THREADS
 
-    monkeypatch.setattr("headroom.image.onnx_router.os.cpu_count", lambda: None)
+    _fake_cpu_topology(monkeypatch, host=None)
     assert _classifier_intra_op_threads() == 1
+
+
+def test_thread_cap_follows_process_affinity_not_host_cores(monkeypatch):
+    """A cpuset-restricted container on a big host must not get 4 threads.
+
+    ``os.cpu_count()`` still reports the host's 64 cores inside such a cgroup,
+    so counting cores that way would reintroduce the oversubscription the cap
+    is meant to prevent.
+    """
+    _fake_cpu_topology(monkeypatch, host=64, affinity={3, 11})
+
+    assert _available_cpu_count() == 2
+    assert _classifier_intra_op_threads() == 2
+
+
+def test_thread_cap_uses_process_cpu_count_without_affinity_api(monkeypatch):
+    """Without ``sched_getaffinity`` the 3.13 process count still wins."""
+    _fake_cpu_topology(monkeypatch, host=64, affinity=None, process=2)
+
+    assert _available_cpu_count() == 2
+    assert _classifier_intra_op_threads() == 2
+
+
+def test_thread_cap_falls_back_to_host_cores(monkeypatch):
+    """With no usable affinity-aware answer, the host count is all we have."""
+    _fake_cpu_topology(monkeypatch, host=2, affinity=None)
+    assert _available_cpu_count() == 2
+
+    # ``process_cpu_count()`` returns None when it cannot determine the count.
+    _fake_cpu_topology(monkeypatch, host=2, affinity=None, process=None)
+    assert _available_cpu_count() == 2
+    assert _classifier_intra_op_threads() == 2
+
+
+def test_classifier_session_honors_affinity_on_many_core_host(monkeypatch, tmp_path):
+    """The session itself, not just the helper, respects the process affinity."""
+    _fake_cpu_topology(monkeypatch, host=64, affinity={0, 5})
+
+    created = _load_classifier(monkeypatch, tmp_path)
+
+    assert created[0].sess_options.intra_op_num_threads == 2
 
 
 def test_classifier_session_keeps_retention_defaults(loaded_classifier):

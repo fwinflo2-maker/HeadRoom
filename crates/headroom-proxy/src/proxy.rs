@@ -17,6 +17,7 @@ use futures_util::{StreamExt as _, TryStreamExt};
 use http_body_util::BodyExt;
 
 use crate::cache_stabilization;
+use crate::cache_stabilization::beta_sticky::BetaProvider;
 use crate::cache_stabilization::drift_detector::{
     compute_structural_hash, derive_session_key, observe_drift, ApiKind, DriftState,
 };
@@ -66,6 +67,13 @@ pub struct AppState {
     /// request body — so this can be cloned freely into every handler
     /// path that buffers the body.
     pub drift_state: DriftState,
+    /// Session-sticky beta-header tracker (parity port of the Python
+    /// `SessionBetaTracker`, PR-A6): per-`(provider, session)` LRU of
+    /// `anthropic-beta` / `openai-beta` tokens, unioned across turns
+    /// so a client dropping a token mid-conversation doesn't rotate
+    /// the upstream prefix-cache key. Shares the drift detector's
+    /// session identity (same `derive_session_key` output).
+    pub beta_sticky: cache_stabilization::beta_sticky::BetaStickyState,
     /// PR-D4: GCP ADC bearer-token source for Vertex routes. Default:
     /// [`crate::vertex::adc::GcpAdcTokenSource`] constructed lazily;
     /// the actual ADC chain is only resolved when the first Vertex
@@ -75,11 +83,16 @@ pub struct AppState {
 }
 
 /// PR-E6: maximum number of sessions tracked by the drift detector
-/// LRU. Picked so that a noisy test fleet of 1000 distinct API keys
-/// stays in cache for at least one full turn before the oldest
-/// evicts. Operators with larger fleets can bump this; the memory
-/// cost per entry is ~150 bytes (key string + 96-byte StructuralHash
-/// + LRU overhead).
+/// LRU. Sessions are keyed per conversation (credential + first-
+/// message fingerprint), not per credential, so the working set is
+/// the number of *concurrently active conversations* — 1000 keeps a
+/// noisy fleet in cache for at least one full turn before the oldest
+/// evicts. A burst of short one-shot conversations can cycle the LRU
+/// and evict a live session between its turns; the cost is telemetry-
+/// only (one repeated `cache_drift_first_request`, no lost requests).
+/// Operators with larger fleets can bump this; the memory cost per
+/// entry is ~250 bytes (key string + 163-byte StructuralHash + LRU
+/// overhead).
 const DRIFT_DETECTOR_CAPACITY: usize = 1000;
 
 impl AppState {
@@ -106,6 +119,9 @@ impl AppState {
             client,
             bedrock_credentials: None,
             drift_state: DriftState::new(DRIFT_DETECTOR_CAPACITY),
+            beta_sticky: cache_stabilization::beta_sticky::BetaStickyState::new(
+                cache_stabilization::beta_sticky::BETA_TRACKER_CAPACITY,
+            ),
             vertex_token_source,
         })
     }
@@ -209,13 +225,20 @@ pub fn build_app(state: AppState) -> Router {
                 "/model/:model_id/converse",
                 post(crate::bedrock::invoke::handle_invoke),
             )
-            // PR-D2: streaming counterpart. Bedrock's protocol is
+            // PR-D2/PR-D5: streaming counterparts. Bedrock's protocol is
             // binary EventStream; the handler parses incrementally,
             // optionally translates each chunk to an SSE frame, and
             // tees translated frames into AnthropicStreamState for
-            // telemetry. See `bedrock::invoke_streaming`.
+            // telemetry. `invoke-with-response-stream` and
+            // `converse-stream` share the same wire framing and
+            // processing pipeline, so both route to the same handler.
+            // See `bedrock::invoke_streaming`.
             .route(
                 "/model/:model_id/invoke-with-response-stream",
+                post(crate::bedrock::invoke_streaming::handle_invoke_streaming),
+            )
+            .route(
+                "/model/:model_id/converse-stream",
                 post(crate::bedrock::invoke_streaming::handle_invoke_streaming),
             )
             .route_layer(axum::middleware::from_fn(
@@ -625,6 +648,26 @@ pub(crate) async fn forward_http(
         let endpoint = compression::classify_compressible_path(uri.path())
             .expect("is_compressible_path guarded above");
 
+        // PR-2027: strip the `[1m]` context-window tier suffix from
+        // the request body for Anthropic messages only. The
+        // Headroom CLI appends `[1m]` to model IDs (e.g.
+        // `glm-5.2[1m]`, `claude-3-7-sonnet[1m]`) to signal 1M
+        // context to Claude Code; the upstream Anthropic API does
+        // not recognize the suffix and rejects the request. The
+        // suffix is an Anthropic/Claude Code compatibility marker,
+        // so we must not silently mutate OpenAI-compatible
+        // request model IDs. The sanitizer is gated on the
+        // already-classified `endpoint`, which is the same source
+        // of truth the dispatcher uses below — keeping the gate
+        // and the dispatch in lockstep.
+        let buffered = match endpoint {
+            compression::CompressibleEndpoint::AnthropicMessages => {
+                compression::sanitize_anthropic_model_id_in_body(buffered)
+            }
+            compression::CompressibleEndpoint::OpenAiChatCompletions
+            | compression::CompressibleEndpoint::OpenAiResponses => buffered,
+        };
+
         // PR-E5 + PR-E6: cache-stabilization observability hooks.
         // Both run READ-ONLY against the buffered body and emit
         // structured logs only — passthrough invariant from Phase A
@@ -672,9 +715,44 @@ pub(crate) async fn forward_http(
                 }
             };
             if let (Some(kind), Some(headers)) = (drift_kind, headers_snapshot.as_ref()) {
-                let session_key = derive_session_key(headers, &client_addr);
+                let session_key = derive_session_key(headers, &client_addr, &parsed, kind);
                 let hash = compute_structural_hash(&parsed, kind);
                 observe_drift(&state.drift_state, &session_key, hash);
+
+                // Session-sticky provider beta headers — port of the
+                // Python PR-A6 `SessionBetaTracker`. Beta headers are
+                // part of the bytes that determine the upstream
+                // prefix-cache key; a client dropping a token between
+                // turns rotates the key and re-writes the whole
+                // prefix at the customer's cost. Forward the
+                // per-conversation union instead. See
+                // `cache_stabilization::beta_sticky` for the behavior
+                // contract, the auth-mode rationale (applies to every
+                // mode, like the Python handler), and the one
+                // documented divergence from Python (per-conversation
+                // keying). Reuses the drift detector's `session_key`
+                // so both cache-stability subsystems agree on
+                // conversation identity. Mutates upstream-bound
+                // HEADERS only; body bytes stay untouched (Phase-A
+                // cache-safety invariant).
+                if state.config.beta_header_sticky.is_enabled() {
+                    let provider = match endpoint {
+                        compression::CompressibleEndpoint::AnthropicMessages => {
+                            BetaProvider::Anthropic
+                        }
+                        compression::CompressibleEndpoint::OpenAiChatCompletions
+                        | compression::CompressibleEndpoint::OpenAiResponses => {
+                            BetaProvider::OpenAi
+                        }
+                    };
+                    cache_stabilization::beta_sticky::apply_sticky_betas(
+                        &state.beta_sticky,
+                        provider,
+                        &session_key,
+                        &mut outgoing_headers,
+                        &request_id,
+                    );
+                }
             }
         }
         let outcome = match endpoint {

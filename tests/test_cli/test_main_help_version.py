@@ -58,3 +58,35 @@ def test_subcommand_verbose_flag_still_works() -> None:
 
     assert result.exit_code == 0, result.output
     assert "HEADROOM WRAP: CLAUDE" in result.output
+
+
+def test_wrap_claude_keeps_diagnostics_off_child_stdout() -> None:
+    """Wrapper chatter must not corrupt Claude print/JSON output on stdout."""
+    runner = CliRunner()
+    completed = SimpleNamespace(returncode=0)
+
+    with patch("headroom.cli.wrap.shutil.which", return_value="claude"):
+        with patch("headroom.cli.wrap._ensure_proxy", return_value=(None, 8787)):
+            with patch("headroom.cli.wrap.subprocess.run", return_value=completed) as run_mock:
+                result = runner.invoke(
+                    main,
+                    [
+                        "wrap",
+                        "claude",
+                        "--no-mcp",
+                        "--code-memory",
+                        "none",
+                        "--",
+                        "--print",
+                        "--output-format",
+                        "json",
+                        "hello",
+                    ],
+                )
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout == ""
+    assert "HEADROOM WRAP: CLAUDE" in result.stderr
+    assert "Launching Claude Code" in result.stderr
+    assert "Extra args:" in result.stderr
+    assert run_mock.call_args.kwargs.keys() == {"env"}

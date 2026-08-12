@@ -33,6 +33,8 @@ import sys
 import time
 import urllib.parse
 from collections.abc import Callable
+from contextlib import redirect_stdout
+from functools import wraps
 from pathlib import Path
 from typing import Any, cast
 
@@ -4369,6 +4371,22 @@ def wrap_selfheal(marker: str | None) -> None:
 # =============================================================================
 
 
+def _wrapper_diagnostics_to_stderr(command: Callable[..., Any]) -> Callable[..., Any]:
+    """Keep wrapper diagnostics off an agent's machine-readable stdout.
+
+    ``redirect_stdout`` affects Python output only. The wrapped CLI is started
+    without a stdout/stderr override, so it still inherits the caller's
+    original OS file descriptors.
+    """
+
+    @wraps(command)
+    def redirected(*args: Any, **kwargs: Any) -> Any:
+        with redirect_stdout(sys.stderr):
+            return command(*args, **kwargs)
+
+    return redirected
+
+
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
 @_serena_instructions_option
@@ -4452,6 +4470,7 @@ def wrap_selfheal(marker: str | None) -> None:
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--prepare-only", is_flag=True, hidden=True)
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
+@_wrapper_diagnostics_to_stderr
 def claude(
     port: int,
     no_mcp: bool,

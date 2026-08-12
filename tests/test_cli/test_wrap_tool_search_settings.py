@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import click
 import pytest
 
 from headroom.cli import init as init_cli
@@ -93,7 +94,7 @@ def test_write_restore_roundtrip_leaves_init_true(tmp_path: Path) -> None:
     assert prev == "true"
     assert json.loads(path.read_text(encoding="utf-8"))["env"]["ENABLE_TOOL_SEARCH"] == "false"
 
-    wrap_cli._restore_claude_wrap_tool_search(prev, settings_path=path)
+    wrap_cli._restore_claude_wrap_tool_search(prev, written="false", settings_path=path)
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["env"]["ENABLE_TOOL_SEARCH"] == "true"
     assert payload["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8787"
@@ -113,7 +114,7 @@ def test_restore_removes_key_when_previous_none(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
-    wrap_cli._restore_claude_wrap_tool_search(None, settings_path=path)
+    wrap_cli._restore_claude_wrap_tool_search(None, written="false", settings_path=path)
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert "ENABLE_TOOL_SEARCH" not in payload["env"]
     assert payload["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8787"
@@ -201,3 +202,96 @@ def test_init_non_foundry_still_defaults_true(
     init_cli._ensure_claude_hooks(settings, profile="init-user", port=8787)
     env = json.loads(settings.read_text(encoding="utf-8"))["env"]
     assert env["ENABLE_TOOL_SEARCH"] == TOOL_SEARCH_DEFAULT
+
+
+def _tool_search_value(path: Path) -> str | None:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    env_map = payload.get("env")
+    if not isinstance(env_map, dict):
+        return None
+    value = env_map.get("ENABLE_TOOL_SEARCH")
+    return value if isinstance(value, str) else None
+
+
+def test_overlapping_wraps_restore_lifo(tmp_path: Path) -> None:
+    """B exits first, then A: each restore still matches what that wrap wrote."""
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"env": {"ENABLE_TOOL_SEARCH": "true"}}), encoding="utf-8")
+
+    prev_a = wrap_cli._write_claude_wrap_tool_search("false", settings_path=path)
+    prev_b = wrap_cli._write_claude_wrap_tool_search("auto", settings_path=path)
+    assert prev_a == "true"
+    assert prev_b == "false"
+    assert _tool_search_value(path) == "auto"
+
+    wrap_cli._restore_claude_wrap_tool_search(prev_b, written="auto", settings_path=path)
+    assert _tool_search_value(path) == "false"
+    wrap_cli._restore_claude_wrap_tool_search(prev_a, written="false", settings_path=path)
+    assert _tool_search_value(path) == "true"
+
+
+def test_overlapping_wraps_restore_fifo_skips_stale_exit(tmp_path: Path) -> None:
+    """A exits while B is still live: A must not restore over B's value."""
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"env": {"ENABLE_TOOL_SEARCH": "true"}}), encoding="utf-8")
+
+    prev_a = wrap_cli._write_claude_wrap_tool_search("false", settings_path=path)
+    prev_b = wrap_cli._write_claude_wrap_tool_search("auto", settings_path=path)
+
+    wrap_cli._restore_claude_wrap_tool_search(prev_a, written="false", settings_path=path)
+    assert _tool_search_value(path) == "auto"
+    wrap_cli._restore_claude_wrap_tool_search(prev_b, written="auto", settings_path=path)
+    assert _tool_search_value(path) == "false"
+
+
+def test_restore_skips_user_edit_between_write_and_restore(tmp_path: Path) -> None:
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"env": {"ENABLE_TOOL_SEARCH": "true", "KEEP": "1"}}),
+        encoding="utf-8",
+    )
+    prev = wrap_cli._write_claude_wrap_tool_search("false", settings_path=path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["env"]["ENABLE_TOOL_SEARCH"] = "auto"
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    wrap_cli._restore_claude_wrap_tool_search(prev, written="false", settings_path=path)
+    assert _tool_search_value(path) == "auto"
+    assert json.loads(path.read_text(encoding="utf-8"))["env"]["KEEP"] == "1"
+
+
+def test_write_refuses_malformed_settings(tmp_path: Path) -> None:
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True)
+    original = "{not json"
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(click.ClickException, match="is not valid JSON"):
+        wrap_cli._write_claude_wrap_tool_search("false", settings_path=path)
+
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_write_refuses_non_object_settings(tmp_path: Path) -> None:
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True)
+    original = "[1, 2, 3]"
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(click.ClickException, match="does not contain a JSON object"):
+        wrap_cli._write_claude_wrap_tool_search("false", settings_path=path)
+
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_restore_leaves_malformed_settings_untouched(tmp_path: Path) -> None:
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True)
+    original = "{not json"
+    path.write_text(original, encoding="utf-8")
+
+    wrap_cli._restore_claude_wrap_tool_search("true", written="false", settings_path=path)
+    assert path.read_text(encoding="utf-8") == original

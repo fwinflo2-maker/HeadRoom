@@ -119,6 +119,30 @@ def test_analyzer_emits_rule_for_thoroughness_retrieve_with_nonspecific_query(
     "headroom.learn.analyzer._call_llm",
     return_value={"context_file_rules": [], "memory_file_rules": []},
 )
+def test_analyzer_emits_rule_for_retrieval_action_query(_mock_call_llm, tmp_path: Path) -> None:
+    tool_call = _retrieve_call(2, query="retrieve again")
+    session = SessionData(
+        session_id="s1",
+        tool_calls=[tool_call],
+        events=[
+            SessionEvent(
+                type="user_message",
+                msg_index=1,
+                text="Be sure the kept summary did not miss anything.",
+            ),
+            SessionEvent(type="tool_call", msg_index=2, tool_call=tool_call),
+        ],
+    )
+
+    result = SessionAnalyzer(model="test-model").analyze(_project(tmp_path), [session])
+
+    assert any(rec.section == LEARN_SECTION for rec in result.recommendations)
+
+
+@patch(
+    "headroom.learn.analyzer._call_llm",
+    return_value={"context_file_rules": [], "memory_file_rules": []},
+)
 def test_analyzer_skips_verify_requests_with_specific_query(_mock_call_llm, tmp_path: Path) -> None:
     tool_call = _retrieve_call(2, query="auth middleware")
     session = SessionData(

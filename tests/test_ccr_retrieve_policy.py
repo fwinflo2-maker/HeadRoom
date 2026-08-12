@@ -103,11 +103,33 @@ def test_classifier_prefers_specific_query_hint_over_thoroughness_wording() -> N
         "Double-check the deploy step.",
         query="rollback command",
     )
+    numbered_record_request = classify_retrieve_need(
+        "Double-check the import.",
+        query="record 12",
+    )
 
-    for assessment in (verify_request, double_check_request):
+    for assessment in (verify_request, double_check_request, numbered_record_request):
         assert assessment.should_retrieve
         assert not assessment.is_redundant
         assert assessment.reason == "specific_followup_with_query_hint"
+
+
+def test_classifier_treats_retrieval_action_hints_as_nonspecific() -> None:
+    for hint in ("retrieve again", "search the content", "look it up again"):
+        assessment = classify_retrieve_need("Verify everything", query=hint)
+
+        assert assessment.is_redundant, hint
+        assert not assessment.should_retrieve, hint
+        assert assessment.reason == "thoroughness_without_gap", hint
+
+
+def test_classifier_treats_content_form_hints_as_nonspecific() -> None:
+    for hint in ("the original content", "raw output"):
+        assessment = classify_retrieve_need("Be sure nothing was dropped.", query=hint)
+
+        assert assessment.is_redundant, hint
+        assert not assessment.should_retrieve, hint
+        assert assessment.reason == "thoroughness_without_gap", hint
 
 
 def test_classifier_ignores_nonspecific_query_hints() -> None:

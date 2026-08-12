@@ -29,7 +29,13 @@ def _skip_proxy_dependency_gate_unless_exercised(
     """Most CLI tests run without headroom-ai[proxy] extras installed."""
     if request.node.get_closest_marker("proxy_dependency_gate") is not None:
         return
-    monkeypatch.setattr("headroom.cli.proxy.ensure_proxy_dependencies", lambda: None)
+    try:
+        from headroom.cli import proxy
+    except ModuleNotFoundError:
+        # Native-wrapper jobs intentionally install only pytest and exercise the
+        # installer scripts without importing Headroom's runtime dependencies.
+        return
+    monkeypatch.setattr(proxy, "ensure_proxy_dependencies", lambda: None)
 
 
 @pytest.fixture(autouse=True)

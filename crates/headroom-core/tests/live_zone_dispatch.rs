@@ -399,6 +399,134 @@ if __name__ == \"__main__\":
 }
 
 #[test]
+fn plain_text_below_threshold_no_op() {
+    // Plain prose, well under the 5120-byte PlainText threshold, so the
+    // dispatcher must not even attempt Kompress.
+    let prose = "The quarterly report highlighted steady growth across every \
+        region, with the operations team noting improved throughput on the \
+        warehouse floor and customer support tickets trending downward for \
+        the third month running. Leadership expects the trend to continue \
+        into next quarter, barring any supply chain disruptions.";
+    assert!(
+        prose.len() < 5120,
+        "fixture must stay below the PlainText byte threshold (5120); got {} bytes",
+        prose.len()
+    );
+
+    let (body, _) = body_with_tool_result(prose);
+    let out = dispatch(&body);
+    let manifest = match &out {
+        LiveZoneOutcome::NoChange { manifest } => manifest,
+        LiveZoneOutcome::Modified { manifest, .. } => {
+            panic!("sub-threshold plain text must not be compressed. manifest: {manifest:?}")
+        }
+    };
+    let action = manifest
+        .block_outcomes
+        .iter()
+        .find(|b| b.block_type == "tool_result")
+        .expect("tool_result block present")
+        .action
+        .clone();
+    match action {
+        BlockAction::BelowByteThreshold {
+            content_type,
+            threshold_bytes,
+            ..
+        } => {
+            assert_eq!(threshold_bytes, 5120, "expected the PlainText threshold");
+            assert_eq!(content_type, "text", "unexpected content_type tag");
+        }
+        other => panic!("expected BelowByteThreshold, got {other:?}"),
+    }
+}
+
+/// Locate a HuggingFace Hub cache artifact under `$HOME/.cache/huggingface/hub`.
+/// Mirrors the runtime-skip helper in `kompress_parity.rs` (kompress_parity.rs:20-36)
+/// so this test degrades gracefully instead of downloading the model.
+fn hf_cache_file(repo_dir: &str, rel: &[&str]) -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let snapshots = std::path::Path::new(&home)
+        .join(".cache/huggingface/hub")
+        .join(repo_dir)
+        .join("snapshots");
+    for snap in std::fs::read_dir(snapshots).ok()?.filter_map(|e| e.ok()) {
+        let mut cand = snap.path();
+        for part in rel {
+            cand = cand.join(part);
+        }
+        if cand.exists() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+#[test]
+fn plain_text_routes_to_kompress_when_model_cached() {
+    // RUNTIME-SKIP pattern (kompress_parity.rs:39-52): if the ModernBERT
+    // tokenizer + kompress-v2-base ONNX artifact are not present in the
+    // local HuggingFace cache, skip rather than download the model.
+    let tok = hf_cache_file("models--answerdotai--ModernBERT-base", &["tokenizer.json"]);
+    let onnx = hf_cache_file(
+        "models--chopratejas--kompress-v2-base",
+        &["onnx", "kompress-int8-wo.onnx"],
+    );
+    if tok.is_none() || onnx.is_none() {
+        eprintln!(
+            "SKIP: kompress model/tokenizer not in HF cache; \
+             run `python scripts/record_kompress_trace.py` first"
+        );
+        return;
+    }
+
+    // Repetitive news-article-like prose: > 350 words so Kompress's
+    // chunk_words=350 chunking actually engages, and > 5120 bytes to
+    // clear the PlainText byte threshold.
+    let mut article = String::new();
+    for i in 0..60 {
+        article.push_str(&format!(
+            "City officials announced today that the downtown revitalization \
+             project will proceed as planned despite budget concerns raised \
+             during round {i} of public comment. "
+        ));
+    }
+    assert!(
+        article.split_whitespace().count() > 350,
+        "fixture must exceed 350 words so Kompress chunking engages; got {} words",
+        article.split_whitespace().count()
+    );
+    assert!(
+        article.len() > 5120,
+        "fixture must clear the PlainText byte threshold (5120); got {} bytes",
+        article.len()
+    );
+
+    let (body, _) = body_with_tool_result(&article);
+    let out = dispatch(&body);
+    let manifest = match &out {
+        LiveZoneOutcome::Modified { manifest, .. } => manifest,
+        LiveZoneOutcome::NoChange { manifest } => panic!(
+            "expected Kompress to compress a {}-word repetitive article; got NoChange. manifest: {manifest:?}",
+            article.split_whitespace().count()
+        ),
+    };
+    let action = manifest
+        .block_outcomes
+        .iter()
+        .find(|b| b.block_type == "tool_result")
+        .expect("tool_result block present")
+        .action
+        .clone();
+    match action {
+        BlockAction::Compressed { strategy, .. } => {
+            assert_eq!(strategy, "kompress", "expected kompress dispatch");
+        }
+        other => panic!("expected BlockAction::Compressed via kompress, got {other:?}"),
+    }
+}
+
+#[test]
 fn unknown_content_type_no_op() {
     // Empty string should not invoke any compressor.
     let (body, _) = body_with_tool_result("");

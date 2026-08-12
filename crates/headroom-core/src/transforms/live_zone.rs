@@ -104,6 +104,8 @@ use thiserror::Error;
 use super::code_compressor::{CodeAwareCompressor, CodeCompressorConfig};
 use super::content_detector::{detect_content_type, ContentType};
 use super::diff_compressor::{DiffCompressor, DiffCompressorConfig};
+#[cfg(feature = "ml")]
+use super::kompress::{Kompress, KompressConfig};
 use super::log_compressor::{LogCompressor, LogCompressorConfig};
 use super::search_compressor::{SearchCompressor, SearchCompressorConfig};
 use super::smart_crusher::{SmartCrusher, SmartCrusherConfig};
@@ -122,6 +124,13 @@ const STRATEGY_SEARCH_COMPRESSOR: &str = "search_compressor";
 const STRATEGY_DIFF_COMPRESSOR: &str = "diff_compressor";
 /// Strategy tag emitted when CodeAwareCompressor rewrote a source-code block.
 const STRATEGY_CODE_COMPRESSOR: &str = "code_compressor";
+/// Strategy tag emitted when Kompress rewrote a plain-text block (also
+/// used by the SourceCode arm's no-shrink fallback — see
+/// [`dispatch_compressor`]). Only referenced from the `#[cfg(feature =
+/// "ml")]` branch of `kompress_or_noop`, so it's dead code in a
+/// `--no-default-features` build.
+#[cfg_attr(not(feature = "ml"), allow(dead_code))]
+const STRATEGY_KOMPRESS: &str = "kompress";
 
 /// Empty query context passed to compressors that take a relevance
 /// query string. PR-B3 dispatcher does not yet plumb the user's last
@@ -559,6 +568,56 @@ fn diff_compressor() -> &'static DiffCompressor {
 fn code_compressor() -> &'static CodeAwareCompressor {
     static INSTANCE: OnceLock<CodeAwareCompressor> = OnceLock::new();
     INSTANCE.get_or_init(|| CodeAwareCompressor::new(CodeCompressorConfig::default()))
+}
+
+/// Cache-only Kompress singleton. `Kompress::from_cache` never touches the
+/// network — it resolves the tokenizer + ONNX artifact from the local
+/// HuggingFace cache and returns `Ok(None)` when either is missing (a
+/// cold cache), which this function maps to `None` too so the caller can
+/// pass text through untouched. Load failures (a corrupt/unreadable cache
+/// entry) are logged and also degrade to `None` — cache-only means this
+/// path must never block the hot path on a download or a hard error.
+///
+/// This mirrors the Python router's not-ready → passthrough behavior:
+/// when Kompress isn't loaded, PlainText content flows through unchanged
+/// rather than blocking the request or erroring.
+#[cfg(feature = "ml")]
+fn kompress_cached() -> Option<&'static Kompress> {
+    static INSTANCE: OnceLock<Option<Kompress>> = OnceLock::new();
+    INSTANCE
+        .get_or_init(|| match Kompress::from_cache(KompressConfig::default()) {
+            Ok(k) => k, // None => HF cache cold: deterministic NoOp downstream
+            Err(e) => {
+                tracing::warn!(event = "kompress_init_failed", error = %e);
+                None
+            }
+        })
+        .as_ref()
+}
+
+/// Route `text` through Kompress when the model is cache-resident;
+/// otherwise (or when the `ml` feature is disabled) fall back to a
+/// deterministic no-op. Shared by the `PlainText` arm and the
+/// `SourceCode` arm's no-shrink fallback (mirrors the Python router's
+/// no-shrink → Kompress fallback chain).
+///
+/// `text` is only read inside the `#[cfg(feature = "ml")]` branch below,
+/// so it's unused in a `--no-default-features` build.
+#[cfg_attr(not(feature = "ml"), allow(unused_variables))]
+fn kompress_or_noop(text: &str, content_type: ContentType) -> DispatchResult {
+    #[cfg(feature = "ml")]
+    if let Some(k) = kompress_cached() {
+        let result = k.compress(text);
+        if !result.is_passthrough() && result.compressed != text {
+            return DispatchResult::Compressed {
+                strategy: STRATEGY_KOMPRESS,
+                compressed: result.compressed,
+            };
+        }
+    }
+    DispatchResult::NoOp {
+        content_type: content_type.as_str(),
+    }
 }
 
 // ─── Public entry point ────────────────────────────────────────────────
@@ -1404,24 +1463,26 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
         // syntax errors, a min-token floor, and a compression-ratio
         // guard), so this arm only has to compare its output against
         // the input; the tokenizer-rejection gate in
-        // `compress_one_block` applies on top of that.
+        // `compress_one_block` applies on top of that. When the code
+        // compressor doesn't shrink the block (e.g. it's already
+        // dense, or tree-sitter reverted on a parse error), fall back
+        // to Kompress rather than giving up — mirrors the Python
+        // router's no-shrink → Kompress fallback.
         ContentType::SourceCode => {
             let result = code_compressor().compress(text);
             if result.compressed == text {
-                return DispatchResult::NoOp {
-                    content_type: content_type.as_str(),
-                };
+                return kompress_or_noop(text, content_type);
             }
             DispatchResult::Compressed {
                 strategy: STRATEGY_CODE_COMPRESSOR,
                 compressed: result.compressed,
             }
         }
-        // TODO(PR-B4): wire Kompress (lossless prose compressor) for
-        // PlainText. For now, leave untouched.
-        ContentType::PlainText => DispatchResult::NoOp {
-            content_type: content_type.as_str(),
-        },
+        // Cache-only lossless prose compressor (PR-B4). `kompress_or_noop`
+        // degrades to a deterministic no-op when the model isn't
+        // cache-resident (or the `ml` feature is off) — no network call
+        // ever happens on this path.
+        ContentType::PlainText => kompress_or_noop(text, content_type),
         // No HTML compressor on the Rust side; pages are handled by
         // upstream extractors, not the proxy.
         ContentType::Html => DispatchResult::NoOp {

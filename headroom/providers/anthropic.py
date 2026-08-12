@@ -24,6 +24,11 @@ import warnings
 from typing import Any, cast
 
 from headroom import paths as _paths
+from headroom.tokenizers.base import (
+    TokenCountCache,
+    coerce_countable_text,
+    count_content_blocks,
+)
 
 from .base import Provider, TokenCounter
 
@@ -59,9 +64,7 @@ _DANGLING_ANSI_STYLE_SUFFIX_RE = re.compile(r"(?:\[[0-9;]*m\])+$")
 def sanitize_anthropic_model_id(model: str) -> str:
     """Return an Anthropic model id without terminal styling artifacts."""
     cleaned = _ANSI_ESCAPE_RE.sub("", str(model)).strip()
-    if cleaned.startswith("claude-"):
-        cleaned = _DANGLING_ANSI_STYLE_SUFFIX_RE.sub("", cleaned)
-    return cleaned
+    return _DANGLING_ANSI_STYLE_SUFFIX_RE.sub("", cleaned)
 
 
 def sanitize_anthropic_model_metadata(value: Any) -> Any:
@@ -83,12 +86,22 @@ def sanitize_anthropic_model_metadata(value: Any) -> Any:
 # Anthropic model context limits
 # All Claude 3+ models have 200K context
 ANTHROPIC_CONTEXT_LIMITS: dict[str, int] = {
+    # Claude Fable 5 - 1M context
+    "claude-fable-5": 1000000,
+    # Claude Opus 4.8 - 1M context
+    "claude-opus-4-8": 1000000,
     # Claude 4.7 (Opus 4.7) - 1M context
     "claude-opus-4-7": 1000000,
     # Claude 4.6 (Opus 4.6) - 1M context
     "claude-opus-4-6": 1000000,
     # Claude 4.5 (Opus 4.5)
     "claude-opus-4-5-20251101": 200000,
+    # Claude Sonnet 5 - 1M context
+    "claude-sonnet-5": 1000000,
+    # Claude Sonnet 4.6 - 1M context window
+    "claude-sonnet-4-6": 1000000,
+    # Claude Sonnet 4.5
+    "claude-sonnet-4-5": 200000,
     # Claude 4 (Sonnet 4, Haiku 4)
     "claude-sonnet-4-20250514": 200000,
     "claude-haiku-4-5-20251001": 200000,
@@ -110,17 +123,25 @@ ANTHROPIC_CONTEXT_LIMITS: dict[str, int] = {
 
 # Fallback pricing - LiteLLM is preferred source
 # NOTE: These are ESTIMATES. Always verify against actual Anthropic billing.
-# Last updated: 2025-01-14
+# Last updated: 2026-07-04
 ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
-    # Claude 4.7 (Opus tier pricing)
-    "claude-opus-4-7": {"input": 15.00, "output": 75.00, "cached_input": 1.50},
-    # Claude 4.6 (Opus tier pricing)
-    "claude-opus-4-6": {"input": 15.00, "output": 75.00, "cached_input": 1.50},
-    # Claude 4.5 (Opus tier pricing)
-    "claude-opus-4-5-20251101": {"input": 15.00, "output": 75.00, "cached_input": 1.50},
+    # Claude Fable 5 (anthropic.com/pricing): $10 in / $50 out, cache read $1.
+    "claude-fable-5": {"input": 10.00, "output": 50.00, "cached_input": 1.00},
+    # Claude Opus 4.8 — current Opus tier: $5 in / $25 out, cache read $0.50.
+    "claude-opus-4-8": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
+    # Claude 4.7 (current Opus tier)
+    "claude-opus-4-7": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
+    # Claude 4.6 (current Opus tier)
+    "claude-opus-4-6": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
+    # Claude 4.5 (current Opus tier — same rates as 4.6–4.8)
+    "claude-opus-4-5-20251101": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
+    # Claude Sonnet 5 / 4.6 / 4.5 (current Sonnet tier): $3 in / $15 out, cache read $0.30
+    "claude-sonnet-5": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
+    "claude-sonnet-4-6": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
+    "claude-sonnet-4-5": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
     # Claude 4 (Sonnet/Haiku tier pricing)
     "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
-    "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00, "cached_input": 0.08},
+    "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00, "cached_input": 0.10},
     # Claude 3.5
     "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
     "claude-3-5-sonnet-latest": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
@@ -136,7 +157,7 @@ ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
 # Default limits for pattern-based inference
 # Used when a model isn't in the explicit list but matches a known pattern
 _PATTERN_DEFAULTS = {
-    "opus": {"context": 200000, "pricing": {"input": 15.00, "output": 75.00, "cached_input": 1.50}},
+    "opus": {"context": 200000, "pricing": {"input": 5.00, "output": 25.00, "cached_input": 0.50}},
     "sonnet": {
         "context": 200000,
         "pricing": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
@@ -292,6 +313,7 @@ class AnthropicTokenCounter(TokenCounter):
         self.model = model
         self._client = client
         self._encoding: Any = None
+        self._count_cache = TokenCountCache()
         self._use_api = client is not None
 
         if not self._use_api and warn and not _FALLBACK_WARNING_SHOWN:
@@ -334,6 +356,14 @@ class AnthropicTokenCounter(TokenCounter):
         if not text:
             return 0
 
+        cached = self._count_cache.get(text)
+        if cached is not None:
+            return cached
+        count = self._count_text_uncached(text)
+        self._count_cache.put(text, count)
+        return count
+
+    def _count_text_uncached(self, text: str) -> int:
         if self._encoding:
             # tiktoken with ~1.1x multiplier for Claude
             try:
@@ -379,23 +409,25 @@ class AnthropicTokenCounter(TokenCounter):
         if isinstance(content, str):
             tokens += self.count_text(content)
         elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict):
-                    if block.get("type") == "text":
-                        tokens += self.count_text(block.get("text", ""))
-                    elif block.get("type") == "tool_use":
-                        tokens += self.count_text(block.get("name", ""))
-                        tokens += self.count_text(str(block.get("input", {})))
-                    elif block.get("type") == "tool_result":
-                        tokens += self.count_text(str(block.get("content", "")))
+            # Delegate to the audited shared walker instead of a partial
+            # per-provider one. Each provider counter had grown its own
+            # shortened branch list, so every modern block priced at ~0:
+            # measured on a 6,800-char block this returned 8 tokens for
+            # tool_result, thinking, document, mcp_tool_result — and for
+            # output_text / refusal, which are OpenAI's OWN Responses shapes.
+            # The shared walker is also image-safe: a 200KB base64 image gets
+            # a pixel-based 1600, not the ~50K phantom text tokens a naive
+            # str(block) catch-all would produce.
+            tokens += count_content_blocks(content, self.count_text)
 
-        # OpenAI format tool calls
-        if "tool_calls" in message:
-            for tool_call in message.get("tool_calls", []):
-                if isinstance(tool_call, dict):
-                    func = tool_call.get("function", {})
-                    tokens += self.count_text(func.get("name", ""))
-                    tokens += self.count_text(func.get("arguments", ""))
+        # OpenAI format tool calls. Guard the value, not just the key: an
+        # OpenAI-format assistant message often carries `tool_calls: null` on a
+        # no-tool turn, and `for ... in None` would raise TypeError.
+        for tool_call in message.get("tool_calls") or []:
+            if isinstance(tool_call, dict):
+                func = tool_call.get("function") or {}
+                tokens += self.count_text(coerce_countable_text(func.get("name")))
+                tokens += self.count_text(coerce_countable_text(func.get("arguments")))
 
         return tokens
 

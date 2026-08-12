@@ -94,17 +94,17 @@ class TestAnthropicModelFallback:
         assert limit == 200000
 
         pricing = provider._get_pricing("claude-opus-5-20260101")
-        assert pricing["input"] == 15.00
-        assert pricing["output"] == 75.00
+        assert pricing["input"] == 5.00
+        assert pricing["output"] == 25.00
 
     def test_pattern_based_inference_sonnet(self):
         """Test pattern-based inference for sonnet models."""
         provider = AnthropicProvider()
 
-        limit = provider.get_context_limit("claude-sonnet-5-20260101")
+        limit = provider.get_context_limit("claude-sonnet-6-20260101")
         assert limit == 200000
 
-        pricing = provider._get_pricing("claude-sonnet-5-20260101")
+        pricing = provider._get_pricing("claude-sonnet-6-20260101")
         assert pricing["input"] == 3.00
         assert pricing["output"] == 15.00
 
@@ -159,9 +159,9 @@ class TestAnthropicModelFallback:
 
         # Claude Opus 4.5
         pricing = provider._get_pricing("claude-opus-4-5-20251101")
-        assert pricing["input"] == 15.00
-        assert pricing["output"] == 75.00
-        assert pricing["cached_input"] == 1.50
+        assert pricing["input"] == 5.00
+        assert pricing["output"] == 25.00
+        assert pricing["cached_input"] == 0.50
 
     def test_cost_estimation_for_new_models(self):
         """Test cost estimation works for new models."""
@@ -174,8 +174,8 @@ class TestAnthropicModelFallback:
             cached_tokens=0,
         )
 
-        # $15/1M input + $75/1M * 0.1M output = $15 + $7.5 = $22.5
-        assert cost == pytest.approx(22.5, rel=0.01)
+        # $5/1M input + $25/1M * 0.1M output = $5 + $2.5 = $7.5
+        assert cost == pytest.approx(7.5, rel=0.01)
 
 
 class TestAnthropicConfigLoading:
@@ -276,9 +276,23 @@ class TestOpenAIModelFallback:
         """Test fallback for unknown models."""
         provider = OpenAIProvider()
 
-        # Unknown model should get 128K default
-        limit = provider.get_context_limit("gpt-5-future")
+        # Unknown model should get 128K default. Deliberately a name that
+        # matches no known family prefix -- this used to say "gpt-5-future",
+        # which stopped being unknown once gpt-5 was added to _CONTEXT_LIMITS.
+        limit = provider.get_context_limit("gpt-9-imaginary")
         assert limit == 128000
+
+    def test_unknown_variant_inherits_its_family_limit(self):
+        """An unrecognized variant of a *known* family takes that family's limit.
+
+        This is the same prefix inheritance that gives "gpt-4o-2024-11-20" the
+        gpt-4o limit, and it is strictly better than dropping such a model to
+        the generic 128K default.
+        """
+        provider = OpenAIProvider()
+
+        assert provider.get_context_limit("gpt-5-future") == 272000
+        assert provider.get_context_limit("gpt-4.1-preview") == 1_047_576
 
     def test_no_exception_for_unknown_model(self):
         """Test that unknown models don't raise exceptions."""

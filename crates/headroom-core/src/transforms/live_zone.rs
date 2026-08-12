@@ -620,6 +620,67 @@ fn kompress_or_noop(text: &str, content_type: ContentType) -> DispatchResult {
     }
 }
 
+// ─── Kill switch (env-var arm disable) ─────────────────────────────────
+//
+// Experiment control and rollback affordance for the PR-B4 arms: set
+// `HEADROOM_LIVE_ZONE_DISABLE_ARMS` to a comma-separated list of
+// `ContentType::as_str()` names to force those arms to a deterministic
+// no-op, bypassing their compressor entirely.
+
+/// Arms disabled via `HEADROOM_LIVE_ZONE_DISABLE_ARMS` (comma-separated
+/// `ContentType::as_str()` names). Read once per process: the set is
+/// latched on first dispatch so a run's behavior cannot change mid-flight
+/// (determinism invariant). Unknown names are ignored with a warning.
+///
+/// The mechanism itself is generic — any `ContentType` name in the list
+/// is honored — but only the PR-B4 arms ([`ContentType::SourceCode`] and
+/// [`ContentType::PlainText`]) consult it today; see the `arm_disabled`
+/// call sites in [`dispatch_compressor`].
+fn disabled_arms() -> &'static HashSet<ContentType> {
+    static INSTANCE: OnceLock<HashSet<ContentType>> = OnceLock::new();
+    INSTANCE.get_or_init(|| {
+        let mut set = HashSet::new();
+        if let Ok(raw) = std::env::var("HEADROOM_LIVE_ZONE_DISABLE_ARMS") {
+            for token in raw.split(',') {
+                let token = token.trim();
+                if token.is_empty() {
+                    continue;
+                }
+                match content_type_from_name(token) {
+                    Some(ct) => {
+                        set.insert(ct);
+                    }
+                    None => tracing::warn!(event = "disable_arms_unknown_token", token = %token),
+                }
+            }
+        }
+        set
+    })
+}
+
+/// Reverse of [`ContentType::as_str`]. `ContentType` (content_detector.rs)
+/// has no public `from_str`-style constructor and this kill switch isn't
+/// reason enough to grow its public API, so this small private mapping
+/// mirrors each variant's string tag instead.
+fn content_type_from_name(name: &str) -> Option<ContentType> {
+    match name {
+        "json_array" => Some(ContentType::JsonArray),
+        "source_code" => Some(ContentType::SourceCode),
+        "search" => Some(ContentType::SearchResults),
+        "build" => Some(ContentType::BuildOutput),
+        "diff" => Some(ContentType::GitDiff),
+        "html" => Some(ContentType::Html),
+        "text" => Some(ContentType::PlainText),
+        _ => None,
+    }
+}
+
+/// True when `content_type`'s dispatch arm has been disabled via
+/// `HEADROOM_LIVE_ZONE_DISABLE_ARMS`.
+fn arm_disabled(content_type: ContentType) -> bool {
+    disabled_arms().contains(&content_type)
+}
+
 // ─── Public entry point ────────────────────────────────────────────────
 
 /// Inspect a buffered Anthropic `/v1/messages` body and decide which
@@ -1469,6 +1530,11 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
         // to Kompress rather than giving up — mirrors the Python
         // router's no-shrink → Kompress fallback.
         ContentType::SourceCode => {
+            if arm_disabled(ContentType::SourceCode) {
+                return DispatchResult::NoOp {
+                    content_type: content_type.as_str(),
+                };
+            }
             let result = code_compressor().compress(text);
             if result.compressed == text {
                 return kompress_or_noop(text, content_type);
@@ -1482,7 +1548,14 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
         // degrades to a deterministic no-op when the model isn't
         // cache-resident (or the `ml` feature is off) — no network call
         // ever happens on this path.
-        ContentType::PlainText => kompress_or_noop(text, content_type),
+        ContentType::PlainText => {
+            if arm_disabled(ContentType::PlainText) {
+                return DispatchResult::NoOp {
+                    content_type: content_type.as_str(),
+                };
+            }
+            kompress_or_noop(text, content_type)
+        }
         // No HTML compressor on the Rust side; pages are handled by
         // upstream extractors, not the proxy.
         ContentType::Html => DispatchResult::NoOp {

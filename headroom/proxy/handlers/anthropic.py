@@ -1326,6 +1326,20 @@ class AnthropicHandlerMixin:
                     from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
 
                     context_limit = self.anthropic_provider.get_context_limit(model)
+                    # Context pressure must be computed against the window the
+                    # request is really subject to: raised to 1M when the
+                    # client sent a context-1m beta (a 1M session is NOT 5x
+                    # over budget), capped by a limit learned from an actual
+                    # prompt-too-long error. See headroom/proxy/context_guard.py.
+                    from headroom.proxy.context_guard import (
+                        context_guard_enabled,
+                        effective_context_limit,
+                    )
+
+                    if context_guard_enabled():
+                        context_limit = effective_context_limit(
+                            model, context_limit, headers.get("anthropic-beta")
+                        )
                     result = None
                     biases = (
                         self.config.hooks.compute_biases(messages, _hook_ctx)
@@ -3219,6 +3233,11 @@ class AnthropicHandlerMixin:
                                 err_body = {"raw": response.text[:2000]}
                                 err_msg = str(response.text[:500])
                                 err_type = "parse_error"
+
+                            if response.status_code == 400:
+                                from headroom.proxy.context_guard import note_prompt_too_long
+
+                                note_prompt_too_long(model, headers.get("anthropic-beta"), err_msg)
 
                             logger.warning(
                                 f"[{request_id}] UPSTREAM_ERROR "

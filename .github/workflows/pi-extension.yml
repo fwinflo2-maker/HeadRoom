@@ -78,7 +78,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - name: Install Headroom
         working-directory: .
-        run: uv sync --frozen
+        run: uv sync --frozen --extra proxy
       - run: npm ci
       - name: Install tested Pi and OMP versions
         run: |

@@ -1897,3 +1897,37 @@ def test_record_request_accumulates_output_tokens_into_checkpoints(tmp_path):
     )
     assert legacy is not None
     assert legacy["output_tokens"] == 0
+
+
+def test_output_only_request_emits_checkpoint(tmp_path):
+    """A request with actual output tokens but zero savings must still emit a
+    history checkpoint: it moves lifetime["output_tokens"], and if it were the
+    final request in a window, consumers diffing checkpoints would omit those
+    actual tokens and overstate the output-reduction rate."""
+    path = tmp_path / "savings.json"
+    tracker = SavingsTracker(path=path)
+    tracker.record_request(
+        model="claude-opus-5",
+        input_tokens=100,
+        tokens_saved=10,
+        output_tokens_saved=5,
+        output_tokens=200,
+    )
+    tracker.record_request(
+        model="claude-opus-5",
+        input_tokens=100,
+        tokens_saved=0,
+        output_tokens_saved=0,
+        output_tokens=300,
+    )
+
+    history = tracker.snapshot()["history"]
+    assert len(history) == 2
+    assert history[-1]["output_tokens"] == 500
+    assert history[-1]["output_tokens_saved"] == 5
+    assert history[-1]["total_tokens_saved"] == 10
+
+    # The output-only checkpoint must survive persistence and reload.
+    reloaded_history = SavingsTracker(path=path).snapshot()["history"]
+    assert len(reloaded_history) == 2
+    assert reloaded_history[-1]["output_tokens"] == 500

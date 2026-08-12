@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 from urllib.error import URLError
 from urllib.request import urlopen
 
@@ -12,17 +13,24 @@ import click
 from .main import main
 
 
-def _load_snapshot(source: str) -> dict:
+def _decode_snapshot(raw: str, source: str) -> dict[str, Any]:
+    snapshot: object = json.loads(raw)
+    if not isinstance(snapshot, dict):
+        raise click.ClickException(f"stats snapshot {source} must be a JSON object")
+    return snapshot
+
+
+def _load_snapshot(source: str) -> dict[str, Any]:
     if source.startswith(("http://", "https://")):
         try:
             with urlopen(source, timeout=10) as response:  # noqa: S310 - user-provided local stats URL
-                return json.loads(response.read().decode("utf-8"))
+                return _decode_snapshot(response.read().decode("utf-8"), source)
         except (OSError, URLError, json.JSONDecodeError) as exc:
             raise click.ClickException(f"failed to read stats URL {source}: {exc}") from exc
 
     path = Path(source)
     try:
-        return json.loads(path.read_text())
+        return _decode_snapshot(path.read_text(), str(path))
     except (OSError, json.JSONDecodeError) as exc:
         raise click.ClickException(f"failed to read stats file {path}: {exc}") from exc
 

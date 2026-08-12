@@ -83,3 +83,18 @@ def test_proxy_benchmark_compare_rejects_missing_tokens(tmp_path) -> None:
 
     assert result.exit_code != 0
     assert "missing tokens.input" in result.output
+
+
+def test_proxy_benchmark_compare_rejects_non_object_snapshot(tmp_path) -> None:
+    baseline = tmp_path / "baseline.json"
+    optimized = tmp_path / "optimized.json"
+    baseline.write_text("[]")
+    _write_stats(optimized, input_tokens=700)
+
+    result = CliRunner().invoke(
+        main,
+        ["proxy-benchmark", "compare", str(baseline), str(optimized)],
+    )
+
+    assert result.exit_code != 0
+    assert "must be a JSON object" in result.output

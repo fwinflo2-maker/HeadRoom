@@ -28,6 +28,7 @@ from . import (  # noqa: F401
     tools,
     update,
     wrap,
+    xray,
 )
 from .main import main
 

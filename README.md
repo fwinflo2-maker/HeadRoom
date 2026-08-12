@@ -587,6 +587,20 @@ Headroom runs **locally**, covers **every** content type, works with every major
 
 > **Stack & integrations.** Headroom is the **proxy** — that's what we build and offer, and it compresses everything flowing through it no matter what sits upstream. Our recommended companion is **[Serena](https://github.com/oraios/serena)** (installed by default when you wrap an agent) for semantic code navigation — plus **Ponytail** if you want leaner model output. Everything else is your call: you're free to attach your own tooling — code-memory MCP, Graphify, Caveman, or any MCP server — and Headroom compresses downstream of all of it.
 
+## Diagnose context bloat — `headroom xray`
+
+```bash
+headroom xray            # 30-day multi-agent usage report
+headroom xray today      # today only
+headroom xray optimize   # find waste patterns + paste-ready fixes
+```
+
+Wraps [CodeBurn](https://github.com/getagentseal/codeburn) (MIT, 25+ agents) and
+adds a Headroom footer with the top tool-type token consumers for your current
+project's latest Claude Code session. Phase 1 reports raw counts; `headroom xray
+replay` (Phase 2) measures actual compression savings. Requires Node 20+. See
+[docs/diagnosing-context-bloat.md](docs/diagnosing-context-bloat.md).
+
 ## Contributing
 
 ```bash

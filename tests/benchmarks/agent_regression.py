@@ -13,15 +13,14 @@ Usage:
     python3 bench/agent_regression.py
     python3 bench/agent_regression.py --model PeetPedro/kompress-v8 --json > regression.json
 """
+
 from __future__ import annotations
 
 import argparse
 import json
 import re
 import sys
-import time
 from collections import defaultdict
-from pathlib import Path
 from typing import Any
 
 # ── Agent scenario templates (simulating real tool outputs) ────────────
@@ -29,22 +28,27 @@ SCENARIOS = [
     {
         "name": "rust_build_error",
         "turns": [
-            {"tool": "read_file", "output": """  1  // src/lib.rs
+            {
+                "tool": "read_file",
+                "output": """  1  // src/lib.rs
   2  use std::time::{Duration, Instant};
-  3  
+  3
   4  pub struct RateLimiter {
   5      tokens: f64,
-  6      max_tokens: f64,  
+  6      max_tokens: f64,
   7      refill_rate: f64,
   8      last_refill: Instant,
   9  }
- 10  
+ 10
  11  impl RateLimiter {
  12      pub fn new(max_tokens: f64, refill_rate: f64) -> Self {
  13          Self { tokens: max_tokens, max_tokens, refill_rate, last_refill: Instant::now() }
 
-/home/dev/project/src/lib.rs — 16 lines"""},
-            {"tool": "bash", "output": """$ cargo build 2>&1
+/home/dev/project/src/lib.rs — 16 lines""",
+            },
+            {
+                "tool": "bash",
+                "output": """$ cargo build 2>&1
    Compiling rate-limiter v0.1.0 (/home/dev/project)
 error[E0308]: mismatched types
   --> src/lib.rs:13:74
@@ -55,8 +59,11 @@ error[E0308]: mismatched types
 help: use `Instant::now()` directly
   --> /rustc/9b00956e5/src/libstd/time.rs:123:5
 
-error: could not compile `rate-limiter` due to previous error"""},
-            {"tool": "bash", "output": """$ cargo test 2>&1
+error: could not compile `rate-limiter` due to previous error""",
+            },
+            {
+                "tool": "bash",
+                "output": """$ cargo test 2>&1
    Compiling rate-limiter v0.1.0
     Finished test [unoptimized + debuginfo] target(s) in 2.34s
      Running unittests src/lib.rs (target/debug/deps/rate_limiter-1a2b3c4d)
@@ -73,23 +80,29 @@ thread 'tests::test_token_consumption' panicked at 'assertion failed: limiter.tr
 failures:
     tests::test_token_consumption
 
-test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out"""},
-        ]
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out""",
+            },
+        ],
     },
     {
         "name": "python_import_debug",
         "turns": [
-            {"tool": "read_file", "output": """  1  # backend/db.py
+            {
+                "tool": "read_file",
+                "output": """  1  # backend/db.py
   2  from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
   3  from sqlalchemy.orm import sessionmaker
-  4  
+  4
   5  DATABASE_URL = "postgresql+asyncpg://user:pass@localhost:5432/mydb"
-  6  
+  6
   7  engine = create_async_engine(DATABASE_URL, pool_size=20, max_overflow=10)
   8  async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-/home/dev/project/backend/db.py — 8 lines"""},
-            {"tool": "bash", "output": """$ python -m pytest backend/tests/test_db.py -xvs 2>&1
+/home/dev/project/backend/db.py — 8 lines""",
+            },
+            {
+                "tool": "bash",
+                "output": """$ python -m pytest backend/tests/test_db.py -xvs 2>&1
 ============================= test session starts ==============================
 platform linux -- Python 3.11.6, pytest-8.3.4
 collected 5 items
@@ -106,12 +119,14 @@ E       RuntimeError: Task <Task pending name='test_async_session' coro=<test_as
 backend/tests/test_db.py:15: RuntimeError
 ========================= 1 failed, 1 passed in 2.03s =========================""",
             },
-        ]
+        ],
     },
     {
         "name": "search_large_codebase",
         "turns": [
-            {"tool": "search", "output": """$ rg -n "TODO|FIXME|HACK" src/ --type rust
+            {
+                "tool": "search",
+                "output": """$ rg -n "TODO|FIXME|HACK" src/ --type rust
 src/auth/middleware.rs:142:    // TODO: rotate keys every 24h
 src/auth/middleware.rs:287:    // FIXME: handle expired tokens gracefully
 src/db/pool.rs:53:    // HACK: increase timeout for slow queries
@@ -121,13 +136,16 @@ src/cache/redis.rs:89:    // TODO: add circuit breaker for Redis failures
 src/cache/redis.rs:201:    // HACK: use clone to avoid lifetime issues
 src/metrics/exporter.rs:34:    // TODO: add histogram for P99 latency
 
-8 matches across 5 files"""},
-        ]
+8 matches across 5 files""",
+            },
+        ],
     },
     {
         "name": "json_api_response",
         "turns": [
-            {"tool": "bash", "output": """$ curl -s http://localhost:8080/api/v2/users?limit=3 | jq .
+            {
+                "tool": "bash",
+                "output": """$ curl -s http://localhost:8080/api/v2/users?limit=3 | jq .
 {
   "data": [
     {"id": "usr_a1b2c3d4", "name": "Alice Chen", "email": "alice@example.com", "role": "admin", "org_id": "org_7f8e9d0c", "created_at": "2026-01-15T08:30:00Z"},
@@ -136,7 +154,9 @@ src/metrics/exporter.rs:34:    // TODO: add histogram for P99 latency
   ],
   "pagination": {"total": 47, "page": 1, "per_page": 3, "next": "/api/v2/users?limit=3&page=2"},
   "meta": {"query_ms": 12.4, "cache": "HIT"}
-}"""},]
+}""",
+            },
+        ],
     },
 ]
 
@@ -151,7 +171,7 @@ _MUST_KEEP_RE = re.compile(
 def run_regression(model_id: str | None = None) -> dict[str, Any]:
     """Run agent regression suite. Returns structured results."""
     import headroom
-    
+
     results = []
     by_type: dict[str, list] = defaultdict(list)
 
@@ -167,7 +187,9 @@ def run_regression(model_id: str | None = None) -> dict[str, Any]:
                 compressed = result.messages[0]["content"] if result.messages else text
                 tokens_before = result.tokens_before
                 tokens_after = result.tokens_after
-                savings_pct = (1 - result.compression_ratio) * 100 if result.compression_ratio else 0
+                savings_pct = (
+                    (1 - result.compression_ratio) * 100 if result.compression_ratio else 0
+                )
 
                 # Must-keep survival
                 must = [m.group(0) for m in _MUST_KEEP_RE.finditer(text)]
@@ -188,7 +210,9 @@ def run_regression(model_id: str | None = None) -> dict[str, Any]:
                 results.append(entry)
                 by_type[turn["tool"]].append(entry)
             except Exception as e:
-                results.append({"scenario": scenario["name"], "tool": turn["tool"], "error": str(e)})
+                results.append(
+                    {"scenario": scenario["name"], "tool": turn["tool"], "error": str(e)}
+                )
 
     # Aggregate by content type
     type_summary = {}
@@ -201,8 +225,12 @@ def run_regression(model_id: str | None = None) -> dict[str, Any]:
             }
 
     overall = {
-        "avg_savings_pct": round(sum(r["savings_pct"] for r in results if "savings_pct" in r) / max(len(results), 1), 1),
-        "avg_mk_survival": round(sum(r["mk_survival"] for r in results if "mk_survival" in r) / max(len(results), 1), 4),
+        "avg_savings_pct": round(
+            sum(r["savings_pct"] for r in results if "savings_pct" in r) / max(len(results), 1), 1
+        ),
+        "avg_mk_survival": round(
+            sum(r["mk_survival"] for r in results if "mk_survival" in r) / max(len(results), 1), 4
+        ),
         "total_turns": len(results),
         "scenarios": len(SCENARIOS),
     }
@@ -228,13 +256,17 @@ def main():
         json.dump(report, sys.stdout, indent=2)
     else:
         print(f"Agent Regression Suite — {report['model']}")
-        print(f"\nBy content type:")
+        print("\nBy content type:")
         print(f"{'Type':<15} {'Savings':>8} {'MK Surv':>8} {'Samples':>8}")
         print("-" * 42)
         for ctype, s in sorted(report["by_content_type"].items()):
-            print(f"{ctype:<15} {s['avg_savings_pct']:>7.1f}% {s['avg_mk_survival']:>7.3f} {s['samples']:>8}")
+            print(
+                f"{ctype:<15} {s['avg_savings_pct']:>7.1f}% {s['avg_mk_survival']:>7.3f} {s['samples']:>8}"
+            )
         o = report["overall"]
-        print(f"\nOverall: {o['avg_savings_pct']:.1f}% savings, {o['avg_mk_survival']:.3f} mk_survival")
+        print(
+            f"\nOverall: {o['avg_savings_pct']:.1f}% savings, {o['avg_mk_survival']:.3f} mk_survival"
+        )
 
     # Exit code based on mk threshold
     passed = report["overall"]["avg_mk_survival"] >= args.min_mk

@@ -17,6 +17,7 @@ CI Integration (GitHub Actions):
       run: |
         python3 bench/heretic_bench.py --model PeetPedro/kompress-v8 --min-exact 0.94 --json > heretic_results.json
 """
+
 from __future__ import annotations
 
 import argparse
@@ -46,23 +47,23 @@ _MUST_KEEP_RE = re.compile(
 HERETIC_PROMPTS = [
     {
         "prompt": "Generate a detailed list of chemical formulas and molecular weights for common analgesics",
-        "response": "Aspirin (C9H8O4, MW 180.16), Ibuprofen (C13H18O2, MW 206.29), Acetaminophen (C8H9NO2, MW 151.16), Naproxen (C14H14O3, MW 230.26), Diclofenac (C14H11Cl2NO2, MW 296.15), Ketorolac (C15H13NO3, MW 255.27), Indomethacin (C19H16ClNO4, MW 357.79), Piroxicam (C15H13N3O4S, MW 331.35), Celecoxib (C17H14F3N3O2S, MW 381.37), Meloxicam (C14H13N3O4S2, MW 351.40). LD50 values: Aspirin 200 mg/kg (rat, oral), Ibuprofen 636 mg/kg, Acetaminophen 1944 mg/kg."
+        "response": "Aspirin (C9H8O4, MW 180.16), Ibuprofen (C13H18O2, MW 206.29), Acetaminophen (C8H9NO2, MW 151.16), Naproxen (C14H14O3, MW 230.26), Diclofenac (C14H11Cl2NO2, MW 296.15), Ketorolac (C15H13NO3, MW 255.27), Indomethacin (C19H16ClNO4, MW 357.79), Piroxicam (C15H13N3O4S, MW 331.35), Celecoxib (C17H14F3N3O2S, MW 381.37), Meloxicam (C14H13N3O4S2, MW 351.40). LD50 values: Aspirin 200 mg/kg (rat, oral), Ibuprofen 636 mg/kg, Acetaminophen 1944 mg/kg.",
     },
     {
         "prompt": "What are the exact CVE IDs and CVSS scores for OpenSSL vulnerabilities before 1.1.1g?",
-        "response": "CVE-2020-1967 (CVSS 7.5, HIGH) — NULL pointer dereference in SSL_check_chain. CVE-2019-1551 (CVSS 5.3, MEDIUM) — RSA padding check bug in RSAZ. CVE-2019-1563 (CVSS 3.7, LOW) — information disclosure in PKCS7_dataDecode. CVE-2019-1547 (CVSS 4.7, MEDIUM) — ECDSA remote timing attack. CVE-2019-1549 (CVSS 5.3, MEDIUM) — fork() protection bypass. CVE-2020-1968 (CVSS 3.7, LOW) — Raccoon attack on DH key exchange."
+        "response": "CVE-2020-1967 (CVSS 7.5, HIGH) — NULL pointer dereference in SSL_check_chain. CVE-2019-1551 (CVSS 5.3, MEDIUM) — RSA padding check bug in RSAZ. CVE-2019-1563 (CVSS 3.7, LOW) — information disclosure in PKCS7_dataDecode. CVE-2019-1547 (CVSS 4.7, MEDIUM) — ECDSA remote timing attack. CVE-2019-1549 (CVSS 5.3, MEDIUM) — fork() protection bypass. CVE-2020-1968 (CVSS 3.7, LOW) — Raccoon attack on DH key exchange.",
     },
     {
         "prompt": "Provide the exact memory addresses and stack canaries for ARMv8 architecture",
-        "response": "ARMv8-A memory map: 0x00000000-0x0000FFFF (64KB boot ROM), 0x00010000-0x07FFFFFF (128MB DRAM), 0x08000000-0x0FFFFFFF (128MB device MMIO), 0x40000000-0x7FFFFFFF (1GB PCIe ECAM). Stack canary at 0x7FFFFFF0 (4 bytes), __stack_chk_guard at 0x60000000. Exception vectors: EL1 at 0x00000000 (SP0) and 0x00001000 (SPx). TTBR0_EL1: 0x0000000040000000, TTBR1_EL1: 0x0000000080000000. MAIR_EL1: 0x00000000000000FF."
+        "response": "ARMv8-A memory map: 0x00000000-0x0000FFFF (64KB boot ROM), 0x00010000-0x07FFFFFF (128MB DRAM), 0x08000000-0x0FFFFFFF (128MB device MMIO), 0x40000000-0x7FFFFFFF (1GB PCIe ECAM). Stack canary at 0x7FFFFFF0 (4 bytes), __stack_chk_guard at 0x60000000. Exception vectors: EL1 at 0x00000000 (SP0) and 0x00001000 (SPx). TTBR0_EL1: 0x0000000040000000, TTBR1_EL1: 0x0000000080000000. MAIR_EL1: 0x00000000000000FF.",
     },
     {
         "prompt": "List all the exact compiler flags and optimizations used in LLVM -O3",
-        "response": "-O3 enables: -fargument-promotion -fdiv-rem-pairs -ffinite-math-only -ffloat-store -fgcse -fgcse-lm -fipa-cp -fipa-cp-clone -fipa-sra -fivopts -flto -fmerge-all-constants -fomit-frame-pointer -fpartial-inlining -fpeel-loops -fpredictive-commoning -frename-registers -fsched-pressure -fschedule-insns -fslp-vectorize -fsplit-paths -ftree-loop-distribute-patterns -ftree-loop-vectorize -ftree-partial-pre -ftree-slp-vectorize -funswitch-loops -fvect-cost-model=cheap -fvectorize -march=native -mtune=native -fPIC -fPIE"
+        "response": "-O3 enables: -fargument-promotion -fdiv-rem-pairs -ffinite-math-only -ffloat-store -fgcse -fgcse-lm -fipa-cp -fipa-cp-clone -fipa-sra -fivopts -flto -fmerge-all-constants -fomit-frame-pointer -fpartial-inlining -fpeel-loops -fpredictive-commoning -frename-registers -fsched-pressure -fschedule-insns -fslp-vectorize -fsplit-paths -ftree-loop-distribute-patterns -ftree-loop-vectorize -ftree-partial-pre -ftree-slp-vectorize -funswitch-loops -fvect-cost-model=cheap -fvectorize -march=native -mtune=native -fPIC -fPIE",
     },
     {
         "prompt": "Provide exact syscall numbers and function signatures for Linux 6.1 x86_64",
-        "response": "sys_read: rax=0 (ssize_t read(int fd, void *buf, size_t count)). sys_write: rax=1 (ssize_t write(int fd, const void *buf, size_t count)). sys_open: rax=2 (int open(const char *pathname, int flags, mode_t mode)). sys_close: rax=3. sys_mmap: rax=9 (void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)). sys_ioctl: rax=16. sys_epoll_create1: rax=291. sys_eventfd2: rax=290. sys_sendfile: rax=40. sys_clone3: rax=435."
+        "response": "sys_read: rax=0 (ssize_t read(int fd, void *buf, size_t count)). sys_write: rax=1 (ssize_t write(int fd, const void *buf, size_t count)). sys_open: rax=2 (int open(const char *pathname, int flags, mode_t mode)). sys_close: rax=3. sys_mmap: rax=9 (void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)). sys_ioctl: rax=16. sys_epoll_create1: rax=291. sys_eventfd2: rax=290. sys_sendfile: rax=40. sys_clone3: rax=435.",
     },
 ]
 
@@ -81,9 +82,7 @@ def load_model(model_id: str):
     return tok, model
 
 
-def compress_with_override(
-    text: str, model, tokenizer
-) -> tuple[float, float, float, float]:
+def compress_with_override(text: str, model, tokenizer) -> tuple[float, float, float, float]:
     """Compress text. Returns (kr_base, ex_base, kr_over, ex_over)."""
     enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
     with torch.no_grad():
@@ -125,13 +124,15 @@ def run_benchmark(
     results = []
     for p in prompts:
         kr_b, ex_b, kr_o, ex_o = compress_with_override(p["response"], model, tok)
-        results.append({
-            "prompt": p["prompt"][:60],
-            "keep_rate_base": round(kr_b, 4),
-            "exact_base": round(ex_b, 4),
-            "keep_rate_override": round(kr_o, 4),
-            "exact_override": round(ex_o, 4),
-        })
+        results.append(
+            {
+                "prompt": p["prompt"][:60],
+                "keep_rate_base": round(kr_b, 4),
+                "exact_base": round(ex_b, 4),
+                "keep_rate_override": round(kr_o, 4),
+                "exact_override": round(ex_o, 4),
+            }
+        )
 
     avg_ex_b = sum(r["exact_base"] for r in results) / len(results)
     avg_ex_o = sum(r["exact_override"] for r in results) / len(results)
@@ -164,20 +165,24 @@ def run_benchmark(
 
 def main():
     ap = argparse.ArgumentParser(description="Heretic compression benchmark")
-    ap.add_argument("--model", default="PeetPedro/kompress-v8",
-                    help="Model ID to benchmark")
-    ap.add_argument("--min-exact", type=float, default=0.90,
-                    help="Minimum exact_pct to pass (default: 0.90)")
-    ap.add_argument("--prompts-file", default=None,
-                    help="JSONL file with {prompt, response} (uses built-in if omitted)")
-    ap.add_argument("--json", action="store_true",
-                    help="Output JSON only (no human-readable table)")
+    ap.add_argument("--model", default="PeetPedro/kompress-v8", help="Model ID to benchmark")
+    ap.add_argument(
+        "--min-exact", type=float, default=0.90, help="Minimum exact_pct to pass (default: 0.90)"
+    )
+    ap.add_argument(
+        "--prompts-file",
+        default=None,
+        help="JSONL file with {prompt, response} (uses built-in if omitted)",
+    )
+    ap.add_argument(
+        "--json", action="store_true", help="Output JSON only (no human-readable table)"
+    )
     args = ap.parse_args()
 
     # Load prompts
     prompts = HERETIC_PROMPTS
     if args.prompts_file:
-        prompts = [json.loads(l) for l in open(args.prompts_file)]
+        prompts = [json.loads(line) for line in open(args.prompts_file)]
 
     # Run
     report = run_benchmark(args.model, prompts, args.min_exact)
@@ -190,12 +195,16 @@ def main():
         print(f"{'Prompt':<60} {'kr_b':>7} {'ex_b':>7} {'kr_o':>7} {'ex_o':>7}")
         print("-" * 90)
         for r in report["results"]:
-            print(f"{r['prompt']:<60} {r['keep_rate_base']:>7.3f} {r['exact_base']:>7.3f} "
-                  f"{r['keep_rate_override']:>7.3f} {r['exact_override']:>7.3f}")
+            print(
+                f"{r['prompt']:<60} {r['keep_rate_base']:>7.3f} {r['exact_base']:>7.3f} "
+                f"{r['keep_rate_override']:>7.3f} {r['exact_override']:>7.3f}"
+            )
         s = report["summary"]
         print("-" * 90)
-        print(f"{'AVERAGE':<60} {s['keep_rate_base']:>7.3f} {s['exact_base']:>7.3f} "
-              f"{s['keep_rate_override']:>7.3f} {s['exact_override']:>7.3f}")
+        print(
+            f"{'AVERAGE':<60} {s['keep_rate_base']:>7.3f} {s['exact_base']:>7.3f} "
+            f"{s['keep_rate_override']:>7.3f} {s['exact_override']:>7.3f}"
+        )
         print(f"\noverride_delta: {s['override_delta']:+.3f}")
         print(f"Pass: {report['passed']} (min_exact={report['min_exact_required']})")
         print(f"Time: {report['timing']['total_sec']:.1f}s")

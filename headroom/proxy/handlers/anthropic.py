@@ -27,7 +27,11 @@ from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
-from headroom.proxy.auth_mode import classify_auth_mode, classify_client
+from headroom.proxy.auth_mode import (
+    classify_auth_mode,
+    classify_client,
+    supports_mid_turn_coalescing,
+)
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
@@ -2906,9 +2910,28 @@ class AnthropicHandlerMixin:
                         cw_5m_tokens, cw_1h_tokens = self._extract_anthropic_cache_ttl_metrics(
                             usage
                         )
-                        uncached_input_tokens = max(
-                            0, attempted_input_tokens - cr_tokens - cw_tokens
-                        )
+                        # Prefer the backend's Anthropic-shaped ``input_tokens``,
+                        # which is already the uncached count (prompt tokens minus
+                        # cache read/creation; see ``_anthropic_usage_from_litellm``
+                        # / #1345), matching the direct-API path below. Re-deriving
+                        # it as ``attempted_input_tokens - cache`` is wrong whenever
+                        # the backend reports it: ``attempted_input_tokens`` is the
+                        # live-zone tokenizer count kept for the compression-ratio
+                        # denominator, not the full request size, so on any turn
+                        # whose cached prefix is larger than the new turn it
+                        # underflows and ``max(0, ...)`` clamps uncached to 0.
+                        #
+                        # Guard on the backend actually reporting it: a backend that
+                        # omits ``input_tokens`` (or sends null) must not silently
+                        # report uncached=0 — fall back to the live-zone derivation,
+                        # which is never worse than the previous behaviour.
+                        _reported_input_tokens = usage.get("input_tokens")
+                        if _reported_input_tokens is not None:
+                            uncached_input_tokens = int(_reported_input_tokens)
+                        else:
+                            uncached_input_tokens = max(
+                                0, attempted_input_tokens - cr_tokens - cw_tokens
+                            )
 
                         # Update prefix cache tracker for next turn. Mirrors the
                         # direct-Anthropic-API branch below (~line 3011) — without
@@ -3071,11 +3094,18 @@ class AnthropicHandlerMixin:
                         body,
                         session_header=explicit_session_header,
                     )
-                    # Only opt-in (header-bearing) callers participate in
-                    # mid-turn steering; see StreamingMixin._should_queue_mid_turn
-                    # for why the coarse md5 fallback must not queue concurrent
-                    # independent streams (it wrongly 202s a streaming caller).
-                    if self._should_queue_mid_turn(session_key, explicit_session_header):
+                    # Coalesce mid-turn messages only for Claude Code, the sole
+                    # client that understands the 202 `headroom_queued` reply and
+                    # the `headroom_pending_messages` SSE event. Other harnesses
+                    # (e.g. OpenCode subagents sharing a body-derived session key)
+                    # would otherwise have their request swallowed and never
+                    # answered. (#1608) `_should_queue_mid_turn` further restricts
+                    # this to opt-in (header-bearing) callers with an active
+                    # stream, so the coarse md5 fallback can't 202 a streaming
+                    # caller.
+                    if supports_mid_turn_coalescing(
+                        classify_client(request.headers)
+                    ) and self._should_queue_mid_turn(session_key, explicit_session_header):
                         from fastapi.responses import JSONResponse
 
                         queued = self._queue_mid_turn_message(session_key, body)

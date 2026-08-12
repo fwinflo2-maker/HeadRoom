@@ -170,7 +170,7 @@ def _create_embedder(config: MemoryConfig) -> Embedder:
                 return cached
             from headroom.memory.adapters.remote import RemoteEmbedder
 
-            embedder = RemoteEmbedder(sidecar_socket)
+            embedder: Embedder = RemoteEmbedder(sidecar_socket)
             _EMBEDDER_CACHE[key] = embedder
             return embedder
 
@@ -205,7 +205,7 @@ def _create_embedder(config: MemoryConfig) -> Embedder:
         if config.embedder_backend == EmbedderBackend.LOCAL:
             from headroom.memory.adapters.embedders import LocalEmbedder
 
-            embedder: Embedder = LocalEmbedder(model_name=config.embedder_model)
+            embedder = LocalEmbedder(model_name=config.embedder_model)
 
         elif config.embedder_backend == EmbedderBackend.ONNX:
             from headroom.memory.adapters.embedders import OnnxLocalEmbedder

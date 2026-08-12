@@ -6,7 +6,7 @@
 //! - Build/log output       → LogCompressor
 //! - Search-result tool_results → SearchCompressor
 //! - Git diff tool_results  → DiffCompressor
-//! - Source code            → no-op (Rust port pending)
+//! - Source code            → CodeAwareCompressor
 //! - Unknown / image / html → no-op
 //!
 //! Plus the cache-safety invariant: bytes outside the rewritten
@@ -76,6 +76,43 @@ fn body_with_tool_result(text: &str) -> (Vec<u8>, (usize, usize)) {
     let needle = serde_json::to_vec(&text).unwrap();
     let range = find_byte_range(&body, &needle);
     (body, range)
+}
+
+/// Build a syntactically valid Python module with `n` small functions,
+/// each carrying a one-line docstring and a body long enough (> 5 lines,
+/// the CodeAwareCompressor's `max_body_lines` default) that body-elision
+/// actually has something to trim. Real Python, not a fixture that only
+/// *looks* like code — the compressor re-parses and reverts on syntax
+/// errors, so this must round-trip through tree-sitter cleanly. Built
+/// with explicit `push_str` calls (rather than a multi-line literal) so
+/// the indentation is unambiguous to read and verify.
+fn python_module_source(n: usize) -> String {
+    let mut code = String::new();
+    code.push_str(
+        "\"\"\"Example data-processing module used by the live-zone dispatch tests.\"\"\"\n",
+    );
+    code.push_str("\n");
+    code.push_str("import json\n");
+    code.push_str("import os\n");
+    code.push_str("from typing import Any, Optional\n");
+    code.push_str("\n\n");
+    for i in 0..n {
+        code.push_str(&format!("def process_record_{i}(record: dict) -> dict:\n"));
+        code.push_str(&format!(
+            "    \"\"\"Normalize record {i} and compute its derived fields.\"\"\"\n"
+        ));
+        code.push_str("    result = dict(record)\n");
+        code.push_str(&format!("    result[\"index\"] = {i}\n"));
+        code.push_str("    result[\"doubled\"] = record.get(\"value\", 0) * 2\n");
+        code.push_str("    result[\"source\"] = \"batch\"\n");
+        code.push_str("    if result[\"doubled\"] > 100:\n");
+        code.push_str("        result[\"flag\"] = \"high\"\n");
+        code.push_str("    else:\n");
+        code.push_str("        result[\"flag\"] = \"low\"\n");
+        code.push_str("    return result\n");
+        code.push_str("\n\n");
+    }
+    code
 }
 
 // ─── Routing tests ─────────────────────────────────────────────────────
@@ -262,29 +299,83 @@ fn diff_tool_result_routes_to_diff_compressor() {
 }
 
 #[test]
-fn source_code_tool_result_routes_to_no_op() {
-    // Detector classifies this as SourceCode. PR-B3 routes it to
-    // no-op (Rust code-compressor port pending). Pin the contract
-    // so a future "wire it up" PR can flip this assertion.
-    let code = "
-fn main() {
-    let x: i32 = 42;
-    let y = x * 2;
-    println!(\"{}\", y);
-    if x > 0 {
-        println!(\"positive\");
-    } else {
-        println!(\"non-positive\");
+fn source_code_tool_result_routes_to_code_compressor() {
+    // Detector classifies this as SourceCode. PR-B4 wires the arm up to
+    // the tree-sitter-backed CodeAwareCompressor. This flips the PR-B3
+    // pin ("a future 'wire it up' PR can flip this assertion").
+    let code = python_module_source(10);
+    assert!(
+        code.len() > 2048,
+        "fixture must clear the SourceCode byte threshold (2048); got {} bytes",
+        code.len()
+    );
+
+    let (body, _) = body_with_tool_result(&code);
+    let out = dispatch(&body);
+    let manifest = match &out {
+        LiveZoneOutcome::Modified { manifest, .. } => manifest,
+        LiveZoneOutcome::NoChange { manifest } => panic!(
+            "expected CodeAwareCompressor to shrink a 10-function Python module; got NoChange. manifest: {manifest:?}"
+        ),
+    };
+    let action = manifest
+        .block_outcomes
+        .iter()
+        .find(|b| b.block_type == "tool_result")
+        .expect("tool_result block present")
+        .action
+        .clone();
+    match action {
+        BlockAction::Compressed {
+            strategy,
+            original_tokens,
+            compressed_tokens,
+            ..
+        } => {
+            assert_eq!(
+                strategy, "code_compressor",
+                "expected code_compressor dispatch"
+            );
+            assert!(
+                compressed_tokens < original_tokens,
+                "tokenizer-validated gate (PR-B4) must accept only token-shrinking output \
+                 ({compressed_tokens} < {original_tokens})"
+            );
+        }
+        other => panic!("expected BlockAction::Compressed, got {other:?}"),
     }
 }
-"
-    .repeat(20);
-    let (body, _) = body_with_tool_result(&code);
+
+#[test]
+fn tiny_source_code_below_threshold_no_op() {
+    // Detector classifies this as SourceCode, but it's well under the
+    // 2048-byte SourceCode threshold, so the dispatcher must not even
+    // spin up the CodeAwareCompressor.
+    let code = "\
+import os
+from typing import Any
+
+
+def add(a: int, b: int) -> int:
+    \"\"\"Add two integers.\"\"\"
+    return a + b
+
+
+if __name__ == \"__main__\":
+    print(add(1, 2))
+";
+    assert!(
+        code.len() < 2048,
+        "fixture must stay below the SourceCode byte threshold (2048); got {} bytes",
+        code.len()
+    );
+
+    let (body, _) = body_with_tool_result(code);
     let out = dispatch(&body);
     let manifest = match &out {
         LiveZoneOutcome::NoChange { manifest } => manifest,
         LiveZoneOutcome::Modified { manifest, .. } => {
-            panic!("PR-B3 must NOT compress SourceCode (Rust port pending). manifest: {manifest:?}")
+            panic!("tiny source-code block must not be compressed. manifest: {manifest:?}")
         }
     };
     let action = manifest
@@ -295,26 +386,15 @@ fn main() {
         .action
         .clone();
     match action {
-        BlockAction::NoCompressionApplied { content_type } => {
-            // Source-code-shaped content above the SourceCode byte
-            // threshold (2 KiB) but below any active compressor:
-            // SmartCrusher / log / search / diff don't apply, and
-            // the Rust code-compressor port is not yet wired.
-            assert!(
-                content_type == "source_code" || content_type == "text",
-                "unexpected content_type tag: {content_type}"
-            );
+        BlockAction::BelowByteThreshold {
+            content_type,
+            threshold_bytes,
+            ..
+        } => {
+            assert_eq!(threshold_bytes, 2048, "expected the SourceCode threshold");
+            assert_eq!(content_type, "source_code", "unexpected content_type tag");
         }
-        BlockAction::BelowByteThreshold { content_type, .. } => {
-            // Detector may classify code-with-prose as PlainText
-            // (5 KiB threshold) — for ~2.6 KiB of mixed code/prose
-            // that still routes to no-op for B4. Pin the tag.
-            assert!(
-                content_type == "text" || content_type == "source_code",
-                "unexpected content_type tag: {content_type}"
-            );
-        }
-        other => panic!("expected NoCompressionApplied or BelowByteThreshold, got {other:?}"),
+        other => panic!("expected BelowByteThreshold, got {other:?}"),
     }
 }
 

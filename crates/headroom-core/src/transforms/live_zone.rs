@@ -101,6 +101,7 @@ use serde_json::value::RawValue;
 use serde_json::Value;
 use thiserror::Error;
 
+use super::code_compressor::{CodeAwareCompressor, CodeCompressorConfig};
 use super::content_detector::{detect_content_type, ContentType};
 use super::diff_compressor::{DiffCompressor, DiffCompressorConfig};
 use super::log_compressor::{LogCompressor, LogCompressorConfig};
@@ -119,6 +120,8 @@ const STRATEGY_LOG_COMPRESSOR: &str = "log_compressor";
 const STRATEGY_SEARCH_COMPRESSOR: &str = "search_compressor";
 /// Strategy tag emitted when DiffCompressor rewrote a unified-diff block.
 const STRATEGY_DIFF_COMPRESSOR: &str = "diff_compressor";
+/// Strategy tag emitted when CodeAwareCompressor rewrote a source-code block.
+const STRATEGY_CODE_COMPRESSOR: &str = "code_compressor";
 
 /// Empty query context passed to compressors that take a relevance
 /// query string. PR-B3 dispatcher does not yet plumb the user's last
@@ -158,14 +161,18 @@ const THRESHOLD_BUILD_OUTPUT: usize = 512;
 const THRESHOLD_SEARCH_RESULTS: usize = 512;
 /// Git-diff blocks below this size route to no-op.
 const THRESHOLD_GIT_DIFF: usize = 512;
-/// Source-code blocks below this size route to no-op. Pinned
-/// for the future Rust code-compressor port — currently unused
-/// because `ContentType::SourceCode` short-circuits to no-op above
-/// the dispatch (see `dispatch_compressor`).
-const THRESHOLD_SOURCE_CODE: usize = 512;
-/// Plain-text blocks below this size route to no-op. Pinned
-/// for the future Kompress wiring (PR-B7 follow-up); currently unused.
-const THRESHOLD_PLAIN_TEXT: usize = 512;
+/// Source-code blocks below this size route to no-op. Sourced from
+/// `REALIGNMENT/04-phase-B-live-zone.md::PR-B4` (2 KiB) — the
+/// CodeAwareCompressor's own `min_tokens_for_compression` floor
+/// already guards tiny snippets, but the byte gate keeps the dispatcher
+/// from spinning up tree-sitter parsing for content that can't possibly
+/// clear it.
+const THRESHOLD_SOURCE_CODE: usize = 2048;
+/// Plain-text blocks below this size route to no-op. Sourced from
+/// `REALIGNMENT/04-phase-B-live-zone.md::PR-B4` (5 KiB). PlainText's
+/// threshold gate already fires before dispatch; its compressor arm
+/// (Kompress) lands in a follow-up PR.
+const THRESHOLD_PLAIN_TEXT: usize = 5120;
 /// HTML blocks have no compressor; threshold matches plain text so
 /// when an HTML compressor lands the value is already pinned.
 const THRESHOLD_HTML: usize = 512;
@@ -547,6 +554,11 @@ fn search_compressor() -> &'static SearchCompressor {
 fn diff_compressor() -> &'static DiffCompressor {
     static INSTANCE: OnceLock<DiffCompressor> = OnceLock::new();
     INSTANCE.get_or_init(|| DiffCompressor::new(DiffCompressorConfig::default()))
+}
+
+fn code_compressor() -> &'static CodeAwareCompressor {
+    static INSTANCE: OnceLock<CodeAwareCompressor> = OnceLock::new();
+    INSTANCE.get_or_init(|| CodeAwareCompressor::new(CodeCompressorConfig::default()))
 }
 
 // ─── Public entry point ────────────────────────────────────────────────
@@ -1324,7 +1336,7 @@ enum DispatchResult {
 /// - `BuildOutput` → LogCompressor
 /// - `SearchResults` → SearchCompressor
 /// - `GitDiff` → DiffCompressor
-/// - `SourceCode` → no-op (Rust port pending; see TODO below)
+/// - `SourceCode` → CodeAwareCompressor (PR-B4)
 /// - `PlainText` → no-op (PR-B4 wires Kompress)
 /// - `Html` → no-op (no compressor)
 fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult {
@@ -1387,13 +1399,24 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
                 compressed: result.compressed,
             }
         }
-        // TODO(PR-B4 / Rust code-compressor port): Python has a
-        // CodeAwareCompressor; the Rust port is not yet shipped. Once
-        // that crate lands, `ContentType::SourceCode` routes here
-        // exactly as the others above.
-        ContentType::SourceCode => DispatchResult::NoOp {
-            content_type: content_type.as_str(),
-        },
+        // Routes to the tree-sitter-backed CodeAwareCompressor (PR-B4).
+        // The compressor fails open internally (re-parse-and-revert on
+        // syntax errors, a min-token floor, and a compression-ratio
+        // guard), so this arm only has to compare its output against
+        // the input; the tokenizer-rejection gate in
+        // `compress_one_block` applies on top of that.
+        ContentType::SourceCode => {
+            let result = code_compressor().compress(text);
+            if result.compressed == text {
+                return DispatchResult::NoOp {
+                    content_type: content_type.as_str(),
+                };
+            }
+            DispatchResult::Compressed {
+                strategy: STRATEGY_CODE_COMPRESSOR,
+                compressed: result.compressed,
+            }
+        }
         // TODO(PR-B4): wire Kompress (lossless prose compressor) for
         // PlainText. For now, leave untouched.
         ContentType::PlainText => DispatchResult::NoOp {

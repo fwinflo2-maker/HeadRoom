@@ -1124,7 +1124,7 @@ class StreamingMixin:
         context_guard = None
         if provider == "anthropic":
             from headroom.proxy.context_guard import (
-                MessageStartGuard,
+                StreamUsageGuard,
                 believed_context_limit,
                 context_guard_enabled,
                 effective_context_limit,
@@ -1134,7 +1134,7 @@ class StreamingMixin:
                 if context_guard_enabled():
                     _guard_model_limit = self.anthropic_provider.get_context_limit(model)
                     _guard_beta = headers.get("anthropic-beta")
-                    context_guard = MessageStartGuard(
+                    context_guard = StreamUsageGuard(
                         believed_limit=believed_context_limit(_guard_model_limit, _guard_beta),
                         effective_limit=effective_context_limit(
                             model, _guard_model_limit, _guard_beta

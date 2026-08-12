@@ -8,7 +8,7 @@ import pytest
 
 from headroom.proxy.context_guard import (
     REPORT_FRACTION,
-    MessageStartGuard,
+    StreamUsageGuard,
     believed_context_limit,
     context_guard_enabled,
     effective_context_limit,
@@ -54,6 +54,24 @@ def _parse_usage(event_bytes: bytes) -> dict:
         if line.startswith(b"data:"):
             return json.loads(line[5:].strip())["message"]["usage"]
     raise AssertionError("no data line in event")
+
+
+def _message_delta_event(
+    input_tokens: int,
+    cache_read: int = 0,
+    cache_creation: int = 0,
+) -> bytes:
+    payload = {
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+        "usage": {
+            "input_tokens": input_tokens,
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_creation,
+            "output_tokens": 42,
+        },
+    }
+    return b"event: message_delta\ndata: " + json.dumps(payload).encode() + b"\n\n"
 
 
 class TestBetaAndLimits:
@@ -117,9 +135,9 @@ class TestBetaAndLimits:
         assert not context_guard_enabled()
 
 
-class TestMessageStartGuard:
+class TestStreamUsageGuard:
     def test_below_trigger_passes_through_byte_identical(self):
-        guard = MessageStartGuard(believed_limit=200_000, effective_limit=200_000)
+        guard = StreamUsageGuard(believed_limit=200_000, effective_limit=200_000)
         event = _message_start_event(50_000, cache_read=100_000)
         assert guard.feed(event) == event
         # Inert afterwards: later chunks untouched even if they look like events.
@@ -127,7 +145,7 @@ class TestMessageStartGuard:
         assert guard.feed(tail) == tail
 
     def test_above_trigger_inflates_to_report_fraction_of_believed(self):
-        guard = MessageStartGuard(believed_limit=1_000_000, effective_limit=200_000)
+        guard = StreamUsageGuard(believed_limit=1_000_000, effective_limit=200_000)
         # 185k total forwarded = 92.5% of the real 200k window.
         event = _message_start_event(5_000, cache_read=170_000, cache_creation=10_000)
         out = guard.feed(event)
@@ -145,18 +163,18 @@ class TestMessageStartGuard:
         assert usage["output_tokens"] == 1
 
     def test_same_limits_nudges_gauge_over_compact_threshold(self):
-        guard = MessageStartGuard(believed_limit=200_000, effective_limit=200_000)
+        guard = StreamUsageGuard(believed_limit=200_000, effective_limit=200_000)
         event = _message_start_event(185_000)
         usage = _parse_usage(guard.feed(event))
         assert usage["input_tokens"] == int(200_000 * REPORT_FRACTION)
 
     def test_never_deflates(self):
-        guard = MessageStartGuard(believed_limit=200_000, effective_limit=200_000)
+        guard = StreamUsageGuard(believed_limit=200_000, effective_limit=200_000)
         event = _message_start_event(199_000)  # above the 95% report target
         assert guard.feed(event) == event
 
     def test_split_chunks_across_event_boundary(self):
-        guard = MessageStartGuard(believed_limit=1_000_000, effective_limit=200_000)
+        guard = StreamUsageGuard(believed_limit=1_000_000, effective_limit=200_000)
         event = _message_start_event(190_000)
         first, second = event[:40], event[40:]
         assert guard.feed(first) == b""  # held back: no complete event yet
@@ -164,14 +182,14 @@ class TestMessageStartGuard:
         assert _parse_usage(out)["input_tokens"] == int(1_000_000 * REPORT_FRACTION)
 
     def test_ping_events_pass_through_before_message_start(self):
-        guard = MessageStartGuard(believed_limit=1_000_000, effective_limit=200_000)
+        guard = StreamUsageGuard(believed_limit=1_000_000, effective_limit=200_000)
         ping = b'event: ping\ndata: {"type": "ping"}\n\n'
         assert guard.feed(ping) == ping
         out = guard.feed(_message_start_event(190_000))
         assert _parse_usage(out)["input_tokens"] == int(1_000_000 * REPORT_FRACTION)
 
     def test_non_message_start_first_event_disarms(self):
-        guard = MessageStartGuard(believed_limit=1_000_000, effective_limit=200_000)
+        guard = StreamUsageGuard(believed_limit=1_000_000, effective_limit=200_000)
         error_event = b'event: error\ndata: {"type": "error"}\n\n'
         assert guard.feed(error_event) == error_event
         # Even a later message_start is untouched (protocol says it is first).
@@ -179,35 +197,74 @@ class TestMessageStartGuard:
         assert guard.feed(event) == event
 
     def test_malformed_json_passes_through(self):
-        guard = MessageStartGuard(believed_limit=1_000_000, effective_limit=200_000)
+        guard = StreamUsageGuard(believed_limit=1_000_000, effective_limit=200_000)
         event = b"event: message_start\ndata: {not json\n\n"
         assert guard.feed(event) == event
 
     def test_buffer_cap_flushes_verbatim(self):
-        guard = MessageStartGuard(believed_limit=1_000_000, effective_limit=200_000)
+        guard = StreamUsageGuard(believed_limit=1_000_000, effective_limit=200_000)
         blob = b"x" * (300 * 1024)  # no event boundary anywhere
         out = guard.feed(blob)
         assert out == blob
         assert guard.feed(b"more") == b"more"  # inert afterwards
 
     def test_flush_returns_held_bytes(self):
-        guard = MessageStartGuard(believed_limit=1_000_000, effective_limit=200_000)
+        guard = StreamUsageGuard(believed_limit=1_000_000, effective_limit=200_000)
         partial = b"event: message_start\ndata: {"
         assert guard.feed(partial) == b""
         assert guard.flush() == partial
 
     def test_unusable_limits_make_guard_inert(self):
-        guard = MessageStartGuard(believed_limit=0, effective_limit=200_000)
+        guard = StreamUsageGuard(believed_limit=0, effective_limit=200_000)
         event = _message_start_event(190_000)
         assert guard.feed(event) == event
 
     def test_rewritten_event_is_valid_sse(self):
-        guard = MessageStartGuard(believed_limit=200_000, effective_limit=200_000)
+        guard = StreamUsageGuard(believed_limit=200_000, effective_limit=200_000)
         out = guard.feed(_message_start_event(185_000))
         assert out.startswith(b"event: message_start\n")
         assert out.endswith(b"\n\n")
         payload = _parse_usage(out)  # parses => data line is intact JSON
         assert payload["input_tokens"] > 185_000
+
+    def test_armed_guard_rewrites_final_message_delta(self):
+        # Clients merge the final cumulative-usage message_delta over
+        # message_start (verified live with Claude Code 2026-08-12), so an
+        # armed guard must rewrite both or the nudge loses the merge.
+        guard = StreamUsageGuard(believed_limit=200_000, effective_limit=200_000)
+        guard.feed(_message_start_event(180_000, cache_creation=5_000))
+        content = b'event: content_block_delta\ndata: {"type":"content_block_delta"}\n\n'
+        assert guard.feed(content) == content  # armed but passthrough
+        delta = _message_delta_event(180_000, cache_creation=5_000)
+        out = guard.feed(delta)
+        usage = json.loads(out.split(b"data: ")[1])["usage"]
+        assert usage["input_tokens"] + usage["cache_creation_input_tokens"] == int(
+            200_000 * REPORT_FRACTION
+        )
+        assert usage["output_tokens"] == 42
+        # Inert afterwards.
+        stop = b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+        assert guard.feed(stop) == stop
+
+    def test_output_only_message_delta_untouched(self):
+        guard = StreamUsageGuard(believed_limit=200_000, effective_limit=200_000)
+        guard.feed(_message_start_event(185_000))
+        delta = (
+            b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":9}}\n\n'
+        )
+        assert guard.feed(delta) == delta
+
+    def test_disarmed_guard_leaves_message_delta_alone(self):
+        guard = StreamUsageGuard(believed_limit=200_000, effective_limit=200_000)
+        guard.feed(_message_start_event(50_000))  # below trigger -> inert
+        delta = _message_delta_event(50_000)
+        assert guard.feed(delta) == delta
+
+    def test_message_delta_never_deflates(self):
+        guard = StreamUsageGuard(believed_limit=200_000, effective_limit=200_000)
+        guard.feed(_message_start_event(185_000))
+        delta = _message_delta_event(199_000)  # already above the 190k target
+        assert guard.feed(delta) == delta
 
 
 class TestStreamResponseIntegration:
@@ -297,16 +354,27 @@ class TestStreamResponseIntegration:
     async def test_near_limit_message_start_is_nudged_on_the_wire(self):
         proxy = self._create_mock_proxy()
         # 185k = above the 90% trigger, below the 95% report target — the
-        # assertion below can only pass if the rewrite actually happened.
+        # assertions below can only pass if the rewrites actually happened.
         upstream = self._mock_upstream(
             _message_start_event(185_000)
+            + b'event: content_block_delta\ndata: {"type":"content_block_delta"}\n\n'
+            + _message_delta_event(185_000)
             + b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
         )
         result = await self._run(proxy, upstream, {"x-api-key": "sk-test"})
         client_bytes = b"".join([chunk async for chunk in result.body_iterator])
-        usage = _parse_usage(client_bytes.split(b"\n\n")[0] + b"\n\n")
+        events = client_bytes.split(b"\n\n")
+        usage = _parse_usage(events[0] + b"\n\n")
         assert usage["input_tokens"] == int(200_000 * REPORT_FRACTION)
-        # The rest of the stream is untouched.
+        # The final cumulative-usage message_delta is nudged too — clients
+        # merge it over message_start, so it must agree.
+        delta_usage = json.loads(events[2].split(b"data: ")[1])["usage"]
+        assert delta_usage["input_tokens"] == int(200_000 * REPORT_FRACTION)
+        assert delta_usage["output_tokens"] == 42
+        # Everything else is untouched.
+        assert (
+            b'event: content_block_delta\ndata: {"type":"content_block_delta"}\n\n' in client_bytes
+        )
         assert b'event: message_stop\ndata: {"type":"message_stop"}\n\n' in client_bytes
 
     @pytest.mark.asyncio

@@ -20,13 +20,15 @@ Three cooperating pieces, all passthrough until the danger zone:
    maximum`` from upstream 400 bodies and records M per (model, 1m-beta)
    key. This is how a client that *believes* 1M but whose account is capped
    at 200k stops looping after exactly one error.
-3. ``MessageStartGuard`` — an SSE transformer for the streamed bytes only:
+3. ``StreamUsageGuard`` — an SSE transformer for the streamed bytes only:
    when the ``message_start`` usage total reaches ``TRIGGER_FRACTION`` of
-   the effective limit, it inflates the reported ``input_tokens`` so the
-   client's gauge reads ``REPORT_FRACTION`` of the window the client
-   believes in, which trips the client's own graceful compaction before the
-   400 wall. Savings metrics and telemetry parse the original upstream
-   bytes, never the nudged ones.
+   the effective limit, it inflates the reported ``input_tokens`` — in both
+   ``message_start`` and the final cumulative-usage ``message_delta``, which
+   clients merge over the former — so the client's gauge reads
+   ``REPORT_FRACTION`` of the window the client believes in, which trips
+   the client's own graceful compaction before the 400 wall. Savings
+   metrics and telemetry parse the original upstream bytes, never the
+   nudged ones.
 
 Kill switch: ``HEADROOM_CONTEXT_GUARD=0``.
 """
@@ -135,15 +137,20 @@ def reset_learned_limits() -> None:
     _learned_limits.clear()
 
 
-class MessageStartGuard:
-    """Rewrites the first message_start event's usage when near the wall.
+class StreamUsageGuard:
+    """Rewrites near-the-wall usage in the client-bound SSE bytes.
 
     Feed every chunk headed to the client through :meth:`feed`; call
-    :meth:`flush` when the stream ends. Until the first data-bearing event is
-    complete, bytes are held back (SSE clients tolerate this — it is the
-    pre-first-token window). After that single decision the guard is inert
-    and chunks pass through untouched, so steady-state overhead is one
-    ``if``.
+    :meth:`flush` when the stream ends. The first ``message_start`` decides
+    whether the nudge is active. When it is not (the common case), the guard
+    goes inert immediately and chunks pass through untouched — steady-state
+    overhead is one ``if``. When it is, the guard rewrites the
+    ``message_start`` usage AND stays armed for the final ``message_delta``:
+    since mid-2025 that event carries cumulative input/cache usage and
+    clients (verified live with Claude Code 2026-08-12) let it override the
+    ``message_start`` values, so nudging only the first event loses the
+    merge. Events are released as soon as their ``\\n\\n`` terminator
+    arrives, so no latency is added beyond SSE's own event framing.
     """
 
     def __init__(
@@ -157,6 +164,10 @@ class MessageStartGuard:
         self._effective_limit = effective_limit
         self._request_id = request_id
         self._buf = bytearray()
+        self._seen_message_start = False
+        self._target_total: int | None = None
+        self._start_cache_read = 0
+        self._start_cache_creation = 0
         # Inert immediately when limits are unusable.
         self._done = believed_limit <= 0 or effective_limit <= 0
 
@@ -189,17 +200,33 @@ class MessageStartGuard:
         return remaining
 
     def _process_event(self, event: bytes) -> bytes:
-        # Pings may precede message_start; anything else data-bearing that
-        # isn't message_start (error events, protocol changes) ends the scan.
         if b"event: ping" in event or event.strip() == b"":
             return event
-        self._done = True
-        if b"message_start" not in event:
+        if not self._seen_message_start:
+            # Anything data-bearing that isn't message_start (error events,
+            # protocol changes) ends the scan.
+            self._seen_message_start = True
+            if b"message_start" not in event:
+                self._done = True
+                return event
+            try:
+                rewritten = self._rewrite_message_start(event)
+            except Exception:
+                logger.debug("context_guard: message_start rewrite skipped", exc_info=True)
+                self._done = True
+                return event
+            if self._target_total is None:
+                # Below trigger (or already reads full): nothing to nudge.
+                self._done = True
+            return rewritten
+        # Armed: pass content deltas through, rewrite the final usage delta.
+        if b"message_delta" not in event:
             return event
+        self._done = True
         try:
-            return self._rewrite_message_start(event)
+            return self._rewrite_message_delta(event)
         except Exception:
-            logger.debug("context_guard: message_start rewrite skipped", exc_info=True)
+            logger.debug("context_guard: message_delta rewrite skipped", exc_info=True)
             return event
 
     def _rewrite_message_start(self, event: bytes) -> bytes:
@@ -223,6 +250,9 @@ class MessageStartGuard:
             if total >= target_total:
                 # Already reads as full to the client — never deflate.
                 return event
+            self._target_total = target_total
+            self._start_cache_read = cache_read
+            self._start_cache_creation = cache_creation
             usage["input_tokens"] = target_total - cache_read - cache_creation
             logger.warning(
                 "[%s] event=context_guard_nudge forwarded_total=%d effective_limit=%d "
@@ -234,6 +264,33 @@ class MessageStartGuard:
                 target_total,
                 self._believed_limit,
             )
+            lines[i] = b"data: " + json.dumps(payload, separators=(",", ":")).encode()
+            return b"\n".join(lines)
+        return event
+
+    def _rewrite_message_delta(self, event: bytes) -> bytes:
+        assert self._target_total is not None
+        lines = event.split(b"\n")
+        for i, line in enumerate(lines):
+            if not line.startswith(b"data:"):
+                continue
+            payload = json.loads(line[len(b"data:") :].strip())
+            if payload.get("type") != "message_delta":
+                return event
+            usage = payload.get("usage")
+            # A delta without cumulative input usage can't override the
+            # message_start values we already rewrote — leave it alone.
+            if not isinstance(usage, dict) or "input_tokens" not in usage:
+                return event
+            cache_read = int(usage.get("cache_read_input_tokens", self._start_cache_read) or 0)
+            cache_creation = int(
+                usage.get("cache_creation_input_tokens", self._start_cache_creation) or 0
+            )
+            new_input = self._target_total - cache_read - cache_creation
+            if int(usage.get("input_tokens") or 0) >= new_input:
+                # Never deflate.
+                return event
+            usage["input_tokens"] = new_input
             lines[i] = b"data: " + json.dumps(payload, separators=(",", ":")).encode()
             return b"\n".join(lines)
         return event

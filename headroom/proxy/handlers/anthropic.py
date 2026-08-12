@@ -292,7 +292,16 @@ class AnthropicHandlerMixin:
             new_content: list[dict[str, Any]] = []
             appended = False
             for block in content:
-                if not appended and isinstance(block, dict) and block.get("type") == "text":
+                if (
+                    not appended
+                    and isinstance(block, dict)
+                    and block.get("type") == "text"
+                    # Never mutate a block carrying the client's cache
+                    # breakpoint: the client re-sends the original bytes
+                    # next turn, so any injection here busts the prefix
+                    # cache at this message from then on.
+                    and "cache_control" not in block
+                ):
                     existing = block.get("text", "")
                     new_content.append({**block, "text": existing + "\n\n" + context_text})
                     appended = True
@@ -737,6 +746,16 @@ class AnthropicHandlerMixin:
                     original_client_messages = copy.deepcopy(messages)
             if input_event.tools is not None:
                 body["tools"] = input_event.tools
+
+            # Snapshot the client's cache_control breakpoints before any
+            # transform runs; paired with the outbound count right before
+            # forwarding (event=cache_breakpoints) so a dropped or moved
+            # final breakpoint is self-diagnosing from proxy.log alone.
+            from headroom.proxy.helpers import count_cache_breakpoints
+
+            inbound_breakpoints = count_cache_breakpoints(
+                body.get("system"), messages, body.get("tools")
+            )
 
             # Validate message array size
             if len(messages) > MAX_MESSAGE_ARRAY_LENGTH:
@@ -1663,12 +1682,19 @@ class AnthropicHandlerMixin:
 
             # Own cache_control placement: the client moves the breakpoint each
             # turn and the overlay replays past markers, so they accumulate ~1/turn
-            # and Anthropic hard-errors at >4. Strip message-level markers and keep
-            # one breakpoint. Pure appends advance it to the newest block; a
-            # proven rewritten tail anchors it at the byte-stable boundary so
-            # that the same prefix is readable next turn. Applied last so the
+            # and Anthropic hard-errors at >4. Strip message-level markers and
+            # re-place them at the CLIENT's current positions: Anthropic resolves
+            # each breakpoint with a ~20-content-block lookback, and the client's
+            # previous-message marker is the read anchor that lets a big turn's
+            # write chain to the prior entry. Collapsing to one newest-block
+            # marker breaks that chain on tool-heavy turns (silent full re-write)
+            # and can leave the tail billing uncached. Applied last so the
             # forwarded AND recorded (next_forwarded) messages stay bounded.
-            _norm = normalize_message_cache_control(optimized_messages, previous_forwarded_messages)
+            _norm = normalize_message_cache_control(
+                optimized_messages,
+                previous_forwarded_messages,
+                client_messages=original_client_messages,
+            )
             if _norm is not optimized_messages:
                 optimized_messages = _norm
 
@@ -2562,35 +2588,6 @@ class AnthropicHandlerMixin:
                         f"{_ts_saved_tokens}tok"
                     )
 
-            # Tool-search history repair (#2805). Once deferral is on, the client
-            # stores Anthropic's server_tool_use / tool_search_tool_result blocks in
-            # its transcript forever, and upstream validates every tool_reference in
-            # that history against THIS request's tools array. Claude Code replays
-            # the same transcript on side-requests carrying a different, smaller
-            # tools array (the prompt-type Stop hook evaluator, /compact), which the
-            # proxy cannot predict — so upstream 400s with "Tool reference 'X' not
-            # found in available tools". Drop the blocks such a request cannot
-            # support. Runs AFTER the injection above so the tool we just added
-            # counts as present: on the main loop nothing is stripped and the prefix
-            # is untouched. Unconditional (not gated on the flag) so transcripts
-            # poisoned before the flag was turned off still recover.
-            from headroom.proxy.helpers import strip_unsupported_tool_search_blocks
-
-            _ts_repaired, _ts_stripped = strip_unsupported_tool_search_blocks(
-                body.get("messages"), body.get("tools")
-            )
-            if _ts_stripped:
-                body["messages"] = _ts_repaired
-                optimized_messages = _ts_repaired
-                body_mutation_tracker.mark_mutated("tool_search_history_repair")
-                transforms_applied.append(f"router:tool_search_repair:{_ts_stripped}blocks")
-                logger.info(
-                    "[%s] Tool search: dropped %d unsupportable history block(s) "
-                    "(tools array cannot resolve their tool_reference entries)",
-                    request_id,
-                    _ts_stripped,
-                )
-
             # Turn hooks (opt-in extensions): a registered hook may inspect or
             # rewrite the outbound tools/messages before we send upstream — the
             # extensible counterpart to the built-in deferral above. A single
@@ -2636,6 +2633,40 @@ class AnthropicHandlerMixin:
                     tags["turn_hook_tools_saved_tokens"] = (
                         int(tags.get("turn_hook_tools_saved_tokens", 0) or 0) + _th_saved
                     )
+
+            # Tool-search history repair (#2805). Once deferral is on, the client
+            # stores Anthropic's server_tool_use / tool_search_tool_result blocks in
+            # its transcript forever, and upstream validates every tool_reference in
+            # that history against THIS request's tools array. Claude Code replays
+            # the same transcript on side-requests carrying a different, smaller
+            # tools array (the prompt-type Stop hook evaluator, /compact), which the
+            # proxy cannot predict — so upstream 400s with "Tool reference 'X' not
+            # found in available tools". Drop the blocks such a request cannot
+            # support. Unconditional (not gated on the flag) so transcripts poisoned
+            # before the flag was turned off still recover.
+            #
+            # ORDERING (#2888): this must be the LAST stage that can invalidate a
+            # tool_reference, so it runs after BOTH the deferral injection above (the
+            # tool we just added counts as present, so the main loop strips nothing
+            # and the prefix is untouched) AND the turn hooks (a hook may rewrite the
+            # tools array, and repairing before it validated against a stale view).
+            # Nothing past this point mutates `body["tools"]` on the outbound path.
+            from headroom.proxy.helpers import strip_unsupported_tool_search_blocks
+
+            _ts_repaired, _ts_stripped = strip_unsupported_tool_search_blocks(
+                body.get("messages"), body.get("tools")
+            )
+            if _ts_stripped:
+                body["messages"] = _ts_repaired
+                optimized_messages = _ts_repaired
+                body_mutation_tracker.mark_mutated("tool_search_history_repair")
+                transforms_applied.append(f"router:tool_search_repair:{_ts_stripped}blocks")
+                logger.info(
+                    "[%s] Tool search: dropped %d unsupportable history block(s) "
+                    "(tools array cannot resolve their tool_reference entries)",
+                    request_id,
+                    _ts_stripped,
+                )
 
             # Consistency: report tok_before/tok_after with ONE tokenizer. The pipeline
             # and the handler use different token estimators, and cache-mode branches
@@ -3023,6 +3054,16 @@ class AnthropicHandlerMixin:
                         "headroom_retrieve available; using buffered stream:false "
                         "upstream request for server-side retrieval handling"
                     )
+
+                from headroom.proxy.helpers import log_cache_breakpoints
+
+                log_cache_breakpoints(
+                    request_id=request_id,
+                    inbound=inbound_breakpoints,
+                    outbound=count_cache_breakpoints(
+                        body.get("system"), body.get("messages"), body.get("tools")
+                    ),
+                )
 
                 if stream and not buffered_stream_ccr:
                     self.pipeline_extensions.emit(

@@ -1098,6 +1098,7 @@ class StreamingMixin:
     ) -> Response | StreamingResponse:
         """Actual streaming implementation, guarded by _stream_response's cleanup wrapper."""
         from fastapi.responses import Response, StreamingResponse
+        from starlette.background import BackgroundTask
 
         from headroom.proxy.helpers import MAX_SSE_BUFFER_SIZE
 
@@ -1656,10 +1657,29 @@ class StreamingMixin:
                     )
                     yield f"event: headroom_pending_messages\ndata: {pending_event}\n\n".encode()
 
+        async def _release_upstream_stream() -> None:
+            # Guarantee the upstream HTTP/2 stream is released even when the
+            # body generator above is never iterated — the client disconnected
+            # before Starlette started sending the response body (routine when a
+            # harness like Claude Code cancels or supersedes an in-flight turn),
+            # so ``generate()`` never entered its own ``aclosing`` and nothing
+            # else closes ``upstream_response``. Each such request otherwise
+            # leaks one open h2 stream; they accumulate on the pooled upstream
+            # connection until it reaches SETTINGS_MAX_CONCURRENT_STREAMS (100)
+            # and no new stream can open ("Max outbound streams is 100, 100
+            # open"), and the proxy goes unhealthy until restart (#2797).
+            # Starlette runs a response's ``background`` task after the body
+            # finishes *and* after an early client disconnect, so this fires in
+            # both cases. ``aclose()`` is idempotent, so on the normal path —
+            # where the generator already closed the stream — this is a no-op.
+            with contextlib.suppress(Exception):
+                await upstream_response.aclose()
+
         return StreamingResponse(
             generate(),
             media_type="text/event-stream",
             headers=forwarded_headers,
+            background=BackgroundTask(_release_upstream_stream),
         )
 
     async def _stream_response_bedrock(

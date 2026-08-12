@@ -49,6 +49,13 @@ _LOOPBACK_URL_RE = re.compile(r"https?://(?:127\.0\.0\.1|localhost):(\d+)")
 _CODEX_BASE_URL_RE = re.compile(r'(?m)^[ \t]*base_url\s*=\s*"([^"\r\n]+)"')
 _CODEX_MODEL_PROVIDER_RE = re.compile(r'(?m)^[ \t]*model_provider\s*=\s*"([^"\r\n]+)"')
 
+# Ollama's fixed default port. `ollama launch claude` writes
+# ``ANTHROPIC_BASE_URL=http://127.0.0.1:11434`` into the launched Claude Code
+# child, which outranks the persistent-install env block and silently bypasses
+# the Headroom proxy (issue #2199). Recognized so the routing diagnostic names
+# the collision instead of telling the user to re-probe port 11434.
+_OLLAMA_DEFAULT_PORT = 11434
+
 
 @dataclass
 class CheckResult:
@@ -356,6 +363,22 @@ def _classify_routing_url(name: str, url: str, port: int, *, source: str) -> Che
         )
     found_port = int(match.group(1))
     if found_port != port:
+        if found_port == _OLLAMA_DEFAULT_PORT:
+            # Not a mis-probed Headroom port — this is Ollama's endpoint, so
+            # `headroom doctor --port 11434` would only chase a red herring.
+            return CheckResult(
+                name=name,
+                status=WARN,
+                summary=(
+                    f"points at Ollama ({url}), not the Headroom proxy ({source}) — "
+                    "`ollama launch claude` bypasses the persistent Headroom route"
+                ),
+                hint=(
+                    "both claim ANTHROPIC_BASE_URL; run Ollama-backed sessions "
+                    "through Headroom by chaining the proxy at its Ollama upstream "
+                    "(see issue #2199)"
+                ),
+            )
         return CheckResult(
             name=name,
             status=WARN,
@@ -438,7 +461,36 @@ def check_budget(stats: dict[str, Any] | None) -> CheckResult:
             hint="set one: headroom proxy --budget 10 (env: HEADROOM_BUDGET)",
         )
     period = cost.get("budget_period", "daily")
-    return CheckResult(name=name, status=PASS, summary=f"${limit}/{period} budget enforced")
+    summary = f"${limit}/{period} budget enforced"
+    return CheckResult(name=name, status=PASS, summary=summary + _estimated_basis_note(cost))
+
+
+def _estimated_basis_note(cost: dict[str, Any]) -> str:
+    """Describe how much of the period's spend was booked from a token estimate.
+
+    Informational, never a WARN: a provider that simply never reports a usage
+    breakdown would otherwise sit at a permanent warning. Every read is
+    defensive so `doctor` still works against a proxy predating these fields.
+    """
+    note = ""
+
+    basis = cost.get("budget_basis")
+    if isinstance(basis, dict):
+        estimated_usd = basis.get("estimated_usd")
+        estimated_pct = basis.get("estimated_pct")
+        if isinstance(estimated_usd, (int, float)) and estimated_usd > 0:
+            pct = f"{estimated_pct:.0f}% " if isinstance(estimated_pct, (int, float)) else ""
+            note += (
+                f" — {pct}of period spend (${estimated_usd:.4f}) "
+                "booked from Headroom token estimates"
+            )
+
+    # Reported independently of the breakdown: a non-default policy changes how
+    # the budget is enforced and should surface even if the split is missing.
+    policy = cost.get("budget_estimated_basis")
+    if isinstance(policy, str) and policy and policy != "count":
+        note += f" — estimated-basis policy: {policy}"
+    return note
 
 
 def check_deployments(manifests: list[Any], probe: Any = probe_json) -> CheckResult | None:

@@ -402,14 +402,6 @@ CAPI_OVERRIDE_SETTING = "github.copilot.advanced.debug.overrideCapiUrl"
 _CAPI_MARKER_START = "// --- Headroom Copilot Chat routing ---"
 _CAPI_MARKER_END = "// --- end Headroom Copilot Chat routing ---"
 
-#: Which single setting each marker pair may carry. Consulted when adopting a
-#: block written before provenance existed, so a block marked for one feature can
-#: never be claimed on the strength of the other's key.
-_BLOCK_KEYS: dict[str, str] = {
-    _CAPI_MARKER_START: CAPI_OVERRIDE_SETTING,
-    _BYOK_MARKER_START: BYOK_ENABLED_SETTING,
-}
-
 
 def _mask_quoted_regions(raw: str) -> str:
     """Same-length copy with JSON string bodies and block comments blanked out.
@@ -496,12 +488,18 @@ def _record_settings_block(path: Path, start: str, block_text: str | None) -> No
     legitimately copy a marker -- Settings Sync merges do it, and so does anyone
     pasting a config snippet -- and a text match alone would then license
     rewriting or deleting their settings.
+
+    Best-effort: this is for a block already on disk, either clearing its record
+    (``block_text`` is ``None``, run after the block itself is gone) or
+    resyncing a *sibling* block's digest after an edit shifted its bytes. Either
+    way the file mutation this call is bookkeeping for has already happened and
+    cannot be undone here, so losing the record only downgrades that block to
+    "not ours" on the next run -- worse than keeping the record, but not a new
+    failure to surface. A *new* block's record is written by
+    ``_require_settings_provenance`` instead, before the block is written, so a
+    failure there can still refuse the write.
     """
     try:
-        # Inside the try: resolving the workspace dir can raise when HOME and
-        # USERPROFILE are both unset, and this runs *after* settings.json was
-        # written -- reporting a failure for a write that succeeded would be
-        # worse than losing the record.
         record = _settings_provenance_path(path, start)
         if block_text is None:
             record.unlink(missing_ok=True)
@@ -517,71 +515,72 @@ def _record_settings_block(path: Path, start: str, block_text: str | None) -> No
             ),
         )
     except (OSError, RuntimeError, ValueError):
-        # Losing the record only downgrades us to "not ours": the next run
-        # refuses to touch the block rather than risking someone else's text.
         pass
 
 
-def _block_body_is_exactly(block: str, start: str, end: str, key: str) -> bool:
-    """Whether the block's body is exactly ``{key: value}`` and nothing else.
+def _require_settings_provenance(path: Path, start: str, block_text: str) -> None:
+    """Record a *new* block's bytes, or refuse to write it at all.
 
-    Parsed as JSON rather than matched line-by-line. A line test asked only
-    "does a line start with our key", which is satisfied by
-    ``"ourKey": "v", "editor.fontSize": 14`` -- so the user's settings sat inside
-    a block we then rewrote or deleted. It also let a trailing comment through,
-    and let a BYOK-marked block be claimed by the CAPI key.
-
-    Anything the parser rejects (a trailing comment, two keys, a stray brace) is
-    not ours, which is the safe answer.
+    Called before the block is written to ``settings.json``, not after: with no
+    record, ``_owns_settings_block`` can never adopt a pair later (adoption was
+    the bug -- see its docstring), so writing a block whose record we failed to
+    create would produce exactly the stuck state that removal exists to avoid --
+    a Headroom-authored block nothing can ever prove is Headroom-authored. This
+    can raise when ``HOME``/``USERPROFILE`` are both unset or the workspace
+    directory is not writable; either way, refusing here means nothing has
+    touched the user's file yet.
     """
-    body = "\n".join(
-        line for line in block.splitlines() if start not in line and end not in line
-    ).strip()
-    body = body.lstrip(",").rstrip(",").strip()
-    if not body:
-        return False
     try:
-        parsed = json.loads("{" + body + "}")
-    except ValueError:
-        return False
-    return isinstance(parsed, dict) and list(parsed) == [key]
+        record = _settings_provenance_path(path, start)
+        record.parent.mkdir(parents=True, exist_ok=True)
+        fsutil.write_text(
+            record,
+            json.dumps(
+                {
+                    "path": str(path),
+                    "sha256": hashlib.sha256(block_text.encode("utf-8")).hexdigest(),
+                }
+            ),
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise click.ClickException(
+            f"Could not create an ownership record for the Headroom block bound for "
+            f"{path} ({exc}). The new block was not written; a Headroom-owned block this "
+            "call was replacing, if any, has already been removed. An unrecorded block "
+            "could never be proven ours later and would need hand-editing to remove."
+        ) from exc
 
 
 def _owns_settings_block(path: Path, raw: str, start: str, end: str) -> bool:
     """True only when this exact block is one we wrote and nobody has edited.
 
-    The recorded digest is authoritative **once it exists**: a mismatch means the
-    block changed under us, and we refuse rather than overwrite whatever it now
-    holds.
+    The recorded digest is the *only* proof accepted, and it must exist: with no
+    record, a structurally intact pair is indistinguishable from one a user wrote
+    or copied by hand -- a pair holding only ``github.copilot.advanced.debug.
+    overrideCapiUrl`` is exactly the shape our own writer produces, so a body
+    check cannot tell them apart. Adopting it anyway is how ``enable`` came to
+    rewrite a user's own gateway and ``disable`` came to delete their setting.
 
-    Structural adoption applies only when there is *no* record, which is the
-    one-time migration for blocks written before provenance existed -- otherwise
-    every such install would be permanently unable to update or unwrap its own
-    block. Adoption still demands that the body be exactly the one setting this
-    marker pair is allowed to carry, so a pair holding the user's own settings is
-    never claimed.
+    This also means a block written before provenance tracking existed (no
+    record on disk) can never be claimed retroactively -- there is no way to
+    tell that case apart from a user's own pair either. Migrating such a block
+    would need an explicit user-confirmed adoption step or independent evidence
+    that we wrote it; absent that, the safe answer is to leave the bytes alone
+    and report "not ours".
     """
     block = _settings_block_text(raw, start, end)
     if block is None:
         return False
     digest = hashlib.sha256(block.encode("utf-8")).hexdigest()
 
-    recorded: str | None = None
     try:
         record = json.loads(fsutil.read_text(_settings_provenance_path(path, start)))
-        if isinstance(record, dict) and isinstance(record.get("sha256"), str):
-            recorded = record["sha256"]
     except (OSError, ValueError):
-        recorded = None
-
-    if recorded is not None:
-        return recorded == digest
-
-    key = _BLOCK_KEYS.get(start)
-    if key and _block_body_is_exactly(block, start, end, key):
-        _record_settings_block(path, start, block)
-        return True
-    return False
+        return False
+    recorded = record.get("sha256") if isinstance(record, dict) else None
+    if not isinstance(recorded, str):
+        return False
+    return recorded == digest
 
 
 def _append_settings_block(path: Path, body_lines: list[str], start: str, end: str) -> str:
@@ -589,7 +588,9 @@ def _append_settings_block(path: Path, body_lines: list[str], start: str, end: s
 
     Returns ``"added"``, or ``"already set"`` when either marker is already
     present -- the caller is responsible for having proved ownership first.
-    Raises rather than editing a file this parser cannot validate.
+    Raises rather than editing a file this parser cannot validate, or one whose
+    ownership record cannot be created (see ``_require_settings_provenance``);
+    in both cases nothing is written.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     raw = _read_settings(path) if path.exists() else "{}\n"
@@ -617,8 +618,10 @@ def _append_settings_block(path: Path, body_lines: list[str], start: str, end: s
     block = line_sep.join([f"\t{start}", *(f"\t{line}" for line in body), f"\t{end}"])
     updated = before + line_sep + block + line_sep + after
     _validate_settings(updated, path)
+    new_block = _settings_block_text(updated, start, end)
+    assert new_block is not None  # the pair was just constructed above
+    _require_settings_provenance(path, start, new_block)
     fsutil.write_text(path, updated)
-    _record_settings_block(path, start, _settings_block_text(updated, start, end))
     return "added"
 
 

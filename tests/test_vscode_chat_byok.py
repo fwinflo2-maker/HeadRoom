@@ -731,12 +731,16 @@ def test_a_user_authored_marker_pair_is_never_touched(tmp_path: Path) -> None:
     ids=["keys-sharing-a-line", "trailing-comment", "two-keys"],
 )
 def test_a_block_holding_anything_else_is_refused(tmp_path: Path, shape: str, body: str) -> None:
-    """Adoption must prove the body is *only* our setting, parsed as JSON.
+    """None of these shapes are ours without a record, same as any other body.
 
-    Asking "does a line start with our key" is not that: it accepts a line that
-    also carries the user's settings, and a trailing comment. Both were then
-    rewritten or deleted -- the exact loss the marker-ownership work exists to
-    prevent, reached by a different route.
+    These predate the digest-only rule and were originally written against a
+    line-based adoption check that accepted a line also carrying the user's
+    settings, or a trailing comment -- both then rewritten or deleted, the exact
+    loss the marker-ownership work exists to prevent. There is no adoption path
+    left to check the body against, but the shapes stay: an unrecorded block is
+    "not ours" regardless of what it holds, and these are still valid, if now
+    redundant with that broader rule, regression coverage for what caused real
+    damage before.
     """
     from headroom.providers.copilot.vscode_chat import (
         _CAPI_MARKER_END,
@@ -796,12 +800,13 @@ def test_marker_text_inside_a_string_value_is_not_a_block(tmp_path: Path) -> Non
 
 
 def test_a_recorded_digest_is_authoritative(tmp_path: Path) -> None:
-    """Once we have a record, a mismatch refuses instead of falling back.
+    """Once we have a record, a mismatch refuses -- there is no fallback to fall back to.
 
-    Structural adoption exists only to migrate blocks written before provenance.
-    Letting it also catch a *mismatched* record would make the digest decorative:
-    an edited block would be silently overwritten, which is precisely what the
-    reviewer asked us to fail closed on.
+    A pair the digest doesn't match is edited or foreign either way, so letting
+    anything else -- shape, key, prior ownership -- override a mismatched record
+    would make the digest decorative: an edited block would be silently
+    overwritten, which is precisely what the reviewer asked us to fail closed
+    on.
     """
     from headroom.providers.copilot.vscode_chat import (
         disable_capi_override,
@@ -822,11 +827,15 @@ def test_a_recorded_digest_is_authoritative(tmp_path: Path) -> None:
 
 
 def test_byok_markers_are_not_claimed_by_the_routing_key(tmp_path: Path) -> None:
-    """Each marker pair may carry only its own setting.
+    """A BYOK pair holding the routing key is still just an unrecorded pair.
 
-    Accepting either key for either pair let a BYOK-marked block be claimed on
-    the strength of the routing key: `enable_byok_setting` then reported
-    "already set" when the setting was absent, leaving every model hidden.
+    This predates the digest-only rule, when accepting either key for either
+    pair let a BYOK-marked block be claimed on the strength of the routing key:
+    `enable_byok_setting` then reported "already set" when the setting was
+    absent, leaving every model hidden. The per-marker key check that caught it
+    is gone -- a mismatched or absent record now refuses every unrecorded pair
+    regardless of which key it holds, which subsumes it -- but the shape stays
+    as regression coverage for that failure.
     """
     from headroom.providers.copilot.vscode_chat import (
         _BYOK_MARKER_END,
@@ -852,19 +861,17 @@ def test_byok_markers_are_not_claimed_by_the_routing_key(tmp_path: Path) -> None
     assert settings.read_text(encoding="utf-8") == original
 
 
-def test_a_block_holding_only_our_setting_is_adopted(tmp_path: Path) -> None:
-    """Where the ownership line is drawn, and deliberately not stricter.
+def test_an_unrecorded_block_predating_provenance_is_never_adopted(tmp_path: Path) -> None:
+    """No record means "not ours", even for a block Headroom itself once wrote.
 
-    A digest alone would lock out every install that predates provenance: their
-    block is genuinely ours but unrecorded, so update and unwrap would both
-    refuse forever. Structural proof closes that gap — an intact pair whose body
-    is *only* the single setting our writer emits is adopted and its digest
-    recorded.
-
-    That also covers a hand-edited URL, which is the same shape. Rewriting it is
-    the command's whole purpose and touches no key but ours, so it is not the
-    risk the digest exists to prevent — destroying a user's *own* settings is,
-    and that case still refuses (see the tests above).
+    A digest-only proof locks out every install that predates provenance: their
+    block is genuinely ours but unrecorded. Adopting it structurally instead --
+    on the strength of the body being exactly our one setting -- is unsafe,
+    because that shape is indistinguishable from a user's own pair (see
+    ``test_an_exact_single_key_user_authored_pair_is_never_adopted`` below).
+    Migrating a pre-provenance block therefore needs an explicit user-confirmed
+    step or independent evidence, neither of which exists here, so the safe
+    default is to leave the bytes alone and report "not ours".
     """
     from headroom.providers.copilot.vscode_chat import (
         _CAPI_MARKER_START,
@@ -878,17 +885,89 @@ def test_a_block_holding_only_our_setting_is_adopted(tmp_path: Path) -> None:
     assert enable_capi_override(settings, "http://127.0.0.1:1234") == "added"
 
     # A block written before provenance existed: our bytes, no record of them.
-    # Deleting the record is the whole point — with one present, a changed block
-    # must refuse instead (see test_a_recorded_digest_is_authoritative).
     _settings_provenance_path(settings, _CAPI_MARKER_START).unlink(missing_ok=True)
+    unrecorded = settings.read_text(encoding="utf-8")
 
-    assert enable_capi_override(settings, "http://127.0.0.1:8970") == "updated"
-    written = settings.read_text(encoding="utf-8")
-    assert "8970" in written and "1234" not in written
-    assert '"editor.fontSize": 14' in written
+    assert enable_capi_override(settings, "http://127.0.0.1:8970") == "not ours"
+    assert settings.read_text(encoding="utf-8") == unrecorded, "an unrecorded block was rewritten"
 
-    assert disable_capi_override(settings) is True
-    assert settings.read_text(encoding="utf-8") == '{\n\t"editor.fontSize": 14\n}\n'
+    with pytest.raises(click.ClickException, match="cannot prove it wrote"):
+        disable_capi_override(settings)
+    assert settings.read_text(encoding="utf-8") == unrecorded, "an unrecorded block was deleted"
+
+
+def test_an_exact_single_key_user_authored_pair_is_never_adopted(tmp_path: Path) -> None:
+    """The indistinguishable shape: a user-authored pair holding only our key.
+
+    `_owns_settings_block()` used to structurally adopt any unrecorded, intact
+    pair whose body was exactly ``{overrideCapiUrl: value}`` -- exactly what a
+    user gets by copying a Headroom block into a new profile, or writing one by
+    hand from documentation. `enable_capi_override` then rewrote their gateway
+    and reported "updated"; `disable_capi_override` deleted their setting and
+    reported success. Neither this pair's shape nor its single key is proof of
+    who wrote it, so absent a recorded digest it must be refused and the bytes
+    preserved -- covering both the enable and disable paths, as requested.
+    """
+    from headroom.providers.copilot.vscode_chat import (
+        _CAPI_MARKER_END,
+        _CAPI_MARKER_START,
+        CAPI_OVERRIDE_SETTING,
+        disable_capi_override,
+        enable_capi_override,
+    )
+
+    settings = tmp_path / "settings.json"
+    theirs = (
+        "{\n\t"
+        + _CAPI_MARKER_START
+        + f'\n\t"{CAPI_OVERRIDE_SETTING}": "https://my-own-gateway:1234"\n\t'
+        + _CAPI_MARKER_END
+        + "\n}\n"
+    )
+    settings.write_text(theirs, encoding="utf-8")
+
+    assert enable_capi_override(settings, "http://127.0.0.1:9999") == "not ours"
+    assert settings.read_text(encoding="utf-8") == theirs, "a user-authored pair was rewritten"
+
+    with pytest.raises(click.ClickException, match="cannot prove it wrote"):
+        disable_capi_override(settings)
+    assert settings.read_text(encoding="utf-8") == theirs, "a user-authored pair was deleted"
+
+
+def test_a_new_block_is_never_written_without_its_ownership_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recording ownership happens before the block is written, not after.
+
+    With no fallback left to adopt an unrecorded pair, losing the record for a
+    block Headroom itself just wrote would leave it stuck forever -- proven ours
+    at the moment of writing, provable by nothing the moment after. Writing
+    settings.json first and recording second (the original order) could not
+    prevent that: only refusing the write itself, before it happens, can.
+    """
+    from headroom.providers.copilot import vscode_chat as vscode_chat_module
+    from headroom.providers.copilot.vscode_chat import enable_capi_override
+
+    settings = tmp_path / "settings.json"
+    original = '{\n\t"editor.fontSize": 14\n}\n'
+    settings.write_text(original, encoding="utf-8")
+
+    # A file where the record's parent directory needs to be created makes
+    # `mkdir` raise, simulating an unwritable workspace directory.
+    blocker = tmp_path / "unwritable"
+    blocker.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setattr(
+        vscode_chat_module,
+        "_settings_provenance_path",
+        lambda path, start: blocker / "record.json",
+    )
+
+    with pytest.raises(click.ClickException, match="Could not create an ownership record"):
+        enable_capi_override(settings, "http://127.0.0.1:9999")
+
+    assert settings.read_text(encoding="utf-8") == original, (
+        "settings.json was written even though its ownership record failed"
+    )
 
 
 def test_duplicate_blocks_are_refused_not_half_removed(tmp_path: Path) -> None:

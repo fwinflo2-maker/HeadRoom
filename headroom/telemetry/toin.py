@@ -402,6 +402,8 @@ class TOINConfig:
     # Default path is ~/.headroom/toin.json (or HEADROOM_TOIN_PATH env var)
     storage_path: str = field(default_factory=get_default_toin_storage_path)
     auto_save_interval: int = 600  # Auto-save every 10 minutes
+    # Bound the in-memory LRU. Each ToolPattern can occupy 5–50 KB depending
+    # on field semantics and tracked instance hashes.
     max_patterns: int = DEFAULT_MAX_PATTERNS
     max_storage_bytes: int = DEFAULT_MAX_STORAGE_BYTES
 
@@ -416,13 +418,6 @@ class TOINConfig:
     # Privacy
     anonymize_queries: bool = True
     max_query_patterns: int = 10
-
-    # Maximum number of patterns kept in-memory. When the cap is reached the
-    # least-recently-used pattern is evicted (LRU order).  Each ToolPattern
-    # can occupy 5–50 KB depending on how many field-semantics / instance
-    # hashes it has accumulated.  2,000 patterns × ~25 KB average = ~50 MB
-    # cap, replacing the previous unbounded growth.
-    max_patterns: int = 2_000
 
     # LOW FIX #22: Metrics/monitoring hooks
     # Callback for emitting metrics events. Signature: (event_name, event_data) -> None

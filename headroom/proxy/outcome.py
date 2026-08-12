@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from headroom.proxy.tool_schema_savings_policy import (
@@ -651,7 +651,10 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         request_logger.log(
             RequestLog(
                 request_id=outcome.request_id,
-                timestamp=datetime.now().isoformat(),
+                # Request logs are consumed by browsers in arbitrary time zones.
+                # Include the UTC offset so relative-age calculations represent
+                # the same instant regardless of where the proxy runs.
+                timestamp=datetime.now(timezone.utc).isoformat(),
                 provider=outcome.provider,
                 model=outcome.model,
                 input_tokens_original=outcome.original_tokens,

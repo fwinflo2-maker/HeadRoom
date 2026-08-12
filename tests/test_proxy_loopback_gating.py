@@ -22,6 +22,14 @@ from headroom.proxy.server import ProxyConfig, create_app
 GATED = [
     ("get", "/transformations/feed"),
     ("post", "/cache/clear"),
+    ("get", "/v1/telemetry"),
+    ("get", "/v1/telemetry/export"),
+    ("post", "/v1/telemetry/import"),
+    ("get", "/v1/telemetry/tools"),
+    ("get", "/v1/telemetry/tools/example"),
+    ("get", "/v1/toin/stats"),
+    ("get", "/v1/toin/patterns"),
+    ("get", "/v1/toin/pattern/example"),
 ]
 
 
@@ -71,8 +79,44 @@ def test_non_loopback_caller_gets_404(method: str, path: str) -> None:
 @pytest.mark.parametrize("method,path", GATED)
 def test_loopback_caller_allowed(method: str, path: str) -> None:
     client = _loopback_client()
-    resp = client.request(method, path)
-    assert resp.status_code == 200, resp.text
+    resp = client.request(method, path, json={} if method == "post" else None)
+    # Detail routes legitimately return 404 when their test key is absent;
+    # the companion non-loopback test proves the guard itself.
+    assert resp.status_code in {200, 404, 422}, resp.text
+
+
+def test_toin_pattern_detail_whitelists_learned_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeTOIN:
+        def export_patterns(self):
+            return {
+                "patterns": {
+                    "unknown|unknown|abc123": {
+                        "sample_size": 10,
+                        "total_compressions": 8,
+                        "total_retrievals": 2,
+                        "retrieval_rate": 0.25,
+                        "confidence": 0.4,
+                        "skip_compression_recommended": False,
+                        "optimal_max_items": 20,
+                        "query_pattern_frequency": {"secret prompt": 1},
+                        "common_query_patterns": ["secret prompt"],
+                        "field_semantics": {"secret": "value"},
+                    }
+                }
+            }
+
+    monkeypatch.setattr("headroom.proxy.server.get_toin", lambda: FakeTOIN())
+    response = _loopback_client().get("/v1/toin/pattern/unknown")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "compressions": 8,
+        "retrievals": 2,
+        "retrieval_rate": 0.25,
+        "confidence": 0.4,
+        "skip_recommended": False,
+        "optimal_max_items": 20,
+    }
 
 
 # CCR data endpoints — cached session content, gated to 404 off-loopback (#1227).

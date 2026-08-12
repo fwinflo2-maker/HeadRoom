@@ -15,6 +15,7 @@ from .models import (
     DeploymentManifest,
     InstallPreset,
     ProviderSelectionMode,
+    RuntimeKind,
     SupervisorKind,
     ToolTarget,
 )
@@ -26,12 +27,16 @@ SUPPORTED_TARGETS = [
     ToolTarget.CODEX,
     ToolTarget.AIDER,
     ToolTarget.CURSOR,
+    ToolTarget.GROK_BUILD,
+    ToolTarget.GROK,
     ToolTarget.OPENCLAW,
+    ToolTarget.OPENCODE,
 ]
 PROVIDER_SCOPE_TARGETS = [
     ToolTarget.CLAUDE,
     ToolTarget.CODEX,
     ToolTarget.OPENCLAW,
+    ToolTarget.OPENCODE,
 ]
 
 
@@ -52,6 +57,9 @@ def detect_targets() -> list[str]:
             continue
         if target == ToolTarget.CURSOR and shutil.which("cursor"):
             detected.append(target.value)
+            continue
+        if target == ToolTarget.GROK_BUILD and shutil.which("grok"):
+            detected.append(target.value)
     return detected
 
 
@@ -67,15 +75,6 @@ def resolve_targets(
     valid = {target.value for target in valid_targets}
     requested = [target.strip().lower() for target in requested_targets]
 
-    if scope == ConfigScope.PROVIDER.value:
-        unsupported = [target for target in requested if target and target not in valid]
-        if unsupported:
-            unsupported_list = ", ".join(sorted(set(unsupported)))
-            raise click.ClickException(
-                "Provider scope supports only claude, codex, and openclaw; "
-                f"unsupported targets: {unsupported_list}"
-            )
-
     if provider_mode == ProviderSelectionMode.ALL.value:
         return [target.value for target in valid_targets]
 
@@ -86,6 +85,20 @@ def resolve_targets(
             ToolTarget.CODEX.value,
             *([] if scope == ConfigScope.PROVIDER.value else [ToolTarget.COPILOT.value]),
         ]
+
+    # Manual selection is the only mode that consults `requested`, so the
+    # provider-scope validation belongs here. Running it earlier rejected
+    # unsupported entries that `all`/`auto` ignore entirely — e.g.
+    # `install apply --scope provider --providers all --target cursor` raised
+    # instead of returning the provider target set.
+    if scope == ConfigScope.PROVIDER.value:
+        unsupported = [target for target in requested if target and target not in valid]
+        if unsupported:
+            unsupported_list = ", ".join(sorted(set(unsupported)))
+            raise click.ClickException(
+                "Provider scope supports only claude, codex, openclaw, and opencode; "
+                f"unsupported targets: {unsupported_list}"
+            )
 
     normalized = []
     seen: set[str] = set()
@@ -117,6 +130,12 @@ def build_manifest(
     memory_enabled: bool,
     telemetry_enabled: bool,
     image: str,
+    no_http2: bool = False,
+    code_aware: bool | None = None,
+    intercept_tool_results: bool = False,
+    protect_tool_results: str | None = None,
+    bedrock_profile: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> DeploymentManifest:
     """Create a normalized deployment manifest."""
 
@@ -141,10 +160,15 @@ def build_manifest(
         base_env["HEADROOM_ANYLLM_PROVIDER"] = anyllm_provider
     if region:
         base_env["HEADROOM_REGION"] = region
-    if not telemetry_enabled:
-        base_env["HEADROOM_TELEMETRY"] = "off"
+    # Telemetry is opt-in (off by default). Write the value explicitly so the
+    # generated manifest is unambiguous and doesn't depend on the runtime default.
+    base_env["HEADROOM_TELEMETRY"] = "on" if telemetry_enabled else "off"
     if memory_enabled:
         base_env["HEADROOM_MEMORY_ENABLED"] = "1"
+    # Applied last so explicit --env overrides win over the auto-derived
+    # defaults above (e.g. a custom HEADROOM_WORKSPACE_DIR).
+    if extra_env:
+        base_env.update(extra_env)
 
     proxy_args = [
         "--host",
@@ -156,14 +180,35 @@ def build_manifest(
         "--backend",
         backend,
     ]
-    if not telemetry_enabled:
-        proxy_args.append("--no-telemetry")
+    proxy_args.append("--telemetry" if telemetry_enabled else "--no-telemetry")
     if memory_enabled:
-        proxy_args.extend(["--memory", "--memory-db-path", str(_paths.memory_db_path())])
+        proxy_args.append("--memory")
+        # `_paths.memory_db_path()` resolves against the HOST home. A container
+        # runtime cannot use it: the container's HOME is /tmp/headroom-home and
+        # the host's ~/.headroom is bind-mounted there, so a host path like
+        # /home/<user>/.headroom/memory.db does not exist inside the container,
+        # SQLite fails to open the DB, /readyz stays 503, and the deployment
+        # times out and rolls back (#2803). Omit the flag for a container runtime:
+        # the proxy then resolves the DB under its own cwd (.headroom/memory.db),
+        # which is the container's workdir and therefore the bind mount, landing
+        # in the same host file the explicit path intended. On the host (python)
+        # runtime the resolved host path is correct, so keep passing it.
+        if runtime_kind != RuntimeKind.DOCKER.value:
+            proxy_args.extend(["--memory-db-path", str(_paths.memory_db_path())])
     if anyllm_provider:
         proxy_args.extend(["--anyllm-provider", anyllm_provider])
     if region:
         proxy_args.extend(["--region", region])
+    if no_http2:
+        proxy_args.append("--no-http2")
+    if code_aware is not None:
+        proxy_args.append("--code-aware" if code_aware else "--no-code-aware")
+    if intercept_tool_results:
+        proxy_args.append("--intercept-tool-results")
+    if protect_tool_results:
+        proxy_args.extend(["--protect-tool-results", protect_tool_results])
+    if bedrock_profile:
+        proxy_args.extend(["--bedrock-profile", bedrock_profile])
 
     container_name = f"headroom-{normalized_profile}"
     return DeploymentManifest(

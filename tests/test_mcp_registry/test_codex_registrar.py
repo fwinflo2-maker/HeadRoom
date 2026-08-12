@@ -144,6 +144,50 @@ def test_get_server_robust_to_unparseable_toml(tmp_path: Path) -> None:
     assert _make_registrar(tmp_path).get_server("headroom") is None
 
 
+def test_register_refuses_unparseable_config(tmp_path: Path) -> None:
+    """An unparseable config.toml must not be appended to (that would corrupt it
+    further); refuse and leave it byte-for-byte untouched."""
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir()
+    original = "this = is = not = valid\n"
+    cfg.write_text(original)
+
+    result = _make_registrar(tmp_path).register_server(_spec())
+
+    assert result.status == RegisterStatus.FAILED
+    assert "not valid TOML" in result.detail
+    assert cfg.read_text() == original
+
+
+def test_register_refuses_non_table_mcp_servers_entry(tmp_path: Path) -> None:
+    """A valid config whose mcp_servers.headroom is a non-table must not get a
+    duplicate `[mcp_servers.headroom]` table appended (which tomllib rejects)."""
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir()
+    original = '[mcp_servers]\nheadroom = "not-a-table"\n'
+    cfg.write_text(original)
+
+    result = _make_registrar(tmp_path).register_server(_spec())
+
+    assert result.status == RegisterStatus.FAILED
+    assert "non-table" in result.detail
+    # Untouched — still the original single (string) definition.
+    assert cfg.read_text() == original
+
+
+def test_register_refuses_non_table_mcp_servers(tmp_path: Path) -> None:
+    """A non-table top-level mcp_servers is also refused, not clobbered."""
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir()
+    original = 'mcp_servers = "oops"\n'
+    cfg.write_text(original)
+
+    result = _make_registrar(tmp_path).register_server(_spec())
+
+    assert result.status == RegisterStatus.FAILED
+    assert cfg.read_text() == original
+
+
 # ----------------------------------------------------------------------
 # register_server() — happy paths
 # ----------------------------------------------------------------------
@@ -359,3 +403,40 @@ def test_round_trip(tmp_path: Path, spec: ServerSpec) -> None:
     assert got.command == spec.command
     assert got.args == spec.args
     assert got.env == spec.env
+
+
+# ---------------------------------------------------------------------------
+# #733 — encoding / line-ending safety on GBK / CRLF Windows configs
+# ---------------------------------------------------------------------------
+
+
+def test_register_does_not_double_crlf(tmp_path: Path) -> None:
+    """A pre-existing CRLF config must not gain ``\\r\\r\\n`` after register."""
+    import tomllib
+
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_bytes(b'model = "gpt-5"\r\nworkers = 1\r\n')
+
+    result = _make_registrar(tmp_path).register_server(_spec())
+
+    assert result.status == RegisterStatus.REGISTERED
+    raw = cfg.read_bytes()
+    assert b"\r\r\n" not in raw
+    tomllib.loads(raw.decode("utf-8"))  # still valid TOML
+
+
+def test_register_preserves_non_ascii_values(tmp_path: Path) -> None:
+    """A config with non-ASCII (Chinese) values survives register and stays parseable."""
+    import tomllib
+
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('model = "gpt-5"\nproject = "比赛/机器人"\n', encoding="utf-8")
+
+    result = _make_registrar(tmp_path).register_server(_spec())
+
+    assert result.status == RegisterStatus.REGISTERED
+    data = tomllib.loads(cfg.read_text(encoding="utf-8"))
+    assert data["project"] == "比赛/机器人"
+    assert "headroom" in data.get("mcp_servers", {})

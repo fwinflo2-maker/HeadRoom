@@ -11,6 +11,7 @@ from typing import Any
 
 import click
 
+from headroom import fsutil
 from headroom.install.paths import opencode_config_path
 
 # Headroom-managed JSON marker comments for idempotent block injection.
@@ -30,6 +31,38 @@ _MCP_BLOCK_RE = re.compile(
 )
 HEADROOM_OPENCODE_PLUGIN = "headroom-opencode"
 
+# Models exposed by the injected `headroom` provider. This provider uses
+# ``@ai-sdk/openai-compatible`` and the proxy's ``/v1/chat/completions`` path,
+# which is routed to the configured OpenAI upstream. Do not advertise Claude
+# models here: OpenCode would send them through the OpenAI endpoint and report
+# an ``invalid_api_key`` error instead of reaching Anthropic. Claude models are
+# available through OpenCode's native ``anthropic`` provider, whose base URL is
+# also redirected to Headroom by ``build_opencode_config_content``.
+#
+# OpenCode only resolves ``headroom/<id>`` for ids listed in this map, so an
+# empty map means every documented ``headroom/*`` model fails with "Model not
+# found".
+HEADROOM_OPENCODE_MODELS: dict[str, Any] = {
+    "gpt-4o": {
+        "name": "GPT-4o",
+        "limit": {"context": 128000, "output": 16384},
+    },
+    "gpt-4.1": {
+        "name": "GPT-4.1",
+        "limit": {"context": 1048576, "output": 32768},
+    },
+}
+
+
+def headroom_provider_entry(port: int) -> dict[str, Any]:
+    """Return the `headroom` provider block pointed at the local proxy."""
+    return {
+        "npm": "@ai-sdk/openai-compatible",
+        "name": "Headroom Proxy",
+        "options": {"baseURL": f"http://127.0.0.1:{port}/v1"},
+        "models": HEADROOM_OPENCODE_MODELS,
+    }
+
 
 def _opencode_home_dir() -> Path:
     """Return the OpenCode home/config directory."""
@@ -42,7 +75,7 @@ def _opencode_home_dir() -> Path:
 def opencode_config_paths() -> tuple[Path, Path]:
     """Return ``(config_file, backup_file)`` for OpenCode."""
     config_file = opencode_config_path()
-    backup_file = config_file.with_suffix(".json.headroom-backup")
+    backup_file = config_file.with_name(config_file.name + ".headroom-backup")
     return config_file, backup_file
 
 
@@ -57,7 +90,7 @@ def snapshot_opencode_config_if_unwrapped(config_file: Path, backup_file: Path) 
     if not config_file.exists():
         return
     try:
-        content = config_file.read_text()
+        content = fsutil.read_text(config_file)
     except OSError:
         return
     if _PROVIDER_MARKER_START in content or _MCP_MARKER_START in content:
@@ -81,34 +114,11 @@ def strip_opencode_headroom_blocks(content: str, *, remove_mcp: bool = True) -> 
 
 def _render_provider_block(port: int) -> str:
     """Render a Headroom provider block as a JSON comment-wrapped snippet."""
-    provider = {
-        "headroom": {
-            "npm": "@ai-sdk/openai-compatible",
-            "name": "Headroom Proxy",
-            "options": {"baseURL": f"http://127.0.0.1:{port}/v1"},
-        }
-    }
+    provider = {"headroom": headroom_provider_entry(port)}
     lines = [
         _PROVIDER_MARKER_START,
         f'"provider": {json.dumps(provider, indent=2)},',
         _PROVIDER_MARKER_END,
-    ]
-    return "\n".join(lines)
-
-
-def _render_mcp_block(port: int) -> str:
-    """Render a Headroom MCP block as a JSON comment-wrapped snippet."""
-    mcp = {
-        "headroom": {
-            "type": "remote",
-            "url": f"http://127.0.0.1:{port}/mcp",
-            "enabled": True,
-        }
-    }
-    lines = [
-        _MCP_MARKER_START,
-        f'"mcp": {json.dumps(mcp, indent=2)},',
-        _MCP_MARKER_END,
     ]
     return "\n".join(lines)
 
@@ -185,36 +195,20 @@ def inject_opencode_provider_config(port: int) -> None:
         snapshot_opencode_config_if_unwrapped(config_file, backup_file)
 
         if config_file.exists():
-            content = config_file.read_text()
+            content = fsutil.read_text(config_file)
             data = _parse_json_loose(content)
         else:
             content = ""
             data = {}
 
         # Strip any prior Headroom-managed blocks before re-injecting.
-        if _PROVIDER_MARKER_START in content:
+        if _PROVIDER_MARKER_START in content or _MCP_MARKER_START in content:
             content = strip_opencode_headroom_blocks(content)
             data = _parse_json_loose(content)
 
         # Merge provider into the JSON data structure.
-        provider = {
-            "headroom": {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "Headroom Proxy",
-                "options": {"baseURL": f"http://127.0.0.1:{port}/v1"},
-            }
-        }
+        provider = {"headroom": headroom_provider_entry(port)}
         data = _inject_key_into_json(data, "provider", provider)
-
-        # Inject MCP if not already present.
-        mcp = {
-            "headroom": {
-                "type": "remote",
-                "url": f"http://127.0.0.1:{port}/mcp",
-                "enabled": True,
-            }
-        }
-        data = _inject_key_into_json(data, "mcp", mcp)
 
         # Write back as formatted JSON (opencode uses standard JSON with comments).
         output = json.dumps(data, indent=2) + "\n"

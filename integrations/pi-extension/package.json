@@ -1,6 +1,6 @@
 {
   "name": "@headroomlabs/pi-extension-headroom",
-  "version": "0.1.0",
+  "version": "0.34.0",
   "description": "Provider-independent Headroom context compression for Pi and Oh My Pi",
   "repository": {
     "type": "git",

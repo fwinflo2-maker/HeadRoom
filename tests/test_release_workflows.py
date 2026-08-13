@@ -1304,6 +1304,93 @@ def test_release_please_config_and_manifest_are_present_and_consistent() -> None
     )
 
 
+def test_release_please_versions_pi_extension() -> None:
+    import json
+
+    config = json.loads((ROOT / ".release-please-config.json").read_text())
+    extra_files = config["packages"]["."]["extra-files"]
+    paths = {item["path"] for item in extra_files}
+
+    assert "integrations/pi-extension/package.json" in paths
+    lockfile_entries = [
+        item
+        for item in extra_files
+        if item["path"] == "integrations/pi-extension/package-lock.json"
+    ]
+    assert {item["jsonpath"] for item in lockfile_entries} == {
+        "$.version",
+        "$.packages[''].version",
+    }
+
+
+def test_version_sync_and_verifier_cover_pi_extension() -> None:
+    sync = (ROOT / "scripts" / "version-sync.py").read_text(encoding="utf-8")
+    verify = (ROOT / "scripts" / "verify-versions.py").read_text(encoding="utf-8")
+
+    for path in (
+        "integrations/pi-extension/package.json",
+        "integrations/pi-extension/package-lock.json",
+    ):
+        assert path in sync
+        assert path in verify
+
+
+def test_pi_extension_version_matches_python_release() -> None:
+    import json
+
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ModuleNotFoundError:  # pragma: no cover
+        import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+
+    python_version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+    package = json.loads((ROOT / "integrations/pi-extension/package.json").read_text())
+    package_lock = json.loads((ROOT / "integrations/pi-extension/package-lock.json").read_text())
+
+    assert package["version"] == python_version
+    assert package_lock["version"] == python_version
+    assert package_lock["packages"][""]["version"] == python_version
+
+
+def test_opencode_version_matches_python_release() -> None:
+    import json
+
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ModuleNotFoundError:  # pragma: no cover
+        import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+
+    python_version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+    package = json.loads((ROOT / "plugins/opencode/package.json").read_text())
+    sync = (ROOT / "scripts/version-sync.py").read_text(encoding="utf-8")
+    verify = (ROOT / "scripts/verify-versions.py").read_text(encoding="utf-8")
+
+    assert package["version"] == python_version
+    assert '"plugins" / "opencode" / "package.json"' in sync
+    assert "plugins/opencode/package.json" in verify
+
+
+def test_release_metadata_includes_pi_extension() -> None:
+    import json
+
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ModuleNotFoundError:  # pragma: no cover
+        import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+
+    python_version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+    metadata = json.loads((ROOT / ".releasemetadata").read_text())
+
+    assert metadata["packages"] == {
+        "pypi": python_version,
+        "npm-sdk": python_version,
+        "npm-openclaw": python_version,
+        "npm-opencode": python_version,
+        "npm-pi-extension": python_version,
+        "agent-hooks-plugin": python_version,
+    }
+
+
 def test_release_metadata_sync_runs_on_release_please_branch() -> None:
     """The release branch must self-heal the versions release-please does not bump.
 

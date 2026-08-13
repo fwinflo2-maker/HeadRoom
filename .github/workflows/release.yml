@@ -993,6 +993,10 @@ jobs:
               exit 1
               ;;
           esac
+          if [ "$pid" -lt 1 ]; then
+            echo "Proxy PID must be greater than zero: $pid" >&2
+            exit 1
+          fi
           if ! kill -0 "$pid" 2>/dev/null; then
             echo "Proxy PID $pid already exited"
             exit 0

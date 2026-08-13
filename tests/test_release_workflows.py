@@ -685,6 +685,8 @@ def test_pi_extension_verify_proxy_cleanup_is_strict() -> None:
     assert 'kill "$(cat "${RUNNER_TEMP}/headroom-proxy.pid")" || true' not in stop["run"]
     assert 'if [ ! -s "$pid_file" ]' in stop["run"]
     assert 'case "$pid" in' in stop["run"]
+    assert 'if [ "$pid" -lt 1 ]' in stop["run"]
+    assert stop["run"].index('if [ "$pid" -lt 1 ]') < stop["run"].index("kill -0")
     assert "kill -0" in stop["run"]
     assert 'if ! kill "$pid"' in stop["run"]
     assert 'if ! kill -0 "$pid"' in stop["run"]

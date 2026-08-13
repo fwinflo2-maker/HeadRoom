@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, cast
 from headroom.providers.claude import DEFAULT_API_URL as DEFAULT_ANTHROPIC_API_URL
 from headroom.providers.codex import DEFAULT_API_URL as DEFAULT_OPENAI_API_URL
 from headroom.providers.gemini import DEFAULT_API_URL as DEFAULT_GEMINI_API_URL
+from headroom.providers.dsh.runtime import DEFAULT_API_URL as DEFAULT_DEEPSEEK_API_URL
 
 DEFAULT_CLOUDCODE_API_URL = "https://cloudcode-pa.googleapis.com"
 DEFAULT_VERTEX_API_URL = "https://us-central1-aiplatform.googleapis.com"
@@ -33,6 +34,7 @@ class ProviderApiOverrides:
     gemini: str | None = None
     cloudcode: str | None = None
     vertex: str | None = None
+    deepseek: str | None = None
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,7 @@ class ProviderApiTargets:
     gemini: str = DEFAULT_GEMINI_API_URL
     cloudcode: str = DEFAULT_CLOUDCODE_API_URL
     vertex: str = DEFAULT_VERTEX_API_URL
+    deepseek: str = DEFAULT_DEEPSEEK_API_URL
 
 
 @dataclass(frozen=True)
@@ -83,6 +86,10 @@ class ProxyProviderRuntime:
                 return azure_base.rstrip("/")
         return self.api_targets.openai
 
+    @property
+    def deepseek_base_url(self) -> str:
+        return self.api_targets.deepseek
+
 
 def _normalize_api_url(url: str | None, *, default: str) -> str:
     if not url:
@@ -116,6 +123,7 @@ def resolve_api_overrides(
     gemini_api_url: str | None,
     cloudcode_api_url: str | None,
     vertex_api_url: str | None = None,
+    deepseek_api_url: str | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> ProviderApiOverrides:
     """Resolve provider API URL overrides from CLI/config inputs and environment."""
@@ -128,6 +136,7 @@ def resolve_api_overrides(
         gemini=gemini_api_url or env.get("GEMINI_TARGET_API_URL"),
         cloudcode=cloudcode_api_url or env.get("CLOUDCODE_TARGET_API_URL"),
         vertex=vertex_api_url or env.get("VERTEX_TARGET_API_URL"),
+        deepseek=deepseek_api_url or env.get("DEEPSEEK_TARGET_API_URL"),
     )
 
 
@@ -165,6 +174,7 @@ def resolve_api_targets(overrides: ProviderApiOverrides) -> ProviderApiTargets:
         gemini=_normalize_api_url(overrides.gemini, default=DEFAULT_GEMINI_API_URL),
         cloudcode=_normalize_api_url(overrides.cloudcode, default=DEFAULT_CLOUDCODE_API_URL),
         vertex=_normalize_api_url(overrides.vertex, default=DEFAULT_VERTEX_API_URL),
+        deepseek=_normalize_api_url(overrides.deepseek, default=DEFAULT_DEEPSEEK_API_URL),
     )
 
 

@@ -1,5 +1,9 @@
 # Headroom for Pi and Oh My Pi
 
+<p align="center">
+  <img src="banner.png" alt="HEADROOM — The context compression layer for AI agents" width="820">
+</p>
+
 Provider-independent context compression for [Pi](https://github.com/earendil-works/pi) and [Oh My Pi](https://github.com/can1357/oh-my-pi). The extension prepares large tool results in the background, substitutes only previously prepared results in the model-facing context, and preserves the host session transcript byte-for-byte.
 
 ## Requirements

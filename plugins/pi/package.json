@@ -20,7 +20,8 @@
     "src",
     "README.md",
     "LICENSE",
-    "NOTICE"
+    "NOTICE",
+    "banner.png"
   ],
   "scripts": {
     "build": "tsup",
@@ -58,7 +59,8 @@
   "pi": {
     "extensions": [
       "./src/index.ts"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/gurkanguray/headroom/feat/pi-extension-headroom/plugins/pi/banner.png"
   },
   "publishConfig": {
     "access": "public"

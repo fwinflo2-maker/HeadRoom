@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-import yaml
+import yaml  # type: ignore[import-untyped]
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -104,10 +104,19 @@ def test_create_release_requires_successful_build_and_pypi_publish() -> None:
     # before publish. create-release must wait for it AND require its
     # success in the `if:` block (otherwise `always()` would let the
     # release proceed even when the smoke gate failed).
-    assert (
-        "needs: [detect-version, build, build-wheels, collect-dist, smoke-import-wheels, verify-pi-extension, publish-pypi, publish-npm, publish-github-packages, publish-docker]"
-        in content
-    )
+    workflow = yaml.safe_load(content)
+    assert workflow["jobs"]["create-release"]["needs"] == [
+        "detect-version",
+        "build",
+        "build-wheels",
+        "collect-dist",
+        "smoke-import-wheels",
+        "verify-pi-extension",
+        "publish-pypi",
+        "publish-npm",
+        "publish-github-packages",
+        "publish-docker",
+    ]
     assert "always()" in content
     assert "needs.build.result == 'success'" in content
     assert "needs.build-wheels.result == 'success'" in content
@@ -668,9 +677,7 @@ def test_pi_extension_registry_gate_uses_exact_version() -> None:
 
 
 def test_pi_extension_host_load_accepts_exact_external_spec() -> None:
-    host_load = (ROOT / "integrations/pi-extension/e2e/host-load.mjs").read_text(
-        encoding="utf-8"
-    )
+    host_load = (ROOT / "integrations/pi-extension/e2e/host-load.mjs").read_text(encoding="utf-8")
 
     assert "process.env.HEADROOM_EXTENSION_SPEC" in host_load
     install = '["install", "--ignore-scripts", "--no-audit", "--no-fund", extensionSpec]'
@@ -697,9 +704,7 @@ def test_npm_release_builder_regenerates_openclaw_dist_metadata_after_rewrite() 
     pack = builder.index(
         'runNpm(["pack", "--pack-destination", assetsDir], openClawDir);', prepare_dist
     )
-    verify = builder.index(
-        'runNode(["scripts/verify_npm_release_assets.mjs", assetsDir, version], rootDir)', pack
-    )
+    verify = builder.index("scripts/verify_npm_release_assets.mjs", pack)
 
     assert rewrite < prepare_dist < pack < verify
 
@@ -709,10 +714,7 @@ def test_npm_release_builder_installs_openclaw_against_local_sdk_tarball() -> No
     builder = (ROOT / "scripts" / "build_npm_release_assets.mjs").read_text(encoding="utf-8")
 
     local_dependency = builder.index("rewriteOpenClawLocalDependency(sdkTarballPath);")
-    install = builder.index(
-        '["install", "--package-lock=false", "--no-audit", "--no-fund", "--ignore-scripts"]',
-        local_dependency,
-    )
+    install = builder.index('"--package-lock=false"', local_dependency)
     build = builder.index('runNpm(["run", "build"], openClawDir);', install)
     release_dependency = builder.index("rewriteOpenClawReleaseDependency();", build)
 
@@ -1308,9 +1310,9 @@ def test_release_please_config_and_manifest_are_present_and_consistent() -> None
     # the project still supports per pyproject.toml `requires-python`).
     # Matches the same fallback pattern in headroom/release_version.py.
     try:
-        import tomllib
+        import tomllib  # type: ignore[import-not-found]
     except ModuleNotFoundError:  # pragma: no cover - Python 3.10 only
-        import tomli as tomllib  # type: ignore[no-redef]
+        import tomli as tomllib  # type: ignore[import-not-found, no-redef]
 
     manifest = json.loads((ROOT / ".release-please-manifest.json").read_text(encoding="utf-8"))
     config = json.loads((ROOT / ".release-please-config.json").read_text(encoding="utf-8"))

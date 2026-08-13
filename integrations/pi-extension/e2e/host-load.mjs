@@ -7,11 +7,13 @@ import { fileURLToPath } from "node:url";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const baseUrl = process.env.HEADROOM_LIVE_BASE_URL ?? "http://127.0.0.1:8787";
-const temporaryDirectory = await mkdtemp(join(tmpdir(), "headroom-pi-host-e2e-"));
+const temporaryDirectory = await mkdtemp(
+	join(tmpdir(), "headroom-pi-host-e2e-"),
+);
 await mkdir(join(temporaryDirectory, ".omp", "agent"), { recursive: true });
 await writeFile(
-  join(temporaryDirectory, ".omp", "agent", "config.yml"),
-  "setupVersion: 1\n",
+	join(temporaryDirectory, ".omp", "agent", "config.yml"),
+	"setupVersion: 1\n",
 );
 
 const ptyProbe = String.raw`
@@ -93,114 +95,124 @@ finally:
 `;
 
 function command(command, args, cwd = packageRoot) {
-  return execFileSync(command, args, {
-    cwd,
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  }).trim();
+	return execFileSync(command, args, {
+		cwd,
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+	}).trim();
 }
 
 function probeHost(name, executable, args) {
-  const version = command(executable, ["--version"]);
-  const resultPath = join(
-    temporaryDirectory,
-    `${name.toLowerCase()}-host-result.json`,
-  );
-  const result = spawnSync(
-    process.env.PYTHON ?? "python3",
-    ["-u", "-c", "import pty\n" + ptyProbe, executable, ...args],
-    {
-      cwd: temporaryDirectory,
-      env: {
-        ...process.env,
-        HOME: temporaryDirectory,
-        XDG_CONFIG_HOME: join(temporaryDirectory, ".config"),
-        HEADROOM_HOST_E2E_RESULT: resultPath,
-      },
-      encoding: "utf8",
-      timeout: 65_000,
-      maxBuffer: 16 * 1024 * 1024,
-    },
-  );
+	const version = command(executable, ["--version"]);
+	const resultPath = join(
+		temporaryDirectory,
+		`${name.toLowerCase()}-host-result.json`,
+	);
+	const result = spawnSync(
+		process.env.PYTHON ?? "python3",
+		["-u", "-c", "import pty\n" + ptyProbe, executable, ...args],
+		{
+			cwd: temporaryDirectory,
+			env: {
+				...process.env,
+				HOME: temporaryDirectory,
+				XDG_CONFIG_HOME: join(temporaryDirectory, ".config"),
+				HEADROOM_HOST_E2E_RESULT: resultPath,
+			},
+			encoding: "utf8",
+			timeout: 65_000,
+			maxBuffer: 16 * 1024 * 1024,
+		},
+	);
 
-  if (result.status !== 0) {
-    process.stderr.write((result.stdout ?? "").slice(-5_000));
-    process.stderr.write((result.stderr ?? "").slice(-30_000));
-    throw new Error(`${name} ${version} failed its packed host integration gate`);
-  }
-  if (!existsSync(resultPath)) {
-    throw new Error(`${name} ${version} did not write host integration evidence`);
-  }
-  const evidence = JSON.parse(readFileSync(resultPath, "utf8"));
-  if (
-    evidence.ok !== true ||
-    evidence.providerEvidence?.provider !== "headroom-e2e-b" ||
-    evidence.providerEvidence?.toolResultCount !== 3 ||
-    evidence.providerEvidence?.firstResultCompressed !== true ||
-    evidence.providerEvidence?.recentResultsRaw !== true ||
-    evidence.exactRawResults !== true ||
-    evidence.modelSwitchApplied !== true
-  ) {
-    throw new Error(
-      `${name} ${version} returned incomplete host evidence: ${JSON.stringify(evidence)}`,
-    );
-  }
-  process.stdout.write(
-    `${name} ${version}: packed extension lifecycle verified ${JSON.stringify(evidence)}\n`,
-  );
+	if (result.status !== 0) {
+		process.stderr.write((result.stdout ?? "").slice(-5_000));
+		process.stderr.write((result.stderr ?? "").slice(-30_000));
+		throw new Error(
+			`${name} ${version} failed its packed host integration gate`,
+		);
+	}
+	if (!existsSync(resultPath)) {
+		throw new Error(
+			`${name} ${version} did not write host integration evidence`,
+		);
+	}
+	const evidence = JSON.parse(readFileSync(resultPath, "utf8"));
+	if (
+		evidence.ok !== true ||
+		evidence.providerEvidence?.provider !== "headroom-e2e-b" ||
+		evidence.providerEvidence?.toolResultCount !== 3 ||
+		evidence.providerEvidence?.firstResultCompressed !== true ||
+		evidence.providerEvidence?.recentResultsRaw !== true ||
+		evidence.exactRawResults !== true ||
+		evidence.modelSwitchApplied !== true
+	) {
+		throw new Error(
+			`${name} ${version} returned incomplete host evidence: ${JSON.stringify(evidence)}`,
+		);
+	}
+	process.stdout.write(
+		`${name} ${version}: packed extension lifecycle verified ${JSON.stringify(evidence)}\n`,
+	);
 }
 
 try {
-  const extensionSpec = process.env.HEADROOM_EXTENSION_SPEC;
-  command("npm", ["init", "--yes"], temporaryDirectory);
-  if (extensionSpec) {
-    command(
-      "npm",
-      ["install", "--ignore-scripts", "--no-audit", "--no-fund", extensionSpec],
-      temporaryDirectory,
-    );
-  } else {
-    const packOutput = command("npm", ["pack", "--pack-destination", temporaryDirectory]);
-    const tarballName = packOutput.split(/\r?\n/).at(-1);
-    if (!tarballName) throw new Error("npm pack did not report a tarball");
-    const tarballPath = join(temporaryDirectory, tarballName);
-    command(
-      "npm",
-      ["install", "--ignore-scripts", "--no-audit", "--no-fund", tarballPath],
-      temporaryDirectory,
-    );
-  }
+	const extensionSpec = process.env.HEADROOM_EXTENSION_SPEC;
+	command("npm", ["init", "--yes"], temporaryDirectory);
+	if (extensionSpec) {
+		command(
+			"npm",
+			["install", "--ignore-scripts", "--no-audit", "--no-fund", extensionSpec],
+			temporaryDirectory,
+		);
+	} else {
+		const packOutput = command("npm", [
+			"pack",
+			"--pack-destination",
+			temporaryDirectory,
+		]);
+		const tarballName = packOutput.split(/\r?\n/).at(-1);
+		if (!tarballName) throw new Error("npm pack did not report a tarball");
+		const tarballPath = join(temporaryDirectory, tarballName);
+		command(
+			"npm",
+			["install", "--ignore-scripts", "--no-audit", "--no-fund", tarballPath],
+			temporaryDirectory,
+		);
+	}
 
-  const extensionPath = join(
-    temporaryDirectory,
-    "node_modules",
-    "@headroomlabs",
-    "pi-extension-headroom",
-    "src",
-    "index.ts",
-  );
-  if (!existsSync(extensionPath)) {
-    throw new Error(`packed extension entry point is missing: ${extensionPath}`);
-  }
+	const extensionPath = join(
+		temporaryDirectory,
+		"node_modules",
+		"@headroomlabs",
+		"pi-extension-headroom",
+		"src",
+		"index.ts",
+	);
+	if (!existsSync(extensionPath)) {
+		throw new Error(
+			`packed extension entry point is missing: ${extensionPath}`,
+		);
+	}
 
-  const driverPath = join(packageRoot, "e2e", "host-driver.ts");
-  if (!existsSync(driverPath)) {
-    throw new Error(`host integration driver is missing: ${driverPath}`);
-  }
+	const driverPath = join(packageRoot, "e2e", "host-driver.ts");
+	if (!existsSync(driverPath)) {
+		throw new Error(`host integration driver is missing: ${driverPath}`);
+	}
 
-  const extensionArgs = [
-    "--no-session",
-    "--extension",
-    extensionPath,
-    "--extension",
-    driverPath,
-  ];
-  probeHost("Pi", process.env.PI_BIN ?? "pi", [
-    "--offline",
-    "--no-extensions",
-    ...extensionArgs,
-  ]);
-  probeHost("OMP", process.env.OMP_BIN ?? "omp", extensionArgs);
+	const extensionArgs = [
+		"--no-session",
+		"--extension",
+		extensionPath,
+		"--extension",
+		driverPath,
+	];
+	probeHost("Pi", process.env.PI_BIN ?? "pi", [
+		"--offline",
+		"--no-extensions",
+		...extensionArgs,
+	]);
+	probeHost("OMP", process.env.OMP_BIN ?? "omp", extensionArgs);
 } finally {
-  await rm(temporaryDirectory, { recursive: true, force: true });
+	await rm(temporaryDirectory, { recursive: true, force: true });
 }

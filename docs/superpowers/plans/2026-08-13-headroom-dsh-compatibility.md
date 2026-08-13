@@ -583,7 +583,7 @@ In `headroom/proxy/server.py`:
 5. Add a DeepSeek line to the banner (after the `Vertex AI:` line ~5288):
 
 ```python
-║    DeepSeek:    {api_targets.deepseek:<57}║
+║    DeepSeek:   {api_targets.deepseek:<57}║
 ```
 
 - [ ] **Step 4: Run test to verify it passes**

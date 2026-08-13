@@ -10,8 +10,17 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from headroom.proxy import runtime_env  # noqa: E402
 from headroom.proxy.loopback_guard import require_loopback  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolate_runtime_env_overrides():
+    """Keep loopback hot-reload state from leaking into later test modules."""
+    runtime_env.clear_overrides()
+    yield
+    runtime_env.clear_overrides()
 
 
 def _make_client() -> TestClient:

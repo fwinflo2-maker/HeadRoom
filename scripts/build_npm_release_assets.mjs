@@ -16,7 +16,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 const sdkDir = path.join(rootDir, "sdk", "typescript");
 const openClawDir = path.join(rootDir, "plugins", "openclaw");
-const piExtensionDir = path.join(rootDir, "integrations", "pi-extension");
+const piExtensionDir = path.join(rootDir, "plugins", "pi");
 
 const rawArgs = process.argv.slice(2);
 const flags = new Set(rawArgs.filter((arg) => arg.startsWith("--")));
@@ -220,7 +220,7 @@ try {
 		piExtensionDir,
 	);
 	runNpm(["pack", "--pack-destination", assetsDir], piExtensionDir);
-	assertTarballBuilt("headroomlabs-pi-extension-headroom");
+	assertTarballBuilt("headroom-pi");
 
 	if (!flags.has("--no-verify")) {
 		runNode(

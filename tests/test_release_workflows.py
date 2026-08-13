@@ -637,15 +637,15 @@ def test_release_workflow_uses_local_npm_asset_builder() -> None:
     assert "scripts/verify_npm_release_assets.mjs" in content
     assert "scripts/verify_npm_release_assets.mjs" in builder
     assert "registerHeadroomPlugin" in verifier
-    assert "pi-extension-headroom" in builder
-    assert "pi-extension-headroom" in verifier
+    assert "headroom-pi" in builder
+    assert "headroom-pi" in verifier
 
 
 def test_npm_release_verifier_requires_pi_extension_tarball() -> None:
     verifier = (ROOT / "scripts" / "verify_npm_release_assets.mjs").read_text(encoding="utf-8")
 
-    assert "@headroomlabs/pi-extension-headroom" in verifier
-    assert "headroomlabs-pi-extension-headroom-${version}.tgz" in verifier
+    assert 'name: "headroom-pi"' in verifier
+    assert "headroom-pi-${version}.tgz" in verifier
     assert 'extensions: ["./src/index.ts"]' in verifier
     assert '"package/src/index.ts"' in verifier
 
@@ -669,7 +669,7 @@ def test_pi_extension_publish_blocks_pypi() -> None:
 def test_pi_extension_registry_gate_uses_exact_version() -> None:
     content = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
 
-    assert "@headroomlabs/pi-extension-headroom@${version}" in content
+    assert "headroom-pi@${version}" in content
     assert "HEADROOM_EXTENSION_SPEC" in content
     assert "npm view" in content
     assert "sha512" in content
@@ -694,7 +694,7 @@ def test_pi_extension_verify_proxy_cleanup_is_strict() -> None:
 
 
 def test_pi_extension_host_load_accepts_exact_external_spec() -> None:
-    host_load = (ROOT / "integrations/pi-extension/e2e/host-load.mjs").read_text(encoding="utf-8")
+    host_load = (ROOT / "plugins/pi/e2e/host-load.mjs").read_text(encoding="utf-8")
 
     assert "process.env.HEADROOM_EXTENSION_SPEC" in host_load
     install = '["install", "--ignore-scripts", "--no-audit", "--no-fund", extensionSpec]'
@@ -1388,11 +1388,9 @@ def test_release_please_versions_pi_extension() -> None:
     extra_files = config["packages"]["."]["extra-files"]
     paths = {item["path"] for item in extra_files}
 
-    assert "integrations/pi-extension/package.json" in paths
+    assert "plugins/pi/package.json" in paths
     lockfile_entries = [
-        item
-        for item in extra_files
-        if item["path"] == "integrations/pi-extension/package-lock.json"
+        item for item in extra_files if item["path"] == "plugins/pi/package-lock.json"
     ]
     assert {item["jsonpath"] for item in lockfile_entries} == {
         "$.version",
@@ -1405,8 +1403,8 @@ def test_version_sync_and_verifier_cover_pi_extension() -> None:
     verify = (ROOT / "scripts" / "verify-versions.py").read_text(encoding="utf-8")
 
     for path in (
-        "integrations/pi-extension/package.json",
-        "integrations/pi-extension/package-lock.json",
+        "plugins/pi/package.json",
+        "plugins/pi/package-lock.json",
     ):
         assert path in sync
         assert path in verify
@@ -1421,8 +1419,8 @@ def test_pi_extension_version_matches_python_release() -> None:
         import tomli as tomllib  # type: ignore[import-not-found,no-redef]
 
     python_version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
-    package = json.loads((ROOT / "integrations/pi-extension/package.json").read_text())
-    package_lock = json.loads((ROOT / "integrations/pi-extension/package-lock.json").read_text())
+    package = json.loads((ROOT / "plugins/pi/package.json").read_text())
+    package_lock = json.loads((ROOT / "plugins/pi/package-lock.json").read_text())
 
     assert package["version"] == python_version
     assert package_lock["version"] == python_version

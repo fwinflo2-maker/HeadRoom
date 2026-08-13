@@ -47,7 +47,7 @@ A source/dev Headroom build cannot durable-init an unpublished extension version
 From a Headroom source checkout:
 
 ```bash
-cd integrations/pi-extension
+cd plugins/pi
 npm ci
 npm run build
 pi --extension "$PWD/src/index.ts"
@@ -62,15 +62,15 @@ The extension does not spawn a subprocess itself; wrappers and durable installs 
 
    ```bash
    uv sync --extra proxy
-   npm --prefix integrations/pi-extension ci
-   npm --prefix integrations/pi-extension run build
+   npm --prefix plugins/pi ci
+   npm --prefix plugins/pi run build
    ```
 
 2. Add the source entry to the existing `extensions` list in `~/.omp/agent/config.yml`:
 
    ```yaml
    extensions:
-     - /absolute/path/to/headroom/integrations/pi-extension/src/index.ts
+     - /absolute/path/to/headroom/plugins/pi/src/index.ts
    ```
 
    A named OMP profile uses `~/.omp/profiles/<name>/agent/config.yml` instead.
@@ -130,21 +130,22 @@ In Pi or OMP:
 /headroom status
 ```
 
-A healthy default setup reports:
+A healthy default setup reports `Headroom online` in the status footer until a compression is accepted, then:
 
 ```text
-Headroom online
-health online
-endpoint http://127.0.0.1:8787
-remote blocked · hosts none
+Headroom saved 8,593 tokens this session
 ```
+
+That number is this Pi/OMP session's accepted savings, not a project lifetime total and not the last model request. It updates when a large unprotected tool result is accepted, not after every chat. `/reload` and `/resume` restore it from a sidecar next to the Pi session file. `/new` starts at zero.
+
+`/headroom status` still shows endpoint, last transform, and last error.
 
 ## Commands
 
 | Command | Purpose |
 | --- | --- |
-| `/headroom` | Show health plus savings applied to the latest model-facing context. |
-| `/headroom status` | Show health, endpoint, thresholds, queue, cache, latest transform, and configuration warnings. |
+| `/headroom` | Show compact session status (same text as the footer). |
+| `/headroom status` | Show health, endpoint, thresholds, queue, cache, latest transform, and last error. |
 | `/headroom stats` | Separate prepared-entry counters from substitutions and savings applied to the latest transform. |
 | `/headroom health` | Run an explicit proxy health check. |
 | `/headroom on` | Enable substitution for the current session. |

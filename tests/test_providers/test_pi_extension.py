@@ -57,8 +57,8 @@ def test_release_version_rejects_development_builds() -> None:
 @pytest.mark.parametrize(
     "entry",
     [
-        "npm:@headroomlabs/pi-extension-headroom@0.34.0",
-        {"source": "npm:@headroomlabs/pi-extension-headroom@0.34.0"},
+        "npm:headroom-pi@0.34.0",
+        {"source": "npm:headroom-pi@0.34.0"},
     ],
 )
 def test_pi_settings_support_string_and_object_entries(tmp_path, entry) -> None:
@@ -71,7 +71,7 @@ def test_pi_settings_support_string_and_object_entries(tmp_path, entry) -> None:
 def test_pi_settings_respect_relocated_config_directory(tmp_path, monkeypatch) -> None:
     settings = tmp_path / "settings.json"
     settings.write_text(
-        json.dumps({"packages": ["npm:@headroomlabs/pi-extension-headroom@0.34.0"]}),
+        json.dumps({"packages": ["npm:headroom-pi@0.34.0"]}),
         encoding="utf-8",
     )
     monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
@@ -150,7 +150,7 @@ def test_malformed_omp_json_is_actionable(monkeypatch) -> None:
             [
                 "/bin/pi",
                 "install",
-                "npm:@headroomlabs/pi-extension-headroom@0.34.0",
+                "npm:headroom-pi@0.34.0",
             ],
         ),
         (
@@ -159,7 +159,7 @@ def test_malformed_omp_json_is_actionable(monkeypatch) -> None:
                 "/bin/omp",
                 "plugin",
                 "install",
-                "@headroomlabs/pi-extension-headroom@0.34.0",
+                "headroom-pi@0.34.0",
                 "--json",
             ],
         ),
@@ -222,7 +222,7 @@ def test_owned_package_is_moved_to_exact_requested_version(monkeypatch, previous
         package_artifact("omp", previous, owned=True),
     )
 
-    assert calls[0][-2] == "@headroomlabs/pi-extension-headroom@0.34.0"
+    assert calls[0][-2] == "headroom-pi@0.34.0"
     assert artifact.metadata["version"] == "0.34.0"
 
 
@@ -266,9 +266,9 @@ def test_failed_new_install_is_removed(monkeypatch) -> None:
         [
             "/bin/pi",
             "install",
-            "npm:@headroomlabs/pi-extension-headroom@0.34.0",
+            "npm:headroom-pi@0.34.0",
         ],
-        ["/bin/pi", "remove", "npm:@headroomlabs/pi-extension-headroom"],
+        ["/bin/pi", "remove", "npm:headroom-pi"],
     ]
     with pytest.raises(StopIteration):
         next(states)
@@ -339,14 +339,14 @@ def test_failed_owned_upgrade_restores_previous_version(monkeypatch) -> None:
             "/bin/omp",
             "plugin",
             "install",
-            "@headroomlabs/pi-extension-headroom@0.34.0",
+            "headroom-pi@0.34.0",
             "--json",
         ],
         [
             "/bin/omp",
             "plugin",
             "install",
-            "@headroomlabs/pi-extension-headroom@0.33.0",
+            "headroom-pi@0.33.0",
             "--json",
         ],
     ]
@@ -447,14 +447,14 @@ def test_nonzero_remove_reports_command_and_verification_failure(
 @pytest.mark.parametrize(
     ("host", "command"),
     [
-        ("pi", ["/bin/pi", "remove", "npm:@headroomlabs/pi-extension-headroom"]),
+        ("pi", ["/bin/pi", "remove", "npm:headroom-pi"]),
         (
             "omp",
             [
                 "/bin/omp",
                 "plugin",
                 "uninstall",
-                "@headroomlabs/pi-extension-headroom",
+                "headroom-pi",
                 "--json",
             ],
         ),

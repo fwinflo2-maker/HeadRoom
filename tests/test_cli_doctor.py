@@ -22,6 +22,7 @@ from headroom.cli.doctor import (
     check_claude_routing,
     check_codex_routing,
     check_deployments,
+    check_metrics,
     check_proxy_liveness,
     check_savings,
     check_shell_env,
@@ -447,6 +448,25 @@ def test_native_extension_config_warns_on_malformed_json(tmp_path) -> None:
     assert result.status == WARN
 
 
+def test_metrics_check_fails_on_scrape_error() -> None:
+    result = check_metrics(
+        (500, "# scrape_error RuntimeError: savings snapshot exploded\n"),
+        "http://127.0.0.1:8787",
+    )
+
+    assert result.status == FAIL
+    assert "savings snapshot exploded" in result.summary
+
+
+def test_metrics_check_passes_on_core_counter() -> None:
+    result = check_metrics(
+        (200, "# TYPE headroom_requests_total counter\nheadroom_requests_total 1\n"),
+        "http://127.0.0.1:8787",
+    )
+
+    assert result.status == PASS
+
+
 def test_native_extension_config_fails_wrong_port(tmp_path) -> None:
     path = tmp_path / "pi-extension.json"
     path.write_text(json.dumps({"baseUrl": "http://127.0.0.1:9999"}), encoding="utf-8")
@@ -654,6 +674,13 @@ class TestDoctorCommand:
 
         return fake_probe
 
+    def _healthy_metrics(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            doctor_mod,
+            "probe_text",
+            lambda url, timeout=2.0: (200, "headroom_requests_total 1\n"),
+        )
+
     def test_proxy_down_exits_2(self, runner, isolated, monkeypatch):
         monkeypatch.setattr(doctor_mod, "probe_json", self._probe(None, None))
         result = runner.invoke(main, ["doctor"])
@@ -662,6 +689,7 @@ class TestDoctorCommand:
 
     def test_warnings_only_exits_1(self, runner, isolated, monkeypatch):
         monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
+        self._healthy_metrics(monkeypatch)
         monkeypatch.setattr(doctor_mod, "get_version", lambda: "0.26.0")
         # proxy healthy, but clients unwrapped + shell env unset -> warns
         result = runner.invoke(main, ["doctor"])
@@ -669,6 +697,7 @@ class TestDoctorCommand:
 
     def test_remote_control_warning_exits_1(self, runner, isolated, monkeypatch):
         monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
+        self._healthy_metrics(monkeypatch)
         monkeypatch.setattr(doctor_mod, "get_version", lambda: "0.26.0")
         (isolated / "settings.json").write_text(
             json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}}),
@@ -686,11 +715,13 @@ class TestDoctorCommand:
 
     def test_json_output_parses(self, runner, isolated, monkeypatch):
         monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
+        self._healthy_metrics(monkeypatch)
         result = runner.invoke(main, ["doctor", "--json"])
         payload = json.loads(result.output)
         assert payload["port"] == 8787
         assert {c["name"] for c in payload["checks"]} >= {
             "proxy",
+            "metrics",
             "version",
             "budget",
             "pi extension",

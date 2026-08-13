@@ -22,7 +22,7 @@ from headroom._version import normalize_release_version
 from headroom.fsutil import write_text
 from headroom.install.models import ArtifactRecord
 
-PACKAGE_NAME = "@headroomlabs/pi-extension-headroom"
+PACKAGE_NAME = "headroom-pi"
 HostName = Literal["pi", "omp"]
 
 

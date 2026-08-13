@@ -24,7 +24,7 @@ from typing import Any, Literal
 import click
 
 from headroom._version import format_version_label, normalize_release_version
-from headroom.install.health import probe_json
+from headroom.install.health import probe_json, probe_text
 from headroom.install.paths import claude_settings_path, codex_config_path
 from headroom.install.state import list_manifests
 from headroom.paths import savings_path
@@ -118,6 +118,33 @@ def check_proxy_liveness(livez: dict[str, Any] | None, base_url: str) -> CheckRe
         status=PASS,
         summary=f"running at {base_url} ({uptime_text}, {format_version_label(version)})",
     )
+
+
+def check_metrics(scrape: tuple[int, str] | None, base_url: str) -> CheckResult:
+    """Is /metrics scrapable with a diagnosable failure body?"""
+    name = "metrics"
+    if scrape is None:
+        return CheckResult(
+            name=name,
+            status=FAIL,
+            summary=f"not reachable at {base_url}/metrics",
+            hint="restart the proxy, then retry: headroom doctor",
+        )
+    status, body = scrape
+    if status != 200 or "# scrape_error" in body:
+        return CheckResult(
+            name=name,
+            status=FAIL,
+            summary=f"scrape failed ({status}): {body.strip()[:160]}",
+            hint="inspect proxy logs, then restart: headroom proxy",
+        )
+    if "headroom_requests_total" not in body:
+        return CheckResult(
+            name=name,
+            status=WARN,
+            summary="/metrics responded without the core request counter",
+        )
+    return CheckResult(name=name, status=PASS, summary=f"scrapable at {base_url}/metrics")
 
 
 def check_version_drift(livez: dict[str, Any] | None, installed: str) -> CheckResult:
@@ -636,6 +663,7 @@ def doctor(port: int, emit_json: bool) -> None:
     base_url = f"http://127.0.0.1:{port}"
     livez = probe_json(f"{base_url}/livez")
     stats = probe_json(f"{base_url}/stats", timeout=5.0) if livez else None
+    metrics = probe_text(f"{base_url}/metrics") if livez else None
     installed = get_version()
     try:
         extension_version = extension_release_version(installed)
@@ -644,6 +672,9 @@ def doctor(port: int, emit_json: bool) -> None:
 
     checks = [
         check_proxy_liveness(livez, base_url),
+        check_metrics(metrics, base_url)
+        if livez is not None
+        else CheckResult(name="metrics", status=SKIP, summary="proxy not reachable"),
         check_version_drift(livez, installed),
         check_claude_routing(claude_settings_path(), port),
         check_wrap_marker_staleness(Path.cwd() / ".claude" / "settings.local.json"),

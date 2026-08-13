@@ -1,13 +1,13 @@
 {
-  "name": "@headroomlabs/pi-extension-headroom",
+  "name": "headroom-pi",
   "version": "0.34.0",
   "description": "Provider-independent Headroom context compression for Pi and Oh My Pi",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/headroomlabs-ai/headroom.git",
-    "directory": "integrations/pi-extension"
+    "directory": "plugins/pi"
   },
-  "homepage": "https://github.com/headroomlabs-ai/headroom/tree/main/integrations/pi-extension#readme",
+  "homepage": "https://github.com/headroomlabs-ai/headroom/tree/main/plugins/pi#readme",
   "bugs": {
     "url": "https://github.com/headroomlabs-ai/headroom/issues"
   },

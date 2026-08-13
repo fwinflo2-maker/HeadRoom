@@ -13,7 +13,7 @@ env:
   NPM_SDK_PACKAGE: headroom-ai
   NPM_OPENCLAW_PACKAGE: headroom-openclaw
   NPM_OPENCODE_PACKAGE: headroom-opencode
-  NPM_PI_EXTENSION_PACKAGE: "@headroomlabs/pi-extension-headroom"
+  NPM_PI_EXTENSION_PACKAGE: headroom-pi
 
   # GitHub Package Registry
   GITHUB_PACKAGES_REGISTRY_URL: https://npm.pkg.github.com
@@ -54,7 +54,7 @@ on:
       - "scripts/version-sync.py"
       - "scripts/build_npm_release_assets.mjs"
       - "scripts/verify_npm_release_assets.mjs"
-      - "integrations/pi-extension/**"
+      - "plugins/pi/**"
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:
@@ -840,8 +840,8 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ needs.detect-version.outputs.npm_version }}"
-          spec="@headroomlabs/pi-extension-headroom@${version}"
-          tarball="release-assets/headroomlabs-pi-extension-headroom-${version}.tgz"
+          spec="headroom-pi@${version}"
+          tarball="release-assets/headroom-pi-${version}.tgz"
           digest="$(
             openssl dgst -sha512 -binary "$tarball" | openssl base64 -A
           )"
@@ -896,7 +896,7 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-          cache-dependency-path: integrations/pi-extension/package-lock.json
+          cache-dependency-path: plugins/pi/package-lock.json
       - uses: oven-sh/setup-bun@v2
 
       - name: Download verified npm release assets
@@ -914,7 +914,7 @@ jobs:
       - name: Install Headroom and extension test dependencies
         run: |
           uv sync --frozen --extra proxy
-          npm ci --prefix integrations/pi-extension
+          npm ci --prefix plugins/pi
 
       - name: Install tested Pi and OMP versions
         run: |
@@ -958,7 +958,7 @@ jobs:
           PY
 
       - name: Run live contract and benchmark
-        working-directory: integrations/pi-extension
+        working-directory: plugins/pi
         env:
           HEADROOM_LIVE_BASE_URL: http://127.0.0.1:8787
         run: |
@@ -966,10 +966,10 @@ jobs:
           npm run benchmark:live
 
       - name: Run deterministic dual-host gate against exact registry spec
-        working-directory: integrations/pi-extension
+        working-directory: plugins/pi
         env:
           HEADROOM_EXTENSION_SPEC: >-
-            @headroomlabs/pi-extension-headroom@${{
+            headroom-pi@${{
             needs.detect-version.outputs.npm_version }}
           HEADROOM_LIVE_BASE_URL: http://127.0.0.1:8787
         run: npm run test:hosts

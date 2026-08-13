@@ -31,17 +31,17 @@
         },
         {
           "type": "json",
-          "path": "integrations/pi-extension/package.json",
+          "path": "plugins/pi/package.json",
           "jsonpath": "$.version"
         },
         {
           "type": "json",
-          "path": "integrations/pi-extension/package-lock.json",
+          "path": "plugins/pi/package-lock.json",
           "jsonpath": "$.version"
         },
         {
           "type": "json",
-          "path": "integrations/pi-extension/package-lock.json",
+          "path": "plugins/pi/package-lock.json",
           "jsonpath": "$.packages[''].version"
         }
       ]

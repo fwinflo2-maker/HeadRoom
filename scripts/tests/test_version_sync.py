@@ -31,7 +31,7 @@ def temp_project(tmp_path: Path) -> dict[str, Path]:
     sdk = root / "sdk"
     typescript = sdk / "typescript"
     typescript.mkdir(parents=True)
-    pi_extension = root / "integrations" / "pi-extension"
+    pi_extension = plugins / "pi"
     pi_extension.mkdir(parents=True)
 
     # pyproject.toml
@@ -95,21 +95,19 @@ def temp_project(tmp_path: Path) -> dict[str, Path]:
     typescript_pkg = typescript / "package.json"
     typescript_pkg.write_text(json.dumps({"name": "test", "version": "0.5.25"}))
 
-    # integrations/pi-extension package manifests
+    # plugins/pi package manifests
     pi_extension_pkg = pi_extension / "package.json"
-    pi_extension_pkg.write_text(
-        json.dumps({"name": "@headroomlabs/pi-extension-headroom", "version": "0.5.25"})
-    )
+    pi_extension_pkg.write_text(json.dumps({"name": "headroom-pi", "version": "0.5.25"}))
     pi_extension_lock = pi_extension / "package-lock.json"
     pi_extension_lock.write_text(
         json.dumps(
             {
-                "name": "@headroomlabs/pi-extension-headroom",
+                "name": "headroom-pi",
                 "version": "0.5.25",
                 "lockfileVersion": 3,
                 "packages": {
                     "": {
-                        "name": "@headroomlabs/pi-extension-headroom",
+                        "name": "headroom-pi",
                         "version": "0.5.25",
                     }
                 },

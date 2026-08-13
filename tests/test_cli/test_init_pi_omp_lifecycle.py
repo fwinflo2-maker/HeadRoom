@@ -46,7 +46,7 @@ args = sys.argv[1:]
 state_path = pathlib.Path(os.environ["HEADROOM_TEST_HOST_STATE"])
 log_path = pathlib.Path(os.environ["HEADROOM_TEST_HOST_LOG"])
 state = json.loads(state_path.read_text())
-package = "@headroomlabs/pi-extension-headroom"
+package = "headroom-pi"
 
 def save(action, version=None):
     state_path.write_text(json.dumps(state, sort_keys=True) + "\\n")

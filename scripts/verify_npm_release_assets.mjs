@@ -29,8 +29,8 @@ const packages = [
 		},
 	},
 	{
-		name: "@headroomlabs/pi-extension-headroom",
-		tarball: `headroomlabs-pi-extension-headroom-${version}.tgz`,
+		name: "headroom-pi",
+		tarball: `headroom-pi-${version}.tgz`,
 		extensions: ["./src/index.ts"],
 	},
 ];

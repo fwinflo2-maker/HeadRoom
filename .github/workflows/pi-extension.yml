@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - "integrations/pi-extension/**"
+      - "plugins/pi/**"
       - "headroom/**"
       - "pyproject.toml"
       - "uv.lock"
@@ -12,7 +12,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "integrations/pi-extension/**"
+      - "plugins/pi/**"
       - "headroom/**"
       - "pyproject.toml"
       - "uv.lock"
@@ -27,7 +27,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  EXTENSION_DIRECTORY: integrations/pi-extension
+  EXTENSION_DIRECTORY: plugins/pi
   HEADROOM_LIVE_BASE_URL: http://127.0.0.1:8787
 
 jobs:
@@ -37,14 +37,14 @@ jobs:
     timeout-minutes: 15
     defaults:
       run:
-        working-directory: integrations/pi-extension
+        working-directory: plugins/pi
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
           cache: npm
-          cache-dependency-path: integrations/pi-extension/package-lock.json
+          cache-dependency-path: plugins/pi/package-lock.json
       - run: npm ci
       - run: npm test
       - run: npm run typecheck
@@ -61,7 +61,7 @@ jobs:
         pi-version: ["0.80.10", "0.82.1", "0.84.1"]
     defaults:
       run:
-        working-directory: integrations/pi-extension
+        working-directory: plugins/pi
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -74,7 +74,7 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-          cache-dependency-path: integrations/pi-extension/package-lock.json
+          cache-dependency-path: plugins/pi/package-lock.json
       - uses: oven-sh/setup-bun@v2
       - name: Install Headroom
         working-directory: .

@@ -21,10 +21,8 @@ def _read_package_lock_versions(path: Path) -> dict[str, str]:
     with open(path, encoding="utf-8") as f:
         payload = json.load(f)
     return {
-        "integrations/pi-extension/package-lock.json": str(payload["version"]),
-        'integrations/pi-extension/package-lock.json:packages[""]': str(
-            payload["packages"][""]["version"]
-        ),
+        "plugins/pi/package-lock.json": str(payload["version"]),
+        'plugins/pi/package-lock.json:packages[""]': str(payload["packages"][""]["version"]),
     }
 
 
@@ -53,9 +51,7 @@ def main() -> None:
         "plugins/openclaw/package.json": _read_json_version(ROOT / "plugins/openclaw/package.json"),
         "plugins/opencode/package.json": _read_json_version(ROOT / "plugins/opencode/package.json"),
         "sdk/typescript/package.json": _read_json_version(ROOT / "sdk/typescript/package.json"),
-        "integrations/pi-extension/package.json": _read_json_version(
-            ROOT / "integrations/pi-extension/package.json"
-        ),
+        "plugins/pi/package.json": _read_json_version(ROOT / "plugins/pi/package.json"),
         "plugins/headroom-agent-hooks/.claude-plugin/plugin.json": _read_json_version(
             ROOT / "plugins/headroom-agent-hooks/.claude-plugin/plugin.json"
         ),
@@ -63,9 +59,7 @@ def main() -> None:
             ROOT / "plugins/headroom-agent-hooks/.github/plugin/plugin.json"
         ),
     }
-    versions.update(
-        _read_package_lock_versions(ROOT / "integrations/pi-extension/package-lock.json")
-    )
+    versions.update(_read_package_lock_versions(ROOT / "plugins/pi/package-lock.json"))
     versions.update(_read_marketplace_versions(ROOT / ".claude-plugin/marketplace.json"))
     versions.update(_read_marketplace_versions(ROOT / ".github/plugin/marketplace.json"))
 

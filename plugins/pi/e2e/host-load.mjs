@@ -6,7 +6,6 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const baseUrl = process.env.HEADROOM_LIVE_BASE_URL ?? "http://127.0.0.1:8787";
 const temporaryDirectory = await mkdtemp(
 	join(tmpdir(), "headroom-pi-host-e2e-"),
 );
@@ -64,7 +63,7 @@ try:
         if loaded and not test_started and now - last_sent >= 0.5:
             os.write(fd, b"/headroom status\r")
             last_sent = now
-        if loaded and not test_started and b"health online" in output and b"endpoint ${baseUrl}" in output:
+        if loaded and not test_started and b"health online" in output:
             os.write(fd, b"/headroom-e2e\r")
             test_started = True
         if result_path and os.path.exists(result_path):
@@ -137,7 +136,14 @@ function probeHost(name, executable, args) {
 			`${name} ${version} did not write host integration evidence`,
 		);
 	}
-	const evidence = JSON.parse(readFileSync(resultPath, "utf8"));
+	let evidence;
+	try {
+		evidence = JSON.parse(readFileSync(resultPath, "utf8"));
+	} catch (error) {
+		throw new Error(
+			`${name} ${version} wrote invalid host integration evidence: ${error}`,
+		);
+	}
 	if (
 		evidence.ok !== true ||
 		evidence.providerEvidence?.provider !== "headroom-e2e-b" ||
@@ -184,8 +190,7 @@ try {
 	const extensionPath = join(
 		temporaryDirectory,
 		"node_modules",
-		"@headroomlabs",
-		"pi-extension-headroom",
+		"headroom-pi",
 		"src",
 		"index.ts",
 	);

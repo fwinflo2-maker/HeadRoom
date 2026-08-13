@@ -49,7 +49,7 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
 
 - **Library** — `compress(messages)` in Python or TypeScript, inline in any app
 - **Proxy** — `headroom proxy --port 8787`, zero code changes, any language
-- **Agent wrap** — `headroom wrap claude|codex|grok|copilot|cursor|aider|opencode|cline|continue|goose|openhands|openclaw|vibe|omp|zcode` in one command; undo with `headroom unwrap <tool>`
+- **Agent wrap** — `headroom wrap claude|codex|grok|copilot|cursor|aider|opencode|cline|continue|goose|openhands|openclaw|vibe|pi|omp|zcode` in one command; undo with `headroom unwrap <tool>`
 - **MCP server** — `headroom_compress`, `headroom_retrieve`, `headroom_stats` for any MCP client
 - **Cross-agent memory** — shared store across Claude, Codex, Gemini, Grok, auto-dedup
 - **`headroom learn`** — mines failed sessions, writes corrections to `CLAUDE.local.md` (default, gitignored) or `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` / `GROK.md`
@@ -241,7 +241,8 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 | Goose        | ✅              | starts proxy + launches          |
 | OpenHands    | ✅              | starts proxy + launches          |
 | Mistral Vibe | ✅              | starts proxy + launches          |
-| Oh My Pi     | ✅              | injects config · starts proxy + launches |
+| Pi           | ✅              | starts proxy + launches; install `headroom-pi` first |
+| Oh My Pi     | ✅              | starts proxy + launches; install `headroom-pi` first |
 | Cortex Code  | Library only    | 60–65% savings (library mode; no `wrap`) |
 | Kimi CLI     | ✅              | OAuth bearer forwarded — log in once |
 | ZCode        | ✅              | starts proxy and prints base URLs for ZCode settings |
@@ -352,11 +353,13 @@ troubleshooting.
 ## When to use · When to skip
 
 **Great fit if you…**
+
 - run AI coding agents daily and want savings without changing your code
 - work across multiple agents and want shared memory
 - need reversible compression — originals are retrievable via CCR within the configured TTL
 
 **Skip it if you…**
+
 - only use a single provider's native compaction and don't need cross-agent memory
 - work in a sandboxed environment where local processes can't run
 
@@ -465,7 +468,7 @@ Using `pipx`? Choose a supported interpreter explicitly:
 pipx install --python python3.13 "headroom-ai[all]"
 ```
 
-> **Pick 3.13 if you want dollar savings.** The dashboard's *Proxy $ Saved* tile prices compression with [LiteLLM](https://github.com/BerriAI/litellm), and LiteLLM can't be installed on Python 3.14+. On 3.14 token savings still track, but the dollar figure stays `$0.00`. If you already installed on 3.14, switch with `pipx reinstall headroom-ai --python python3.13` and restart the proxy.
+> **Pick 3.13 if you want dollar savings.** The dashboard's *Proxy $ Saved* tile prices compression with [LiteLLM](https://github.com/BerriAI/litellm), and LiteLLM can't be installed on Python 3.14+. On 3.14 token savings still track, but the dollar figure stays `$0.00`. If you already installed on 3.14, switch with`pipx reinstall headroom-ai --python python3.13` and restart the proxy.
 
 → [Installation guide](https://headroom-docs.vercel.app/docs/installation) — Docker tags, persistent service, PowerShell, devcontainers.
 

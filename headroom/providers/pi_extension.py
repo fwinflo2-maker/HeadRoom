@@ -79,7 +79,13 @@ def _inspect_pi_settings(path: Path) -> PackageState | None:
         raise click.ClickException(f"Pi settings.json at {path} has an invalid packages value.")
 
     for entry in packages:
-        source = entry if isinstance(entry, str) else entry.get("source") if isinstance(entry, dict) else None
+        source = (
+            entry
+            if isinstance(entry, str)
+            else entry.get("source")
+            if isinstance(entry, dict)
+            else None
+        )
         if not isinstance(source, str):
             continue
         state = _npm_state(source)
@@ -171,9 +177,7 @@ def _rollback_new_install(host: HostName, binary: str) -> None:
         raise click.ClickException(f"Failed to verify rollback of the {host} package install.")
 
 
-def _rollback_owned_upgrade(
-    host: HostName, binary: str, previous: PackageState
-) -> None:
+def _rollback_owned_upgrade(host: HostName, binary: str, previous: PackageState) -> None:
     _run(
         _install_command(host, binary, previous.version),
         f"restore {host} package version {previous.version}",
@@ -215,7 +219,9 @@ def ensure_host_package(
             else:
                 _rollback_owned_upgrade(host, binary, previous)
         except click.ClickException as rollback_error:
-            raise click.ClickException(f"{install_error} Rollback also failed: {rollback_error}") from rollback_error
+            raise click.ClickException(
+                f"{install_error} Rollback also failed: {rollback_error}"
+            ) from rollback_error
         raise install_error
 
     return _artifact(host, version, owned=True, source="npm")

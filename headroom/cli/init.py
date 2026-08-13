@@ -816,10 +816,28 @@ def _restore_extension_config_snapshot(
         path.chmod(mode)
 
 
+def _command_bytes(value: Any) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    return str(value or "").encode("utf-8", errors="surrogateescape")
+
+
+def _scheduler_snapshot_error(platform: str, stderr: Any) -> click.ClickException:
+    detail = _command_bytes(stderr).decode("utf-8", errors="replace").strip()
+    return click.ClickException(
+        f"Could not snapshot {platform} scheduler state: {detail or 'unknown query failure'}."
+    )
+
+
 def _snapshot_scheduler(manifest: Any) -> tuple[str, Any]:
     if sys.platform.startswith("linux"):
-        result = run(["crontab", "-l"], capture_output=True, text=True)
-        return "linux", (result.returncode == 0, result.stdout if result.returncode == 0 else "")
+        result = run(["crontab", "-l"], capture_output=True)
+        if result.returncode == 0:
+            return "linux", (True, _command_bytes(result.stdout))
+        detail = _command_bytes(result.stderr).lower()
+        if result.returncode == 1 and b"no crontab for" in detail:
+            return "linux", (False, b"")
+        raise _scheduler_snapshot_error("Linux crontab", result.stderr)
     if sys.platform == "darwin":
         plist = Path.home() / "Library" / "LaunchAgents" / f"com.headroom.{manifest.profile}.plist"
         try:
@@ -830,27 +848,40 @@ def _snapshot_scheduler(manifest: Any) -> tuple[str, Any]:
         result = run(
             ["launchctl", "print", f"{domain}/com.headroom.{manifest.profile}"],
             capture_output=True,
-            text=True,
         )
-        return "darwin", (plist, content, result.returncode == 0, domain)
+        if result.returncode == 0:
+            loaded = True
+        else:
+            detail = _command_bytes(result.stderr).lower()
+            if result.returncode == 113 or b"could not find service" in detail:
+                loaded = False
+            else:
+                raise _scheduler_snapshot_error("macOS launchd", result.stderr)
+        return "darwin", (plist, content, loaded, domain)
     if sys.platform.startswith("win"):
-        tasks: dict[str, str | None] = {}
+        tasks: dict[str, bytes | None] = {}
         for suffix in ("startup", "health"):
             name = f"{manifest.service_name}-{suffix}"
             result = run(
                 ["schtasks", "/Query", "/TN", name, "/XML"],
                 capture_output=True,
-                text=True,
             )
-            tasks[name] = result.stdout if result.returncode == 0 else None
+            if result.returncode == 0:
+                tasks[name] = _command_bytes(result.stdout)
+                continue
+            detail = _command_bytes(result.stderr).lower()
+            if result.returncode == 1 and b"cannot find the file specified" in detail:
+                tasks[name] = None
+                continue
+            raise _scheduler_snapshot_error("Windows Task Scheduler", result.stderr)
         return "windows", tasks
     return "none", None
 
 
-def _restore_windows_task(name: str, xml: str) -> None:
+def _restore_windows_task(name: str, xml: bytes) -> None:
     temp = Path(tempfile.mkstemp(suffix=".xml")[1])
     try:
-        temp.write_text(xml, encoding="utf-16")
+        temp.write_bytes(xml)
         run(["schtasks", "/Create", "/TN", name, "/XML", str(temp), "/F"], check=True)
     finally:
         temp.unlink(missing_ok=True)
@@ -861,7 +892,7 @@ def _restore_scheduler(snapshot: tuple[str, Any]) -> None:
     if platform == "linux":
         existed, content = state
         if existed:
-            run(["crontab", "-"], input=content, text=True, check=True)
+            run(["crontab", "-"], input=content, check=True)
         else:
             run(["crontab", "-r"], capture_output=True, text=True)
     elif platform == "darwin":
@@ -907,6 +938,41 @@ def _restore_native_package(
     ensure_host_package(host, binary, previous.version, current_artifact)
 
 
+def _start_profile_strict(manifest: Any) -> None:
+    if not getattr(manifest, "preset", None):
+        start_detached_agent(manifest.profile)
+        return
+    if runtime_status(manifest) != "running":
+        start_detached_agent(manifest.profile)
+    if not wait_ready(manifest, timeout_seconds=45):
+        raise click.ClickException(
+            f"Headroom runtime for profile {manifest.profile} did not become ready."
+        )
+
+
+def _restore_runtime_state(manifest: Any, status: str, was_ready: bool) -> None:
+    if getattr(manifest, "preset", None):
+        stop_runtime(manifest)
+    if status == "stopped":
+        if getattr(manifest, "preset", None) and runtime_status(manifest) != "stopped":
+            raise click.ClickException(
+                f"Could not restore stopped runtime state for profile {manifest.profile}."
+            )
+        return
+    if status != "running":
+        raise click.ClickException(
+            f"Cannot restore unknown runtime state {status!r} for profile {manifest.profile}."
+        )
+    if was_ready:
+        _start_profile_strict(manifest)
+        return
+    start_detached_agent(manifest.profile)
+    if runtime_status(manifest) != "running":
+        raise click.ClickException(
+            f"Could not restore running runtime state for profile {manifest.profile}."
+        )
+
+
 def _init_native_hosts(
     *,
     hosts: list[tuple[Literal["pi", "omp"], str]],
@@ -921,9 +987,14 @@ def _init_native_hosts(
     expected_config_bytes = _expected_extension_config(config_snapshot, port)
     task_files_snapshot = _snapshot_files(_task_file_paths(manifest))
     scheduler_snapshot = _snapshot_scheduler(manifest)
-    runtime_was_running = bool(
+    prior_runtime_status = (
+        runtime_status(previous_manifest)
+        if previous_manifest is not None and getattr(previous_manifest, "preset", None)
+        else "stopped"
+    )
+    prior_runtime_ready = bool(
         previous_manifest is not None
-        and getattr(previous_manifest, "health_url", None)
+        and prior_runtime_status == "running"
         and wait_ready(previous_manifest, timeout_seconds=1)
     )
     previous_config = next(
@@ -968,13 +1039,20 @@ def _init_native_hosts(
             package_artifact = ensure_host_package(host, binary, release, previous_artifact)
             installed_packages.append((host, binary, package_artifact))
 
-        manifest.targets = sorted(
-            set(previous_manifest.targets if previous_manifest else []).union(
-                host for host, _binary in hosts
-            )
+        native_targets = [host for host, _binary in hosts]
+        final_targets = sorted(
+            set(previous_manifest.targets if previous_manifest else []).union(native_targets)
         )
+        provisional = deepcopy(manifest)
+        provisional.targets = list(previous_manifest.targets if previous_manifest else [])
+        provisional.artifacts = list(previous_manifest.artifacts if previous_manifest else [])
+        provisional.supervisor_kind = SupervisorKind.TASK.value
+        task_artifacts = install_supervisor(provisional)
+        _save_manifest_verified(provisional)
+        _start_profile_strict(provisional)
+
+        manifest.targets = final_targets
         manifest.supervisor_kind = SupervisorKind.TASK.value
-        task_artifacts = install_supervisor(manifest)
         _upsert_artifacts(
             manifest,
             [
@@ -984,7 +1062,6 @@ def _init_native_hosts(
             ],
         )
         _save_manifest_verified(manifest)
-        _ensure_profile_running(manifest.profile)
     except BaseException as initiating_error:
         rollback_errors: list[str] = []
         for host, binary, artifact in reversed(installed_packages):
@@ -1019,11 +1096,10 @@ def _init_native_hosts(
             lambda: _restore_files(task_files_snapshot),
             lambda: _restore_manifest_snapshot(manifest.profile, manifest_existed, manifest_bytes),
             lambda: (
-                stop_runtime(manifest) if getattr(manifest, "preset", None) is not None else None
-            ),
-            lambda: (
-                _ensure_profile_running(previous_manifest.profile)
-                if runtime_was_running and previous_manifest is not None
+                _restore_runtime_state(previous_manifest, prior_runtime_status, prior_runtime_ready)
+                if previous_manifest is not None
+                else stop_runtime(manifest)
+                if getattr(manifest, "preset", None) is not None
                 else None
             ),
         ):

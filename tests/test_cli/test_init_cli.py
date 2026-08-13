@@ -692,9 +692,7 @@ def test_native_batch_installs_shared_supervisor_once(monkeypatch) -> None:
     monkeypatch.setattr(
         init_cli, "install_supervisor", lambda value: calls.append("supervisor") or []
     )
-    monkeypatch.setattr(
-        init_cli, "_ensure_profile_running", lambda profile: calls.append("runtime")
-    )
+    monkeypatch.setattr(init_cli, "_start_profile_strict", lambda value: calls.append("runtime"))
     monkeypatch.setattr(init_cli, "_save_manifest_verified", lambda value: None)
 
     init_cli._init_native_hosts(
@@ -716,7 +714,7 @@ def test_native_platform_scheduler_snapshot_restore(
     calls: list[tuple[list[str], dict]] = []
 
     class Result:
-        def __init__(self, returncode=0, stdout=""):
+        def __init__(self, returncode=0, stdout: str | bytes = ""):
             self.returncode = returncode
             self.stdout = stdout
             self.stderr = ""
@@ -726,13 +724,13 @@ def test_native_platform_scheduler_snapshot_restore(
         if platform == "darwin" and command[:2] == ["launchctl", "print"]:
             return Result(0)
         if platform == "win32" and command[:2] == ["schtasks", "/Query"]:
-            return Result(0, "<Task>original</Task>")
+            return Result(0, b"<Task>original</Task>")
         return Result(0)
 
     monkeypatch.setattr(init_cli, "run", fake_run)
     monkeypatch.setattr(init_cli.sys, "platform", platform)
     plist: Path | None = None
-    restored: list[tuple[str, str]] = []
+    restored: list[tuple[str, bytes]] = []
     if platform == "darwin":
         monkeypatch.setattr(init_cli.Path, "home", lambda: tmp_path)
         plist = tmp_path / "Library" / "LaunchAgents" / "com.headroom.init-user.plist"
@@ -754,20 +752,44 @@ def test_native_platform_scheduler_snapshot_restore(
         assert any(command[:2] == ["launchctl", "bootstrap"] for command, _ in calls)
     else:
         assert restored == [
-            ("headroom-init-user-startup", "<Task>original</Task>"),
-            ("headroom-init-user-health", "<Task>original</Task>"),
+            ("headroom-init-user-startup", b"<Task>original</Task>"),
+            ("headroom-init-user-health", b"<Task>original</Task>"),
         ]
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin", "win32"])
+def test_native_scheduler_snapshot_transient_failure_aborts_before_mutation(
+    monkeypatch, platform: str
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    touched: list[str] = []
+
+    class Result:
+        returncode = 5
+        stdout = b""
+        stderr = b"transient failure"
+
+    monkeypatch.setattr(init_cli.sys, "platform", platform)
+    monkeypatch.setattr(init_cli, "run", lambda command, **kwargs: Result())
+    monkeypatch.setattr(init_cli, "ensure_extension_config", lambda *args: touched.append("config"))
+
+    with pytest.raises(click.ClickException, match="snapshot"):
+        init_cli._snapshot_scheduler(
+            SimpleNamespace(profile="init-user", service_name="headroom-init-user")
+        )
+
+    assert touched == []
 
 
 def test_native_crontab_snapshot_restores_exact_whitespace(monkeypatch) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
-    original = "# user cron\n\n  0 1 * * * command  \n"
-    writes: list[str] = []
+    original = b"# user cron\n\xff\n  0 1 * * * command  \n"
+    writes: list[bytes] = []
 
     class Result:
         returncode = 0
         stdout = original
-        stderr = ""
+        stderr = b""
 
     def fake_run(command, **kwargs):
         if command == ["crontab", "-"]:
@@ -783,11 +805,14 @@ def test_native_crontab_snapshot_restores_exact_whitespace(monkeypatch) -> None:
     assert writes == [original]
 
 
-@pytest.mark.parametrize("was_running", [True, False])
-def test_native_runtime_state_restored_on_rollback(monkeypatch, was_running: bool) -> None:
+def test_native_running_but_unready_runtime_is_restored_and_verified(monkeypatch) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     previous = SimpleNamespace(
-        profile="init-user", supervisor_kind="none", artifacts=[], health_url="http://ready"
+        profile="init-user",
+        supervisor_kind="none",
+        artifacts=[],
+        health_url="http://ready",
+        preset="persistent-task",
     )
     manifest = SimpleNamespace(
         profile="init-user",
@@ -802,6 +827,105 @@ def test_native_runtime_state_restored_on_rollback(monkeypatch, was_running: boo
         memory_enabled=False,
     )
     calls: list[str] = []
+    monkeypatch.setattr(init_cli, "runtime_status", lambda value: "running")
+    monkeypatch.setattr(init_cli, "wait_ready", lambda value, timeout_seconds: False)
+    monkeypatch.setattr(init_cli, "inspect_host_package", lambda host, binary: None)
+    monkeypatch.setattr(
+        init_cli,
+        "ensure_extension_config",
+        lambda port, existing: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    monkeypatch.setattr(init_cli, "remove_supervisor", lambda value: None)
+    monkeypatch.setattr(init_cli, "_restore_manifest_snapshot", lambda *args: None)
+    monkeypatch.setattr(init_cli, "stop_runtime", lambda value: calls.append("stop"))
+    monkeypatch.setattr(init_cli, "start_detached_agent", lambda profile: calls.append("restart"))
+
+    with pytest.raises(click.ClickException, match="boom"):
+        init_cli._init_native_hosts(
+            hosts=[("pi", "/bin/pi")],
+            release="1.2.3",
+            manifest=manifest,
+            manifest_snapshot=(True, b"prior", previous),
+            port=8787,
+        )
+
+    assert calls == ["stop", "restart"]
+
+
+def test_native_runtime_restart_failure_is_combined(monkeypatch) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    previous = SimpleNamespace(
+        profile="init-user",
+        supervisor_kind="none",
+        artifacts=[],
+        health_url="http://ready",
+        preset="persistent-task",
+    )
+    manifest = SimpleNamespace(
+        **previous.__dict__,
+        targets=["pi"],
+        port=8787,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        memory_enabled=False,
+    )
+    monkeypatch.setattr(init_cli, "runtime_status", lambda value: "running")
+    monkeypatch.setattr(init_cli, "wait_ready", lambda value, timeout_seconds: False)
+    monkeypatch.setattr(init_cli, "inspect_host_package", lambda host, binary: None)
+    monkeypatch.setattr(
+        init_cli,
+        "ensure_extension_config",
+        lambda port, existing: (_ for _ in ()).throw(RuntimeError("initiating")),
+    )
+    monkeypatch.setattr(init_cli, "remove_supervisor", lambda value: None)
+    monkeypatch.setattr(init_cli, "stop_runtime", lambda value: None)
+    monkeypatch.setattr(init_cli, "_restore_manifest_snapshot", lambda *args: None)
+    monkeypatch.setattr(
+        init_cli,
+        "start_detached_agent",
+        lambda profile: (_ for _ in ()).throw(RuntimeError("restart failed")),
+    )
+
+    with pytest.raises(click.ClickException) as exc_info:
+        init_cli._init_native_hosts(
+            hosts=[("pi", "/bin/pi")],
+            release="1.2.3",
+            manifest=manifest,
+            manifest_snapshot=(True, b"prior", previous),
+            port=8787,
+        )
+
+    assert "initiating" in str(exc_info.value)
+    assert "restart failed" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("was_running", [True, False])
+def test_native_runtime_state_restored_on_rollback(monkeypatch, was_running: bool) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    previous = SimpleNamespace(
+        profile="init-user",
+        supervisor_kind="none",
+        artifacts=[],
+        health_url="http://ready",
+        preset="persistent-task",
+    )
+    manifest = SimpleNamespace(
+        profile="init-user",
+        targets=["pi"],
+        supervisor_kind="none",
+        artifacts=[],
+        preset="persistent-task",
+        port=8787,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        memory_enabled=False,
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(
+        init_cli, "runtime_status", lambda value: "running" if was_running else "stopped"
+    )
     monkeypatch.setattr(init_cli, "wait_ready", lambda value, timeout_seconds: was_running)
     monkeypatch.setattr(init_cli, "inspect_host_package", lambda host, binary: None)
     monkeypatch.setattr(
@@ -814,9 +938,7 @@ def test_native_runtime_state_restored_on_rollback(monkeypatch, was_running: boo
     monkeypatch.setattr(init_cli, "_save_manifest_verified", lambda value: None)
     monkeypatch.setattr(init_cli, "_restore_manifest_snapshot", lambda *args: None)
     monkeypatch.setattr(init_cli, "stop_runtime", lambda value: calls.append("stop"))
-    monkeypatch.setattr(
-        init_cli, "_ensure_profile_running", lambda profile: calls.append("restart")
-    )
+    monkeypatch.setattr(init_cli, "_start_profile_strict", lambda value: calls.append("restart"))
 
     with pytest.raises(click.ClickException, match="boom"):
         init_cli._init_native_hosts(
@@ -828,6 +950,78 @@ def test_native_runtime_state_restored_on_rollback(monkeypatch, was_running: boo
         )
 
     assert calls == (["stop", "restart"] if was_running else ["stop"])
+
+
+def test_native_strict_startup_failure_leaves_no_native_claims(monkeypatch) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    previous = init_cli._build_runtime_manifest(
+        profile="init-user",
+        existing=None,
+        targets=["claude"],
+        port=8787,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        memory=False,
+    )
+    manifest = init_cli._build_runtime_manifest(
+        profile="init-user",
+        existing=previous,
+        targets=["pi"],
+        port=8787,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        memory=False,
+    )
+    saved: list[list[str]] = []
+    removed: list[str] = []
+    monkeypatch.setattr(init_cli, "runtime_status", lambda value: "stopped")
+    monkeypatch.setattr(init_cli, "wait_ready", lambda value, timeout_seconds: False)
+    monkeypatch.setattr(init_cli, "inspect_host_package", lambda host, binary: None)
+    monkeypatch.setattr(
+        init_cli,
+        "ensure_host_package",
+        lambda host, binary, version, existing: init_cli.ArtifactRecord(
+            "pi-extension-package", host, {"version": version, "owned": True}
+        ),
+    )
+    monkeypatch.setattr(
+        init_cli,
+        "remove_owned_host_package",
+        lambda host, binary, artifact: removed.append(host) or "removed",
+    )
+    monkeypatch.setattr(
+        init_cli,
+        "ensure_extension_config",
+        lambda port, existing: init_cli.ArtifactRecord(
+            "pi-extension-config", str(init_cli.extension_config_path()), {}
+        ),
+    )
+    monkeypatch.setattr(init_cli, "install_supervisor", lambda value: [])
+    monkeypatch.setattr(init_cli, "remove_supervisor", lambda value: None)
+    monkeypatch.setattr(
+        init_cli, "_save_manifest_verified", lambda value: saved.append(list(value.targets))
+    )
+    monkeypatch.setattr(
+        init_cli,
+        "_start_profile_strict",
+        lambda value: (_ for _ in ()).throw(RuntimeError("startup failed")),
+    )
+    monkeypatch.setattr(init_cli, "_restore_manifest_snapshot", lambda *args: None)
+    monkeypatch.setattr(init_cli, "stop_runtime", lambda value: None)
+
+    with pytest.raises(click.ClickException, match="startup failed"):
+        init_cli._init_native_hosts(
+            hosts=[("pi", "/bin/pi")],
+            release="1.2.3",
+            manifest=manifest,
+            manifest_snapshot=(True, b"prior", previous),
+            port=8787,
+        )
+
+    assert saved == [["claude"]]
+    assert removed == ["pi"]
 
 
 def test_pi_and_omp_share_init_user_profile_and_config_artifact(monkeypatch) -> None:

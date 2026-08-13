@@ -723,10 +723,15 @@ def _is_deepseek_request(request_headers: dict[str, str], model: str | None) -> 
         return _resolve_openai_upstream_base(request.headers) or self.OPENAI_API_URL
 ```
 
-3. Update the single caller in `handle_openai_chat` (line ~2973):
+3. Update the caller in `handle_openai_chat` (line ~2973) AND the URL-build site (line ~4429):
 
 ```python
-        upstream_base_url = self._resolve_openai_upstream(request, model=model)
+        upstream_base_url = self._resolve_openai_upstream(request, model=model)  # line ~2973
+        ...
+        url = build_copilot_upstream_url(
+            self._resolve_openai_upstream(request, model=model),  # line ~4429 (the actual routing)
+            handler_path,
+        )
 ```
 
 - [ ] **Step 4: Run test to verify it passes**

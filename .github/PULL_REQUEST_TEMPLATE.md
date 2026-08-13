@@ -40,9 +40,14 @@ Closes #
 - Observed result:
 - Not tested:
 
-## Rollout Safety
+## Runtime Rollout Safety
 
-- Release channel / feature flag impact:
+- Rollout-managed feature(s):
+- Minimum rollout channel:
+- Stable/default behavior changed:
+- Kill switch / disable path:
+- Unsafe override required:
+- Qualification impact:
 - Rollback path:
 
 ## Review Readiness

@@ -64,9 +64,14 @@ pytest scripts/tests/test_pr_governance.py -q
 - Observed result: The governance check fails and the PR gets a needs-author-action label.
 - Not tested: Automatic Copilot review rulesets in repository settings.
 
-## Rollout Safety
+## Runtime Rollout Safety
 
-- Release channel / feature flag impact: No runtime feature flags changed.
+- Rollout-managed feature(s): None.
+- Minimum rollout channel: Stable.
+- Stable/default behavior changed: No.
+- Kill switch / disable path: Not applicable.
+- Unsafe override required: No.
+- Qualification impact: None.
 - Rollback path: Revert the workflow and script changes.
 
 ## Review Readiness
@@ -191,9 +196,14 @@ Fixes #123
 - Observed result:
 - Not tested:
 
-## Rollout Safety
+## Runtime Rollout Safety
 
-- Release channel / feature flag impact:
+- Rollout-managed feature(s):
+- Minimum rollout channel:
+- Stable/default behavior changed:
+- Kill switch / disable path:
+- Unsafe override required:
+- Qualification impact:
 - Rollback path:
 
 ## Review Readiness
@@ -211,7 +221,7 @@ Fixes #123
     assert any("Type of Change" in problem for problem in report.problems)
     assert any("Test Output" in problem for problem in report.problems)
     assert any("Real Behavior Proof" in problem for problem in report.problems)
-    assert any("Rollout Safety" in problem for problem in report.problems)
+    assert any("Runtime Rollout Safety" in problem for problem in report.problems)
 
 
 def test_validate_pull_request_skips_bot_authored_prs() -> None:

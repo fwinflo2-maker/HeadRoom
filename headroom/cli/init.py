@@ -60,7 +60,7 @@ from headroom.install.runtime import (
     stop_runtime,
     wait_ready,
 )
-from headroom.install.state import ManifestError, load_manifest, save_manifest
+from headroom.install.state import ManifestError, delete_manifest, load_manifest, save_manifest
 from headroom.install.supervisors import (
     install_supervisor,
     remove_supervisor,
@@ -75,6 +75,7 @@ from headroom.providers.pi_extension import (
     extension_config_path,
     extension_release_version,
     inspect_host_package,
+    remove_owned_extension_config,
     remove_owned_host_package,
 )
 
@@ -1687,6 +1688,94 @@ def init(
 
 def _ctx_value(ctx: click.Context, key: str) -> Any:
     return (ctx.obj or {}).get(key)
+
+
+def _remove_native_target(host: Literal["pi", "omp"], global_scope: bool) -> None:
+    if not global_scope:
+        raise click.ClickException("Durable Pi/OMP removal requires -g (current-user scope).")
+
+    manifest = load_manifest(_GLOBAL_PROFILE)
+    if manifest is None or host not in manifest.targets:
+        click.echo(f"No durable {host} integration is installed.")
+        return
+
+    package = next(
+        (
+            artifact
+            for artifact in manifest.artifacts
+            if artifact.kind == "pi-extension-package" and artifact.path == host
+        ),
+        None,
+    )
+    if package is not None:
+        binary = shutil.which(host)
+        if not binary:
+            raise click.ClickException(
+                f"'{host}' not found in PATH; cannot safely remove its managed package."
+            )
+        remove_owned_host_package(host, binary, package)
+
+    manifest.targets = [target for target in manifest.targets if target != host]
+    if package is not None:
+        manifest.artifacts.remove(package)
+
+    if _NATIVE_EXTENSION_TARGETS.intersection(manifest.targets):
+        save_manifest(manifest)
+        click.echo(f"Removed durable {host} integration.")
+        return
+
+    config = next(
+        (artifact for artifact in manifest.artifacts if artifact.kind == "pi-extension-config"),
+        None,
+    )
+    if config is not None:
+        remove_owned_extension_config(config)
+    task_paths = _task_file_paths(manifest)
+    remove_supervisor(manifest)
+    for path in task_paths:
+        path.unlink(missing_ok=True)
+    manifest.artifacts = [
+        artifact
+        for artifact in manifest.artifacts
+        if artifact.kind
+        not in {
+            "pi-extension-config",
+            "script",
+            "service-unit",
+            "cron",
+            "crontab",
+            "plist",
+            "windows-service",
+            "windows-task",
+        }
+    ]
+    manifest.supervisor_kind = SupervisorKind.NONE.value
+
+    if manifest.targets:
+        save_manifest(manifest)
+    else:
+        stop_runtime(manifest)
+        delete_manifest(manifest.profile)
+    click.echo(f"Removed durable {host} integration.")
+
+
+@init.group("remove")
+def init_remove() -> None:
+    """Remove Headroom-managed durable agent integrations."""
+
+
+@init_remove.command("pi")
+@click.pass_context
+def init_remove_pi(ctx: click.Context) -> None:
+    """Remove the durable Pi Headroom extension."""
+    _remove_native_target("pi", bool(_ctx_value(ctx, "global_scope")))
+
+
+@init_remove.command("omp")
+@click.pass_context
+def init_remove_omp(ctx: click.Context) -> None:
+    """Remove the durable OMP Headroom extension."""
+    _remove_native_target("omp", bool(_ctx_value(ctx, "global_scope")))
 
 
 @init.command("claude")

@@ -16,6 +16,30 @@ Use the Python-native `headroom install` CLI when you want supported tools to ke
 | Wrapped (Python) | Proxy lasts for wrapped session | `headroom wrap ...` |
 | Wrapped (Docker) | Containerized proxy + host tool session | Docker-native wrapper |
 
+## Durable Pi and OMP integrations
+
+Native Pi and OMP extensions share the `init-user` persistent-task profile:
+
+```bash
+headroom init -g pi
+headroom init -g omp
+headroom init -g remove pi
+headroom init -g remove omp
+headroom install status --profile init-user
+```
+
+Both targets can coexist. Removing one keeps the shared configuration, task,
+and runtime while the other remains. Removing the last native target removes
+the task and shared config; if no other target remains, removal also stops the
+runtime and deletes the profile. Persistent-task profiles do not expose manual
+`headroom install stop`; native-target removal owns teardown.
+
+`headroom wrap ...` remains transient and does not claim extension package
+ownership. Durable OMP init is provider-independent and never edits
+`models.yml`; `headroom unwrap omp` only removes wrapper inference routing.
+For rollback, reinstall an older Headroom release and rerun the corresponding
+init command to install its matching extension version.
+
 ## Quick examples
 
 ### Persistent service on the local machine

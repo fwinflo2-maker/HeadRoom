@@ -188,6 +188,227 @@ def test_explicit_omp_init_dispatches_native_host(monkeypatch) -> None:
     assert calls[0]["global_scope"] is True
 
 
+def native_manifest(init_cli, targets, artifacts):
+    return SimpleNamespace(
+        profile=init_cli._GLOBAL_PROFILE,
+        targets=list(targets),
+        supervisor_kind=init_cli.SupervisorKind.TASK.value,
+        artifacts=list(artifacts),
+    )
+
+
+def native_package(init_cli, host, *, owned):
+    return init_cli.ArtifactRecord(
+        kind="pi-extension-package",
+        path=host,
+        metadata={"version": "0.34.0", "owned": owned},
+    )
+
+
+def native_config(init_cli):
+    return init_cli.ArtifactRecord(
+        kind="pi-extension-config",
+        path="/home/test/.headroom/integrations/pi-extension.json",
+        metadata={"managed_sha256": "abc"},
+    )
+
+
+def test_remove_pi_preserves_shared_omp_runtime(monkeypatch) -> None:
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    pi_package = native_package(init_cli, "pi", owned=True)
+    omp_package = native_package(init_cli, "omp", owned=True)
+    manifest = native_manifest(
+        init_cli,
+        ["pi", "omp"],
+        [pi_package, omp_package, native_config(init_cli)],
+    )
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli, "save_manifest", lambda value: None)
+    monkeypatch.setattr(init_cli.shutil, "which", lambda host: f"/bin/{host}")
+    monkeypatch.setattr(init_cli, "remove_owned_host_package", lambda *args: "removed")
+    stopped = []
+    monkeypatch.setattr(init_cli, "remove_supervisor", lambda value: stopped.append(value))
+
+    result = CliRunner().invoke(fake_main, ["init", "-g", "remove", "pi"])
+
+    assert result.exit_code == 0, result.output
+    assert manifest.targets == ["omp"]
+    assert stopped == []
+    assert omp_package in manifest.artifacts
+    assert pi_package not in manifest.artifacts
+
+
+def test_remove_last_native_target_preserves_user_owned_package(monkeypatch) -> None:
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    package = native_package(init_cli, "pi", owned=False)
+    config = native_config(init_cli)
+    manifest = native_manifest(init_cli, ["pi"], [package, config])
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli.shutil, "which", lambda host: f"/bin/{host}")
+    monkeypatch.setattr(init_cli, "remove_owned_host_package", lambda *args: "preserved")
+    monkeypatch.setattr(init_cli, "remove_owned_extension_config", lambda item: "restored")
+    removed_tasks = []
+    stopped = []
+    deleted = []
+    monkeypatch.setattr(init_cli, "remove_supervisor", lambda value: removed_tasks.append(value))
+    monkeypatch.setattr(init_cli, "stop_runtime", lambda value: stopped.append(value))
+    monkeypatch.setattr(init_cli, "delete_manifest", lambda profile: deleted.append(profile))
+
+    result = CliRunner().invoke(fake_main, ["init", "-g", "remove", "pi"])
+
+    assert result.exit_code == 0, result.output
+    assert removed_tasks == [manifest]
+    assert stopped == [manifest]
+    assert deleted == [init_cli._GLOBAL_PROFILE]
+
+
+def test_remove_omp_never_touches_models_yml(monkeypatch, tmp_path) -> None:
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    models = tmp_path / "models.yml"
+    before = b"providers:\n  anthropic:\n    baseUrl: https://example.invalid\n"
+    models.write_bytes(before)
+    package = native_package(init_cli, "omp", owned=True)
+    manifest = native_manifest(init_cli, ["omp"], [package, native_config(init_cli)])
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli.shutil, "which", lambda host: f"/bin/{host}")
+    monkeypatch.setattr(init_cli, "remove_owned_host_package", lambda *args: "removed")
+    monkeypatch.setattr(init_cli, "remove_owned_extension_config", lambda item: "restored")
+    monkeypatch.setattr(init_cli, "remove_supervisor", lambda value: None)
+    monkeypatch.setattr(init_cli, "stop_runtime", lambda value: None)
+    monkeypatch.setattr(init_cli, "delete_manifest", lambda profile: None)
+
+    result = CliRunner().invoke(fake_main, ["init", "-g", "remove", "omp"])
+
+    assert result.exit_code == 0, result.output
+    assert models.read_bytes() == before
+
+
+def test_local_native_remove_fails_before_mutation(monkeypatch) -> None:
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    touched = []
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: touched.append(profile))
+    monkeypatch.setattr(init_cli, "remove_owned_host_package", lambda *args: touched.append("pkg"))
+
+    result = CliRunner().invoke(fake_main, ["init", "remove", "pi"])
+
+    assert result.exit_code != 0
+    assert "requires -g" in result.output
+    assert touched == []
+
+
+def test_remove_missing_native_target_is_idempotent(monkeypatch) -> None:
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    manifest = native_manifest(init_cli, ["omp"], [native_package(init_cli, "omp", owned=True)])
+    touched = []
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli.shutil, "which", lambda host: touched.append(host))
+    monkeypatch.setattr(init_cli, "save_manifest", lambda value: touched.append("manifest"))
+
+    result = CliRunner().invoke(fake_main, ["init", "-g", "remove", "pi"])
+
+    assert result.exit_code == 0, result.output
+    assert touched == []
+    assert manifest.targets == ["omp"]
+
+
+def test_remove_preserves_user_owned_or_externally_changed_package(monkeypatch) -> None:
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    package = native_package(init_cli, "pi", owned=True)
+    manifest = native_manifest(init_cli, ["pi", "omp"], [package])
+    saved = []
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli.shutil, "which", lambda host: "/bin/pi")
+    monkeypatch.setattr(init_cli, "remove_owned_host_package", lambda *args: "preserved")
+    monkeypatch.setattr(init_cli, "save_manifest", lambda value: saved.append(copy.deepcopy(value)))
+
+    result = CliRunner().invoke(fake_main, ["init", "-g", "remove", "pi"])
+
+    assert result.exit_code == 0, result.output
+    assert saved[0].targets == ["omp"]
+    assert package not in saved[0].artifacts
+
+
+def test_failed_package_uninstall_keeps_manifest_ownership_for_retry(monkeypatch) -> None:
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    package = native_package(init_cli, "pi", owned=True)
+    manifest = native_manifest(init_cli, ["pi"], [package])
+    saved = []
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli.shutil, "which", lambda host: "/bin/pi")
+    monkeypatch.setattr(
+        init_cli,
+        "remove_owned_host_package",
+        lambda *args: (_ for _ in ()).throw(click.ClickException("uninstall failed")),
+    )
+    monkeypatch.setattr(init_cli, "save_manifest", lambda value: saved.append(value))
+
+    result = CliRunner().invoke(fake_main, ["init", "-g", "remove", "pi"])
+
+    assert result.exit_code != 0
+    assert "uninstall failed" in result.output
+    assert manifest.targets == ["pi"]
+    assert package in manifest.artifacts
+    assert saved == []
+
+
+def test_last_native_remove_drops_task_but_keeps_non_native_shared_profile(
+    monkeypatch, tmp_path
+) -> None:
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    package = native_package(init_cli, "pi", owned=True)
+    config = native_config(init_cli)
+    task_path = tmp_path / "task"
+    task_path.write_text("managed task", encoding="utf-8")
+    task = init_cli.ArtifactRecord(kind="cron", path=str(task_path))
+    manifest = native_manifest(init_cli, ["claude", "pi"], [package, config, task])
+    saved = []
+    removed_tasks = []
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli.shutil, "which", lambda host: "/bin/pi")
+    monkeypatch.setattr(init_cli, "remove_owned_host_package", lambda *args: "removed")
+    monkeypatch.setattr(init_cli, "remove_owned_extension_config", lambda item: "removed")
+    monkeypatch.setattr(init_cli, "remove_supervisor", lambda value: removed_tasks.append(value))
+    monkeypatch.setattr(init_cli, "save_manifest", lambda value: saved.append(copy.deepcopy(value)))
+    monkeypatch.setattr(
+        init_cli, "stop_runtime", lambda value: (_ for _ in ()).throw(AssertionError("stop"))
+    )
+
+    result = CliRunner().invoke(fake_main, ["init", "-g", "remove", "pi"])
+
+    assert result.exit_code == 0, result.output
+    assert removed_tasks == [manifest]
+    assert saved[0].targets == ["claude"]
+    assert saved[0].supervisor_kind == init_cli.SupervisorKind.NONE.value
+    assert saved[0].artifacts == []
+    assert not task_path.exists()
+
+
+def test_last_overall_target_stops_runtime_restores_config_and_deletes_profile(monkeypatch) -> None:
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    package = native_package(init_cli, "omp", owned=True)
+    config = native_config(init_cli)
+    manifest = native_manifest(init_cli, ["omp"], [package, config])
+    calls = []
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli.shutil, "which", lambda host: "/bin/omp")
+    monkeypatch.setattr(
+        init_cli, "remove_owned_host_package", lambda *args: calls.append("package") or "removed"
+    )
+    monkeypatch.setattr(
+        init_cli,
+        "remove_owned_extension_config",
+        lambda item: calls.append("config") or "restored",
+    )
+    monkeypatch.setattr(init_cli, "remove_supervisor", lambda value: calls.append("task"))
+    monkeypatch.setattr(init_cli, "stop_runtime", lambda value: calls.append("runtime"))
+    monkeypatch.setattr(init_cli, "delete_manifest", lambda profile: calls.append("manifest"))
+
+    result = CliRunner().invoke(fake_main, ["init", "-g", "remove", "omp"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == ["package", "config", "task", "runtime", "manifest"]
+
+
 def test_run_init_targets_includes_native_runtime_targets(monkeypatch) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     native: list[tuple[str, str, list[str]]] = []

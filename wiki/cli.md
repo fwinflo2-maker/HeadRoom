@@ -597,6 +597,29 @@ headroom mcp serve --proxy-url http://127.0.0.1:9000 --debug
 
 See also: [MCP Tools](mcp.md)
 
+## `headroom init`
+
+Install or remove durable current-user Pi/OMP integrations backed by the shared
+`init-user` persistent-task profile:
+
+```bash
+headroom init -g pi
+headroom init -g omp
+headroom init -g remove pi
+headroom init -g remove omp
+headroom install status --profile init-user
+```
+
+Pi and OMP can coexist on the shared runtime. Removing one preserves the shared
+configuration, task, and runtime while the other remains. Removing the last
+native target removes the task and configuration; it stops and deletes the
+profile only when no other target remains. Persistent-task profiles do not
+expose manual `headroom install stop`; native-target removal owns teardown.
+
+Durable OMP init is provider-independent and does not edit `models.yml`.
+`headroom unwrap omp` only removes wrapper inference routing. Reinstall an older
+Headroom release and rerun init for the supported extension downgrade/rollback.
+
 ## `headroom install`
 
 Install and manage persistent local Headroom deployments.
@@ -724,6 +747,7 @@ Wrap external coding tools so their traffic flows through Headroom.
 
 ### Shared semantics
 
+- `wrap` is transient and does not claim package ownership
 - `--port`, when available, defaults to `8787`
 - `--no-proxy` skips proxy startup and assumes an existing proxy
 - `--learn` enables live traffic learning

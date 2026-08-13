@@ -203,6 +203,31 @@ def test_admin_runtime_env_rejects_non_object(loopback_client):
     assert resp.status_code == 400
 
 
+def test_admin_runtime_env_rejects_process_local_update_with_multiple_workers(monkeypatch):
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    rollout = resolve_rollout({"HEADROOM_ROLLOUT_CHANNEL": "beta"})
+    config = ProxyConfig(
+        worker_processes=2,
+        rollout=rollout,
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+    )
+    app = create_app(config)
+    before_digest = rollout.snapshot_digest
+
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+        response = client.post("/admin/runtime-env", json={"HEADROOM_OUTPUT_SHAPER": "1"})
+        after = client.get("/stats").json()["rollout"]
+
+    assert response.status_code == 409
+    assert response.json()["worker_processes"] == 2
+    assert "restart" in response.json()["error"]
+    assert rt.getenv("HEADROOM_OUTPUT_SHAPER") is None
+    assert after["snapshot_digest"] == before_digest
+
+
 def test_admin_runtime_env_is_loopback_only():
     config = ProxyConfig(
         optimize=False,

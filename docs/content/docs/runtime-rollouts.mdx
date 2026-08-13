@@ -56,7 +56,10 @@ The existing loopback-only `/admin/runtime-env` endpoint is one narrow
 exception: hot-reloading the legacy `HEADROOM_OUTPUT_SHAPER` alias replaces the
 proxy's immutable snapshot with a newly resolved snapshot. Channel bounds and
 `HEADROOM_DISABLE_FEATURES` still win, and `/stats.rollout` changes with the
-effective running decision. Ambient environment mutation remains ignored.
+effective running decision. Because these overrides are process-local, the
+endpoint rejects updates when the built-in server uses multiple workers; restart
+the proxy with the desired environment instead. Ambient environment mutation
+remains ignored.
 
 Precedence is deterministic:
 

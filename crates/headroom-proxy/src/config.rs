@@ -703,10 +703,20 @@ impl Config {
         if args.enable_bedrock_native {
             explicit_features.push(Feature::NativeBedrock);
         }
+        // Preserve the pre-rollout rollback controls as legacy disables. Both
+        // features are stable defaults in the registry, so merely omitting a
+        // false flag from `explicit_features` would turn it straight back on.
+        let mut disabled_features = split_feature_names(&args.disable_features);
+        if !args.enable_responses_streaming {
+            disabled_features.push(Feature::OpenAiResponsesStreaming.spec().name.to_owned());
+        }
+        if !args.enable_bedrock_native {
+            disabled_features.push(Feature::NativeBedrock.spec().name.to_owned());
+        }
         let rollout = RolloutSnapshot::from_parts_with_explicit(
             &args.rollout_channel,
             &args.features,
-            &args.disable_features,
+            &disabled_features.join(","),
             args.unsafe_allow_unstable_features,
             &explicit_features,
         );
@@ -824,5 +834,33 @@ mod rollout_input_tests {
         let error = parse_rollout_features("native_bedrok").unwrap_err();
         assert!(error.contains("native_bedrok"));
         assert!(error.contains("native_bedrock"));
+    }
+
+    #[test]
+    fn legacy_false_flags_remain_effective_rollout_disables() {
+        let args = CliArgs::try_parse_from([
+            "headroom-proxy",
+            "--upstream",
+            "http://127.0.0.1:9",
+            "--enable-responses-streaming",
+            "false",
+            "--enable-bedrock-native",
+            "false",
+        ])
+        .unwrap();
+
+        let config = Config::from_cli(args);
+
+        for feature in [Feature::OpenAiResponsesStreaming, Feature::NativeBedrock] {
+            let decision = config.rollout.decision(feature);
+            assert!(!decision.enabled);
+            assert!(decision.disabled);
+            assert_eq!(
+                decision.reason,
+                headroom_core::rollout::FeatureDecisionReason::Disabled
+            );
+        }
+        assert!(!config.enable_responses_streaming);
+        assert!(!config.enable_bedrock_native);
     }
 }

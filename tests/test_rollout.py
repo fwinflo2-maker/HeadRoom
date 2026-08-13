@@ -223,7 +223,7 @@ def test_multi_worker_config_round_trip_preserves_typed_rollout(monkeypatch) -> 
             "HEADROOM_DISABLE_FEATURES": "read_maturation",
         }
     )
-    original = ProxyConfig(rollout=rollout)
+    original = ProxyConfig(rollout=rollout, worker_processes=2)
     monkeypatch.setenv(_MULTI_WORKER_CONFIG_ENV, json.dumps(_proxy_config_payload(original)))
 
     restored = _proxy_config_from_env()
@@ -232,6 +232,63 @@ def test_multi_worker_config_round_trip_preserves_typed_rollout(monkeypatch) -> 
     assert restored.rollout.to_internal_dict() == rollout.to_internal_dict()
     assert restored.rollout.is_enabled("proxy_output_shaper") is True
     assert restored.rollout.is_enabled("read_maturation") is False
+    assert restored.worker_processes == 2
+
+
+def test_documented_proxy_json_without_internal_snapshot_is_preserved(monkeypatch) -> None:
+    from headroom.proxy.server import _MULTI_WORKER_CONFIG_ENV, _proxy_config_from_env
+
+    monkeypatch.setenv(
+        _MULTI_WORKER_CONFIG_ENV,
+        json.dumps(
+            {
+                "port": 39099,
+                "rate_limit_enabled": False,
+                "proxy_token": "required-token",
+                "offline": True,
+            }
+        ),
+    )
+
+    restored = _proxy_config_from_env()
+
+    assert restored.port == 39099
+    assert restored.rate_limit_enabled is False
+    assert restored.proxy_token == "required-token"
+    assert restored.offline is True
+    assert restored.rollout is not None
+
+
+def test_internal_proxy_json_still_rejects_tampered_rollout_snapshot(monkeypatch) -> None:
+    from headroom.proxy.models import ProxyConfig
+    from headroom.proxy.server import (
+        _MULTI_WORKER_CONFIG_ENV,
+        _proxy_config_from_env,
+        _proxy_config_payload,
+    )
+
+    payload = _proxy_config_payload(ProxyConfig(port=39099))
+    payload["_rollout_snapshot"]["snapshot_digest"] = "sha256:tampered"  # type: ignore[index]
+    monkeypatch.setenv(_MULTI_WORKER_CONFIG_ENV, json.dumps(payload))
+    monkeypatch.setenv("HEADROOM_PORT", "39100")
+
+    restored = _proxy_config_from_env()
+
+    assert restored.port == 39100
+    assert restored.rollout is not None
+
+
+@pytest.mark.parametrize("raw_config", ["null", "[]", '"not-an-object"'])
+def test_non_object_proxy_json_falls_back_without_crashing(monkeypatch, raw_config: str) -> None:
+    from headroom.proxy.server import _MULTI_WORKER_CONFIG_ENV, _proxy_config_from_env
+
+    monkeypatch.setenv(_MULTI_WORKER_CONFIG_ENV, raw_config)
+    monkeypatch.setenv("HEADROOM_PORT", "39100")
+
+    restored = _proxy_config_from_env()
+
+    assert restored.port == 39100
+    assert restored.rollout is not None
 
 
 @pytest.mark.parametrize(

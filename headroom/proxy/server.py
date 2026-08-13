@@ -3498,8 +3498,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         Loopback-only. The body is a flat ``{ENV_NAME: "value"}`` map; unknown
         keys and non-string values are ignored. Returns what was applied plus
-        the resulting live config. Last writer wins (overrides are global to the
-        proxy, which is inherent — every wrapper shares one process).
+        the resulting live config. Last writer wins in a single-worker proxy;
+        multi-worker proxies reject the update because overrides are process-local.
         """
         try:
             body = await request.json()
@@ -3509,6 +3509,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             return JSONResponse(
                 status_code=400,
                 content={"error": "expected a JSON object of {ENV_NAME: value}"},
+            )
+        if proxy.config.worker_processes > 1:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": (
+                        "runtime environment hot reload is unavailable with multiple "
+                        "worker processes; restart the proxy with the desired environment"
+                    ),
+                    "worker_processes": proxy.config.worker_processes,
+                },
             )
         applied = runtime_env.set_overrides(body)
         rollout_aliases = {
@@ -5093,10 +5104,13 @@ def _proxy_config_from_env() -> ProxyConfig:
     if raw_config:
         try:
             values = json.loads(raw_config)
-            rollout_value = values.pop("_rollout_snapshot")
-            from headroom.rollout import RolloutSnapshot
+            if not isinstance(values, dict):
+                raise TypeError("proxy config JSON must be an object")
+            if "_rollout_snapshot" in values:
+                rollout_value = values.pop("_rollout_snapshot")
+                from headroom.rollout import RolloutSnapshot
 
-            values["rollout"] = RolloutSnapshot.from_internal_dict(rollout_value)
+                values["rollout"] = RolloutSnapshot.from_internal_dict(rollout_value)
             return ProxyConfig(**values)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             logger.warning(
@@ -5235,6 +5249,9 @@ def run_server(
     seed_proxy_env_defaults()
 
     config = config or ProxyConfig()
+    if workers < 1:
+        raise ValueError("workers must be >= 1")
+    config.worker_processes = workers
     code_aware_status = _get_code_aware_banner_status(config)
 
     # Format connection pool info

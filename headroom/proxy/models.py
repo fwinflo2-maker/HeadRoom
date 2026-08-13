@@ -496,6 +496,12 @@ class ProxyConfig:
     # ``HeadroomProxy._run_compression_in_executor``.
     compression_max_workers: int | None = None
 
+    # Number of built-in uvicorn worker processes sharing this listen socket.
+    # Kept at the end to avoid shifting existing positional constructor fields.
+    # Process-local runtime hot reload is unsafe above one worker because only
+    # the worker receiving the admin request would observe the update.
+    worker_processes: int = 1
+
     def __post_init__(self, smart_routing: bool | None = None) -> None:
         if self.rollout is None:
             self.rollout = resolve_rollout()
@@ -504,6 +510,8 @@ class ProxyConfig:
         # root derives it from this same snapshot before constructing the
         # config; rewriting it here would resolve policy a second time and
         # break explicit non-CLI configuration.
+        if self.worker_processes < 1:
+            raise ValueError("worker_processes must be >= 1")
         if self.retry_enabled and self.retry_max_attempts < 1:
             raise ValueError("retry_max_attempts must be >= 1 when retry_enabled=True")
         # A 0 (or negative) requests-per-minute limit divides by zero in the

@@ -1712,6 +1712,19 @@ def _remove_native_target(host: Literal["pi", "omp"], global_scope: bool) -> Non
         ),
         None,
     )
+    removing_last_native = not (_NATIVE_EXTENSION_TARGETS.intersection(manifest.targets) - {host})
+    if removing_last_native:
+        with acquire_runtime_start_lock(manifest.profile) as acquired:
+            if not acquired:
+                raise click.ClickException(
+                    f"Profile {manifest.profile} is already being initialized."
+                )
+            _remove_native_target_locked(host, manifest, package)
+        return
+    _remove_native_target_locked(host, manifest, package)
+
+
+def _remove_native_target_locked(host: Literal["pi", "omp"], manifest: Any, package: Any) -> None:
     if package is not None:
         binary = shutil.which(host)
         if not binary and package.metadata.get("owned") is True:
@@ -1720,11 +1733,11 @@ def _remove_native_target(host: Literal["pi", "omp"], global_scope: bool) -> Non
             )
         remove_owned_host_package(host, binary or "", package)
 
-    manifest.targets = [target for target in manifest.targets if target != host]
-    if package is not None:
-        manifest.artifacts.remove(package)
-
-    if _NATIVE_EXTENSION_TARGETS.intersection(manifest.targets):
+    remaining_targets = [target for target in manifest.targets if target != host]
+    if _NATIVE_EXTENSION_TARGETS.intersection(remaining_targets):
+        manifest.targets = remaining_targets
+        if package is not None:
+            manifest.artifacts.remove(package)
         _save_manifest_verified(manifest)
         click.echo(f"Removed durable {host} integration.")
         return
@@ -1737,6 +1750,9 @@ def _remove_native_target(host: Literal["pi", "omp"], global_scope: bool) -> Non
         remove_owned_extension_config(config)
     task_paths = _task_file_paths(manifest)
     remove_supervisor(manifest)
+    manifest.targets = remaining_targets
+    if package is not None:
+        manifest.artifacts.remove(package)
     for path in task_paths:
         path.unlink(missing_ok=True)
     manifest.artifacts = [

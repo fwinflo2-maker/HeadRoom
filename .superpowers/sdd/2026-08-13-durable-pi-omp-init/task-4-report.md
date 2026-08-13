@@ -160,3 +160,22 @@ Native init holds the profile start lock across provisional persistence, supervi
 - Ruff format/check on all five covered files: passed.
 - mypy on both changed production files: passed.
 - `git diff --check`: passed.
+
+## Final Review Fix Wave
+
+### RED
+
+Added focused teardown regressions before implementation. Replaying the six new tests against the prior commit produced 6 failures: lock-held removal mutated extension state instead of failing at the lock boundary, failed supervisor teardown removed in-memory ownership, unknown Linux crontab failure was treated as absence, macOS bootout failure deleted the plist, Windows task deletion failure was ignored, and `stop_runtime()` deleted a replacement PID file.
+
+### Fixes
+
+- `remove_supervisor()` now treats only authoritative scheduler absence as success for Linux user crontab, macOS launchd, and Windows scheduled tasks; other failures raise before owned artifacts are removed.
+- Last-native removal acquires the profile runtime-start lock before package/config/scheduler/runtime/manifest mutation. Supervisor teardown completes before the manifest drops native ownership.
+- `stop_runtime()` clears a PID file only when it still names the PID that was stopped.
+
+### Validation
+
+- `uv run pytest -q tests/test_cli/test_init_cli.py tests/test_cli/test_init_pi_omp_lifecycle.py tests/test_install/test_supervisors.py tests/test_install/test_runtime.py` — 198 passed.
+- `uv run ruff format --check headroom/cli/init.py headroom/install/supervisors.py headroom/install/runtime.py tests/test_cli/test_init_cli.py tests/test_install/test_supervisors.py tests/test_install/test_runtime.py` — 6 files already formatted.
+- `uv run ruff check headroom/cli/init.py headroom/install/supervisors.py headroom/install/runtime.py tests/test_cli/test_init_cli.py tests/test_install/test_supervisors.py tests/test_install/test_runtime.py` — passed.
+- `uv run mypy headroom/cli/init.py headroom/install/supervisors.py headroom/install/runtime.py` — no issues found.

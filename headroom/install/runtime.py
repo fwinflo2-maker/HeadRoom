@@ -219,8 +219,10 @@ def _read_pid(profile: str) -> int | None:
         return None
 
 
-def _clear_pid(profile: str) -> None:
+def _clear_pid(profile: str, expected_pid: int | None = None) -> None:
     path = pid_path(profile)
+    if expected_pid is not None and _read_pid(profile) != expected_pid:
+        return
     if path.exists():
         path.unlink()
 
@@ -383,11 +385,11 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
         pass
     for _ in range(round(_STOP_TIMEOUT_SECONDS / _STOP_POLL_SECONDS)):
         if not pid_alive(pid):
-            _clear_pid(manifest.profile)
+            _clear_pid(manifest.profile, pid)
             return
         time.sleep(_STOP_POLL_SECONDS)
     if not pid_alive(pid):
-        _clear_pid(manifest.profile)
+        _clear_pid(manifest.profile, pid)
         return
     raise RuntimeError(
         f"Runtime process {pid} did not stop within {_STOP_TIMEOUT_SECONDS} seconds."

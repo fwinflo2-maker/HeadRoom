@@ -767,6 +767,23 @@ def test_remove_supervisor_removes_user_crontab_block(monkeypatch) -> None:
     assert calls[1][0] == ["crontab", "-"]
 
 
+def test_remove_supervisor_rejects_failed_user_crontab_read(monkeypatch) -> None:
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "linux")
+    monkeypatch.setattr(
+        "headroom.install.supervisors._linux_task_spec",
+        lambda manifest, script: (None, "cron"),
+    )
+    monkeypatch.setattr(
+        "headroom.install.supervisors.subprocess.run",
+        lambda command, **kwargs: type(
+            "Result", (), {"returncode": 2, "stdout": "", "stderr": "permission denied"}
+        )(),
+    )
+
+    with pytest.raises(click.ClickException, match="Could not read the current crontab"):
+        remove_supervisor(_manifest(supervisor=SupervisorKind.TASK.value))
+
+
 def test_remove_supervisor_linux_service_cron_path_and_missing_crontab(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -775,7 +792,11 @@ def test_remove_supervisor_linux_service_cron_path_and_missing_crontab(
 
     def fake_run(command: list[str], **kwargs):
         calls.append(command)
-        return type("Result", (), {"returncode": 1, "stdout": ""})()
+        return type(
+            "Result",
+            (),
+            {"returncode": 1, "stdout": "", "stderr": "no crontab for test"},
+        )()
 
     monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
     unit_path = tmp_path / "headroom-default.service"
@@ -808,10 +829,12 @@ def test_remove_supervisor_linux_service_cron_path_and_missing_crontab(
 
 def test_remove_supervisor_darwin_and_windows(monkeypatch, tmp_path: Path) -> None:
     calls: list[list[str]] = []
-    monkeypatch.setattr(
-        "headroom.install.supervisors.subprocess.run",
-        lambda command, **kwargs: calls.append(command),
-    )
+
+    def successful_run(command, **kwargs):
+        calls.append(command)
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", successful_run)
     monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 55, raising=False)
 
     plist_path = tmp_path / "com.headroom.default.plist"
@@ -843,3 +866,50 @@ def test_remove_supervisor_darwin_and_windows(monkeypatch, tmp_path: Path) -> No
         ["schtasks", "/Delete", "/TN", "headroom-default-startup", "/F"],
         ["schtasks", "/Delete", "/TN", "headroom-default-health", "/F"],
     ]
+
+
+def test_remove_supervisor_keeps_macos_plist_when_bootout_fails(
+    monkeypatch, tmp_path: Path
+) -> None:
+    plist_path = tmp_path / "com.headroom.default.plist"
+    plist_path.write_text("plist", encoding="utf-8")
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "darwin")
+    monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 55, raising=False)
+    monkeypatch.setattr(
+        "headroom.install.supervisors._macos_launchd_plist",
+        lambda manifest, script, interval=None: (plist_path, "plist"),
+    )
+    monkeypatch.setattr(
+        "headroom.install.supervisors.subprocess.run",
+        lambda command, **kwargs: type(
+            "Result",
+            (),
+            {"returncode": 9, "stdout": "", "stderr": "Operation not permitted"},
+        )(),
+    )
+
+    with pytest.raises(click.ClickException, match="launchctl bootout failed"):
+        remove_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
+
+    assert plist_path.exists()
+
+
+def test_remove_supervisor_rejects_failed_windows_task_delete(monkeypatch) -> None:
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "win32")
+    results = iter(
+        [
+            type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+            type(
+                "Result",
+                (),
+                {"returncode": 5, "stdout": "", "stderr": "Access is denied"},
+            )(),
+        ]
+    )
+    monkeypatch.setattr(
+        "headroom.install.supervisors.subprocess.run",
+        lambda command, **kwargs: next(results),
+    )
+
+    with pytest.raises(click.ClickException, match="Task Scheduler delete failed"):
+        remove_supervisor(_manifest(supervisor=SupervisorKind.TASK.value))

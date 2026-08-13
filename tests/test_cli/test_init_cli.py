@@ -441,6 +441,61 @@ def test_failed_package_uninstall_keeps_manifest_ownership_for_retry(monkeypatch
     assert saved == []
 
 
+def test_last_native_remove_fails_before_mutation_when_start_lock_is_held(monkeypatch) -> None:
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    package = native_package(init_cli, "pi", owned=True)
+    manifest = native_manifest(init_cli, ["pi"], [package, native_config(init_cli)])
+    touched = []
+
+    @contextmanager
+    def held_lock(profile):
+        yield False
+
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli, "acquire_runtime_start_lock", held_lock)
+    monkeypatch.setattr(
+        init_cli,
+        "remove_owned_host_package",
+        lambda *args: touched.append("package"),
+    )
+    monkeypatch.setattr(init_cli, "remove_supervisor", lambda value: touched.append("task"))
+    monkeypatch.setattr(init_cli, "stop_runtime", lambda value: touched.append("runtime"))
+    monkeypatch.setattr(init_cli, "delete_manifest", lambda profile: touched.append("manifest"))
+
+    result = CliRunner().invoke(fake_main, ["init", "-g", "remove", "pi"])
+
+    assert result.exit_code != 0
+    assert "already being initialized" in result.output
+    assert touched == []
+    assert manifest.targets == ["pi"]
+    assert package in manifest.artifacts
+
+
+def test_last_native_remove_keeps_manifest_when_supervisor_teardown_fails(monkeypatch) -> None:
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    package = native_package(init_cli, "pi", owned=True)
+    manifest = native_manifest(init_cli, ["pi"], [package, native_config(init_cli)])
+    saved = []
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli.shutil, "which", lambda host: "/bin/pi")
+    monkeypatch.setattr(init_cli, "remove_owned_host_package", lambda *args: "removed")
+    monkeypatch.setattr(init_cli, "remove_owned_extension_config", lambda item: "removed")
+    monkeypatch.setattr(
+        init_cli,
+        "remove_supervisor",
+        lambda value: (_ for _ in ()).throw(click.ClickException("scheduler failed")),
+    )
+    monkeypatch.setattr(init_cli, "save_manifest", lambda value: saved.append(copy.deepcopy(value)))
+
+    result = CliRunner().invoke(fake_main, ["init", "-g", "remove", "pi"])
+
+    assert result.exit_code != 0
+    assert "scheduler failed" in result.output
+    assert saved == []
+    assert manifest.targets == ["pi"]
+    assert package in manifest.artifacts
+
+
 def test_last_native_remove_drops_task_but_keeps_non_native_shared_profile(
     monkeypatch, tmp_path
 ) -> None:

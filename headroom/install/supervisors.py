@@ -590,7 +590,13 @@ def remove_supervisor(manifest: DeploymentManifest) -> None:
             text=True,
         )
         if current.returncode != 0:
-            return
+            stderr = current.stderr or ""
+            if current.returncode == 1 and "no crontab for" in stderr.lower():
+                return
+            detail = (stderr or current.stdout or "").strip()
+            raise click.ClickException(
+                f"Could not read the current crontab: {detail or 'unknown error'}"
+            )
         marker_start = f"# >>> headroom {manifest.profile} >>>"
         marker_end = f"# <<< headroom {manifest.profile} <<<"
         pattern = re.compile(re.escape(marker_start) + r".*?" + re.escape(marker_end), re.DOTALL)
@@ -618,11 +624,17 @@ def remove_supervisor(manifest: DeploymentManifest) -> None:
             and manifest.supervisor_kind == SupervisorKind.SERVICE.value
             else f"gui/{os.getuid()}"
         )
-        run(
+        result = run(
             ["launchctl", "bootout", f"{domain}/{label}"],
             capture_output=True,
             text=True,
         )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            if result.returncode != _LAUNCHCTL_ESRCH or "no such process" not in detail.lower():
+                raise click.ClickException(
+                    f"launchctl bootout failed for {domain}/{label}: {detail or 'unknown error'}"
+                )
         if plist_path.exists():
             plist_path.unlink()
         return
@@ -640,13 +652,18 @@ def remove_supervisor(manifest: DeploymentManifest) -> None:
                 text=True,
             )
             return
-        run(
-            ["schtasks", "/Delete", "/TN", f"{manifest.service_name}-startup", "/F"],
-            capture_output=True,
-            text=True,
-        )
-        run(
-            ["schtasks", "/Delete", "/TN", f"{manifest.service_name}-health", "/F"],
-            capture_output=True,
-            text=True,
-        )
+        for suffix in ("startup", "health"):
+            name = f"{manifest.service_name}-{suffix}"
+            result = run(
+                ["schtasks", "/Delete", "/TN", name, "/F"],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                continue
+            detail = (result.stderr or result.stdout or "").strip()
+            if result.returncode == 1 and "cannot find the file specified" in detail.lower():
+                continue
+            raise click.ClickException(
+                f"Task Scheduler delete failed for {name}: {detail or 'unknown error'}"
+            )

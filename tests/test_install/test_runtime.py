@@ -642,6 +642,34 @@ def test_start_stop_wait_and_runtime_status_branches(monkeypatch, tmp_path: Path
     assert runtime_status(python_manifest) == "stopped"
 
 
+def test_stop_runtime_does_not_clear_replacement_pid(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-task",
+        runtime_kind="python",
+        supervisor_kind="task",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    _write_pid("default", 123)
+    monkeypatch.setattr("headroom.install.runtime.os.kill", lambda pid, sig: None)
+
+    def replaced_process_is_dead(pid: int) -> bool:
+        _write_pid("default", 456)
+        return False
+
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", replaced_process_is_dead)
+
+    stop_runtime(manifest)
+
+    assert _read_pid("default") == 456
+
+
 def test_stop_runtime_waits_for_live_process_before_clearing_pid(
     monkeypatch, tmp_path: Path
 ) -> None:

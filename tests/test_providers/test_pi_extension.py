@@ -744,6 +744,77 @@ def test_config_remove_does_not_unlink_competitor_after_claim(
     assert path.read_bytes() == user_bytes
 
 
+def test_config_publish_collision_retains_named_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+    artifact = ensure_extension_config(8787, None)
+    before = path.read_bytes()
+    user_bytes = b'{"baseUrl":"http://127.0.0.1:9999"}\n'
+    publish = module._publish_staged
+
+    def collide_publish(staged: Path, destination: Path) -> bool:
+        destination.write_bytes(user_bytes)
+        return publish(staged, destination)
+
+    monkeypatch.setattr(module, "_publish_staged", collide_publish)
+
+    with pytest.raises(click.ClickException, match=r"recovery path (.+\.recovery)") as exc_info:
+        ensure_extension_config(9444, artifact)
+
+    recovery = Path(str(exc_info.value).split("recovery path ", 1)[1].split(";", 1)[0])
+    assert path.read_bytes() == user_bytes
+    assert recovery.read_bytes() == before
+    assert not list(tmp_path.glob("*.stage"))
+
+
+def test_config_verification_error_restores_displaced_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+    artifact = ensure_extension_config(8787, None)
+    before = path.read_bytes()
+    candidate_matches = module._candidate_matches
+
+    def fail_verification(candidate: Path, expected: object) -> bool:
+        raise OSError("injected verification failure")
+
+    monkeypatch.setattr(module, "_candidate_matches", fail_verification)
+
+    with pytest.raises(click.ClickException, match="injected verification failure"):
+        ensure_extension_config(9444, artifact)
+
+    assert path.read_bytes() == before
+    assert not list(tmp_path.glob("*.stage"))
+    assert not list(tmp_path.glob("*.recovery"))
+    monkeypatch.setattr(module, "_candidate_matches", candidate_matches)
+
+
+def test_config_verification_and_recovery_error_retains_named_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+    artifact = ensure_extension_config(8787, None)
+    before = path.read_bytes()
+
+    def fail_verification(candidate: Path, expected: object) -> bool:
+        path.write_bytes(b'{"enabled":false}\n')
+        raise OSError("injected verification failure")
+
+    monkeypatch.setattr(module, "_candidate_matches", fail_verification)
+
+    with pytest.raises(click.ClickException, match=r"recovery path (.+\.recovery)") as exc_info:
+        ensure_extension_config(9444, artifact)
+
+    recovery = Path(str(exc_info.value).split("recovery path ", 1)[1].split(";", 1)[0])
+    assert path.read_bytes() == b'{"enabled":false}\n'
+    assert recovery.read_bytes() == before
+    assert not list(tmp_path.glob("*.stage"))
+
+
 def test_config_publish_error_restores_displaced_candidate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -194,7 +194,12 @@ def _commit_config(path: Path, expected: _ConfigCandidate | None, desired: bytes
             _displace_candidate(path, displaced)
         except FileNotFoundError:
             return False
-        if not _candidate_matches(displaced, expected):
+        try:
+            matches = _candidate_matches(displaced, expected)
+        except OSError as exc:
+            _recover_displaced(displaced, path, exc)
+            raise exc
+        if not matches:
             _recover_displaced(
                 displaced,
                 path,
@@ -210,8 +215,11 @@ def _commit_config(path: Path, expected: _ConfigCandidate | None, desired: bytes
             _recover_displaced(displaced, path, exc)
             raise exc
         if not published:
-            _remove_displaced(displaced)
-            return False
+            raise click.ClickException(
+                f"Pi extension config at {path} changed during configuration; "
+                f"the competing file was preserved and prior bytes are retained "
+                f"at recovery path {displaced}; manual recovery may be required."
+            )
         _remove_displaced(displaced)
         return True
     finally:

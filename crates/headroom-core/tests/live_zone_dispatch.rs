@@ -91,7 +91,7 @@ fn python_module_source(n: usize) -> String {
     code.push_str(
         "\"\"\"Example data-processing module used by the live-zone dispatch tests.\"\"\"\n",
     );
-    code.push_str("\n");
+    code.push('\n');
     code.push_str("import json\n");
     code.push_str("import os\n");
     code.push_str("from typing import Any, Optional\n");

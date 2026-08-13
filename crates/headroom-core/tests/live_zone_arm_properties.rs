@@ -1,7 +1,6 @@
 //! Property coverage for the PR-B4 dispatch arms (`SourceCode` →
 //! `CodeAwareCompressor`, `PlainText` → Kompress, cache-only) plus the
-//! round-trip test that closes the kill-switch alias bug class (task
-//! R6 Part 0).
+//! round-trip test that closes the kill-switch alias bug class.
 //!
 //! Background: `content_type_from_name`
 //! (`crates/headroom-core/src/transforms/live_zone.rs`) used to accept
@@ -15,7 +14,7 @@
 //! test below pins the fix for the three remaining variants
 //! (`SearchResults`, `BuildOutput`, `GitDiff`).
 //!
-//! **R6 fix-round-1 note:** an earlier version of this comment claimed
+//! **Review note:** an earlier version of this comment claimed
 //! that the round-trip test's exhaustive `natural_name_for` match alone
 //! "makes adding an 8th `ContentType` variant force a compile-time
 //! visit" in a way that keeps the test's coverage complete. A review
@@ -29,7 +28,7 @@
 //! below: no-panic and determinism properties (proptest), plus a
 //! byte-fidelity test for the SourceCode arm cloned from
 //! `live_zone_dispatch.rs::byte_fidelity_outside_compressed_block`, plus
-//! (R6 fix-round-1) an instrumentation test that measures — rather than
+//! an instrumentation test that measures — rather than
 //! asserts — what fraction of generated cases actually reach a dispatch
 //! arm, broken down by content type. House style for the proptest
 //! blocks mirrors `live_zone_token_validation.rs:201-254` — dispatch
@@ -150,7 +149,7 @@ fn python_module_source(n: usize) -> String {
 /// (plus `natural_name_for` below, kept only as an independent
 /// cross-check) that has to be edited when a variant's alias changes.
 ///
-/// R6 fix-round-1: this replaces the old scheme, where the round-trip
+/// This replaces an earlier scheme, where the round-trip
 /// test carried its own hand-written `[ContentType; 7]` array
 /// completely independent of `natural_name_for`'s match. See the
 /// honesty note on `natural_name_for` for why this still isn't a fully
@@ -192,7 +191,7 @@ const _: () = assert!(VARIANT_TABLE.len() == CONTENT_TYPE_VARIANT_COUNT);
 /// `ContentType` variant without touching this function is a compile
 /// error.
 ///
-/// **Honesty note (R6 fix-round-1 review, Finding (a)):** that compile
+/// **Honesty note:** that compile
 /// error is the ONLY part of this file's variant-coverage mechanism the
 /// Rust compiler actually enforces. It forces a human to choose *some*
 /// string for the new variant right here — it does NOT force them to
@@ -283,7 +282,7 @@ result = process(payload)\n    \
 return {\"statusCode\": 200, \"body\": json.dumps(result)}\n";
 
 /// Function-name pool for the "code-like" generator bucket's varied
-/// identifiers (R6 fix-round-1, Finding (c)) — deliberately NOT the
+/// identifiers — deliberately NOT the
 /// single `process_record_{i}` pattern `python_module_source` uses for
 /// its fixed byte-fidelity fixture.
 const CODE_IDENTIFIERS: &[&str] = &[
@@ -348,8 +347,8 @@ fn render_function(name: &str, index: usize, body_lines: usize) -> String {
 /// Syntactically-plausible Python, 2048-6000 bytes, with VARIED
 /// structure: differing function counts and body lengths straddling
 /// the CodeAwareCompressor's 5-line collapse floor, varied identifiers
-/// drawn from `CODE_IDENTIFIERS`. Added in R6 fix-round-1 to close
-/// Finding (c) — the reviewer measured that before this bucket existed,
+/// drawn from `CODE_IDENTIFIERS`. Added after a review measured that
+/// before this bucket existed,
 /// 0% of `pathological_text()`'s generated cases ever reached the
 /// SourceCode dispatch arm (the fixed `python_module_source(10)`
 /// fixture in `byte_fidelity_outside_compressed_source_block` was
@@ -574,8 +573,8 @@ const PROSE_WORDS: &[&str] = &[
 /// Prose-like text, 5200-11800 bytes, built from `PROSE_WORDS` with
 /// varied sentence/paragraph shape — deliberately NOT a single repeated
 /// character, unlike the pre-existing `pathological_text()` bucket that
-/// repeats `'x'` 1000-8000 times. Added in R6 fix-round-1 to close
-/// Finding (c): the reviewer's point about the old repeated-`'x'`
+/// repeats `'x'` 1000-8000 times. Added by the same review as
+/// `code_like_source`: the problem with the old repeated-`'x'`
 /// bucket was that it only reaches the PlainText arm by luck of length
 /// crossing 5120 bytes, not because it looks like prose — this bucket
 /// looks like prose AND always clears the threshold.
@@ -633,23 +632,24 @@ fn prose_like_text() -> impl Strategy<Value = String> {
 ///   tool output cut off mid-token is a realistic production shape, not
 ///   just a fuzz artifact),
 /// - very long single lines with no newlines, 1000-8000 chars (minified
-///   JS, a base64 blob, ...) — the only pre-R6-fix-round-1 bucket that
+///   JS, a base64 blob, ...) — before the two rich buckets below were
+///   added, the only bucket that
 ///   could ever clear a threshold (PlainText's 5120, when the sampled
 ///   length lands >= 5120, ~41% of this bucket's own range),
-/// - (R6 fix-round-1, Finding (c)) `code_like_source()` — syntactically
+/// - `code_like_source()` — syntactically
 ///   plausible, varied-structure Python that always clears the
 ///   SourceCode threshold (2048) and always detects as SourceCode,
-/// - (R6 fix-round-1, Finding (c)) `prose_like_text()` — varied
+/// - `prose_like_text()` — varied
 ///   natural-language-shaped text that always clears the PlainText
 ///   threshold (5120) and always detects as PlainText.
 ///
-/// Weights reworked in R6 fix-round-1 so the new two buckets carry
+/// Weights are set so the two rich buckets carry
 /// enough weight to matter (see `dispatch_reach_fractions_meet_floor`
 /// for the measured, instrumented result) while keeping every small
 /// pathological bucket from before — the no-panic envelope over
 /// encoding/detection/threshold-comparison logic on genuinely
 /// pathological BYTES (not just large-but-tame text) is still valuable
-/// and is not what Finding (c) was about.
+/// in its own right.
 fn pathological_text() -> impl Strategy<Value = String> {
     prop_oneof![
         2 => any::<String>(),
@@ -667,23 +667,22 @@ fn pathological_text() -> impl Strategy<Value = String> {
 // The dispatcher must never panic on arbitrary text, however
 // pathological, and must be deterministic.
 //
-// R6 fix-round-1: the two new richer generator buckets (real,
+// The two richer generator buckets (real,
 // varied-structure source code and prose, both large enough to reach a
 // dispatch arm) make each case noticeably more expensive than the old
 // all-small-or-threshold-capped mix — a meaningful share of cases now
 // actually run CodeAwareCompressor's tree-sitter parse or the Kompress
 // path instead of bottoming out at `BelowByteThreshold` immediately.
-// Case counts were cut from the pre-fix 2048/1024 (order of magnitude
+// Case counts were cut from the earlier 2048/1024 (order of magnitude
 // of `sse_framing.rs`'s parser fuzz tests) down to 40/20 after two
 // larger settings both measured over the ~60s guidance with the richer
 // generators in place: 128/64 measured ~84s combined, 64/32 measured
 // ~60s combined (right at the boundary, not comfortably under it).
-// 40/20 is what actually landed with margin. See the fix-round-1
-// report for the measured wall time at each setting tried. If a future
+// 40/20 is what actually landed with margin. If a future
 // change to these generators pushes wall time back over budget, the
 // guidance is to cut case counts further, not shrink the payload
 // ranges back down to threshold-capped sizes (that would silently
-// reopen Finding (c)). The no-panic property keeps the larger count
+// regress dispatch reach). The no-panic property keeps the larger count
 // since it's the property most likely to catch a real crash, the
 // determinism property the smaller since each case dispatches twice.
 //
@@ -841,8 +840,8 @@ fn byte_fidelity_outside_compressed_source_block() {
 
 // ─── Part 1, instrumentation: measured dispatch-reach fractions ───────
 //
-// R6 fix-round-1, Finding (c). The review quantified (from pinned
-// proptest 1.11.0 source and the pre-fix `pathological_text()`
+// A review quantified (from pinned
+// proptest 1.11.0 source and the earlier `pathological_text()`
 // weights) that ~4.5% of generated cases reached ANY dispatch arm and
 // 0% ever reached SourceCode. This section re-measures the same
 // quantity against the CURRENT generator empirically, rather than just
@@ -853,8 +852,8 @@ fn byte_fidelity_outside_compressed_source_block() {
 /// duplicated here because this instrumentation test needs to decide
 /// "would this case have cleared the byte-threshold gate" without
 /// reimplementing `compress_one_block` itself. Values: SourceCode 2048,
-/// PlainText 5120, everything else 512 (all pinned in `live_zone.rs`
-/// and restated in this fix round's brief). If production's thresholds
+/// PlainText 5120, everything else 512 (all pinned in `live_zone.rs`).
+/// If production's thresholds
 /// ever change, this drifts and the printed/asserted fractions below
 /// become stale — it cannot hide a panic or a wrong *classification*,
 /// both of which are still independently caught by
@@ -895,10 +894,12 @@ const REACH_SAMPLE_COUNT: u32 = 5_000;
 ///
 /// Floors are set well below the closed-form expectation from the
 /// current bucket weights (SourceCode ~20%, PlainText ~24%, overall
-/// ~44% — derived in the fix-round-1 report) so ordinary sampling noise
+/// ~44% — from each bucket's weight times its probability of clearing
+/// its threshold) so ordinary sampling noise
 /// at N=5000 can't flake this, while a future regression that collapses
-/// a bucket back to threshold-capped output (Finding (c)'s original
-/// failure mode) fails loudly instead of silently.
+/// a bucket back to threshold-capped output (the original
+/// failure mode this instrumentation exists to catch) fails loudly
+/// instead of silently.
 #[test]
 fn dispatch_reach_fractions_meet_floor() {
     let mut runner = TestRunner::new_with_rng(

@@ -673,7 +673,7 @@ fn disabled_arms() -> &'static HashSet<ContentType> {
 /// with log/metric field values elsewhere) and a natural-name alias — the
 /// operator-facing spelling a human is more likely to write. `PlainText`
 /// accepts `"text"` and `"plain_text"`: `"plain_text"` is the example this
-/// module's own doc comment and the original task brief both use
+/// module's own doc comment uses
 /// (`HEADROOM_LIVE_ZONE_DISABLE_ARMS=source_code,plain_text`). Without
 /// that alias the documented example silently no-ops: `"plain_text"`
 /// doesn't match `"text"`, so it falls through to the unknown-token

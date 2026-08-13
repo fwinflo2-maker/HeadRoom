@@ -68,6 +68,40 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     assert guard_start < manifest_script.index("exit 1", guard_start) < create_start
 
 
+def test_docker_manifest_downloads_exactly_one_artifact_per_architecture() -> None:
+    """Each manifest cell must download exactly its two architecture digests.
+
+    Keeping the variant before a trailing wildcard makes prefix-related names
+    overlap: ``digests-code-*`` also selects code-nonroot, code-slim, and
+    code-slim-nonroot. The 0.35.0 Docker release exposed this by downloading
+    eight markers into the code manifest job instead of two.
+    """
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "docker.yml").read_text())
+    jobs = workflow["jobs"]
+    build = jobs["docker-build"]
+    manifest = jobs["docker-manifest"]
+    upload = next(step for step in build["steps"] if step.get("name") == "Upload digest marker")
+    downloads = [
+        step
+        for step in manifest["steps"]
+        if step.get("name")
+        in {
+            "Download amd64 digest for this variant",
+            "Download arm64 digest for this variant",
+        }
+    ]
+
+    assert upload["with"]["name"] == (
+        "digests-${{ matrix.variant.name || 'root' }}-${{ matrix.arch.name }}"
+    )
+    assert [step["with"]["name"] for step in downloads] == [
+        "digests-${{ matrix.variant.name || 'root' }}-amd64",
+        "digests-${{ matrix.variant.name || 'root' }}-arm64",
+    ]
+    assert all("pattern" not in step["with"] for step in downloads)
+    assert all(step["with"]["path"] == "${{ runner.temp }}/digests" for step in downloads)
+
+
 def test_release_workflow_publishes_both_node_packages_to_github_packages() -> None:
     content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 

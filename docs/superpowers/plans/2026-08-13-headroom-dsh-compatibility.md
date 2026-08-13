@@ -15,7 +15,7 @@
 - Default DeepSeek upstream is `https://api.deepseek.com`; override via `DEEPSEEK_TARGET_API_URL` env or `--deepseek-api-url` flag.
 - dsh appends `/chat/completions` to its `baseURL` (no `/v1`); the wrap sets `DEEPSEEK_BASE_URL=http://127.0.0.1:{port}/v1` so dsh hits the existing `/v1/chat/completions` route.
 - Launch-env-only wrap: no durable dsh settings/cordis.yml mutation in v1. `unwrap dsh` only stops the proxy.
-- Test runner: `python -m pytest <path> -v` from the repo root (the `headroom` package must be importable; `uv sync` or `pip install -e .` as needed).
+- Test runner: `uv run python -m pytest <path> -v` from the repo root (the `headroom` package must be importable; `uv sync` or `pip install -e .` as needed).
 - New tests live in `tests/` (flat, `test_*.py`), using pytest `monkeypatch` and Click `CliRunner` conventions already in the repo.
 - Conventional Commits for commit messages (the repo enforces commitlint).
 
@@ -28,7 +28,7 @@
 - **Create** `headroom/providers/dsh/install.py` — `build_install_env`.
 - **Create** `tests/test_dsh_runtime.py` — unit tests for the provider runtime.
 - **Create** `tests/test_deepseek_routing.py` — unit tests for the proxy routing detection.
-- **Create** `tests/test_wrap_dsh.py` — CLI wrap/unwrap tests.
+- **Create** `tests/test_cli/test_wrap_dsh.py` — CLI wrap/unwrap tests.
 - **Modify** `headroom/providers/install_registry.py` — register the dsh env builder.
 - **Modify** `headroom/providers/registry.py` — `deepseek` target/override surface.
 - **Modify** `headroom/proxy/models.py` — `ProxyConfig.deepseek_api_url` + `provider_api_overrides`.
@@ -122,7 +122,7 @@ def test_resolve_dsh_command_missing_binary_raises(monkeypatch: pytest.MonkeyPat
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python -m pytest tests/test_dsh_runtime.py -v`
+Run: `uv run python -m pytest tests/test_dsh_runtime.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'headroom.providers.dsh'`
 
 - [ ] **Step 3: Write the implementation**
@@ -175,15 +175,17 @@ def resolve_dsh_command(
     """
     if command:
         argv = shlex.split(command)
-    elif shutil.which("dsh"):
-        argv = ["dsh"]
-    elif shutil.which("pnpm"):
-        argv = ["pnpm", "dsh"]
     else:
-        raise RuntimeError(
-            "dsh was not found on PATH. Install it with `npm i -g @deepseek-ai/dsh` "
-            "or pass `--command`."
-        )
+        dsh_bin = shutil.which("dsh")
+        if dsh_bin:
+            argv = [dsh_bin]
+        elif shutil.which("pnpm"):
+            argv = ["pnpm", "dsh"]
+        else:
+            raise RuntimeError(
+                "dsh was not found on PATH. Install it with `npm i -g @deepseek-ai/dsh` "
+                "or pass `--command`."
+            )
     if profile == "headless":
         argv.extend(["--profile", "headless", *task_args])
     else:
@@ -208,7 +210,7 @@ __all__ = [
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `python -m pytest tests/test_dsh_runtime.py -v`
+Run: `uv run python -m pytest tests/test_dsh_runtime.py -v`
 Expected: PASS (all 7 tests)
 
 - [ ] **Step 5: Commit**
@@ -253,7 +255,7 @@ def test_install_registry_includes_dsh() -> None:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python -m pytest tests/test_dsh_runtime.py -v`
+Run: `uv run python -m pytest tests/test_dsh_runtime.py -v`
 Expected: FAIL (`ModuleNotFoundError` for `headroom.providers.dsh.install`, or `KeyError: 'dsh'` if the install module is added before the registry entry)
 
 - [ ] **Step 3: Write the implementation**
@@ -288,7 +290,7 @@ and inside `_ENV_BUILDERS` (the dict at the top of the file, keyed by provider n
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `python -m pytest tests/test_dsh_runtime.py -v`
+Run: `uv run python -m pytest tests/test_dsh_runtime.py -v`
 Expected: PASS (all 9 tests)
 
 - [ ] **Step 5: Commit**
@@ -365,7 +367,7 @@ def test_resolve_api_targets_deepseek_strips_v1() -> None:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python -m pytest tests/test_registry_deepseek.py -v`
+Run: `uv run python -m pytest tests/test_registry_deepseek.py -v`
 Expected: FAIL (missing `DEFAULT_DEEPSEEK_API_URL`, missing `deepseek` params/fields)
 
 - [ ] **Step 3: Write the implementation**
@@ -432,7 +434,7 @@ def resolve_api_overrides(
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `python -m pytest tests/test_registry_deepseek.py -v`
+Run: `uv run python -m pytest tests/test_registry_deepseek.py -v`
 Expected: PASS (all 4 tests)
 
 - [ ] **Step 5: Commit**
@@ -474,7 +476,7 @@ def test_proxy_config_deepseek_defaults_to_none() -> None:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python -m pytest tests/test_registry_deepseek.py -v`
+Run: `uv run python -m pytest tests/test_registry_deepseek.py -v`
 Expected: FAIL (`ProxyConfig.__init__() got an unexpected keyword argument 'deepseek_api_url'`)
 
 - [ ] **Step 3: Write the implementation**
@@ -502,7 +504,7 @@ In `headroom/proxy/models.py`:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `python -m pytest tests/test_registry_deepseek.py -v`
+Run: `uv run python -m pytest tests/test_registry_deepseek.py -v`
 Expected: PASS (all 6 tests)
 
 - [ ] **Step 5: Commit**
@@ -547,7 +549,7 @@ Append to `tests/test_backend_bugs.py` (inside `TestOpenAIURLNormalization`, fol
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python -m pytest tests/test_backend_bugs.py::TestOpenAIURLNormalization::test_deepseek_v1_suffix_stripped -v`
+Run: `uv run python -m pytest tests/test_backend_bugs.py::TestOpenAIURLNormalization::test_deepseek_v1_suffix_stripped -v`
 Expected: FAIL (`AttributeError: type object 'HeadroomProxy' has no attribute 'DEEPSEEK_API_URL'`)
 
 - [ ] **Step 3: Write the implementation**
@@ -586,7 +588,7 @@ In `headroom/proxy/server.py`:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `python -m pytest tests/test_backend_bugs.py::TestOpenAIURLNormalization -v`
+Run: `uv run python -m pytest tests/test_backend_bugs.py::TestOpenAIURLNormalization -v`
 Expected: PASS (all 4 tests, including the new DeepSeek one)
 
 - [ ] **Step 5: Commit**
@@ -682,7 +684,7 @@ def test_resolve_openai_upstream_custom_base_url_wins_when_not_deepseek() -> Non
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python -m pytest tests/test_deepseek_routing.py -v`
+Run: `uv run python -m pytest tests/test_deepseek_routing.py -v`
 Expected: FAIL (`ImportError: cannot import name '_is_deepseek_request'`)
 
 - [ ] **Step 3: Write the implementation**
@@ -729,7 +731,7 @@ def _is_deepseek_request(request_headers: dict[str, str], model: str | None) -> 
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `python -m pytest tests/test_deepseek_routing.py -v`
+Run: `uv run python -m pytest tests/test_deepseek_routing.py -v`
 Expected: PASS (all 9 tests)
 
 - [ ] **Step 5: Commit**
@@ -745,82 +747,124 @@ git commit -m "feat(proxy): route dsh DeepSeek traffic to the deepseek upstream"
 
 **Files:**
 - Modify: `headroom/cli/wrap.py`
-- Test: `tests/test_wrap_dsh.py`
+- Test: `tests/test_cli/test_wrap_dsh.py`
 
 **Interfaces:**
 - Produces: `wrap dsh` / `unwrap dsh` Click commands. Threads `deepseek_api_url` through `_start_proxy`, `_ensure_proxy_unlocked`, and `_launch_tool` (mirroring `openai_api_url`).
 
 - [ ] **Step 1: Write the failing test**
 
-Create `tests/test_wrap_dsh.py`:
+Create `tests/test_cli/test_wrap_dsh.py`:
 
 ```python
-"""Tests for the `wrap dsh` / `unwrap dsh` CLI commands."""
+"""Tests for the `headroom wrap dsh` command."""
 
 from __future__ import annotations
 
+import pytest
 from click.testing import CliRunner
 
-from headroom.cli.wrap import dsh, unwrap_dsh
+from headroom.cli.main import main
 
 
-def test_wrap_dsh_launches_web_with_proxy_env(monkeypatch) -> None:
-    captured: dict[str, object] = {}
+@pytest.fixture
+def runner() -> CliRunner:
+    return CliRunner()
 
+
+def _capture(captured: dict[str, object]):
     def fake_launch_tool(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("headroom.cli.wrap._launch_tool", fake_launch_tool)
+    return fake_launch_tool
+
+
+def test_wrap_dsh_launches_web_with_proxy_env(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr("headroom.cli.wrap._launch_tool", _capture(captured))
     monkeypatch.setattr(
-        "headroom.cli.wrap.shutil.which", lambda _name: "/usr/bin/dsh"
+        "headroom.providers.dsh.runtime.shutil.which",
+        lambda _name: "/usr/bin/dsh",
     )
 
-    result = CliRunner().invoke(dsh, ["--port", "9000"])
+    result = runner.invoke(main, ["wrap", "dsh", "--port", "9000"])
     assert result.exit_code == 0, result.output
 
     env = captured["env"]
     assert env["DEEPSEEK_BASE_URL"] == "http://127.0.0.1:9000/v1"
     assert captured["binary"] == "/usr/bin/dsh"
+    assert captured["args"] == ("web",)
     assert captured["agent_type"] == "dsh"
 
 
-def test_wrap_dsh_forwards_deepseek_api_url(monkeypatch) -> None:
+def test_wrap_dsh_headless_profile(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
     captured: dict[str, object] = {}
-
-    def fake_launch_tool(**kwargs: object) -> None:
-        captured.update(kwargs)
-
-    monkeypatch.setattr("headroom.cli.wrap._launch_tool", fake_launch_tool)
+    monkeypatch.setattr("headroom.cli.wrap._launch_tool", _capture(captured))
     monkeypatch.setattr(
-        "headroom.cli.wrap.shutil.which", lambda _name: "/usr/bin/dsh"
+        "headroom.providers.dsh.runtime.shutil.which",
+        lambda _name: "/usr/bin/dsh",
     )
 
-    result = CliRunner().invoke(
-        dsh, ["--deepseek-api-url", "https://deepseek.internal"]
+    result = runner.invoke(
+        main, ["wrap", "dsh", "--profile", "headless", "explain foo"]
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["args"] == ("--profile", "headless", "explain foo")
+
+
+def test_wrap_dsh_forwards_deepseek_api_url(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr("headroom.cli.wrap._launch_tool", _capture(captured))
+    monkeypatch.setattr(
+        "headroom.providers.dsh.runtime.shutil.which",
+        lambda _name: "/usr/bin/dsh",
+    )
+
+    result = runner.invoke(
+        main, ["wrap", "dsh", "--deepseek-api-url", "https://deepseek.internal"]
     )
     assert result.exit_code == 0, result.output
     assert captured["deepseek_api_url"] == "https://deepseek.internal"
 
 
-def test_wrap_dsh_missing_binary_fails(monkeypatch) -> None:
-    monkeypatch.setattr("headroom.cli.wrap.shutil.which", lambda _name: None)
+def test_wrap_dsh_missing_binary_fails(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "headroom.providers.dsh.runtime.shutil.which", lambda _name: None
+    )
 
-    result = CliRunner().invoke(dsh, [])
+    result = runner.invoke(main, ["wrap", "dsh"])
     assert result.exit_code == 1
     assert "not found in PATH" in result.output
 
 
-def test_unwrap_dsh_registered() -> None:
-    # `unwrap dsh` exists and takes the standard options.
-    result = CliRunner().invoke(unwrap_dsh, ["--no-stop-proxy"])
-    # unwrap dsh only stops the proxy; with --no-stop-proxy it is a no-op exit 0.
+def test_unwrap_dsh_stops_proxy(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "headroom.cli.wrap._stop_local_proxy_for_unwrap",
+        lambda _port: "stopped",
+    )
+    monkeypatch.setattr(
+        "headroom.cli.wrap._echo_unwrap_proxy_stop_status",
+        lambda _status, _port: None,
+    )
+
+    result = runner.invoke(main, ["unwrap", "dsh"])
     assert result.exit_code == 0, result.output
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python -m pytest tests/test_wrap_dsh.py -v`
-Expected: FAIL (`ImportError: cannot import name 'dsh'`)
+Run: `uv run python -m pytest tests/test_cli/test_wrap_dsh.py -v`
+Expected: FAIL (Click error `No such command 'dsh'` — the wrap command does not exist yet)
 
 - [ ] **Step 3: Write the implementation**
 
@@ -939,7 +983,11 @@ def dsh(
     if prepare_only:
         return
 
-    argv = resolve_dsh_command(profile=profile, command=command, task_args=dsh_args)
+    try:
+        argv = resolve_dsh_command(profile=profile, command=command, task_args=dsh_args)
+    except RuntimeError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1)
 
     env, env_vars_display = build_launch_env(port, os.environ)
 
@@ -955,7 +1003,6 @@ def dsh(
         memory=memory,
         agent_type="dsh",
         deepseek_api_url=deepseek_api_url,
-        verbose=verbose,
     )
 ```
 
@@ -982,13 +1029,13 @@ from headroom.providers.dsh.runtime import build_launch_env, resolve_dsh_command
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `python -m pytest tests/test_wrap_dsh.py -v`
-Expected: PASS (all 4 tests)
+Run: `uv run python -m pytest tests/test_cli/test_wrap_dsh.py -v`
+Expected: PASS (all 5 tests)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add headroom/cli/wrap.py tests/test_wrap_dsh.py
+git add headroom/cli/wrap.py tests/test_cli/test_wrap_dsh.py
 git commit -m "feat(dsh): add wrap/unwrap dsh CLI commands"
 ```
 
@@ -1028,7 +1075,7 @@ git commit -m "docs(dsh): document dsh wrap in compatibility matrix and wiki"
 
 - [ ] **Step 1: Run the full Python test suite**
 
-Run: `python -m pytest tests/ -q`
+Run: `uv run python -m pytest tests/ -q`
 Expected: PASS, with no regressions from the new `deepseek` target threading.
 
 - [ ] **Step 2: Smoke test against a mock DeepSeek upstream**

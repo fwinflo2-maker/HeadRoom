@@ -7404,6 +7404,8 @@ def dsh(
     """
     if prepare_only:
         return
+    if deepseek_api_url is None:
+        deepseek_api_url = os.environ.get("DEEPSEEK_BASE_URL")
 
     try:
         argv = resolve_dsh_command(profile=profile, command=command, task_args=dsh_args)

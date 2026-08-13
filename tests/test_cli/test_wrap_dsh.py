@@ -74,6 +74,20 @@ def test_wrap_dsh_forwards_deepseek_api_url(
     assert captured["deepseek_api_url"] == "https://deepseek.internal"
 
 
+def test_wrap_dsh_captures_ambient_deepseek_base_url(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr("headroom.cli.wrap._launch_tool", _capture(captured))
+    monkeypatch.setattr(
+        "headroom.providers.dsh.runtime.shutil.which", lambda _name: "/usr/bin/dsh"
+    )
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://gateway.internal")
+    result = runner.invoke(main, ["wrap", "dsh"])
+    assert result.exit_code == 0, result.output
+    assert captured["deepseek_api_url"] == "https://gateway.internal"
+
+
 def test_wrap_dsh_missing_binary_fails(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:

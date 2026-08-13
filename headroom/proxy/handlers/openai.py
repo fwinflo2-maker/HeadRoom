@@ -4426,7 +4426,7 @@ class OpenAIHandlerMixin:
 
         # Direct OpenAI API (no backend configured)
         url = build_copilot_upstream_url(
-            upstream_base_url or self.OPENAI_API_URL,
+            self._resolve_openai_upstream(request, model=model),
             handler_path,
         )
         url = _append_request_query(url, request.url.query)

@@ -62,3 +62,18 @@ def test_resolve_dsh_command_missing_binary_raises(monkeypatch: pytest.MonkeyPat
     )
     with pytest.raises(RuntimeError, match="not found on PATH"):
         resolve_dsh_command()
+
+
+from headroom.providers.dsh.install import build_install_env
+from headroom.providers.install_registry import build_install_target_envs
+
+
+def test_dsh_build_install_env_sets_deepseek_base_url() -> None:
+    assert build_install_env(port=9000, backend="anthropic") == {
+        "DEEPSEEK_BASE_URL": "http://127.0.0.1:9000/v1"
+    }
+
+
+def test_install_registry_includes_dsh() -> None:
+    envs = build_install_target_envs(port=9000, backend="anthropic", targets=["dsh"])
+    assert envs["dsh"] == {"DEEPSEEK_BASE_URL": "http://127.0.0.1:9000/v1"}

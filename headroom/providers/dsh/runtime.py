@@ -51,7 +51,7 @@ def resolve_dsh_command(
             argv = ["pnpm", "dsh"]
         else:
             raise RuntimeError(
-                "dsh was not found on PATH. Install it with `npm i -g @deepseek-ai/dsh` "
+                "dsh was not found in PATH. Install it with `npm i -g @deepseek-ai/dsh` "
                 "or pass `--command`."
             )
     if profile == "headless":

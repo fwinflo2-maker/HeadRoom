@@ -60,7 +60,7 @@ def test_resolve_dsh_command_missing_binary_raises(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(
         "headroom.providers.dsh.runtime.shutil.which", lambda _name: None
     )
-    with pytest.raises(RuntimeError, match="not found on PATH"):
+    with pytest.raises(RuntimeError, match="not found in PATH"):
         resolve_dsh_command()
 
 

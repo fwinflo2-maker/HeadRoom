@@ -706,7 +706,7 @@ def test_transform_adapter_tokens_before_is_baseline_not_reconstruction(tokenize
 def test_proxy_pipeline_includes_interceptor_when_env_enabled(monkeypatch):
     """An eligible legacy request installs the interceptor in both pipelines."""
     monkeypatch.setenv("HEADROOM_INTERCEPT_ENABLED", "1")
-    monkeypatch.setenv("HEADROOM_RELEASE_CHANNEL", "canary")
+    monkeypatch.setenv("HEADROOM_ROLLOUT_CHANNEL", "canary")
     from headroom.proxy.interceptors import ToolResultInterceptorTransform
     from headroom.proxy.models import ProxyConfig
     from headroom.proxy.server import HeadroomProxy
@@ -718,10 +718,10 @@ def test_proxy_pipeline_includes_interceptor_when_env_enabled(monkeypatch):
         assert isinstance(transforms[0], ToolResultInterceptorTransform)
 
 
-def test_proxy_pipeline_blocks_interceptor_below_release_channel(monkeypatch):
-    """A legacy request cannot bypass the stable release-channel boundary."""
+def test_proxy_pipeline_blocks_interceptor_below_rollout_channel(monkeypatch):
+    """A legacy request cannot bypass the stable rollout-channel boundary."""
     monkeypatch.setenv("HEADROOM_INTERCEPT_ENABLED", "1")
-    monkeypatch.setenv("HEADROOM_RELEASE_CHANNEL", "stable")
+    monkeypatch.setenv("HEADROOM_ROLLOUT_CHANNEL", "stable")
     from headroom.proxy.interceptors import ToolResultInterceptorTransform
     from headroom.proxy.models import ProxyConfig
     from headroom.proxy.server import HeadroomProxy

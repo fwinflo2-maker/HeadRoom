@@ -2763,7 +2763,13 @@ class AnthropicHandlerMixin:
                     shape_request,
                 )
 
-                _shaper_settings = OutputShaperSettings.from_env()
+                _shaper_settings = OutputShaperSettings.from_env(
+                    enabled=(
+                        self.config.rollout.is_enabled("proxy_output_shaper")
+                        if getattr(self.config, "rollout", None) is not None
+                        else None
+                    )
+                )
                 if _shaper_settings.enabled:
                     # Conversation-stable holdout assignment: a whole
                     # conversation is treatment or control. This keeps the A/B

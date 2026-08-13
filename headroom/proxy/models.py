@@ -14,6 +14,7 @@ from typing import Any, Literal
 from headroom.memory import qdrant_env
 from headroom.providers.registry import ProviderApiOverrides
 from headroom.proxy.model_router import ModelRouterConfig
+from headroom.rollout import RolloutSnapshot, resolve_rollout
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +134,8 @@ class ProxyConfig:
     # Server
     host: str = "127.0.0.1"
     port: int = 8787
+    # Resolved at this configuration boundary and then injected unchanged.
+    rollout: RolloutSnapshot | None = None
     anthropic_api_url: str | None = None  # Custom Anthropic API URL override
     openai_api_url: str | None = None  # Custom OpenAI API URL override
     # Display label for the OpenAI-compatible upstream (dashboard/stats only).
@@ -494,6 +497,11 @@ class ProxyConfig:
     compression_max_workers: int | None = None
 
     def __post_init__(self, smart_routing: bool | None = None) -> None:
+        if self.rollout is None:
+            self.rollout = resolve_rollout()
+        # Legacy typed/env input remains accepted at the composition boundary,
+        # but the immutable rollout decision is authoritative downstream.
+        self.read_maturation = self.read_maturation and self.rollout.is_enabled("read_maturation")
         if self.retry_enabled and self.retry_max_attempts < 1:
             raise ValueError("retry_max_attempts must be >= 1 when retry_enabled=True")
         # A 0 (or negative) requests-per-minute limit divides by zero in the

@@ -49,6 +49,7 @@ async def _ok_response(
 
 def test_http_responses_output_shaper_rewrites_and_labels(monkeypatch):
     monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_ROLLOUT_CHANNEL", "beta")
     monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "2")
     monkeypatch.delenv("HEADROOM_OUTPUT_HOLDOUT", raising=False)
     captured: dict[str, Any] = {}
@@ -104,6 +105,7 @@ def test_http_responses_output_shaper_rewrites_and_labels(monkeypatch):
 
 def test_http_responses_output_shaper_respects_bypass(monkeypatch):
     monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_ROLLOUT_CHANNEL", "beta")
     captured: dict[str, Any] = {}
     payload = {"model": "gpt-5", "input": "hi"}
 
@@ -131,6 +133,7 @@ def test_http_responses_output_shaper_respects_bypass(monkeypatch):
 
 def test_http_responses_output_shaper_holdout_labels_without_rewrite(monkeypatch):
     monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_ROLLOUT_CHANNEL", "beta")
     monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "1")
     captured: dict[str, Any] = {}
     outcomes: list[Any] = []

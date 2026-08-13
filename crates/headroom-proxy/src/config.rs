@@ -1,7 +1,9 @@
 //! Configuration for the proxy: CLI flags + env vars.
 
 use clap::{Parser, ValueEnum};
-use headroom_core::rollout::{Feature, Rollout};
+use headroom_core::rollout::{
+    feature_names, split_feature_names, Feature, RolloutChannel, RolloutSnapshot,
+};
 use std::net::SocketAddr;
 use std::time::Duration;
 use url::Url;
@@ -231,21 +233,27 @@ impl BetaHeaderSticky {
     about = "Headroom transparent reverse proxy"
 )]
 pub struct CliArgs {
-    /// Release channel that bounds which rollout-managed features may run.
+    /// Runtime rollout channel that bounds which managed features may run.
     ///
     /// `stable` admits only features that have completed bake time. `beta` and
     /// `canary` admit progressively newer features. `dev` is for local work.
     /// Explicit feature requests still cannot cross this boundary unless the
     /// unsafe override is set.
     #[arg(
-        long = "release-channel",
-        env = "HEADROOM_RELEASE_CHANNEL",
-        default_value = "stable"
+        long = "rollout-channel",
+        env = "HEADROOM_ROLLOUT_CHANNEL",
+        default_value = "stable",
+        value_parser = parse_rollout_channel,
     )]
-    pub release_channel: String,
+    pub rollout_channel: String,
 
     /// Comma-separated rollout features to request explicitly.
-    #[arg(long = "features", env = "HEADROOM_FEATURES", default_value = "")]
+    #[arg(
+        long = "features",
+        env = "HEADROOM_FEATURES",
+        default_value = "",
+        value_parser = parse_rollout_features,
+    )]
     pub features: String,
 
     /// Comma-separated rollout features to force off. Disable wins over defaults
@@ -253,7 +261,8 @@ pub struct CliArgs {
     #[arg(
         long = "disable-features",
         env = "HEADROOM_DISABLE_FEATURES",
-        default_value = ""
+        default_value = "",
+        value_parser = parse_rollout_features,
     )]
     pub disable_features: String,
 
@@ -576,6 +585,32 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     humantime::parse_duration(s).map_err(|e| format!("invalid duration `{s}`: {e}"))
 }
 
+fn parse_rollout_channel(value: &str) -> Result<String, String> {
+    value
+        .parse::<RolloutChannel>()
+        .map(|channel| channel.as_str().to_owned())
+        .map_err(|_| {
+            format!("unknown rollout channel `{value}` (valid: stable, beta, canary, dev)")
+        })
+}
+
+fn parse_rollout_features(value: &str) -> Result<String, String> {
+    let valid = feature_names();
+    let unknown: Vec<_> = split_feature_names(value)
+        .into_iter()
+        .filter(|name| !valid.contains(name.as_str()))
+        .collect();
+    if unknown.is_empty() {
+        Ok(value.to_owned())
+    } else {
+        Err(format!(
+            "unknown rollout feature(s): {}; valid: {}",
+            unknown.join(", "),
+            valid.into_iter().collect::<Vec<_>>().join(", ")
+        ))
+    }
+}
+
 fn parse_bytes(s: &str) -> Result<u64, String> {
     s.parse::<bytesize::ByteSize>()
         .map(|b| b.as_u64())
@@ -586,7 +621,7 @@ fn parse_bytes(s: &str) -> Result<u64, String> {
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Runtime rollout state resolved from CLI/env.
-    pub rollout: Rollout,
+    pub rollout: RolloutSnapshot,
     pub listen: SocketAddr,
     pub upstream: Url,
     pub upstream_timeout: Duration,
@@ -661,11 +696,19 @@ pub struct Config {
 
 impl Config {
     pub fn from_cli(args: CliArgs) -> Self {
-        let rollout = Rollout::from_parts(
-            &args.release_channel,
+        let mut explicit_features = Vec::new();
+        if args.enable_responses_streaming {
+            explicit_features.push(Feature::OpenAiResponsesStreaming);
+        }
+        if args.enable_bedrock_native {
+            explicit_features.push(Feature::NativeBedrock);
+        }
+        let rollout = RolloutSnapshot::from_parts_with_explicit(
+            &args.rollout_channel,
             &args.features,
             &args.disable_features,
             args.unsafe_allow_unstable_features,
+            &explicit_features,
         );
         let rewrite_host = if args.no_rewrite_host {
             false
@@ -712,7 +755,7 @@ impl Config {
     /// production-default behaviour so existing tests stay unchanged.
     pub fn for_test(upstream: Url) -> Self {
         Self {
-            rollout: Rollout::default(),
+            rollout: RolloutSnapshot::default(),
             listen: "127.0.0.1:0".parse().unwrap(),
             upstream,
             upstream_timeout: Duration::from_secs(60),
@@ -764,5 +807,22 @@ impl Config {
             vertex_region: "us-central1".to_string(),
             vertex_adc_scope: "https://www.googleapis.com/auth/cloud-platform".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod rollout_input_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_rollout_inputs_are_strict_and_diagnosable() {
+        assert_eq!(parse_rollout_channel("CANARY").unwrap(), "canary");
+        assert!(parse_rollout_channel("stabel")
+            .unwrap_err()
+            .contains("unknown rollout channel"));
+        assert!(parse_rollout_features("native-bedrock").is_ok());
+        let error = parse_rollout_features("native_bedrok").unwrap_err();
+        assert!(error.contains("native_bedrok"));
+        assert!(error.contains("native_bedrock"));
     }
 }

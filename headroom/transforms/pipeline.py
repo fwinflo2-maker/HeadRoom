@@ -19,7 +19,6 @@ from ..config import (
     WasteSignals,
 )
 from ..observability import get_headroom_tracer, get_otel_metrics
-from ..rollout import feature_enabled
 from ..tokenizer import Tokenizer
 from ..utils import deep_copy_messages
 from .base import Transform
@@ -139,13 +138,10 @@ class TransformPipeline:
 
         # 0. Tool-result interceptors (ast-grep Read outline, etc.) run first
         # so downstream compressors operate on the already-shrunk content.
-        # Rollout-managed: callers may request interceptors through typed config
-        # or the legacy env var, but the feature still has to be eligible in the
-        # active release channel.
-        if feature_enabled(
-            "tool_result_interceptors",
-            explicit=getattr(self.config, "intercept_tool_results", False),
-        ):
+        # Rollout was resolved once by HeadroomConfig. Never re-read process
+        # environment here: this pipeline must match its recorded provenance.
+        assert self.config.rollout is not None
+        if self.config.rollout.is_enabled("tool_result_interceptors"):
             from headroom.proxy.interceptors import ToolResultInterceptorTransform
 
             transforms.append(ToolResultInterceptorTransform())

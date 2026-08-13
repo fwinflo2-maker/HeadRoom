@@ -612,3 +612,130 @@ async def test_buffered_ccr_pre_keepalive_exception_returns_json_error() -> None
         payload["error"]["message"]
         == "An error occurred while processing your request. Please try again."
     )
+
+
+def _buffered_ccr_scope() -> tuple[dict, dict]:
+    """Scope + body for a stream:true request carrying the CCR retrieve tool."""
+    body = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "stream": True,
+        "tools": [create_ccr_tool_definition("anthropic")],
+        "messages": [{"role": "user", "content": "wait"}],
+    }
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/messages",
+        "raw_path": b"/v1/messages",
+        "query_string": b"",
+        "headers": [(b"x-api-key", b"test-key"), (b"anthropic-version", b"2023-06-01")],
+        "server": ("testserver", 80),
+        "client": ("testclient", 123),
+        "root_path": "",
+    }
+    return scope, body
+
+
+async def _run_buffered_ccr_after_keepalive(
+    upstream: object,
+) -> tuple[list[dict], list[logging.LogRecord]]:
+    """Drive the buffered-CCR wrapper past its keepalive, then release `upstream`.
+
+    Returns the ASGI messages the client would have seen plus any WARNING+
+    records, so tests can assert on both the wire bytes and diagnosability.
+    """
+    scope, body = _buffered_ccr_scope()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def receive():
+        return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
+
+    with patch("headroom.proxy.server.AnyLLMBackend"):
+        app = create_app(_make_config())
+        with TestClient(app):
+            proxy = app.state.proxy
+            proxy_logger = logging.getLogger("headroom.proxy")
+            records: list[logging.LogRecord] = []
+            handler = logging.Handler()
+            handler.setLevel(logging.WARNING)
+            handler.emit = records.append
+            proxy_logger.addHandler(handler)
+            try:
+
+                async def delayed(*args, **kwargs):  # noqa: ANN002, ANN003
+                    started.set()
+                    await release.wait()
+                    return upstream
+
+                proxy._retry_request = delayed
+                task = asyncio.create_task(proxy.handle_anthropic_messages(Request(scope, receive)))
+                await started.wait()
+                response = await asyncio.wait_for(asyncio.shield(task), 1)
+                events: list[dict] = []
+                first_visible = asyncio.Event()
+
+                async def send(message):  # noqa: ANN001
+                    events.append(message)
+                    if message["type"] == "http.response.body" and message["body"]:
+                        first_visible.set()
+
+                response_task = asyncio.create_task(response(scope, receive, send))
+                # Only release upstream once the keepalive has committed the
+                # 200 + text/event-stream status line -- that is the state in
+                # which the real upstream status can no longer reach the client.
+                await asyncio.wait_for(first_visible.wait(), 2)
+                release.set()
+                await response_task
+            finally:
+                proxy_logger.removeHandler(handler)
+
+    return events, records
+
+
+@pytest.mark.asyncio
+async def test_buffered_ccr_late_non_200_reports_upstream_status_in_band() -> None:
+    """A non-200 upstream that lands after the keepalive must not read as success.
+
+    The wrapper has already committed `200 text/event-stream`, so the real status
+    cannot reach the client. Before this fix the client got a contextless
+    "An error occurred" event and no log line at all, which is
+    indistinguishable from a truncated stream and is not retryable.
+    """
+    events, records = await _run_buffered_ccr_after_keepalive(
+        httpx.Response(529, json={"error": {"message": "upstream is overloaded"}})
+    )
+
+    bodies = [event["body"] for event in events if event["type"] == "http.response.body"]
+    assert bodies[0] == b'event: ping\ndata: {"type":"ping"}\n\n'
+    assert b"529" in bodies[-1], "real upstream status must be reported in-band"
+    assert events[-1]["more_body"] is False
+    # A status code is exactly what the client would have seen had the stream
+    # not been committed; the upstream body text is still not leaked.
+    assert b"upstream is overloaded" not in bodies[-1]
+    assert any(
+        record.levelno >= logging.WARNING and "status=529" in record.getMessage()
+        for record in records
+    ), "laundering a non-200 into a committed 200 must be logged"
+
+
+@pytest.mark.asyncio
+async def test_buffered_ccr_late_unparseable_body_is_logged_and_reported() -> None:
+    """An unparseable 200 body must not be logged at debug and dropped silently."""
+    events, records = await _run_buffered_ccr_after_keepalive(
+        httpx.Response(200, content=b"<html>gateway timeout</html>")
+    )
+
+    bodies = [event["body"] for event in events if event["type"] == "http.response.body"]
+    assert bodies[0] == b'event: ping\ndata: {"type":"ping"}\n\n'
+    # The client must receive an SSE error, never a ping-only 200 stream.
+    assert b"event: error" in b"".join(bodies)
+    assert events[-1]["more_body"] is False
+    assert any(
+        record.levelno >= logging.WARNING
+        and "Failed to parse response JSON for CCR handling" in record.getMessage()
+        for record in records
+    ), "an unparseable buffered body must be visible in the proxy log"

@@ -73,6 +73,21 @@ def _strip_index_from_content_blocks(content: Any) -> None:
             _strip_index_from_content_blocks(block.get("content"))
 
 
+def _ccr_sse_error_event(message: str) -> bytes:
+    """Build a well-formed Anthropic SSE ``error`` event.
+
+    Module-level rather than a closure because the buffered-CCR keepalive
+    wrapper (``_BufferedCCRResponse``) lives in an outer scope than the
+    resynthesis block and must be able to report a failure over an SSE stream
+    whose status line it has already committed.
+    """
+    error_event = {
+        "type": "error",
+        "error": {"type": "api_error", "message": message},
+    }
+    return f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
+
+
 class AnthropicHandlerMixin:
     """Mixin providing Anthropic API handler methods for HeadroomProxy."""
 
@@ -3392,8 +3407,16 @@ class AnthropicHandlerMixin:
                         try:
                             resp_json = response.json()
                         except (json.JSONDecodeError, ValueError) as e:
-                            logger.debug(
-                                f"[{request_id}] Failed to parse response JSON for CCR handling: {e}"
+                            # On the buffered-CCR path this is not cosmetic: an
+                            # unparseable body routes to the non-SSE fallback
+                            # below, which the keepalive wrapper cannot report
+                            # cleanly once it has committed a 200. At debug level
+                            # that leaves the failure invisible in the proxy log.
+                            _parse_log = logger.warning if buffered_stream_ccr else logger.debug
+                            _parse_log(
+                                f"[{request_id}] Failed to parse response JSON for CCR "
+                                f"handling (status={response.status_code}, "
+                                f"{len(response.content)}B): {e}"
                             )
 
                         # CCR Response Handling: Handle headroom_retrieve tool calls automatically
@@ -3898,13 +3921,6 @@ class AnthropicHandlerMixin:
                                 )
                             }
 
-                            def _sse_error_event(message: str) -> bytes:
-                                error_event = {
-                                    "type": "error",
-                                    "error": {"type": "api_error", "message": message},
-                                }
-                                return f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
-
                             # Residual headroom_retrieve is only a hard failure when it
                             # is NOT an intentional mixed-tool skip. When the model
                             # emitted headroom_retrieve alongside a client tool (#839),
@@ -3930,7 +3946,7 @@ class AnthropicHandlerMixin:
                                 )
 
                                 async def _residual_ccr_error_sse():
-                                    yield _sse_error_event(
+                                    yield _ccr_sse_error_event(
                                         "Unable to safely complete streamed CCR retrieval."
                                     )
 
@@ -3950,7 +3966,7 @@ class AnthropicHandlerMixin:
                                 )
 
                                 async def _conversion_error_sse():
-                                    yield _sse_error_event(
+                                    yield _ccr_sse_error_event(
                                         "Unable to safely convert buffered response to SSE."
                                     )
 
@@ -4044,11 +4060,37 @@ class AnthropicHandlerMixin:
 
                                         body_iterator = getattr(result, "body_iterator", None)
                                         if body_iterator is not None:
+                                            sent_any = False
                                             async for chunk in body_iterator:
+                                                if chunk:
+                                                    sent_any = True
                                                 await send(
                                                     {
                                                         "type": "http.response.body",
                                                         "body": chunk,
+                                                        "more_body": True,
+                                                    }
+                                                )
+                                            if not sent_any:
+                                                # A committed 200 carrying no SSE
+                                                # events is indistinguishable at the
+                                                # client from a truncated stream: it
+                                                # reports an empty/malformed 200 and,
+                                                # because the status is 200, does not
+                                                # retry. Fail loudly instead.
+                                                logger.warning(
+                                                    f"[{request_id}] CCR: buffered SSE "
+                                                    "resynthesis produced no events; "
+                                                    "sending an error event instead of "
+                                                    "an empty 200 stream"
+                                                )
+                                                await send(
+                                                    {
+                                                        "type": "http.response.body",
+                                                        "body": _ccr_sse_error_event(
+                                                            "Buffered CCR response "
+                                                            "produced no stream events."
+                                                        ),
                                                         "more_body": True,
                                                     }
                                                 )
@@ -4061,10 +4103,25 @@ class AnthropicHandlerMixin:
                                             )
                                             return
 
+                                        # Non-streaming fallback with the SSE stream
+                                        # already committed as 200: the real upstream
+                                        # status can no longer reach the client, so
+                                        # surface it in-band and in the log rather
+                                        # than emitting a contextless error.
+                                        _upstream_status = getattr(result, "status_code", 502)
+                                        logger.warning(
+                                            f"[{request_id}] CCR: buffered upstream returned "
+                                            f"status={_upstream_status} after the SSE stream "
+                                            "was committed as 200; reporting it in-band"
+                                        )
                                         await send(
                                             {
                                                 "type": "http.response.body",
-                                                "body": b'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"An error occurred while processing the request."}}\n\n',
+                                                "body": _ccr_sse_error_event(
+                                                    "Upstream returned HTTP "
+                                                    f"{_upstream_status} for a buffered "
+                                                    "CCR request."
+                                                ),
                                                 "more_body": False,
                                             }
                                         )

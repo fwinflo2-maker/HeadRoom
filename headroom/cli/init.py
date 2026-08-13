@@ -1694,7 +1694,12 @@ def _remove_native_target(host: Literal["pi", "omp"], global_scope: bool) -> Non
     if not global_scope:
         raise click.ClickException("Durable Pi/OMP removal requires -g (current-user scope).")
 
-    manifest = load_manifest(_GLOBAL_PROFILE)
+    try:
+        manifest = load_manifest(_GLOBAL_PROFILE)
+    except ManifestError as exc:
+        raise click.ClickException(
+            f"Cannot remove durable {host} integration: {exc}. Fix or move the manifest, then retry."
+        ) from exc
     if manifest is None or host not in manifest.targets:
         click.echo(f"No durable {host} integration is installed.")
         return
@@ -1709,18 +1714,18 @@ def _remove_native_target(host: Literal["pi", "omp"], global_scope: bool) -> Non
     )
     if package is not None:
         binary = shutil.which(host)
-        if not binary:
+        if not binary and package.metadata.get("owned") is True:
             raise click.ClickException(
                 f"'{host}' not found in PATH; cannot safely remove its managed package."
             )
-        remove_owned_host_package(host, binary, package)
+        remove_owned_host_package(host, binary or "", package)
 
     manifest.targets = [target for target in manifest.targets if target != host]
     if package is not None:
         manifest.artifacts.remove(package)
 
     if _NATIVE_EXTENSION_TARGETS.intersection(manifest.targets):
-        save_manifest(manifest)
+        _save_manifest_verified(manifest)
         click.echo(f"Removed durable {host} integration.")
         return
 
@@ -1752,10 +1757,14 @@ def _remove_native_target(host: Literal["pi", "omp"], global_scope: bool) -> Non
     manifest.supervisor_kind = SupervisorKind.NONE.value
 
     if manifest.targets:
-        save_manifest(manifest)
+        _save_manifest_verified(manifest)
     else:
         stop_runtime(manifest)
         delete_manifest(manifest.profile)
+        if profile_root(manifest.profile).exists():
+            raise click.ClickException(
+                f"Could not verify deletion of profile {manifest.profile!r}."
+            )
     click.echo(f"Removed durable {host} integration.")
 
 

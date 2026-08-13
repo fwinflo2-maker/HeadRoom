@@ -328,6 +328,96 @@ def test_remove_preserves_user_owned_or_externally_changed_package(monkeypatch) 
     assert package not in saved[0].artifacts
 
 
+def test_removed_package_manifest_save_failure_is_reported(monkeypatch) -> None:
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    package = native_package(init_cli, "pi", owned=True)
+    manifest = native_manifest(
+        init_cli,
+        ["pi", "omp"],
+        [package, native_package(init_cli, "omp", owned=True)],
+    )
+    removed = []
+    persisted = copy.deepcopy(manifest)
+    loads = iter([manifest, persisted])
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: next(loads))
+    monkeypatch.setattr(init_cli, "save_manifest", lambda value: None)
+    monkeypatch.setattr(init_cli.shutil, "which", lambda host: "/bin/pi")
+    monkeypatch.setattr(
+        init_cli,
+        "remove_owned_host_package",
+        lambda *args: removed.append("package") or "removed",
+    )
+
+    result = CliRunner().invoke(fake_main, ["init", "-g", "remove", "pi"])
+
+    assert result.exit_code != 0
+    assert "Could not verify persisted ownership state" in result.output
+    assert "Removed durable pi integration" not in result.output
+    assert removed == ["package"]
+
+
+def test_remove_user_owned_package_does_not_require_host_binary(monkeypatch) -> None:
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    package = native_package(init_cli, "pi", owned=False)
+    manifest = native_manifest(
+        init_cli,
+        ["pi", "omp"],
+        [package, native_package(init_cli, "omp", owned=True)],
+    )
+    removed = []
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli.shutil, "which", lambda host: None)
+    monkeypatch.setattr(
+        init_cli,
+        "remove_owned_host_package",
+        lambda host, binary, artifact: removed.append((host, binary)) or "preserved",
+    )
+    monkeypatch.setattr(init_cli, "_save_manifest_verified", lambda value: None)
+
+    result = CliRunner().invoke(fake_main, ["init", "-g", "remove", "pi"])
+
+    assert result.exit_code == 0, result.output
+    assert removed == [("pi", "")]
+    assert manifest.targets == ["omp"]
+    assert package not in manifest.artifacts
+
+
+def test_native_remove_reports_corrupt_manifest(monkeypatch) -> None:
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    monkeypatch.setattr(
+        init_cli,
+        "load_manifest",
+        lambda profile: (_ for _ in ()).throw(init_cli.ManifestError("corrupt state")),
+    )
+
+    result = CliRunner().invoke(fake_main, ["init", "-g", "remove", "pi"])
+
+    assert result.exit_code != 0
+    assert "Cannot remove durable pi integration" in result.output
+    assert "corrupt state" in result.output
+
+
+def test_last_overall_remove_verifies_profile_deletion(monkeypatch, tmp_path) -> None:
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    package = native_package(init_cli, "pi", owned=False)
+    manifest = native_manifest(init_cli, ["pi"], [package])
+    profile_dir = tmp_path / "init-user"
+    profile_dir.mkdir()
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli.shutil, "which", lambda host: None)
+    monkeypatch.setattr(init_cli, "remove_owned_host_package", lambda *args: "preserved")
+    monkeypatch.setattr(init_cli, "remove_supervisor", lambda value: None)
+    monkeypatch.setattr(init_cli, "stop_runtime", lambda value: None)
+    monkeypatch.setattr(init_cli, "delete_manifest", lambda profile: None)
+    monkeypatch.setattr(init_cli, "profile_root", lambda profile: profile_dir)
+
+    result = CliRunner().invoke(fake_main, ["init", "-g", "remove", "pi"])
+
+    assert result.exit_code != 0
+    assert "Could not verify deletion" in result.output
+    assert "Removed durable pi integration" not in result.output
+
+
 def test_failed_package_uninstall_keeps_manifest_ownership_for_retry(monkeypatch) -> None:
     init_cli, fake_main = _load_init_module(monkeypatch)
     package = native_package(init_cli, "pi", owned=True)

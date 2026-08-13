@@ -21,7 +21,7 @@ from headroom._subprocess import run
 from headroom._version import __version__ as _HEADROOM_VERSION
 
 try:
-    import tomllib
+    import tomllib  # type: ignore[import-not-found]
 except ModuleNotFoundError:  # Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
 
@@ -37,6 +37,8 @@ from headroom.install.models import (
 from headroom.install.paths import (
     claude_settings_path,
     codex_config_path,
+    manifest_path,
+    profile_root,
     unix_ensure_script_path,
     unix_run_script_path,
     validate_profile_name,
@@ -71,7 +73,6 @@ from headroom.providers.pi_extension import (
     extension_config_path,
     extension_release_version,
     inspect_host_package,
-    remove_owned_extension_config,
     remove_owned_host_package,
 )
 
@@ -578,23 +579,17 @@ def _manifest_changed(
     )
 
 
-def _ensure_runtime_manifest(
+def _build_runtime_manifest(
     *,
-    global_scope: bool,
+    profile: str,
+    existing: Any | None,
     targets: list[str],
     port: int,
     backend: str,
     anyllm_provider: str | None,
     region: str | None,
     memory: bool,
-) -> str:
-    profile = _runtime_profile(global_scope)
-    try:
-        existing = load_manifest(profile)
-    except ManifestError as e:
-        # Recover from a corrupt manifest by overwriting it rather than crashing.
-        click.echo(f"Warning: {e}; overwriting.")
-        existing = None
+) -> Any:
     merged_targets = sorted(set(existing.targets if existing else []).union(targets))
     manifest = build_manifest(
         profile=profile,
@@ -612,6 +607,9 @@ def _ensure_runtime_manifest(
         telemetry_enabled=True,
         image="ghcr.io/headroomlabs-ai/headroom:latest",
     )
+    # The planner intentionally recognizes only proxy/provider targets. Native
+    # hosts share this manifest, so restore the merged ownership list afterward.
+    manifest.targets = merged_targets
     manifest.supervisor_kind = (
         getattr(existing, "supervisor_kind", SupervisorKind.NONE.value)
         if existing
@@ -619,6 +617,37 @@ def _ensure_runtime_manifest(
     )
     manifest.artifacts = list(getattr(existing, "artifacts", [])) if existing else []
     manifest.mutations = existing.mutations if existing else []
+    return manifest
+
+
+def _ensure_runtime_manifest(
+    *,
+    global_scope: bool,
+    targets: list[str],
+    port: int,
+    backend: str,
+    anyllm_provider: str | None,
+    region: str | None,
+    memory: bool,
+) -> str:
+    profile = _runtime_profile(global_scope)
+    try:
+        existing = load_manifest(profile)
+    except ManifestError as e:
+        # Keep the legacy init behavior; native init preflights corrupt ownership
+        # state before calling this path and never overwrites it.
+        click.echo(f"Warning: {e}; overwriting.")
+        existing = None
+    manifest = _build_runtime_manifest(
+        profile=profile,
+        existing=existing,
+        targets=targets,
+        port=port,
+        backend=backend,
+        anyllm_provider=anyllm_provider,
+        region=region,
+        memory=memory,
+    )
     if existing is not None and _manifest_changed(
         existing,
         port=port,
@@ -644,6 +673,40 @@ def _upsert_artifacts(manifest: Any, records: list[ArtifactRecord]) -> None:
     manifest.artifacts = [
         artifact for artifact in manifest.artifacts if _artifact_key(artifact) not in replacements
     ] + list(replacements.values())
+
+
+def _snapshot_manifest(profile: str) -> tuple[bool, bytes, Any | None]:
+    path = manifest_path(profile)
+    try:
+        content = path.read_bytes()
+    except FileNotFoundError:
+        return False, b"", load_manifest(profile)
+    try:
+        manifest = load_manifest(profile)
+    except ManifestError as exc:
+        raise click.ClickException(
+            f"Native Pi/OMP init cannot use corrupt ownership state: {exc}. "
+            "Fix or move the manifest, then retry."
+        ) from exc
+    return True, content, manifest
+
+
+def _restore_manifest_snapshot(profile: str, existed: bool, content: bytes) -> None:
+    path = manifest_path(profile)
+    if not existed:
+        root = profile_root(profile)
+        shutil.rmtree(root, ignore_errors=True)
+        if root.exists():
+            raise click.ClickException(
+                f"Could not remove newly created ownership state for profile {profile}."
+            )
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    if path.read_bytes() != content:
+        raise click.ClickException(
+            f"Could not verify restored ownership state for profile {profile}."
+        )
 
 
 def _save_manifest_verified(manifest: Any) -> None:
@@ -713,18 +776,40 @@ def _snapshot_extension_config() -> tuple[bool, bytes, int | None]:
         return False, b"", None
 
 
-def _restore_extension_config(
-    snapshot: tuple[bool, bytes, int | None], artifact: ArtifactRecord
+def _expected_extension_config(snapshot: tuple[bool, bytes, int | None], port: int) -> bytes | None:
+    _existed, content, _mode = snapshot
+    try:
+        payload = json.loads(content) if content else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    payload["baseUrl"] = f"http://127.0.0.1:{port}"
+    return (json.dumps(payload, indent=2) + "\n").encode()
+
+
+def _restore_extension_config_snapshot(
+    snapshot: tuple[bool, bytes, int | None],
+    *,
+    expected_managed: bytes | None,
 ) -> None:
-    result = remove_owned_extension_config(artifact)
-    if result == "preserved":
-        raise click.ClickException("Pi extension config changed during rollback; it was preserved.")
     existed, content, mode = snapshot
     path = extension_config_path().absolute()
-    if not existed:
-        path.unlink(missing_ok=True)
+    try:
+        current = path.read_bytes()
+    except FileNotFoundError:
+        current = None
+
+    if current == content if existed else current is None:
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if expected_managed is None or current != expected_managed:
+        raise click.ClickException(
+            f"Pi extension config at {path} changed during the failed init; "
+            "the concurrent file was preserved."
+        )
+    if not existed:
+        path.unlink()
+        return
     path.write_bytes(content)
     if mode is not None:
         path.chmod(mode)
@@ -747,40 +832,64 @@ def _restore_native_package(
     ensure_host_package(host, binary, previous.version, current_artifact)
 
 
-def _init_native_host(*, host: Literal["pi", "omp"], binary: str, profile: str, port: int) -> None:
-    release = extension_release_version(_HEADROOM_VERSION)
-    manifest = load_manifest(profile)
-    if manifest is None:
-        raise click.ClickException(f"Deployment profile {profile!r} was not created.")
-
-    previous_manifest = deepcopy(manifest)
+def _run_native_transaction(
+    *,
+    host: Literal["pi", "omp"],
+    binary: str,
+    release: str,
+    manifest: Any,
+    manifest_snapshot: tuple[bool, bytes, Any | None],
+    port: int,
+) -> None:
+    manifest_existed, manifest_bytes, previous_manifest = manifest_snapshot
     previous_package = inspect_host_package(host, binary)
     config_snapshot = _snapshot_extension_config()
+    expected_config_bytes = _expected_extension_config(config_snapshot, port)
     task_files_snapshot = _snapshot_files(_task_file_paths(manifest))
     previous_config = next(
-        (artifact for artifact in manifest.artifacts if artifact.kind == "pi-extension-config"),
+        (
+            artifact
+            for artifact in (previous_manifest.artifacts if previous_manifest else [])
+            if artifact.kind == "pi-extension-config"
+        ),
+        None,
+    )
+    previous_host_artifact = next(
+        (
+            artifact
+            for artifact in (previous_manifest.artifacts if previous_manifest else [])
+            if artifact.kind == "pi-extension-package" and artifact.path == host
+        ),
         None,
     )
     package_artifact: ArtifactRecord | None = None
-    config_artifact: ArtifactRecord | None = None
+    config_managed_bytes: bytes | None = None
 
     try:
+        if previous_manifest is not None and _manifest_changed(
+            previous_manifest,
+            port=getattr(manifest, "port", port),
+            backend=getattr(manifest, "backend", "anthropic"),
+            anyllm_provider=getattr(manifest, "anyllm_provider", None),
+            region=getattr(manifest, "region", None),
+            memory=getattr(manifest, "memory_enabled", False),
+        ):
+            try:
+                stop_runtime(previous_manifest)
+            except Exception:
+                pass
         manifest.supervisor_kind = SupervisorKind.TASK.value
         _save_manifest_verified(manifest)
         task_artifacts = install_supervisor(manifest)
         _upsert_artifacts(manifest, task_artifacts)
         _save_manifest_verified(manifest)
-        _ensure_profile_running(profile)
+        _ensure_profile_running(manifest.profile)
 
         config_artifact = ensure_extension_config(port, previous_config)
-        previous_host_artifact = next(
-            (
-                artifact
-                for artifact in manifest.artifacts
-                if artifact.kind == "pi-extension-package" and artifact.path == host
-            ),
-            None,
-        )
+        try:
+            config_managed_bytes = extension_config_path().absolute().read_bytes()
+        except FileNotFoundError:
+            config_managed_bytes = None
         package_artifact = ensure_host_package(host, binary, release, previous_host_artifact)
         _upsert_artifacts(manifest, [config_artifact, package_artifact])
         _save_manifest_verified(manifest)
@@ -793,19 +902,19 @@ def _init_native_host(*, host: Literal["pi", "omp"], binary: str, profile: str, 
                 previous=previous_package,
                 current_artifact=package_artifact,
             ),
-            lambda: (
-                _restore_extension_config(config_snapshot, config_artifact)
-                if config_artifact is not None
-                else None
+            lambda: _restore_extension_config_snapshot(
+                config_snapshot,
+                expected_managed=config_managed_bytes or expected_config_bytes,
             ),
             lambda: remove_supervisor(manifest),
             lambda: (
                 install_supervisor(previous_manifest)
-                if previous_manifest.supervisor_kind != SupervisorKind.NONE.value
+                if previous_manifest is not None
+                and previous_manifest.supervisor_kind != SupervisorKind.NONE.value
                 else None
             ),
             lambda: _restore_files(task_files_snapshot),
-            lambda: _save_manifest_verified(previous_manifest),
+            lambda: _restore_manifest_snapshot(manifest.profile, manifest_existed, manifest_bytes),
         ):
             try:
                 restore()
@@ -815,6 +924,22 @@ def _init_native_host(*, host: Literal["pi", "omp"], binary: str, profile: str, 
         if rollback_errors:
             message += " Rollback also failed: " + "; ".join(rollback_errors)
         raise click.ClickException(message) from initiating_error
+
+
+def _init_native_host(*, host: Literal["pi", "omp"], binary: str, profile: str, port: int) -> None:
+    release = extension_release_version(_HEADROOM_VERSION)
+    manifest_snapshot = _snapshot_manifest(profile)
+    manifest = manifest_snapshot[2]
+    if manifest is None:
+        raise click.ClickException(f"Deployment profile {profile!r} was not created.")
+    _run_native_transaction(
+        host=host,
+        binary=binary,
+        release=release,
+        manifest=deepcopy(manifest),
+        manifest_snapshot=manifest_snapshot,
+        port=port,
+    )
 
 
 def _env_manifest(values: dict[str, str]) -> Any:
@@ -1117,18 +1242,39 @@ def _run_init_targets(
     native_targets = _NATIVE_EXTENSION_TARGETS.intersection(targets)
     if not global_scope and native_targets:
         raise click.ClickException("Durable Pi/OMP init requires -g (current-user scope).")
+
+    native_preflight: dict[str, tuple[str, str]] = {}
+    native_manifest_snapshot: tuple[bool, bytes, Any | None] | None = None
+    native_manifest: Any | None = None
+    profile = _runtime_profile(global_scope)
     if native_targets:
-        extension_release_version(_HEADROOM_VERSION)
-    runtime_targets = [target for target in targets if target != "openclaw"]
-    profile = _ensure_runtime_manifest(
-        global_scope=global_scope,
-        targets=runtime_targets,
-        port=port,
-        backend=backend,
-        anyllm_provider=anyllm_provider,
-        region=region,
-        memory=memory,
-    )
+        release = extension_release_version(_HEADROOM_VERSION)
+        for target in sorted(native_targets):
+            binary = shutil.which(target)
+            if not binary:
+                raise click.ClickException(f"'{target}' not found in PATH. Install {target} first.")
+            native_preflight[target] = (binary, release)
+        native_manifest_snapshot = _snapshot_manifest(profile)
+        native_manifest = _build_runtime_manifest(
+            profile=profile,
+            existing=native_manifest_snapshot[2],
+            targets=[target for target in targets if target != "openclaw"],
+            port=port,
+            backend=backend,
+            anyllm_provider=anyllm_provider,
+            region=region,
+            memory=memory,
+        )
+    else:
+        profile = _ensure_runtime_manifest(
+            global_scope=global_scope,
+            targets=[target for target in targets if target != "openclaw"],
+            port=port,
+            backend=backend,
+            anyllm_provider=anyllm_provider,
+            region=region,
+            memory=memory,
+        )
     logger.debug("run_init_targets: using profile=%s", profile)
     for target in targets:
         logger.debug("run_init_targets: dispatching -> %s", target)
@@ -1141,15 +1287,21 @@ def _run_init_targets(
         elif target == "openclaw":
             _init_openclaw(global_scope=global_scope, port=port)
         elif target in _NATIVE_EXTENSION_TARGETS:
-            binary = shutil.which(target)
-            if not binary:
-                raise click.ClickException(f"'{target}' not found in PATH. Install {target} first.")
-            _init_native_host(
+            if native_manifest_snapshot is None or native_manifest is None:
+                raise click.ClickException("Native Pi/OMP init transaction was not prepared.")
+            binary, release = native_preflight[target]
+            _run_native_transaction(
                 host=cast(Literal["pi", "omp"], target),
                 binary=binary,
-                profile=profile,
+                release=release,
+                manifest=deepcopy(native_manifest),
+                manifest_snapshot=native_manifest_snapshot,
                 port=port,
             )
+            refreshed_snapshot = _snapshot_manifest(profile)
+            if refreshed_snapshot[2] is not None:
+                native_manifest_snapshot = refreshed_snapshot
+                native_manifest = refreshed_snapshot[2]
 
     # Register the headroom MCP server with every targeted agent that has
     # a registrar implemented. Wave 1 covers Claude Code; subsequent waves

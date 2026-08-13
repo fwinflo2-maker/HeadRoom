@@ -2769,13 +2769,20 @@ class AnthropicHandlerMixin:
                 # built with it busts the whole provider cache exactly like
                 # appending one to a prefix built without it — so the pin is
                 # read before the enablement and arm gates and replayed below
-                # when those no longer hold (shaper switched off live, holdout
-                # drift into control). Only an explicit request bypass, handled
-                # by the enclosing guard, may sacrifice the cache.
+                # when those no longer hold (shaper switched off live, rollout
+                # channel moved, holdout drift into control). Only an explicit
+                # request bypass, handled by the enclosing guard, may sacrifice
+                # the cache.
                 _pinned = getattr(prefix_tracker, "output_shaping_level", None)
                 _pinned_established = frozen_message_count > 0 and _pinned is not None
 
-                _shaper_settings = OutputShaperSettings.from_env()
+                _shaper_settings = OutputShaperSettings.from_env(
+                    enabled=(
+                        self.config.rollout.is_enabled("proxy_output_shaper")
+                        if getattr(self.config, "rollout", None) is not None
+                        else None
+                    )
+                )
                 _arm = "control"
                 if _shaper_settings.enabled:
                     # Conversation-stable holdout assignment: a whole

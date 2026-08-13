@@ -1,6 +1,8 @@
 import base64
 import hashlib
 import json
+import os
+import stat
 from pathlib import Path
 from subprocess import CompletedProcess
 from typing import Literal
@@ -719,8 +721,121 @@ def test_config_remove_preserves_file_created_after_displacement(
 
     monkeypatch.setattr(module, "_displace_candidate", create_after_displace)
 
-    assert remove_owned_extension_config(artifact) == "preserved"
+    assert remove_owned_extension_config(artifact) == "removed"
     assert path.read_bytes() == user_bytes
+
+
+def test_config_remove_does_not_unlink_competitor_after_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+    artifact = ensure_extension_config(8787, None)
+    user_bytes = b'{"enabled":false}\n'
+    remove_displaced = module._remove_displaced
+
+    def create_before_cleanup(displaced: Path) -> None:
+        path.write_bytes(user_bytes)
+        remove_displaced(displaced)
+
+    monkeypatch.setattr(module, "_remove_displaced", create_before_cleanup)
+
+    assert remove_owned_extension_config(artifact) == "removed"
+    assert path.read_bytes() == user_bytes
+
+
+def test_config_publish_error_restores_displaced_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+    artifact = ensure_extension_config(8787, None)
+    before = path.read_bytes()
+
+    def fail_publish(staged: Path, destination: Path) -> bool:
+        raise OSError("injected publish failure")
+
+    monkeypatch.setattr(module, "_publish_staged", fail_publish)
+
+    with pytest.raises(click.ClickException, match="injected publish failure"):
+        ensure_extension_config(9444, artifact)
+
+    assert path.read_bytes() == before
+    assert not list(tmp_path.glob("*.recovery"))
+
+
+def test_config_publish_and_recovery_error_retains_named_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+    artifact = ensure_extension_config(8787, None)
+    before = path.read_bytes()
+
+    def fail_publish(staged: Path, destination: Path) -> bool:
+        raise OSError("injected publish failure")
+
+    def fail_recovery(source: Path, destination: Path) -> None:
+        raise OSError("injected recovery failure")
+
+    monkeypatch.setattr(module, "_publish_staged", fail_publish)
+    monkeypatch.setattr(module.os, "link", fail_recovery)
+
+    with pytest.raises(click.ClickException, match=r"recovery path (.+\.recovery)") as exc_info:
+        ensure_extension_config(9444, artifact)
+
+    recovery = Path(str(exc_info.value).split("recovery path ", 1)[1].split(";", 1)[0])
+    assert recovery.read_bytes() == before
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("operation", ["ensure", "remove"])
+def test_symlink_config_is_rejected_without_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    target = tmp_path / "target.json"
+    target.write_bytes(b'{"enabled":false}\n')
+    path = tmp_path / "pi-extension.json"
+    path.symlink_to(target)
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+
+    with pytest.raises(click.ClickException, match="symbolic link"):
+        if operation == "ensure":
+            ensure_extension_config(8787, None)
+        else:
+            remove_owned_extension_config(
+                ArtifactRecord(
+                    kind="pi-extension-config",
+                    path=str(path),
+                    metadata={
+                        "previous_exists": False,
+                        "previous_base64": "",
+                        "managed_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+                    },
+                )
+            )
+
+    assert path.is_symlink()
+    assert target.read_bytes() == b'{"enabled":false}\n'
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits")
+def test_config_update_and_restore_preserve_modes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    path.write_bytes(b'{"enabled":false}\n')
+    path.chmod(0o640)
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+
+    artifact = ensure_extension_config(8787, None)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+
+    updated = ensure_extension_config(9444, artifact)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+
+    assert remove_owned_extension_config(updated) == "restored"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
 
 
 def test_config_remove_reports_absent_directly(

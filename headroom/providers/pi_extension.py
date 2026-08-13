@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import os
+import stat
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -36,6 +37,7 @@ class _ConfigCandidate:
     content: bytes
     device: int
     inode: int
+    mode: int
 
 
 def extension_release_version(version_label: str) -> str:
@@ -102,6 +104,10 @@ def _extension_config_lock(path: Path) -> Iterator[None]:
 def _capture_candidate(path: Path) -> _ConfigCandidate | None:
     try:
         before = path.lstat()
+        if stat.S_ISLNK(before.st_mode):
+            raise click.ClickException(
+                f"Refusing to manage Pi extension config symbolic link at {path}."
+            )
         content = path.read_bytes()
         after = path.lstat()
     except FileNotFoundError:
@@ -113,15 +119,16 @@ def _capture_candidate(path: Path) -> _ConfigCandidate | None:
         or before.st_ctime_ns != after.st_ctime_ns
     ):
         raise click.ClickException(f"Pi extension config at {path} changed while being read.")
-    return _ConfigCandidate(content, after.st_dev, after.st_ino)
+    return _ConfigCandidate(content, after.st_dev, after.st_ino, stat.S_IMODE(after.st_mode))
 
 
-def _stage_bytes(path: Path, content: bytes, suffix: str) -> Path:
+def _stage_bytes(path: Path, content: bytes, suffix: str, mode: int = 0o600) -> Path:
     fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=suffix)
     os.close(fd)
     staged = Path(name)
     try:
         write_text(staged, content.decode("utf-8"))
+        staged.chmod(mode)
     except BaseException:
         staged.unlink(missing_ok=True)
         raise
@@ -140,6 +147,26 @@ def _displace_candidate(candidate: Path, displaced: Path) -> None:
     os.replace(candidate, displaced)
 
 
+def _remove_displaced(displaced: Path) -> None:
+    try:
+        displaced.unlink()
+    except OSError as exc:
+        raise click.ClickException(
+            f"Could not clean up Pi extension config recovery path {displaced}: {exc}"
+        ) from exc
+
+
+def _recover_displaced(displaced: Path, path: Path, cause: BaseException) -> None:
+    try:
+        os.link(displaced, path)
+    except OSError as exc:
+        raise click.ClickException(
+            f"Pi extension config commit failed: {cause}. The displaced config is "
+            f"retained at recovery path {displaced}; recovery failed: {exc}"
+        ) from cause
+    _remove_displaced(displaced)
+
+
 def _candidate_matches(path: Path, expected: _ConfigCandidate) -> bool:
     try:
         stat = path.lstat()
@@ -154,35 +181,38 @@ def _candidate_matches(path: Path, expected: _ConfigCandidate) -> bool:
 
 
 def _commit_config(path: Path, expected: _ConfigCandidate | None, desired: bytes | None) -> bool:
-    staged = _stage_bytes(path, desired, ".stage") if desired is not None else None
+    mode = expected.mode if expected is not None else 0o600
+    staged = _stage_bytes(path, desired, ".stage", mode) if desired is not None else None
     displaced: Path | None = None
     try:
         if expected is None:
             return staged is not None and _publish_staged(staged, path)
 
-        displaced = _stage_bytes(path, b"", ".recovery")
+        displaced = _stage_bytes(path, b"", ".recovery", expected.mode)
         displaced.unlink()
         try:
             _displace_candidate(path, displaced)
         except FileNotFoundError:
             return False
         if not _candidate_matches(displaced, expected):
-            if _publish_staged(displaced, path):
-                displaced.unlink()
+            _recover_displaced(
+                displaced,
+                path,
+                click.ClickException(f"Pi extension config at {path} changed"),
+            )
             return False
         if staged is None:
-            try:
-                os.link(displaced, path)
-                path.unlink()
-            except FileExistsError:
-                displaced.unlink()
-                return False
-            displaced.unlink()
+            _remove_displaced(displaced)
             return True
-        if not _publish_staged(staged, path):
-            displaced.unlink()
+        try:
+            published = _publish_staged(staged, path)
+        except OSError as exc:
+            _recover_displaced(displaced, path, exc)
+            raise exc
+        if not published:
+            _remove_displaced(displaced)
             return False
-        displaced.unlink()
+        _remove_displaced(displaced)
         return True
     finally:
         if staged is not None:

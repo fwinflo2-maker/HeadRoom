@@ -499,9 +499,11 @@ class ProxyConfig:
     def __post_init__(self, smart_routing: bool | None = None) -> None:
         if self.rollout is None:
             self.rollout = resolve_rollout()
-        # Legacy typed/env input remains accepted at the composition boundary,
-        # but the immutable rollout decision is authoritative downstream.
-        self.read_maturation = self.read_maturation and self.rollout.is_enabled("read_maturation")
+        # ``read_maturation`` remains a concrete, already-resolved runtime
+        # setting for programmatic/config-file callers.  The CLI composition
+        # root derives it from this same snapshot before constructing the
+        # config; rewriting it here would resolve policy a second time and
+        # break explicit non-CLI configuration.
         if self.retry_enabled and self.retry_max_attempts < 1:
             raise ValueError("retry_max_attempts must be >= 1 when retry_enabled=True")
         # A 0 (or negative) requests-per-minute limit divides by zero in the

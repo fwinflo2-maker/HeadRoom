@@ -2807,8 +2807,10 @@ class OpenAIHandlerMixin:
                 model=model,
                 request_id=request_id,
                 output_shaper_enabled=(
-                    getattr(self.config, "rollout", None).is_enabled("proxy_output_shaper")
-                    if getattr(self.config, "rollout", None) is not None
+                    getattr(getattr(self, "config", None), "rollout", None).is_enabled(
+                        "proxy_output_shaper"
+                    )
+                    if getattr(getattr(self, "config", None), "rollout", None) is not None
                     else None
                 ),
             )

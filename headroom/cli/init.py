@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from copy import deepcopy
@@ -853,7 +854,7 @@ def _snapshot_scheduler(manifest: Any) -> tuple[str, Any]:
             loaded = True
         else:
             detail = _command_bytes(result.stderr).lower()
-            if result.returncode == 113 or b"could not find service" in detail:
+            if result.returncode == 113 and b"could not find service" in detail:
                 loaded = False
             else:
                 raise _scheduler_snapshot_error("macOS launchd", result.stderr)
@@ -894,14 +895,21 @@ def _restore_scheduler(snapshot: tuple[str, Any]) -> None:
         if existed:
             run(["crontab", "-"], input=content, check=True)
         else:
-            run(["crontab", "-r"], capture_output=True, text=True)
+            result = run(["crontab", "-r"], capture_output=True)
+            if result.returncode != 0:
+                detail = _command_bytes(result.stderr).lower()
+                if result.returncode != 1 or b"no crontab for" not in detail:
+                    raise _scheduler_snapshot_error("Linux crontab rollback", result.stderr)
     elif platform == "darwin":
         plist, content, was_loaded, domain = state
-        run(
+        result = run(
             ["launchctl", "bootout", f"{domain}/{plist.stem}"],
             capture_output=True,
-            text=True,
         )
+        if result.returncode != 0:
+            detail = _command_bytes(result.stderr).lower()
+            if result.returncode != 3 or b"no such process" not in detail:
+                raise _scheduler_snapshot_error("macOS launchd rollback", result.stderr)
         if content is None:
             plist.unlink(missing_ok=True)
         else:
@@ -912,11 +920,16 @@ def _restore_scheduler(snapshot: tuple[str, Any]) -> None:
     elif platform == "windows":
         for name, xml in state.items():
             if xml is None:
-                run(
+                result = run(
                     ["schtasks", "/Delete", "/TN", name, "/F"],
                     capture_output=True,
-                    text=True,
                 )
+                if result.returncode != 0:
+                    detail = _command_bytes(result.stderr).lower()
+                    if result.returncode != 1 or b"cannot find the file specified" not in detail:
+                        raise _scheduler_snapshot_error(
+                            "Windows Task Scheduler rollback", result.stderr
+                        )
             else:
                 _restore_windows_task(name, xml)
 
@@ -938,7 +951,27 @@ def _restore_native_package(
     ensure_host_package(host, binary, previous.version, current_artifact)
 
 
-def _start_profile_strict(manifest: Any) -> None:
+def _wait_runtime_status(manifest: Any, expected: str, timeout_seconds: int = 10) -> bool:
+    for _ in range(timeout_seconds):
+        if runtime_status(manifest) == expected:
+            return True
+        time.sleep(1)
+    return runtime_status(manifest) == expected
+
+
+def _wait_runtime_transition(manifest: Any, expected: str, before: str) -> bool:
+    current = runtime_status(manifest)
+    # stop_runtime removes the PID file before SIGTERM is necessarily observed,
+    # so a first "stopped" result after a running snapshot is not authoritative.
+    if expected == "stopped" and before == "running" and current == "stopped":
+        time.sleep(1)
+        return runtime_status(manifest) == "stopped"
+    if current == expected:
+        return True
+    return _wait_runtime_status(manifest, expected)
+
+
+def _start_profile_strict_locked(manifest: Any) -> None:
     if not getattr(manifest, "preset", None):
         start_detached_agent(manifest.profile)
         return
@@ -950,14 +983,24 @@ def _start_profile_strict(manifest: Any) -> None:
         )
 
 
+def _start_profile_strict(manifest: Any) -> None:
+    with acquire_runtime_start_lock(manifest.profile) as acquired:
+        if not acquired:
+            raise click.ClickException(
+                f"Headroom runtime for profile {manifest.profile} is already being started."
+            )
+        _start_profile_strict_locked(manifest)
+
+
 def _restore_runtime_state(manifest: Any, status: str, was_ready: bool) -> None:
     if getattr(manifest, "preset", None):
+        current_status = runtime_status(manifest)
         stop_runtime(manifest)
-    if status == "stopped":
-        if getattr(manifest, "preset", None) and runtime_status(manifest) != "stopped":
+        if not _wait_runtime_transition(manifest, "stopped", current_status):
             raise click.ClickException(
                 f"Could not restore stopped runtime state for profile {manifest.profile}."
             )
+    if status == "stopped":
         return
     if status != "running":
         raise click.ClickException(
@@ -967,7 +1010,7 @@ def _restore_runtime_state(manifest: Any, status: str, was_ready: bool) -> None:
         _start_profile_strict(manifest)
         return
     start_detached_agent(manifest.profile)
-    if runtime_status(manifest) != "running":
+    if not _wait_runtime_status(manifest, "running"):
         raise click.ClickException(
             f"Could not restore running runtime state for profile {manifest.profile}."
         )
@@ -981,8 +1024,10 @@ def _init_native_hosts(
     manifest_snapshot: tuple[bool, bytes, Any | None],
     port: int,
 ) -> None:
-    manifest_existed, manifest_bytes, previous_manifest = manifest_snapshot
-    package_states = {host: inspect_host_package(host, binary) for host, binary in hosts}
+    _manifest_existed, _manifest_bytes, previous_manifest = manifest_snapshot
+    package_states: dict[str, Any] = {
+        host: inspect_host_package(host, binary) for host, binary in hosts
+    }
     config_snapshot = _snapshot_extension_config()
     expected_config_bytes = _expected_extension_config(config_snapshot, port)
     task_files_snapshot = _snapshot_files(_task_file_paths(manifest))
@@ -1005,6 +1050,43 @@ def _init_native_hosts(
         ),
         None,
     )
+    with acquire_runtime_start_lock(manifest.profile) as acquired:
+        if not acquired:
+            raise click.ClickException(f"Profile {manifest.profile} is already being initialized.")
+        _init_native_hosts_locked(
+            hosts=hosts,
+            release=release,
+            manifest=manifest,
+            manifest_snapshot=manifest_snapshot,
+            port=port,
+            package_states=package_states,
+            config_snapshot=config_snapshot,
+            expected_config_bytes=expected_config_bytes,
+            task_files_snapshot=task_files_snapshot,
+            scheduler_snapshot=scheduler_snapshot,
+            prior_runtime_status=prior_runtime_status,
+            prior_runtime_ready=prior_runtime_ready,
+            previous_config=previous_config,
+        )
+
+
+def _init_native_hosts_locked(
+    *,
+    hosts: list[tuple[Literal["pi", "omp"], str]],
+    release: str,
+    manifest: Any,
+    manifest_snapshot: tuple[bool, bytes, Any | None],
+    port: int,
+    package_states: dict[str, Any],
+    config_snapshot: tuple[bool, bytes, int | None],
+    expected_config_bytes: bytes | None,
+    task_files_snapshot: dict[Path, tuple[bytes, int] | None],
+    scheduler_snapshot: tuple[str, Any],
+    prior_runtime_status: str,
+    prior_runtime_ready: bool,
+    previous_config: ArtifactRecord | None,
+) -> None:
+    manifest_existed, manifest_bytes, previous_manifest = manifest_snapshot
     installed_packages: list[tuple[Literal["pi", "omp"], str, ArtifactRecord]] = []
     config_managed_bytes: bytes | None = None
 
@@ -1047,9 +1129,9 @@ def _init_native_hosts(
         provisional.targets = list(previous_manifest.targets if previous_manifest else [])
         provisional.artifacts = list(previous_manifest.artifacts if previous_manifest else [])
         provisional.supervisor_kind = SupervisorKind.TASK.value
-        task_artifacts = install_supervisor(provisional)
         _save_manifest_verified(provisional)
-        _start_profile_strict(provisional)
+        task_artifacts = install_supervisor(provisional)
+        _start_profile_strict_locked(provisional)
 
         manifest.targets = final_targets
         manifest.supervisor_kind = SupervisorKind.TASK.value

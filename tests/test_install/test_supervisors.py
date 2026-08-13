@@ -293,7 +293,11 @@ def test_native_init_selects_task_supervisor(monkeypatch, tmp_path: Path) -> Non
 
     def fake_run(command: list[str], **kwargs):
         calls.append(command)
-        return type("Result", (), {"returncode": 1, "stdout": ""})()
+        return type(
+            "Result",
+            (),
+            {"returncode": 1, "stdout": b"", "stderr": b"no crontab for test"},
+        )()
 
     monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
     records = install_supervisor(
@@ -302,6 +306,71 @@ def test_native_init_selects_task_supervisor(monkeypatch, tmp_path: Path) -> Non
 
     assert records[-1].kind == "crontab"
     assert calls == [["crontab", "-l"], ["crontab", "-"]]
+
+
+def test_install_supervisor_linux_crontab_preserves_raw_bytes(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "linux")
+    monkeypatch.setattr(
+        "headroom.install.supervisors.render_runner_scripts",
+        lambda manifest: [
+            type(
+                "Record",
+                (),
+                {"kind": "script", "path": (tmp_path / "ensure-headroom.sh").as_posix()},
+            )(),
+        ],
+    )
+    original = b"# user cron\n\xff\n"
+    writes: list[bytes] = []
+
+    def fake_run(command: list[str], **kwargs):
+        if command == ["crontab", "-l"]:
+            assert kwargs.get("text") is not True
+            return type("Result", (), {"returncode": 0, "stdout": original, "stderr": b""})()
+        writes.append(kwargs["input"])
+        return type("Result", (), {"returncode": 0, "stdout": b"", "stderr": b""})()
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+
+    install_supervisor(_manifest(profile="raw", supervisor=SupervisorKind.TASK.value))
+
+    assert writes == [
+        original
+        + b"# >>> headroom raw >>>\n"
+        + b"@reboot "
+        + str(tmp_path / "ensure-headroom.sh").encode()
+        + b"\n*/5 * * * * "
+        + str(tmp_path / "ensure-headroom.sh").encode()
+        + b"\n# <<< headroom raw <<<\n"
+    ]
+
+
+def test_install_supervisor_linux_crontab_query_fails_closed(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "linux")
+    monkeypatch.setattr(
+        "headroom.install.supervisors.render_runner_scripts",
+        lambda manifest: [
+            type(
+                "Record",
+                (),
+                {"kind": "script", "path": (tmp_path / "ensure-headroom.sh").as_posix()},
+            )(),
+        ],
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs):
+        calls.append(command)
+        return type(
+            "Result", (), {"returncode": 2, "stdout": b"", "stderr": b"permission denied"}
+        )()
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+
+    with pytest.raises(click.ClickException, match="permission denied"):
+        install_supervisor(_manifest(supervisor=SupervisorKind.TASK.value))
+
+    assert calls == [["crontab", "-l"]]
 
 
 def test_install_supervisor_none_returns_runner_records(monkeypatch, tmp_path: Path) -> None:
@@ -388,7 +457,7 @@ def test_install_supervisor_linux_service_and_tasks(monkeypatch, tmp_path: Path)
     user_task_records = install_supervisor(_manifest(supervisor=SupervisorKind.TASK.value))
     assert user_task_records[-1].kind == "crontab"
     assert calls[-1][0] == ["crontab", "-"]
-    assert "@reboot ensure" in calls[-1][1]["input"]
+    assert b"@reboot ensure" in calls[-1][1]["input"]
 
 
 def test_install_supervisor_darwin_windows_and_unsupported(monkeypatch, tmp_path: Path) -> None:

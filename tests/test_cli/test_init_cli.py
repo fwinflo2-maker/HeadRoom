@@ -692,7 +692,9 @@ def test_native_batch_installs_shared_supervisor_once(monkeypatch) -> None:
     monkeypatch.setattr(
         init_cli, "install_supervisor", lambda value: calls.append("supervisor") or []
     )
-    monkeypatch.setattr(init_cli, "_start_profile_strict", lambda value: calls.append("runtime"))
+    monkeypatch.setattr(
+        init_cli, "_start_profile_strict_locked", lambda value: calls.append("runtime")
+    )
     monkeypatch.setattr(init_cli, "_save_manifest_verified", lambda value: None)
 
     init_cli._init_native_hosts(
@@ -704,6 +706,114 @@ def test_native_batch_installs_shared_supervisor_once(monkeypatch) -> None:
     )
 
     assert calls == ["supervisor", "runtime"]
+
+
+def test_native_init_saves_provisional_before_supervisor_and_holds_start_lock(monkeypatch) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    manifest = init_cli._build_runtime_manifest(
+        profile="init-user",
+        existing=None,
+        targets=["pi"],
+        port=8787,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        memory=False,
+    )
+    calls: list[str] = []
+
+    @contextmanager
+    def start_lock(profile):
+        calls.append("lock-enter")
+        yield True
+        calls.append("lock-exit")
+
+    monkeypatch.setattr(init_cli, "acquire_runtime_start_lock", start_lock)
+    monkeypatch.setattr(init_cli, "inspect_host_package", lambda host, binary: None)
+    monkeypatch.setattr(
+        init_cli,
+        "ensure_host_package",
+        lambda host, binary, version, existing: init_cli.ArtifactRecord(
+            "pi-extension-package", host, {"version": version, "owned": True}
+        ),
+    )
+    monkeypatch.setattr(
+        init_cli,
+        "ensure_extension_config",
+        lambda port, existing: init_cli.ArtifactRecord(
+            "pi-extension-config", str(init_cli.extension_config_path()), {}
+        ),
+    )
+    monkeypatch.setattr(
+        init_cli,
+        "_save_manifest_verified",
+        lambda value: calls.append("final-save" if value.targets else "provisional-save"),
+    )
+    monkeypatch.setattr(
+        init_cli, "install_supervisor", lambda value: calls.append("supervisor") or []
+    )
+    monkeypatch.setattr(
+        init_cli,
+        "_start_profile_strict_locked",
+        lambda value: calls.append("start:locked"),
+    )
+
+    init_cli._init_native_hosts(
+        hosts=[("pi", "/bin/pi")],
+        release="1.2.3",
+        manifest=manifest,
+        manifest_snapshot=(False, b"", None),
+        port=8787,
+    )
+
+    assert calls == [
+        "lock-enter",
+        "provisional-save",
+        "supervisor",
+        "start:locked",
+        "final-save",
+        "lock-exit",
+    ]
+
+
+def test_native_init_start_lock_denial_avoids_duplicate_setup(monkeypatch) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    manifest = init_cli._build_runtime_manifest(
+        profile="init-user",
+        existing=None,
+        targets=["pi"],
+        port=8787,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        memory=False,
+    )
+    touched: list[str] = []
+
+    @contextmanager
+    def denied_lock(profile):
+        yield False
+
+    monkeypatch.setattr(init_cli, "acquire_runtime_start_lock", denied_lock)
+    monkeypatch.setattr(init_cli, "inspect_host_package", lambda host, binary: None)
+    monkeypatch.setattr(
+        init_cli,
+        "ensure_host_package",
+        lambda *args: touched.append("package"),
+    )
+    monkeypatch.setattr(init_cli, "ensure_extension_config", lambda *args: touched.append("config"))
+    monkeypatch.setattr(init_cli, "install_supervisor", lambda value: touched.append("supervisor"))
+
+    with pytest.raises(click.ClickException, match="already being initialized"):
+        init_cli._init_native_hosts(
+            hosts=[("pi", "/bin/pi")],
+            release="1.2.3",
+            manifest=manifest,
+            manifest_snapshot=(False, b"", None),
+            port=8787,
+        )
+
+    assert touched == []
 
 
 @pytest.mark.parametrize("platform", ["darwin", "win32"])
@@ -805,6 +915,83 @@ def test_native_crontab_snapshot_restores_exact_whitespace(monkeypatch) -> None:
     assert writes == [original]
 
 
+@pytest.mark.parametrize(
+    ("returncode", "stderr"),
+    [(113, b"permission denied"), (5, b"Could not find service")],
+)
+def test_native_macos_scheduler_absence_requires_code_and_message(
+    monkeypatch, returncode: int, stderr: bytes
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+
+    class Result:
+        stdout = b""
+
+        def __init__(self) -> None:
+            self.returncode = returncode
+            self.stderr = stderr
+
+    monkeypatch.setattr(init_cli.sys, "platform", "darwin")
+    monkeypatch.setattr(init_cli, "run", lambda command, **kwargs: Result())
+
+    with pytest.raises(click.ClickException, match="snapshot"):
+        init_cli._snapshot_scheduler(
+            SimpleNamespace(profile="init-user", service_name="headroom-init-user")
+        )
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin", "windows"])
+def test_native_scheduler_absence_rollback_failure_is_reported(
+    monkeypatch, tmp_path: Path, platform: str
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+
+    class Result:
+        returncode = 7
+        stdout = b""
+        stderr = b"rollback denied"
+
+    monkeypatch.setattr(init_cli, "run", lambda command, **kwargs: Result())
+    snapshots = {
+        "linux": ("linux", (False, b"")),
+        "darwin": ("darwin", (tmp_path / "task.plist", None, False, "gui/1")),
+        "windows": ("windows", {"headroom-init-user-startup": None}),
+    }
+
+    with pytest.raises(click.ClickException, match="rollback denied"):
+        init_cli._restore_scheduler(snapshots[platform])
+
+
+@pytest.mark.parametrize(
+    ("platform", "returncode", "stderr"),
+    [
+        ("linux", 1, b"no crontab for test"),
+        ("darwin", 113, b"Could not find service"),
+        ("win32", 1, b"ERROR: The system cannot find the file specified."),
+    ],
+)
+def test_native_scheduler_authoritative_absence_is_supported(
+    monkeypatch, platform: str, returncode: int, stderr: bytes
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+
+    class Result:
+        stdout = b""
+
+        def __init__(self) -> None:
+            self.returncode = returncode
+            self.stderr = stderr
+
+    monkeypatch.setattr(init_cli.sys, "platform", platform)
+    monkeypatch.setattr(init_cli, "run", lambda command, **kwargs: Result())
+
+    snapshot = init_cli._snapshot_scheduler(
+        SimpleNamespace(profile="init-user", service_name="headroom-init-user")
+    )
+
+    assert snapshot[0] == ("windows" if platform == "win32" else platform)
+
+
 def test_native_running_but_unready_runtime_is_restored_and_verified(monkeypatch) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     previous = SimpleNamespace(
@@ -827,7 +1014,8 @@ def test_native_running_but_unready_runtime_is_restored_and_verified(monkeypatch
         memory_enabled=False,
     )
     calls: list[str] = []
-    monkeypatch.setattr(init_cli, "runtime_status", lambda value: "running")
+    statuses = iter(["running", "stopped", "stopped"])
+    monkeypatch.setattr(init_cli, "runtime_status", lambda value: next(statuses))
     monkeypatch.setattr(init_cli, "wait_ready", lambda value, timeout_seconds: False)
     monkeypatch.setattr(init_cli, "inspect_host_package", lambda host, binary: None)
     monkeypatch.setattr(
@@ -852,6 +1040,32 @@ def test_native_running_but_unready_runtime_is_restored_and_verified(monkeypatch
     assert calls == ["stop", "restart"]
 
 
+def test_native_runtime_restoration_polls_delayed_transitions(monkeypatch) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    manifest = SimpleNamespace(profile="init-user", preset="persistent-task")
+    statuses = iter(["running", "stopped", "stopped", "running"])
+    calls: list[str] = []
+    monkeypatch.setattr(init_cli, "runtime_status", lambda value: next(statuses))
+    monkeypatch.setattr(init_cli.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(init_cli, "stop_runtime", lambda value: calls.append("stop"))
+    monkeypatch.setattr(init_cli, "start_detached_agent", lambda profile: calls.append("start"))
+
+    init_cli._restore_runtime_state(manifest, "running", False)
+
+    assert calls == ["stop", "start"]
+
+
+def test_native_runtime_restoration_reports_stop_timeout(monkeypatch) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    manifest = SimpleNamespace(profile="init-user", preset="persistent-task")
+    monkeypatch.setattr(init_cli, "runtime_status", lambda value: "running")
+    monkeypatch.setattr(init_cli.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(init_cli, "stop_runtime", lambda value: None)
+
+    with pytest.raises(click.ClickException, match="stop"):
+        init_cli._restore_runtime_state(manifest, "stopped", False)
+
+
 def test_native_runtime_restart_failure_is_combined(monkeypatch) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     previous = SimpleNamespace(
@@ -870,7 +1084,8 @@ def test_native_runtime_restart_failure_is_combined(monkeypatch) -> None:
         region=None,
         memory_enabled=False,
     )
-    monkeypatch.setattr(init_cli, "runtime_status", lambda value: "running")
+    statuses = iter(["running", "running", "stopped", "stopped"])
+    monkeypatch.setattr(init_cli, "runtime_status", lambda value: next(statuses))
     monkeypatch.setattr(init_cli, "wait_ready", lambda value, timeout_seconds: False)
     monkeypatch.setattr(init_cli, "inspect_host_package", lambda host, binary: None)
     monkeypatch.setattr(
@@ -923,9 +1138,11 @@ def test_native_runtime_state_restored_on_rollback(monkeypatch, was_running: boo
         memory_enabled=False,
     )
     calls: list[str] = []
-    monkeypatch.setattr(
-        init_cli, "runtime_status", lambda value: "running" if was_running else "stopped"
-    )
+    if was_running:
+        statuses = iter(["running", "running", "stopped", "stopped"])
+        monkeypatch.setattr(init_cli, "runtime_status", lambda value: next(statuses))
+    else:
+        monkeypatch.setattr(init_cli, "runtime_status", lambda value: "stopped")
     monkeypatch.setattr(init_cli, "wait_ready", lambda value, timeout_seconds: was_running)
     monkeypatch.setattr(init_cli, "inspect_host_package", lambda host, binary: None)
     monkeypatch.setattr(
@@ -1005,7 +1222,7 @@ def test_native_strict_startup_failure_leaves_no_native_claims(monkeypatch) -> N
     )
     monkeypatch.setattr(
         init_cli,
-        "_start_profile_strict",
+        "_start_profile_strict_locked",
         lambda value: (_ for _ in ()).throw(RuntimeError("startup failed")),
     )
     monkeypatch.setattr(init_cli, "_restore_manifest_snapshot", lambda *args: None)

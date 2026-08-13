@@ -1,4 +1,7 @@
+import base64
+import hashlib
 import json
+from pathlib import Path
 from subprocess import CompletedProcess
 from typing import Literal
 
@@ -11,9 +14,12 @@ from headroom.providers.pi_extension import (
     PACKAGE_NAME,
     PackageState,
     _inspect_pi_settings,
+    ensure_extension_config,
     ensure_host_package,
+    extension_config_path,
     extension_release_version,
     inspect_host_package,
+    remove_owned_extension_config,
     remove_owned_host_package,
 )
 
@@ -474,3 +480,168 @@ def test_remove_owned_package_uses_host_native_command(
 
     assert result == "removed"
     assert calls == [command]
+
+
+def test_extension_config_path_matches_runtime() -> None:
+    assert extension_config_path() == Path.home() / ".headroom/integrations/pi-extension.json"
+
+
+def test_config_merge_preserves_unrelated_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    path.write_text(
+        '{\n  "enabled": false,\n  "minResultChars": 9000\n}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+
+    artifact = ensure_extension_config(9444, None)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert payload == {
+        "enabled": False,
+        "minResultChars": 9000,
+        "baseUrl": "http://127.0.0.1:9444",
+    }
+    assert artifact.metadata["previous_exists"] is True
+    assert artifact.kind == "pi-extension-config"
+    assert artifact.path == str(path)
+
+
+def test_config_remove_restores_exact_prior_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    before = b'{"enabled":false}\n'
+    path.write_bytes(before)
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+
+    artifact = ensure_extension_config(8787, None)
+
+    assert artifact.metadata["previous_base64"] == base64.b64encode(before).decode()
+    assert artifact.metadata["managed_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert remove_owned_extension_config(artifact) == "restored"
+    assert path.read_bytes() == before
+
+
+def test_config_remove_preserves_user_edits_after_init(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+    artifact = ensure_extension_config(8787, None)
+    path.write_text(
+        '{"baseUrl":"http://127.0.0.1:8787","enabled":false}\n',
+        encoding="utf-8",
+    )
+    edited = path.read_bytes()
+
+    assert ensure_extension_config(8787, artifact) == artifact
+    assert path.read_bytes() == edited
+    assert remove_owned_extension_config(artifact) == "preserved"
+    assert json.loads(path.read_text())["enabled"] is False
+
+
+def test_new_config_is_removed_when_still_managed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+
+    artifact = ensure_extension_config(8787, None)
+
+    assert remove_owned_extension_config(artifact) == "removed"
+    assert not path.exists()
+
+
+def test_empty_config_retains_exact_prior_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    path.write_bytes(b"")
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+
+    artifact = ensure_extension_config(8787, None)
+
+    assert remove_owned_extension_config(artifact) == "restored"
+    assert path.read_bytes() == b""
+
+
+@pytest.mark.parametrize("content", ["{", "[]", "null"])
+def test_malformed_and_non_object_config_are_not_rewritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: str
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    before = content.encode()
+    path.write_bytes(before)
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+
+    with pytest.raises(click.ClickException, match="pi-extension.json"):
+        ensure_extension_config(8787, None)
+
+    assert path.read_bytes() == before
+
+
+def test_repeated_init_is_byte_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "pi-extension.json"
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+    artifact = ensure_extension_config(8787, None)
+    before = path.read_bytes()
+
+    repeated_artifact = ensure_extension_config(8787, artifact)
+
+    assert path.read_bytes() == before
+    assert repeated_artifact == artifact
+
+
+def test_port_change_rewrites_only_unchanged_managed_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+    artifact = ensure_extension_config(8787, None)
+
+    updated_artifact = ensure_extension_config(9444, artifact)
+
+    assert json.loads(path.read_bytes())["baseUrl"] == "http://127.0.0.1:9444"
+    assert updated_artifact.metadata["previous_base64"] == artifact.metadata["previous_base64"]
+    assert updated_artifact.metadata["managed_sha256"] != artifact.metadata["managed_sha256"]
+
+
+def test_conflicting_user_base_url_is_not_overwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+    artifact = ensure_extension_config(8787, None)
+    before = b'{"baseUrl":"http://127.0.0.1:9999","enabled":false}\n'
+    path.write_bytes(before)
+
+    with pytest.raises(click.ClickException, match="Refusing to overwrite"):
+        ensure_extension_config(9444, artifact)
+
+    assert path.read_bytes() == before
+
+
+def test_config_lifecycle_has_no_omp_models_path_dependency(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+    original_read_bytes = module.Path.read_bytes
+    original_write_bytes = module.Path.write_bytes
+
+    def guarded_read_bytes(candidate: Path) -> bytes:
+        assert candidate.name != "models.yml"
+        return original_read_bytes(candidate)
+
+    def guarded_write_bytes(candidate: Path, content: bytes) -> int:
+        assert candidate.name != "models.yml"
+        return original_write_bytes(candidate, content)
+
+    monkeypatch.setattr(module.Path, "read_bytes", guarded_read_bytes)
+    monkeypatch.setattr(module.Path, "write_bytes", guarded_write_bytes)
+
+    artifact = ensure_extension_config(8787, None)
+    assert remove_owned_extension_config(artifact) == "removed"

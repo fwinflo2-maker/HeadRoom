@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -13,6 +15,7 @@ import click
 
 from headroom._subprocess import run
 from headroom._version import normalize_release_version
+from headroom.fsutil import write_text
 from headroom.install.models import ArtifactRecord
 
 PACKAGE_NAME = "@headroomlabs/pi-extension-headroom"
@@ -41,6 +44,148 @@ def _read_json(path: Path, description: str) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise click.ClickException(f"Could not read valid {description} at {path}: {exc}") from exc
+
+
+def extension_config_path() -> Path:
+    """Return the shared config path consumed by the Pi/OMP extension."""
+    return Path("~/.headroom/integrations/pi-extension.json").expanduser()
+
+
+def _sha256(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _config_payload(content: bytes, path: Path) -> dict[str, Any]:
+    if not content:
+        return {}
+    try:
+        payload = json.loads(content)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise click.ClickException(
+            f"Could not read valid pi-extension.json at {path}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise click.ClickException(f"Pi extension config at {path} must contain an object.")
+    return payload
+
+
+def _config_artifact(
+    path: Path,
+    previous_exists: bool,
+    previous: bytes,
+    managed: bytes,
+) -> ArtifactRecord:
+    return ArtifactRecord(
+        kind="pi-extension-config",
+        path=str(path),
+        metadata={
+            "previous_exists": previous_exists,
+            "previous_base64": base64.b64encode(previous).decode("ascii"),
+            "managed_sha256": _sha256(managed),
+        },
+    )
+
+
+def _owned_config_metadata(artifact: ArtifactRecord, path: Path) -> tuple[bool, bytes, str]:
+    metadata = artifact.metadata
+    if artifact.kind != "pi-extension-config" or Path(artifact.path) != path:
+        raise click.ClickException(f"Invalid Pi extension config ownership record for {path}.")
+    previous_exists = metadata.get("previous_exists")
+    previous_base64 = metadata.get("previous_base64")
+    managed_sha256 = metadata.get("managed_sha256")
+    if (
+        not isinstance(previous_exists, bool)
+        or not isinstance(previous_base64, str)
+        or not isinstance(managed_sha256, str)
+    ):
+        raise click.ClickException(f"Invalid Pi extension config ownership record for {path}.")
+    try:
+        previous = base64.b64decode(previous_base64, validate=True)
+    except ValueError as exc:
+        raise click.ClickException(
+            f"Invalid Pi extension config ownership record for {path}."
+        ) from exc
+    return previous_exists, previous, managed_sha256
+
+
+def ensure_extension_config(port: int, existing_artifact: ArtifactRecord | None) -> ArtifactRecord:
+    """Set the loopback endpoint while preserving exact prior config bytes."""
+    path = extension_config_path().absolute()
+    requested_url = f"http://127.0.0.1:{port}"
+
+    if existing_artifact is None:
+        previous_exists = path.exists()
+        try:
+            previous = path.read_bytes() if previous_exists else b""
+        except OSError as exc:
+            raise click.ClickException(
+                f"Could not read Pi extension config at {path}: {exc}"
+            ) from exc
+        payload = _config_payload(previous, path)
+    else:
+        previous_exists, previous, managed_sha256 = _owned_config_metadata(existing_artifact, path)
+        try:
+            current = path.read_bytes()
+        except FileNotFoundError as exc:
+            raise click.ClickException(
+                f"Refusing to recreate changed Pi extension config at {path}."
+            ) from exc
+        except OSError as exc:
+            raise click.ClickException(
+                f"Could not read Pi extension config at {path}: {exc}"
+            ) from exc
+        payload = _config_payload(current, path)
+        if _sha256(current) != managed_sha256:
+            if payload.get("baseUrl") == requested_url:
+                return existing_artifact
+            raise click.ClickException(
+                f"Refusing to overwrite changed Pi extension config at {path}; "
+                f"baseUrl does not match {requested_url}."
+            )
+        if payload.get("baseUrl") == requested_url:
+            return existing_artifact
+
+    payload["baseUrl"] = requested_url
+    managed = (json.dumps(payload, indent=2) + "\n").encode()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        write_text(path, managed.decode())
+    except OSError as exc:
+        raise click.ClickException(f"Could not write Pi extension config at {path}: {exc}") from exc
+    return _config_artifact(path, previous_exists, previous, managed)
+
+
+def remove_owned_extension_config(
+    artifact: ArtifactRecord,
+) -> Literal["restored", "removed", "preserved", "absent"]:
+    """Undo config ownership only while the managed bytes remain unchanged."""
+    path = extension_config_path().absolute()
+    previous_exists, previous, managed_sha256 = _owned_config_metadata(artifact, path)
+    try:
+        current = path.read_bytes()
+    except FileNotFoundError:
+        return "absent"
+    except OSError as exc:
+        raise click.ClickException(f"Could not read Pi extension config at {path}: {exc}") from exc
+    if _sha256(current) != managed_sha256:
+        return "preserved"
+    if not previous_exists:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return "absent"
+        except OSError as exc:
+            raise click.ClickException(
+                f"Could not remove Pi extension config at {path}: {exc}"
+            ) from exc
+        return "removed"
+    try:
+        write_text(path, previous.decode("utf-8"))
+    except (OSError, UnicodeDecodeError) as exc:
+        raise click.ClickException(
+            f"Could not restore Pi extension config at {path}: {exc}"
+        ) from exc
+    return "restored"
 
 
 def _npm_state(source: str) -> PackageState | None:

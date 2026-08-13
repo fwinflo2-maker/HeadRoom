@@ -1287,6 +1287,22 @@ def test_release_please_config_and_manifest_are_present_and_consistent() -> None
         "changelog because the bot can't find its baseline."
     )
 
+    # This manifest has one package. Sending it through the merge plugin
+    # produces the group title `chore: release main`, which contains neither
+    # the package component nor its version. On merge, release-please cannot
+    # associate that title with `headroom-ai`, leaves the PR tagged
+    # `autorelease: pending`, and never emits the release event that publishes
+    # to PyPI. Keep the single package on the normal, versioned PR path and
+    # preserve the component in the title used to match the merged PR.
+    assert config.get("separate-pull-requests") is True, (
+        "The single root package must bypass release-please's merge plugin; "
+        "its grouped PR title is `chore: release main` and cannot be tagged."
+    )
+    assert config.get("pull-request-title-pattern") == ("chore: release${component} ${version}"), (
+        "Release PR titles must include both component and version so "
+        "release-please can match the merged PR back to headroom-ai."
+    )
+
     # extra-files: TypeScript SDK and npm plugin package.json files
     # files must be in lockstep with pyproject.toml.
     extra_paths = {ef["path"] for ef in root_pkg.get("extra-files", [])}

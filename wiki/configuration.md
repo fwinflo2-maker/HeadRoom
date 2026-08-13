@@ -2,14 +2,14 @@
 
 Headroom can be configured via the SDK, proxy command line, or per-request overrides.
 
-## Release Channels
+## Runtime Rollout Channels
 
-New user-visible behavior should pass through a rollout channel before becoming
-stable by default.
+Rollout channels control behaviors in an already-installed artifact. They do
+not install or select a Headroom release/version.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `HEADROOM_RELEASE_CHANNEL` | `stable` | Selects `stable`, `beta`, `canary`, or `dev`. |
+| `HEADROOM_ROLLOUT_CHANNEL` | `stable` | Selects `stable`, `beta`, `canary`, or `dev`. |
 | `HEADROOM_FEATURES` | unset | Comma-separated feature names to request explicitly. |
 | `HEADROOM_DISABLE_FEATURES` | unset | Comma-separated feature names to force off. Disable wins over every enable path. |
 | `HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES` | unset | Break-glass override for emergency mitigation only. |
@@ -17,7 +17,7 @@ stable by default.
 Example:
 
 ```bash
-export HEADROOM_RELEASE_CHANNEL=canary
+export HEADROOM_ROLLOUT_CHANNEL=canary
 export HEADROOM_FEATURES=tool_result_interceptors
 headroom proxy --intercept-tool-results
 ```

@@ -58,7 +58,7 @@
     "architecture",
     "ci-cd-flows",
     "releases",
-    "release-channels",
+    "runtime-rollouts",
     "benchmarks",
     "limitations",
     "---Help---",

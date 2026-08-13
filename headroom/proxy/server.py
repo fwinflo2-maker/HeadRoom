@@ -5290,7 +5290,7 @@ def run_server(
 ║    Gemini:     {api_targets.gemini:<57}║
 ║    Cloud Code: {api_targets.cloudcode:<57}║
 ║    Vertex AI:  {api_targets.vertex:<57}║
-║    DeepSeek:    {api_targets.deepseek:<57}║
+║    DeepSeek:   {api_targets.deepseek:<57}║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  FEATURES:                                                           ║
 ║    Optimization:    {"ENABLED " if config.optimize else "DISABLED"}                                       ║

@@ -163,3 +163,43 @@ def test_http_responses_output_shaper_holdout_labels_without_rewrite(monkeypatch
     transforms = outcomes[-1].transforms_applied
     assert any(t.startswith("output_shaper:control:") for t in transforms)
     assert "output_shaper:verbosity:L2" not in transforms
+
+
+def test_http_output_shaper_hot_reload_changes_the_running_request_path(monkeypatch):
+    """The admin endpoint must not report success while traffic stays unchanged."""
+    monkeypatch.setenv("HEADROOM_ROLLOUT_CHANNEL", "beta")
+    monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
+    payload = {
+        "model": "gpt-5",
+        "input": [{"type": "function_call_output", "call_id": "call_1", "output": "ok"}],
+        "reasoning": {"effort": "high"},
+        "text": {"verbosity": "medium"},
+    }
+    sent: list[dict[str, Any]] = []
+
+    with _make_client() as client:
+        proxy = client.app.state.proxy
+
+        async def _fake_retry(*args: Any, **kwargs: Any) -> httpx.Response:
+            sent.append(copy.deepcopy(args[3]))
+            return await _ok_response(*args, **kwargs)
+
+        proxy._retry_request = _fake_retry
+        first = client.post(
+            "/v1/responses", headers={"authorization": "Bearer test-key"}, json=payload
+        )
+        update = client.post("/admin/runtime-env", json={"HEADROOM_OUTPUT_SHAPER": "1"})
+        second = client.post(
+            "/v1/responses", headers={"authorization": "Bearer test-key"}, json=payload
+        )
+
+    assert first.status_code == second.status_code == update.status_code == 200
+    assert sent[0] == payload
+    assert "<headroom_output_shaping>" in sent[1]["instructions"]
+    decision = next(
+        item
+        for item in update.json()["rollout"]["features"]
+        if item["name"] == "proxy_output_shaper"
+    )
+    assert decision["enabled"] is True
+    assert decision["decision"] == "legacy_alias"

@@ -166,6 +166,13 @@ class RolloutConfig:
     requested: frozenset[str]
     disabled: frozenset[str]
     unsafe_allow_unstable: bool
+    # Retain source provenance so a supported live compatibility alias can be
+    # re-resolved without erasing a generic kill switch or converting an
+    # explicit request into an alias request. These stay out of the JSON schema.
+    explicit_requested: frozenset[str] = frozenset()
+    explicit_disabled: frozenset[str] = frozenset()
+    legacy_requested: frozenset[str] = frozenset()
+    legacy_disabled: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -258,6 +265,90 @@ class RolloutSnapshot:
             result["qualification_ineligible_reason"] = "unsafe_rollout_override_active"
         return result
 
+    def to_internal_dict(self) -> dict[str, object]:
+        """Serialize source-separated state for trusted worker handoff."""
+
+        return {
+            "schema_version": self.schema_version,
+            "policy_version": self.policy_version,
+            "registry_digest": self.registry_digest,
+            "snapshot_digest": self.snapshot_digest,
+            "channel": self.channel.value,
+            "unsafe_allow_unstable": self.unsafe_allow_unstable,
+            "explicit_requested": sorted(self.config.explicit_requested),
+            "explicit_disabled": sorted(self.config.explicit_disabled),
+            "legacy_requested": sorted(self.config.legacy_requested),
+            "legacy_disabled": sorted(self.config.legacy_disabled),
+        }
+
+    @classmethod
+    def from_internal_dict(cls, value: Mapping[str, object]) -> RolloutSnapshot:
+        """Validate and restore a snapshot serialized for worker handoff."""
+
+        if not isinstance(value, Mapping):
+            raise RolloutConfigurationError("invalid rollout worker snapshot")
+        try:
+            if value.get("schema_version") != ROLLOUT_SCHEMA_VERSION:
+                raise RolloutConfigurationError("unsupported rollout worker schema version")
+            if value.get("policy_version") != ROLLOUT_POLICY_VERSION:
+                raise RolloutConfigurationError("rollout worker policy version mismatch")
+            channel = RolloutChannel.parse(str(value["channel"]), strict=True)
+            unsafe = value["unsafe_allow_unstable"]
+            if not isinstance(unsafe, bool):
+                raise RolloutConfigurationError("invalid rollout worker unsafe override")
+
+            def names(field: str) -> set[str]:
+                raw = value[field]
+                if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+                    raise RolloutConfigurationError(f"invalid rollout worker field {field!r}")
+                return set(_validate_names(set(raw), source=field, strict=True))
+
+            snapshot = _resolve_snapshot(
+                channel=channel,
+                explicit_requested=names("explicit_requested"),
+                explicit_disabled=names("explicit_disabled"),
+                legacy_requested=names("legacy_requested"),
+                legacy_disabled=names("legacy_disabled"),
+                unsafe=unsafe,
+            )
+        except (KeyError, TypeError) as exc:
+            raise RolloutConfigurationError("invalid rollout worker snapshot") from exc
+        if value.get("registry_digest") != snapshot.registry_digest:
+            raise RolloutConfigurationError("rollout worker registry digest mismatch")
+        if value.get("snapshot_digest") != snapshot.snapshot_digest:
+            raise RolloutConfigurationError("rollout worker snapshot digest mismatch")
+        return snapshot
+
+    def with_legacy_env(self, environ: Mapping[str, str]) -> RolloutSnapshot:
+        """Return a new snapshot after applying supplied legacy alias values.
+
+        This intentionally supports existing hot-reloadable aliases without
+        re-reading ambient process state or weakening named disable precedence.
+        Both the old and new snapshots remain immutable, so requests observe a
+        complete policy rather than partially updated fields.
+        """
+
+        legacy_requested = set(self.config.legacy_requested)
+        legacy_disabled = set(self.config.legacy_disabled)
+        for spec in FEATURES.values():
+            for alias in spec.legacy_env:
+                if alias not in environ:
+                    continue
+                legacy_requested.discard(spec.name)
+                legacy_disabled.discard(spec.name)
+                if _truthy(environ[alias]):
+                    legacy_requested.add(spec.name)
+                elif _falsey(environ[alias]):
+                    legacy_disabled.add(spec.name)
+        return _resolve_snapshot(
+            channel=self.channel,
+            explicit_requested=set(self.config.explicit_requested),
+            explicit_disabled=set(self.config.explicit_disabled),
+            legacy_requested=legacy_requested,
+            legacy_disabled=legacy_disabled,
+            unsafe=self.unsafe_allow_unstable,
+        )
+
 
 def _validate_names(names: set[str], *, source: str, strict: bool) -> frozenset[str]:
     unknown = sorted(names - FEATURES.keys())
@@ -282,10 +373,10 @@ def resolve_rollout(
     env = os.environ if environ is None else environ
     channel = RolloutChannel.parse(env.get("HEADROOM_ROLLOUT_CHANNEL"), strict=strict)
     requested_names = _split_names(env.get("HEADROOM_FEATURES")) | {
-        name.strip().lower().replace("-", "_") for name in requested
+        normalized for name in requested if (normalized := name.strip().lower().replace("-", "_"))
     }
     disabled_names = _split_names(env.get("HEADROOM_DISABLE_FEATURES")) | {
-        name.strip().lower().replace("-", "_") for name in disabled
+        normalized for name in disabled if (normalized := name.strip().lower().replace("-", "_"))
     }
     requested_names = set(
         _validate_names(requested_names, source="requested features", strict=strict)
@@ -300,13 +391,39 @@ def resolve_rollout(
             elif _falsey(env.get(alias)):
                 legacy_disabled.add(spec.name)
 
-    disabled_names.update(legacy_disabled)
     unsafe = _truthy(env.get("HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES"))
+    return _resolve_snapshot(
+        channel=channel,
+        explicit_requested=requested_names,
+        explicit_disabled=disabled_names,
+        legacy_requested=legacy_requested,
+        legacy_disabled=legacy_disabled,
+        unsafe=unsafe,
+    )
+
+
+def _resolve_snapshot(
+    *,
+    channel: RolloutChannel,
+    explicit_requested: set[str],
+    explicit_disabled: set[str],
+    legacy_requested: set[str],
+    legacy_disabled: set[str],
+    unsafe: bool,
+) -> RolloutSnapshot:
+    """Resolve validated, source-separated inputs into one snapshot."""
+
+    requested_names = explicit_requested | legacy_requested
+    disabled_names = explicit_disabled | legacy_disabled
     config = RolloutConfig(
         channel=channel,
-        requested=frozenset(requested_names | legacy_requested),
+        requested=frozenset(requested_names),
         disabled=frozenset(disabled_names),
         unsafe_allow_unstable=unsafe,
+        explicit_requested=frozenset(explicit_requested),
+        explicit_disabled=frozenset(explicit_disabled),
+        legacy_requested=frozenset(legacy_requested),
+        legacy_disabled=frozenset(legacy_disabled),
     )
     decisions: list[FeatureDecision] = []
     for name, spec in sorted(FEATURES.items()):
@@ -321,7 +438,7 @@ def resolve_rollout(
             enabled, reason = True, FeatureDecisionReason.UNSAFE_OVERRIDE
         elif name in legacy_requested:
             enabled, reason = True, FeatureDecisionReason.LEGACY_ALIAS
-        elif name in requested_names:
+        elif name in explicit_requested:
             enabled, reason = True, FeatureDecisionReason.EXPLICIT
         elif spec.default_enabled(channel):
             enabled, reason = True, FeatureDecisionReason.DEFAULT

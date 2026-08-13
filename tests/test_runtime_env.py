@@ -14,6 +14,7 @@ pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
+from headroom.rollout import resolve_rollout  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -153,6 +154,48 @@ def test_admin_runtime_env_applies_and_reflects_in_health(loopback_client):
     health = loopback_client.get("/health").json()["config"]["runtime_env"]
     assert health["HEADROOM_OUTPUT_SHAPER"] == "1"
     assert health["HEADROOM_VERBOSITY_LEVEL"] == "3"
+
+
+@pytest.mark.parametrize(
+    ("rollout", "expected_enabled", "expected_reason"),
+    [
+        (resolve_rollout({"HEADROOM_ROLLOUT_CHANNEL": "beta"}), True, "legacy_alias"),
+        (resolve_rollout({}), False, "blocked_by_channel"),
+        (
+            resolve_rollout(
+                {
+                    "HEADROOM_ROLLOUT_CHANNEL": "beta",
+                    "HEADROOM_DISABLE_FEATURES": "proxy_output_shaper",
+                }
+            ),
+            False,
+            "disabled",
+        ),
+    ],
+)
+def test_admin_runtime_env_reresolves_running_rollout_without_weakening_policy(
+    rollout, expected_enabled, expected_reason
+):
+    app = create_app(
+        ProxyConfig(
+            rollout=rollout,
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+        )
+    )
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+        before = client.get("/stats?cached=1").json()["rollout"]
+        response = client.post("/admin/runtime-env", json={"HEADROOM_OUTPUT_SHAPER": "1"})
+        after = client.get("/stats?cached=1").json()["rollout"]
+
+    decision = next(item for item in after["features"] if item["name"] == "proxy_output_shaper")
+    assert response.status_code == 200
+    assert response.json()["rollout"] == after
+    assert decision["enabled"] is expected_enabled
+    assert decision["decision"] == expected_reason
+    assert after["snapshot_digest"] != before["snapshot_digest"]
 
 
 def test_admin_runtime_env_rejects_non_object(loopback_client):

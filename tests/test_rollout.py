@@ -15,6 +15,9 @@ from headroom.rollout import (
     FeatureSpec,
     RolloutChannel,
     RolloutConfigurationError,
+    RolloutSnapshot,
+    current_rollout,
+    feature_enabled,
     registry_digest,
     resolve_rollout,
 )
@@ -33,6 +36,25 @@ def test_default_stable_resolution_is_versioned_and_eligible() -> None:
 @pytest.mark.parametrize("channel", ["beta", "canary", "dev"])
 def test_valid_rollout_channels(channel: str) -> None:
     assert resolve_rollout({"HEADROOM_ROLLOUT_CHANNEL": channel}).channel.value == channel
+
+
+@pytest.mark.parametrize(
+    ("alias", "expected"),
+    [
+        ("prod", RolloutChannel.STABLE),
+        ("production", RolloutChannel.STABLE),
+        ("preview", RolloutChannel.BETA),
+        ("nightly", RolloutChannel.CANARY),
+        ("development", RolloutChannel.DEV),
+    ],
+)
+def test_channel_aliases(alias: str, expected: RolloutChannel) -> None:
+    assert RolloutChannel.parse(alias) is expected
+
+
+def test_strict_channel_configuration_rejects_unknown_input() -> None:
+    with pytest.raises(RolloutConfigurationError, match="unknown rollout channel"):
+        resolve_rollout({"HEADROOM_ROLLOUT_CHANNEL": "stabel"}, strict=True)
 
 
 def test_unknown_channel_fails_closed_with_diagnostic(caplog: pytest.LogCaptureFixture) -> None:
@@ -158,6 +180,108 @@ def test_disable_still_beats_unsafe_override() -> None:
     assert snapshot.decision("tool_result_interceptors").reason is FeatureDecisionReason.DISABLED
 
 
+def test_live_legacy_reresolution_preserves_channel_and_named_kill_switch() -> None:
+    eligible = resolve_rollout({"HEADROOM_ROLLOUT_CHANNEL": "beta"})
+    enabled = eligible.with_legacy_env({"HEADROOM_OUTPUT_SHAPER": "1"})
+    disabled_again = enabled.with_legacy_env({"HEADROOM_OUTPUT_SHAPER": "0"})
+    killed = resolve_rollout(
+        {
+            "HEADROOM_ROLLOUT_CHANNEL": "beta",
+            "HEADROOM_DISABLE_FEATURES": "proxy_output_shaper",
+        }
+    ).with_legacy_env({"HEADROOM_OUTPUT_SHAPER": "1"})
+    blocked = resolve_rollout({}).with_legacy_env({"HEADROOM_OUTPUT_SHAPER": "1"})
+
+    assert enabled.decision("proxy_output_shaper").reason is FeatureDecisionReason.LEGACY_ALIAS
+    assert disabled_again.decision("proxy_output_shaper").reason is FeatureDecisionReason.DISABLED
+    assert killed.decision("proxy_output_shaper").reason is FeatureDecisionReason.DISABLED
+    assert (
+        blocked.decision("proxy_output_shaper").reason is FeatureDecisionReason.BLOCKED_BY_CHANNEL
+    )
+    assert enabled.snapshot_digest != eligible.snapshot_digest
+
+
+def test_empty_programmatic_feature_names_are_ignored() -> None:
+    snapshot = resolve_rollout({}, requested=["", "  "], disabled=[""])
+
+    assert snapshot.config.requested == frozenset()
+    assert snapshot.config.disabled == frozenset()
+
+
+def test_multi_worker_config_round_trip_preserves_typed_rollout(monkeypatch) -> None:
+    from headroom.proxy.models import ProxyConfig
+    from headroom.proxy.server import (
+        _MULTI_WORKER_CONFIG_ENV,
+        _proxy_config_from_env,
+        _proxy_config_payload,
+    )
+
+    rollout = resolve_rollout(
+        {
+            "HEADROOM_ROLLOUT_CHANNEL": "beta",
+            "HEADROOM_OUTPUT_SHAPER": "1",
+            "HEADROOM_DISABLE_FEATURES": "read_maturation",
+        }
+    )
+    original = ProxyConfig(rollout=rollout)
+    monkeypatch.setenv(_MULTI_WORKER_CONFIG_ENV, json.dumps(_proxy_config_payload(original)))
+
+    restored = _proxy_config_from_env()
+
+    assert restored.rollout is not None
+    assert restored.rollout.to_internal_dict() == rollout.to_internal_dict()
+    assert restored.rollout.is_enabled("proxy_output_shaper") is True
+    assert restored.rollout.is_enabled("read_maturation") is False
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ({"schema_version": 999}, "schema version"),
+        ({"policy_version": "999"}, "policy version"),
+        ({"unsafe_allow_unstable": "yes"}, "unsafe override"),
+        ({"explicit_requested": "proxy_output_shaper"}, "explicit_requested"),
+        ({"registry_digest": "sha256:tampered"}, "registry digest"),
+        ({"snapshot_digest": "sha256:tampered"}, "snapshot digest"),
+    ],
+)
+def test_worker_rollout_handoff_rejects_invalid_or_tampered_state(
+    mutation: dict[str, object], message: str
+) -> None:
+    payload = resolve_rollout({}).to_internal_dict()
+    payload.update(mutation)
+
+    with pytest.raises(RolloutConfigurationError, match=message):
+        RolloutSnapshot.from_internal_dict(payload)
+
+
+def test_worker_rollout_handoff_rejects_non_object_state() -> None:
+    with pytest.raises(RolloutConfigurationError, match="invalid rollout worker snapshot"):
+        RolloutSnapshot.from_internal_dict([])  # type: ignore[arg-type]
+
+
+def test_snapshot_query_and_compatibility_helpers() -> None:
+    snapshot = current_rollout(
+        {
+            "HEADROOM_ROLLOUT_CHANNEL": "canary",
+            "HEADROOM_FEATURES": "tool_result_interceptors",
+            "HEADROOM_DISABLE_FEATURES": "read_maturation",
+        }
+    )
+
+    assert snapshot.is_available("tool-result-interceptors") is True
+    assert snapshot.enabled == frozenset({"tool_result_interceptors"})
+    assert snapshot.disabled == frozenset({"read_maturation"})
+    assert feature_enabled(
+        "tool_result_interceptors",
+        explicit=True,
+        environ={"HEADROOM_ROLLOUT_CHANNEL": "canary"},
+    )
+    assert not feature_enabled("tool_result_interceptors", environ={})
+    with pytest.raises(KeyError, match="missing"):
+        snapshot.decision("missing")
+
+
 def test_registry_and_snapshot_digests_are_deterministic_and_policy_sensitive() -> None:
     first = resolve_rollout({"HEADROOM_ROLLOUT_CHANNEL": "canary"})
     second = resolve_rollout({"HEADROOM_ROLLOUT_CHANNEL": "canary"})
@@ -217,6 +341,54 @@ def test_cli_json_status_and_strict_error() -> None:
     assert payload["features"][2]["name"] == "tool_result_interceptors"
     assert invalid.exit_code != 0
     assert "unknown rollout feature" in invalid.output
+
+
+def test_cli_human_status_exercises_disable_and_unsafe_options() -> None:
+    result = CliRunner().invoke(
+        main,
+        [
+            "rollout",
+            "status",
+            "--channel",
+            "stable",
+            "--features",
+            "tool_result_interceptors",
+            "--disable-features",
+            "read_maturation",
+            "--unsafe-allow-unstable-features",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Rollout channel: stable" in result.output
+    assert "Qualification eligible: false" in result.output
+    assert "tool_result_interceptors: enabled=true decision=unsafe_override" in result.output
+    assert "read_maturation: enabled=false decision=disabled" in result.output
+
+
+@pytest.mark.parametrize(
+    ("option", "message", "required_channel"),
+    [
+        ("--read-maturation", "--read-maturation is not available", "beta"),
+        (
+            "--intercept-tool-results",
+            "--intercept-tool-results is not available",
+            "canary",
+        ),
+    ],
+)
+def test_proxy_cli_fails_loudly_when_explicit_feature_is_channel_blocked(
+    option: str, message: str, required_channel: str
+) -> None:
+    result = CliRunner().invoke(
+        main,
+        ["proxy", option],
+        env={"HEADROOM_ROLLOUT_CHANNEL": "stable"},
+    )
+
+    assert result.exit_code == 1
+    assert message in result.output
+    assert f"HEADROOM_ROLLOUT_CHANNEL={required_channel}" in result.output
 
 
 def test_shared_python_rust_policy_vectors() -> None:

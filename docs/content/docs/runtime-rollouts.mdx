@@ -52,6 +52,12 @@ at configuration construction. The immutable snapshot is injected into the
 proxy and transform pipelines; changing the process environment afterward does
 not alter a running proxy.
 
+The existing loopback-only `/admin/runtime-env` endpoint is one narrow
+exception: hot-reloading the legacy `HEADROOM_OUTPUT_SHAPER` alias replaces the
+proxy's immutable snapshot with a newly resolved snapshot. Channel bounds and
+`HEADROOM_DISABLE_FEATURES` still win, and `/stats.rollout` changes with the
+effective running decision. Ambient environment mutation remains ignored.
+
 Precedence is deterministic:
 
 | Condition | Result |
@@ -82,9 +88,11 @@ while its snapshot reports:
 }
 ```
 
-An unknown channel logs a warning and falls back to `stable`. Unknown feature
-names from the environment log a warning and are ignored (fail-closed). Explicit
-CLI diagnostics reject unknown channels/features and list the valid features.
+The Python resolver logs a warning and falls back to `stable` for an unknown
+channel; unknown feature names are warned and ignored (fail-closed). Explicit
+Python diagnostics (`headroom rollout status`) and the Rust front proxy's typed
+CLI/environment parser reject unknown channels/features and list valid values
+before startup.
 
 ## Machine-readable status and provenance
 
@@ -159,5 +167,5 @@ Contributors should add named registry entries and tests for default behavior,
 explicit request, channel blocking, disable precedence, unsafe behavior,
 decision reasons, and provenance rather than reading rollout variables inside
 implementation components. Python and Rust registries contain features relevant
-to their own runtimes, but share channel ordering, precedence, reasons, invalid
-input handling, and deterministic identity semantics.
+to their own runtimes, but share channel ordering, precedence, decision reasons,
+fail-closed invalid-input semantics, and deterministic identity semantics.

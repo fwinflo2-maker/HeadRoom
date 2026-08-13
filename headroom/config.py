@@ -673,7 +673,7 @@ class HeadroomConfig:
     content_router_enabled: InitVar[bool | None] = None
 
     # Tool-result interceptors (ast-grep Read outline, etc.). Opt-in for now.
-    # Env var HEADROOM_INTERCEPT_ENABLED=1 also enables (for CLI `--intercept-tool-results`).
+    # The legacy env alias and this typed request still obey the canary rollout gate.
     intercept_tool_results: bool = False
 
     # Immutable runtime rollout state. ``None`` is resolved once here so every

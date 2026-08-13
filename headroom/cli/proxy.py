@@ -258,7 +258,7 @@ def dashboard(port: int, no_open: bool) -> None:
     is_flag=True,
     help=(
         "Opt in to tool_result interceptors (ast-grep Read outliner, etc.). "
-        "Off by default while this feature ships."
+        "Requires HEADROOM_ROLLOUT_CHANNEL=canary (or dev)."
     ),
 )
 @click.option("--no-optimize", is_flag=True, help="Disable optimization (passthrough mode)")
@@ -641,7 +641,8 @@ def dashboard(port: int, no_open: bool) -> None:
     help=(
         "EXPERIMENTAL: activity-based read maturation — hold fresh Reads "
         "out of the provider prefix cache and compress them once their "
-        "file quiesces (env: HEADROOM_READ_MATURATION=1)"
+        "file quiesces. Requires HEADROOM_ROLLOUT_CHANNEL=beta (or dev); "
+        "env: HEADROOM_READ_MATURATION=1."
     ),
 )
 @click.option(
@@ -1091,6 +1092,17 @@ def proxy(
     if read_maturation:
         rollout_requests.append("read_maturation")
     rollout_snapshot = resolve_rollout(os.environ, requested=rollout_requests)
+
+    if read_maturation and not rollout_snapshot.is_enabled("read_maturation"):
+        click.secho(
+            "error: --read-maturation is not available in the current rollout channel "
+            f"({rollout_snapshot.channel.value}). Set HEADROOM_ROLLOUT_CHANNEL=beta "
+            "(or dev), or use HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES=1 for an "
+            "emergency override.",
+            fg="red",
+            err=True,
+        )
+        sys.exit(1)
 
     # Opt-in: turn on tool_result interceptors (ast-grep Read outline, etc.).
     # Only fetch the bundled CLI tool binaries when the feature is enabled —

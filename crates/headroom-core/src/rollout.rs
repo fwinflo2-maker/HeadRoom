@@ -420,8 +420,8 @@ mod tests {
         ))
         .unwrap();
         for vector in vectors {
-            let requested = vector.requested.then_some("canary_probe").unwrap_or("");
-            let disabled = vector.disabled.then_some("canary_probe").unwrap_or("");
+            let requested = if vector.requested { "canary_probe" } else { "" };
+            let disabled = if vector.disabled { "canary_probe" } else { "" };
             let rollout = RolloutSnapshot::from_parts(
                 &vector.channel,
                 requested,

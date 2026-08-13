@@ -245,6 +245,7 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 | Cortex Code  | Library only    | 60–65% savings (library mode; no `wrap`) |
 | Kimi CLI     | ✅              | OAuth bearer forwarded — log in once |
 | ZCode        | ✅              | starts proxy and prints base URLs for ZCode settings |
+| DeepSeek Harness (dsh) | ✅ | `web` + `headless`; routes via `DEEPSEEK_BASE_URL` |
 
 Any OpenAI-compatible client works via `headroom proxy`. MCP-native: `headroom mcp install`.
 Undo durable wrapping with `headroom unwrap <tool>` (supports: `claude`, `copilot`, `codex`, `grok`, `kimi`, `omp`, `opencode`, `openclaw`, `zcode`).

@@ -45,3 +45,17 @@ def test_resolve_api_targets_deepseek_strips_v1() -> None:
         ProviderApiOverrides(deepseek="http://127.0.0.1:4000/v1")
     )
     assert targets.deepseek == "http://127.0.0.1:4000"
+
+
+from headroom.proxy.models import ProxyConfig
+
+
+def test_proxy_config_exposes_deepseek_api_url_in_overrides() -> None:
+    config = ProxyConfig(deepseek_api_url="https://deepseek.internal")
+    assert config.provider_api_overrides.deepseek == "https://deepseek.internal"
+
+
+def test_proxy_config_deepseek_defaults_to_none() -> None:
+    config = ProxyConfig()
+    assert config.deepseek_api_url is None
+    assert config.provider_api_overrides.deepseek is None

@@ -468,6 +468,74 @@ def test_handle_openai_responses_routes_api_key_auth_direct_to_openai(monkeypatc
     assert response.status_code == 200
 
 
+def test_handle_openai_responses_non_stream_adapts_sse_upstream(monkeypatch):
+    """A ``stream: false`` request whose upstream replies ``200
+    text/event-stream`` must be adapted to the terminal response JSON, not
+    converted into a 502 proxy_error (#2613)."""
+    import httpx
+
+    sse = (
+        b"event: response.completed\n"
+        b'data: {"type":"response.completed","response":{"id":"resp_sse_repro",'
+        b'"output":[],"usage":{"input_tokens":2,"output_tokens":1}}}\n\n'
+    )
+
+    class _SSEUpstreamHandler(_DummyOpenAIHandler):
+        async def _retry_request(self, method, url, headers, body, **kwargs):
+            self.captured_request = (method, url, headers, body)
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=sse,
+            )
+
+    request = _build_request(
+        {"model": "gpt-5.4", "stream": False, "input": "hello"},
+        {"Authorization": "Bearer sk-test"},
+    )
+    handler = _SSEUpstreamHandler()
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert response.status_code == 200, response.body
+    payload = json.loads(response.body)
+    assert payload["id"] == "resp_sse_repro"
+    assert response.headers["content-type"].startswith("application/json")
+
+
+def test_handle_openai_responses_non_stream_passes_through_unparseable_sse(monkeypatch):
+    """A 200 SSE upstream body with no recognizable terminal response event
+    must be forwarded as-is — never converted into a 502 (#2613)."""
+    import httpx
+
+    sse = b"event: response.weird\ndata: not-json\n\n"
+
+    class _SSEUpstreamHandler(_DummyOpenAIHandler):
+        async def _retry_request(self, method, url, headers, body, **kwargs):
+            self.captured_request = (method, url, headers, body)
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=sse,
+            )
+
+    request = _build_request(
+        {"model": "gpt-5.4", "stream": False, "input": "hello"},
+        {"Authorization": "Bearer sk-test"},
+    )
+    handler = _SSEUpstreamHandler()
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert response.status_code == 200, response.body
+    assert response.body == sse
+    assert response.headers["content-type"] == "text/event-stream"
+
+
 def test_handle_openai_responses_stream_skips_python_compression(monkeypatch):
     """PR-C5: Python no longer compresses /v1/responses (Rust handles it
     natively). The streaming forward path must still fire — only the

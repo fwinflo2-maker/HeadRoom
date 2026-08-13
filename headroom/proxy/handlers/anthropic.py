@@ -36,7 +36,7 @@ from headroom.proxy.auth_mode import (
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
-from headroom.proxy.helpers import extract_tags
+from headroom.proxy.helpers import extract_tags, relocate_system_messages_to_top_level
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
@@ -71,6 +71,20 @@ def _strip_index_from_content_blocks(content: Any) -> None:
             block.pop("index", None)
             # tool_result blocks nest their own content list of blocks.
             _strip_index_from_content_blocks(block.get("content"))
+
+
+def _looks_like_sse_response(response: httpx.Response) -> bool:
+    """Return whether an upstream reply is a Server-Sent Events stream.
+
+    Trusts the declared content-type first and falls back to sniffing the
+    leading bytes for an SSE field, because a gateway in front of Anthropic may
+    relay the stream under a vaguer type.
+    """
+    content_type = (response.headers.get("content-type") or "").lower()
+    if "text/event-stream" in content_type:
+        return True
+    head = response.content[:64].lstrip()
+    return head.startswith(b"event:") or head.startswith(b"data:")
 
 
 class AnthropicHandlerMixin:
@@ -1054,6 +1068,11 @@ class AnthropicHandlerMixin:
                     response_headers = dict(cached.response_headers)
                     response_headers.pop("content-encoding", None)
                     response_headers.pop("content-length", None)
+                    # Drop the stored content-type too. Starlette lets an
+                    # explicit header win over ``media_type``, so keeping the
+                    # producing request's type would let a cache entry hand this
+                    # caller a wire format it never asked for (#2952).
+                    response_headers.pop("content-type", None)
 
                     # Unit 4: release the pre-upstream semaphore on cache
                     # hit — no upstream call will happen.
@@ -2006,6 +2025,10 @@ class AnthropicHandlerMixin:
                     inject_system_instructions=inject_system_instructions,
                 )
                 injector.scan_for_markers(optimized_messages)
+                # Shape-only scanning also matches markers from other context
+                # tools; drop hashes this proxy never actually stored before
+                # they can drive tool injection (issue #2836).
+                injector.verify_ownership()
                 if inject_system_instructions and injector.has_compressed_content:
                     optimized_messages = injector.inject_into_system_message(optimized_messages)
 
@@ -2026,7 +2049,10 @@ class AnthropicHandlerMixin:
                 # dropping the gate cannot start injecting into non-CCR
                 # conversations.
                 if configured_inject_tool:
-                    from headroom.proxy.helpers import apply_session_sticky_ccr_tool
+                    from headroom.proxy.helpers import (
+                        apply_session_sticky_ccr_tool,
+                        history_references_ccr_tool,
+                    )
 
                     # Inject whenever the request carries ANY CCR marker, new or
                     # replayed from the frozen prefix. #1850 narrowed the
@@ -2051,6 +2077,7 @@ class AnthropicHandlerMixin:
                         request_id=request_id,
                         existing_tools=tools,
                         has_compressed_content_this_turn=injector.has_compressed_content,
+                        history_has_ccr_reference=history_references_ccr_tool(optimized_messages),
                     )
                     if ccr_tool_injected:
                         logger.debug(
@@ -2710,6 +2737,28 @@ class AnthropicHandlerMixin:
                     _ts_stripped,
                 )
 
+            # CCR retrieve history repair (#2814). Run beside the tool-search
+            # repair and after both normal CCR injection and turn hooks, so it
+            # validates against the final outbound tools array. A side-request
+            # that does not declare headroom_retrieve cannot retain historical
+            # tool_use/tool_result references that Anthropic would reject.
+            from headroom.proxy.helpers import strip_unsupported_ccr_retrieve_blocks
+
+            _ccr_repaired, _ccr_neutralized = strip_unsupported_ccr_retrieve_blocks(
+                body.get("messages"), body.get("tools")
+            )
+            if _ccr_neutralized:
+                body["messages"] = _ccr_repaired
+                optimized_messages = _ccr_repaired
+                body_mutation_tracker.mark_mutated("ccr_retrieve_history_repair")
+                transforms_applied.append(f"router:ccr_retrieve_repair:{_ccr_neutralized}blocks")
+                logger.info(
+                    "[%s] CCR: neutralized %d headroom_retrieve history block(s) "
+                    "(tools array does not declare the tool this turn)",
+                    request_id,
+                    _ccr_neutralized,
+                )
+
             # Consistency: report tok_before/tok_after with ONE tokenizer. The pipeline
             # and the handler use different token estimators, and cache-mode branches
             # can leave original_tokens (handler, line ~1049) and optimized_tokens
@@ -2763,7 +2812,13 @@ class AnthropicHandlerMixin:
                     shape_request,
                 )
 
-                _shaper_settings = OutputShaperSettings.from_env()
+                _shaper_settings = OutputShaperSettings.from_env(
+                    enabled=(
+                        self.config.rollout.is_enabled("proxy_output_shaper")
+                        if getattr(self.config, "rollout", None) is not None
+                        else None
+                    )
+                )
                 if _shaper_settings.enabled:
                     # Conversation-stable holdout assignment: a whole
                     # conversation is treatment or control. This keeps the A/B
@@ -2808,6 +2863,28 @@ class AnthropicHandlerMixin:
                 "total_pre_upstream",
                 (time.perf_counter() - pre_upstream_started_at) * 1000.0,
             )
+
+            # Anthropic wire-contract guard (issue #765). Any transform or
+            # pipeline extension above may have left a ``role="system"`` entry
+            # in ``messages`` (e.g. a harness system block relocated during
+            # compression). Anthropic rejects that with a 400 ("messages.0: use
+            # the top-level 'system' parameter ..."), so relocate it back to the
+            # top-level ``system`` parameter as the last step before forwarding.
+            relocated_messages, relocated_system, system_relocated = (
+                relocate_system_messages_to_top_level(body["messages"], body.get("system"))
+            )
+            if system_relocated:
+                body["messages"] = relocated_messages
+                if relocated_system is None:
+                    body.pop("system", None)
+                else:
+                    body["system"] = relocated_system
+                body_mutation_tracker.mark_mutated("system_role_relocated")
+                logger.warning(
+                    "[%s] Relocated role=system message(s) out of messages[] into the "
+                    "top-level system parameter (Anthropic wire-contract guard, issue #765)",
+                    request_id,
+                )
 
             # Byte-faithful forwarder support (PR-A3, fixes P0-2). At this
             # point body has been through every transform (image, compression,
@@ -3097,13 +3174,37 @@ class AnthropicHandlerMixin:
                 ccr_response_handler_enabled = bool(
                     self.ccr_response_handler and getattr(ccr_handler_config, "enabled", True)
                 )
-                buffered_stream_ccr = bool(
+                # A body carrying signed thinking blocks leaves as the client's
+                # original bytes (see ``select_outbound_body``), which throws
+                # away every edit made here — including the ``stream`` flip
+                # below. Taking the buffered path anyway asks upstream for a
+                # stream:true reply and then tries to read it as buffered JSON:
+                # the parse fails, SSE resynthesis is skipped, and the client
+                # gets a 200 with no usable body (#2952). The retrieve tool is
+                # itself an injected (and equally discarded) mutation on these
+                # turns, so the plain streaming path is the coherent choice.
+                from headroom.proxy.body_forwarding import outbound_body_is_client_bytes
+
+                outbound_locked_to_client_bytes = outbound_body_is_client_bytes(
+                    body=body,
+                    original_body_bytes=original_body_bytes,
+                )
+                wants_buffered_stream_ccr = bool(
                     stream
                     and ccr_response_handler_enabled
                     and self._has_headroom_retrieve_tool(
                         tools if tools is not None else body.get("tools")
                     )
                 )
+                buffered_stream_ccr = (
+                    wants_buffered_stream_ccr and not outbound_locked_to_client_bytes
+                )
+                if wants_buffered_stream_ccr and outbound_locked_to_client_bytes:
+                    logger.info(
+                        f"[{request_id}] CCR: signed thinking blocks force byte-faithful "
+                        "passthrough, so a stream:false flip could not reach upstream; "
+                        "using the plain streaming path instead of buffered retrieval"
+                    )
                 if buffered_stream_ccr:
                     if body.get("stream") is not False:
                         body["stream"] = False
@@ -3386,9 +3487,23 @@ class AnthropicHandlerMixin:
                         try:
                             resp_json = response.json()
                         except (json.JSONDecodeError, ValueError) as e:
-                            logger.debug(
-                                f"[{request_id}] Failed to parse response JSON for CCR handling: {e}"
-                            )
+                            # DEBUG is right for the buffered non-stream path, where
+                            # an unparseable body is just "no CCR handling". On the
+                            # buffered-stream path it means the reply came back in a
+                            # wire format we did not ask for, and every downstream
+                            # step (retrieval, SSE resynthesis, usage accounting)
+                            # silently no-ops — that has to be visible (#2952).
+                            if buffered_stream_ccr:
+                                logger.warning(
+                                    f"[{request_id}] CCR: buffered stream:false request got a "
+                                    f"non-JSON {response.status_code} reply "
+                                    f"(content-type={response.headers.get('content-type')!r}): {e}"
+                                )
+                            else:
+                                logger.debug(
+                                    f"[{request_id}] Failed to parse response JSON for CCR "
+                                    f"handling: {e}"
+                                )
 
                         # CCR Response Handling: Handle headroom_retrieve tool calls automatically
                         if (
@@ -3716,7 +3831,13 @@ class AnthropicHandlerMixin:
                         # Cache response under the SAME key it was looked up by:
                         # cache_lookup_messages is the raw pre-mutation snapshot, not
                         # the live (compressed/hooked) `messages` (#327).
-                        if self.cache and response.status_code == 200:
+                        # ``resp_json`` is None when the reply did not parse as
+                        # JSON — an SSE stream, most often. Caching those bytes
+                        # poisons the entry for every later caller that shares
+                        # the key: the cache key has no ``stream`` component, so
+                        # a buffered request would be answered with a stream it
+                        # cannot read (#2952).
+                        if self.cache and response.status_code == 200 and resp_json is not None:
                             await self.cache.set(
                                 cache_lookup_messages,
                                 model,
@@ -3878,6 +3999,44 @@ class AnthropicHandlerMixin:
                                 logger.warning(
                                     f"[{request_id}] Security response scan error: {sec_err}"
                                 )
+
+                        if (
+                            buffered_stream_ccr
+                            and response.status_code == 200
+                            and not resp_json
+                            and _looks_like_sse_response(response)
+                        ):
+                            # Upstream streamed instead of buffering, so there is
+                            # nothing to resynthesize — but the client asked for a
+                            # stream and this already is one. Relay it verbatim
+                            # rather than falling through to a plain Response the
+                            # _BufferedCCRResponse wrapper can only turn into a bare
+                            # error event (#2952).
+                            logger.warning(
+                                f"[{request_id}] CCR: relaying the upstream SSE reply verbatim; "
+                                "server-side retrieval was skipped for this turn"
+                            )
+                            relay_headers = {
+                                k: v
+                                for k, v in response_headers.items()
+                                if k.lower()
+                                not in (
+                                    "content-encoding",
+                                    "content-length",
+                                    "transfer-encoding",
+                                    "content-type",
+                                )
+                            }
+                            relayed_sse = response.content
+
+                            async def _upstream_sse_relay():
+                                yield relayed_sse
+
+                            return StreamingResponse(
+                                _upstream_sse_relay(),
+                                media_type="text/event-stream",
+                                headers=relay_headers,
+                            )
 
                         if buffered_stream_ccr and response.status_code == 200 and resp_json:
                             sse_headers = {

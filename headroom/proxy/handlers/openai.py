@@ -674,6 +674,7 @@ def _shape_openai_responses_payload(
     *,
     model: str,
     request_id: str,
+    output_shaper_enabled: bool | None = None,
 ) -> tuple[list[str], bool]:
     """Output shaping for a Responses payload (opt-in, HEADROOM_OUTPUT_SHAPER).
 
@@ -704,7 +705,7 @@ def _shape_openai_responses_payload(
             shape_responses_request,
         )
 
-        settings = OutputShaperSettings.from_env()
+        settings = OutputShaperSettings.from_env(enabled=output_shaper_enabled)
         if not settings.enabled:
             return [], False
 
@@ -1181,6 +1182,47 @@ def _openai_responses_to_sse(response: dict[str, Any]) -> list[bytes]:
     return events
 
 
+def _openai_responses_from_sse(sse_text: str) -> dict[str, Any] | None:
+    """Reassemble the final Responses API JSON body from an SSE stream.
+
+    Inverse of ``_openai_responses_to_sse``, for upstreams that answer a
+    ``stream: false`` request with a valid ``200 text/event-stream`` body
+    (#2613). The terminal ``response.completed`` event carries the complete
+    response object, so no delta accumulation is needed. Returns ``None``
+    when no terminal event is present — the caller forwards the raw body
+    unchanged in that case.
+    """
+    completed: dict[str, Any] | None = None
+    data_lines: list[str] = []
+
+    def _consume(lines: list[str]) -> None:
+        nonlocal completed
+        if not lines:
+            return
+        data_str = "\n".join(lines)
+        if data_str == "[DONE]":
+            return
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            return
+        if isinstance(data, dict) and data.get("type") == "response.completed":
+            response = data.get("response")
+            if isinstance(response, dict):
+                completed = response
+
+    for raw_line in sse_text.split("\n"):
+        line = raw_line.rstrip("\r")
+        if not line:
+            _consume(data_lines)
+            data_lines = []
+        elif line.startswith("data:"):
+            # Per the SSE spec, strip at most one leading space after the colon.
+            data_lines.append(line[5:].removeprefix(" "))
+    _consume(data_lines)
+    return completed
+
+
 def _output_shaping_holdout_fraction() -> float:
     from headroom.proxy import runtime_env
 
@@ -1196,6 +1238,7 @@ def _shape_openai_responses_for_output(
     input_tokens: int,
     model: str,
     conversation_key: str | None = None,
+    output_shaper_enabled: bool | None = None,
 ) -> Any:
     """Apply OpenAI Responses output shaping and attach holdout labels."""
     from headroom.proxy.output_savings import (
@@ -1212,7 +1255,7 @@ def _shape_openai_responses_for_output(
         shape_openai_responses_request,
     )
 
-    settings = OutputShaperSettings.from_env()
+    settings = OutputShaperSettings.from_env(enabled=output_shaper_enabled)
     result = ShapeResult()
     if not settings.enabled:
         return result
@@ -1279,6 +1322,7 @@ def _shape_openai_response_create_frame(
     *,
     input_tokens: int,
     conversation_key: str | None = None,
+    output_shaper_enabled: bool | None = None,
 ) -> tuple[str, bool, list[str], str | None]:
     try:
         parsed = json.loads(raw_msg)
@@ -1297,6 +1341,7 @@ def _shape_openai_response_create_frame(
         input_tokens=input_tokens,
         model=str(payload.get("model") or ""),
         conversation_key=conversation_key,
+        output_shaper_enabled=output_shaper_enabled,
     )
     labels = list(result.labels or [])
     if not result.changed:
@@ -2799,7 +2844,16 @@ class OpenAIHandlerMixin:
             # closure so the extra payload serialization stays off the event
             # loop.
             shape_labels, shape_mutated = _shape_openai_responses_payload(
-                payload, model=model, request_id=request_id
+                payload,
+                model=model,
+                request_id=request_id,
+                output_shaper_enabled=(
+                    getattr(getattr(self, "config", None), "rollout", None).is_enabled(
+                        "proxy_output_shaper"
+                    )
+                    if getattr(getattr(self, "config", None), "rollout", None) is not None
+                    else None
+                ),
             )
             compression_kwargs: dict[str, Any] = {
                 "model": model,
@@ -3549,6 +3603,10 @@ class OpenAIHandlerMixin:
                 ),
             )
             injector.scan_for_markers(optimized_messages)
+            # Shape-only scanning also matches markers from other context
+            # tools; drop hashes this proxy never actually stored before
+            # they can drive tool injection (issue #2836).
+            injector.verify_ownership()
             if (
                 self.config.ccr_inject_system_instructions
                 and not stream
@@ -3560,6 +3618,7 @@ class OpenAIHandlerMixin:
                 from headroom.proxy.helpers import (
                     apply_session_sticky_ccr_tool,
                     has_new_ccr_markers,
+                    history_references_ccr_tool,
                 )
 
                 # #1850: markers replayed from overlay_cached_prefix are
@@ -3578,6 +3637,7 @@ class OpenAIHandlerMixin:
                     request_id=request_id,
                     existing_tools=tools,
                     has_compressed_content_this_turn=has_new_compressed_content,
+                    history_has_ccr_reference=history_references_ccr_tool(optimized_messages),
                 )
                 if ccr_tool_injected:
                     logger.debug(
@@ -3980,7 +4040,13 @@ class OpenAIHandlerMixin:
                 shape_openai_chat_request,
             )
 
-            _shaper_settings = OutputShaperSettings.from_env()
+            _shaper_settings = OutputShaperSettings.from_env(
+                enabled=(
+                    self.config.rollout.is_enabled("proxy_output_shaper")
+                    if getattr(self.config, "rollout", None) is not None
+                    else None
+                )
+            )
             if _shaper_settings.enabled:
                 # Conversation-stable holdout: a whole conversation is treatment
                 # or control, which keeps the A/B comparison clean and the
@@ -5412,6 +5478,11 @@ class OpenAIHandlerMixin:
                     if _http_conversation_key
                     else None
                 ),
+                output_shaper_enabled=(
+                    self.config.rollout.is_enabled("proxy_output_shaper")
+                    if getattr(self.config, "rollout", None) is not None
+                    else None
+                ),
             )
             _append_unique_transforms(transforms_applied, _shape_result.labels)
             if _shape_result.changed:
@@ -5647,6 +5718,45 @@ class OpenAIHandlerMixin:
                                 )
 
                     total_latency = (time.time() - start_time) * 1000
+
+                    # Some OpenAI-compatible upstreams answer a ``stream: false``
+                    # request with a valid 200 SSE body carrying Responses API
+                    # events (#2613). Reassemble the terminal response JSON so
+                    # the buffered path keeps working — previously
+                    # ``response.json()`` raised JSONDecodeError past the
+                    # narrow usage-extraction catch below and the successful
+                    # upstream reply surfaced as a 502 proxy_error.
+                    upstream_content_type = response.headers.get("content-type", "")
+                    if (
+                        response.status_code == 200
+                        and "text/event-stream" in upstream_content_type.lower()
+                    ):
+                        completed_json = _openai_responses_from_sse(response.text)
+                        if completed_json is None:
+                            # No terminal event to adapt — forward the
+                            # successful upstream body unchanged rather than
+                            # fabricating a 502.
+                            return Response(
+                                content=response.content,
+                                status_code=response.status_code,
+                                headers=_sanitize_forwarded_response_headers(response.headers),
+                            )
+                        adapted_headers = {
+                            k: v
+                            for k, v in response.headers.items()
+                            if k.lower()
+                            not in (
+                                "content-type",
+                                "content-length",
+                                "content-encoding",
+                                "transfer-encoding",
+                            )
+                        }
+                        response = httpx.Response(
+                            status_code=response.status_code,
+                            content=json.dumps(completed_json).encode(),
+                            headers={**adapted_headers, "content-type": "application/json"},
+                        )
 
                     total_input_tokens = original_tokens  # fallback
                     output_tokens = 0
@@ -7293,6 +7403,11 @@ class OpenAIHandlerMixin:
                         self.openai_provider,
                     ),
                     conversation_key=f"ws:{session_id}",
+                    output_shaper_enabled=(
+                        self.config.rollout.is_enabled("proxy_output_shaper")
+                        if getattr(self.config, "rollout", None) is not None
+                        else None
+                    ),
                 )
                 _append_unique_transforms(transforms_applied, _shape_labels)
                 if _shape_modified:
@@ -7719,6 +7834,11 @@ class OpenAIHandlerMixin:
                                             self.openai_provider,
                                         ),
                                         conversation_key=f"ws:{session_id}",
+                                        output_shaper_enabled=(
+                                            self.config.rollout.is_enabled("proxy_output_shaper")
+                                            if getattr(self.config, "rollout", None) is not None
+                                            else None
+                                        ),
                                     )
                                     _append_unique_transforms(
                                         transforms_applied,

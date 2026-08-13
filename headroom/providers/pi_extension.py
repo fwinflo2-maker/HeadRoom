@@ -171,21 +171,62 @@ def _owns_state(artifact: ArtifactRecord | None, host: HostName, state: PackageS
     )
 
 
+def _mutation_error(command: list[str], description: str) -> click.ClickException | None:
+    try:
+        _run(command, description)
+    except click.ClickException as exc:
+        return exc
+    return None
+
+
+def _verified_cleanup(
+    command_error: click.ClickException | None,
+    verification_error: click.ClickException | None,
+) -> None:
+    if verification_error is None:
+        return
+    if command_error is not None:
+        raise click.ClickException(f"{command_error} {verification_error}") from verification_error
+    raise verification_error
+
+
 def _rollback_new_install(host: HostName, binary: str) -> None:
-    _run(_remove_command(host, binary), f"roll back {host} package install")
-    if inspect_host_package(host, binary) is not None:
-        raise click.ClickException(f"Failed to verify rollback of the {host} package install.")
+    command_error = _mutation_error(
+        _remove_command(host, binary), f"roll back {host} package install"
+    )
+    try:
+        remaining = inspect_host_package(host, binary)
+        verification_error = (
+            click.ClickException(f"Failed to verify rollback of the {host} package install.")
+            if remaining is not None
+            else None
+        )
+    except click.ClickException as exc:
+        verification_error = click.ClickException(
+            f"Failed to verify rollback of the {host} package install: {exc}"
+        )
+    _verified_cleanup(command_error, verification_error)
 
 
 def _rollback_owned_upgrade(host: HostName, binary: str, previous: PackageState) -> None:
-    _run(
+    command_error = _mutation_error(
         _install_command(host, binary, previous.version),
         f"restore {host} package version {previous.version}",
     )
-    if inspect_host_package(host, binary) != previous:
-        raise click.ClickException(
-            f"Failed to verify rollback to {host} package version {previous.version}."
+    try:
+        restored = inspect_host_package(host, binary)
+        verification_error = (
+            click.ClickException(
+                f"Failed to verify rollback to {host} package version {previous.version}."
+            )
+            if restored != previous
+            else None
         )
+    except click.ClickException as exc:
+        verification_error = click.ClickException(
+            f"Failed to verify rollback to {host} package version {previous.version}: {exc}"
+        )
+    _verified_cleanup(command_error, verification_error)
 
 
 def ensure_host_package(
@@ -205,14 +246,29 @@ def ensure_host_package(
             f"Refusing to overwrite pre-existing {host} package version {previous.version}."
         )
 
+    install_error = _mutation_error(
+        _install_command(host, binary, version),
+        f"install {host} package version {version}",
+    )
     try:
-        _run(_install_command(host, binary, version), f"install {host} package version {version}")
         installed = inspect_host_package(host, binary)
-        if installed != PackageState(version, "npm"):
-            raise click.ClickException(
+        verification_error = (
+            click.ClickException(
                 f"Could not verify exact {host} package version {version} after install."
             )
-    except click.ClickException as install_error:
+            if installed != PackageState(version, "npm")
+            else None
+        )
+    except click.ClickException as exc:
+        verification_error = click.ClickException(
+            f"Could not verify exact {host} package version {version} after install: {exc}"
+        )
+    if install_error is None:
+        install_error = verification_error
+    elif verification_error is not None:
+        install_error = click.ClickException(f"{install_error} {verification_error}")
+
+    if install_error is not None:
         try:
             if previous is None:
                 _rollback_new_install(host, binary)
@@ -239,7 +295,17 @@ def remove_owned_host_package(
     if not _owns_state(artifact, host, current):
         return "preserved"
 
-    _run(_remove_command(host, binary), f"remove owned {host} package")
-    if inspect_host_package(host, binary) is not None:
-        raise click.ClickException(f"Could not verify removal of the owned {host} package.")
+    command_error = _mutation_error(_remove_command(host, binary), f"remove owned {host} package")
+    try:
+        remaining = inspect_host_package(host, binary)
+        verification_error = (
+            click.ClickException(f"Could not verify removal of the owned {host} package.")
+            if remaining is not None
+            else None
+        )
+    except click.ClickException as exc:
+        verification_error = click.ClickException(
+            f"Could not verify removal of the owned {host} package: {exc}"
+        )
+    _verified_cleanup(command_error, verification_error)
     return "removed"

@@ -1,5 +1,6 @@
 import json
 from subprocess import CompletedProcess
+from typing import Literal
 
 import click
 import pytest
@@ -20,6 +21,11 @@ from headroom.providers.pi_extension import (
 def successful(calls: list[list[str]], command: list[str], stdout: str = ""):
     calls.append(command)
     return CompletedProcess(command, 0, stdout, "")
+
+
+def failed(calls: list[list[str]], command: list[str]):
+    calls.append(command)
+    return CompletedProcess(command, 1, "", "native command failed")
 
 
 def package_artifact(host: str, version: str, *, owned: bool) -> ArtifactRecord:
@@ -212,6 +218,29 @@ def test_owned_package_is_moved_to_exact_requested_version(monkeypatch, previous
     assert artifact.metadata["version"] == "0.34.0"
 
 
+def test_nonzero_install_is_rolled_back_even_when_registration_succeeds(
+    monkeypatch,
+) -> None:
+    states = iter([None, PackageState("0.34.0", "npm"), None])
+    monkeypatch.setattr(module, "inspect_host_package", lambda *_: next(states))
+    calls: list[list[str]] = []
+
+    def fail_install(command, **kwargs):
+        if not calls:
+            return failed(calls, command)
+        return successful(calls, command)
+
+    monkeypatch.setattr(module, "run", fail_install)
+
+    with pytest.raises(click.ClickException, match="install pi package") as exc_info:
+        ensure_host_package("pi", "/bin/pi", "0.34.0", None)
+
+    assert "Rollback also failed" not in str(exc_info.value)
+    assert len(calls) == 2
+    with pytest.raises(StopIteration):
+        next(states)
+
+
 def test_failed_new_install_is_removed(monkeypatch) -> None:
     states = iter([None, None, None])
     monkeypatch.setattr(module, "inspect_host_package", lambda *_: next(states))
@@ -233,6 +262,42 @@ def test_failed_new_install_is_removed(monkeypatch) -> None:
         ],
         ["/bin/pi", "remove", "npm:@headroomlabs/pi-extension-headroom"],
     ]
+    with pytest.raises(StopIteration):
+        next(states)
+
+
+def test_nonzero_new_install_and_rollback_report_both_failures(monkeypatch) -> None:
+    states = iter([None, PackageState("0.34.0", "npm"), PackageState("0.34.0", "npm")])
+    monkeypatch.setattr(module, "inspect_host_package", lambda *_: next(states))
+    calls: list[list[str]] = []
+    monkeypatch.setattr(module, "run", lambda command, **kwargs: failed(calls, command))
+
+    with pytest.raises(click.ClickException) as exc_info:
+        ensure_host_package("pi", "/bin/pi", "0.34.0", None)
+
+    message = str(exc_info.value)
+    assert "install pi package" in message
+    assert "Rollback also failed" in message
+    assert "roll back pi package install" in message
+    assert "verify rollback" in message
+    assert len(calls) == 2
+    with pytest.raises(StopIteration):
+        next(states)
+
+
+def test_nonzero_new_install_with_verified_nonzero_rollback_reports_original_only(
+    monkeypatch,
+) -> None:
+    states = iter([None, PackageState("0.34.0", "npm"), None])
+    monkeypatch.setattr(module, "inspect_host_package", lambda *_: next(states))
+    calls: list[list[str]] = []
+    monkeypatch.setattr(module, "run", lambda command, **kwargs: failed(calls, command))
+
+    with pytest.raises(click.ClickException, match="install pi package") as exc_info:
+        ensure_host_package("pi", "/bin/pi", "0.34.0", None)
+
+    assert "Rollback also failed" not in str(exc_info.value)
+    assert len(calls) == 2
     with pytest.raises(StopIteration):
         next(states)
 
@@ -279,7 +344,49 @@ def test_failed_owned_upgrade_restores_previous_version(monkeypatch) -> None:
     ]
 
 
-def test_remove_preserves_user_owned_and_changed_packages(monkeypatch) -> None:
+def test_nonzero_upgrade_restores_previous_version_and_reports_original_only(
+    monkeypatch,
+) -> None:
+    states = iter(
+        [
+            PackageState("0.33.0", "npm"),
+            PackageState("0.35.0", "npm"),
+            PackageState("0.33.0", "npm"),
+        ]
+    )
+    monkeypatch.setattr(module, "inspect_host_package", lambda *_: next(states))
+    calls: list[list[str]] = []
+    results = iter(
+        [
+            CompletedProcess([], 1, "", "upgrade failed"),
+            CompletedProcess([], 1, "", "rollback failed"),
+        ]
+    )
+
+    def run_next(command: list[str], **kwargs: object) -> CompletedProcess[str]:
+        calls.append(command)
+        result = next(results)
+        return CompletedProcess(command, result.returncode, result.stdout, result.stderr)
+
+    monkeypatch.setattr(module, "run", run_next)
+
+    with pytest.raises(click.ClickException, match="install omp package") as exc_info:
+        ensure_host_package(
+            "omp",
+            "/bin/omp",
+            "0.34.0",
+            package_artifact("omp", "0.33.0", owned=True),
+        )
+
+    assert "Rollback also failed" not in str(exc_info.value)
+    assert len(calls) == 2
+    with pytest.raises(StopIteration):
+        next(states)
+
+
+def test_remove_preserves_user_owned_and_changed_packages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     user_owned = package_artifact("pi", "0.34.0", owned=False)
     assert remove_owned_host_package("pi", "/bin/pi", user_owned) == "preserved"
 
@@ -290,6 +397,43 @@ def test_remove_preserves_user_owned_and_changed_packages(monkeypatch) -> None:
         lambda *_: PackageState("0.35.0", "npm"),
     )
     assert remove_owned_host_package("pi", "/bin/pi", owned) == "preserved"
+
+
+def test_nonzero_remove_is_accepted_when_verification_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    states = iter([PackageState("0.34.0", "npm"), None])
+    monkeypatch.setattr(module, "inspect_host_package", lambda *_: next(states))
+    calls: list[list[str]] = []
+    monkeypatch.setattr(module, "run", lambda command, **kwargs: failed(calls, command))
+
+    result = remove_owned_host_package(
+        "pi", "/bin/pi", package_artifact("pi", "0.34.0", owned=True)
+    )
+
+    assert result == "removed"
+    assert len(calls) == 1
+    with pytest.raises(StopIteration):
+        next(states)
+
+
+def test_nonzero_remove_reports_command_and_verification_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = PackageState("0.34.0", "npm")
+    states = iter([state, state])
+    monkeypatch.setattr(module, "inspect_host_package", lambda *_: next(states))
+    calls: list[list[str]] = []
+    monkeypatch.setattr(module, "run", lambda command, **kwargs: failed(calls, command))
+
+    with pytest.raises(click.ClickException) as exc_info:
+        remove_owned_host_package("pi", "/bin/pi", package_artifact("pi", "0.34.0", owned=True))
+
+    message = str(exc_info.value)
+    assert "remove owned pi package" in message
+    assert "verify removal" in message
+    with pytest.raises(StopIteration):
+        next(states)
 
 
 @pytest.mark.parametrize(
@@ -308,7 +452,11 @@ def test_remove_preserves_user_owned_and_changed_packages(monkeypatch) -> None:
         ),
     ],
 )
-def test_remove_owned_package_uses_host_native_command(monkeypatch, host, command) -> None:
+def test_remove_owned_package_uses_host_native_command(
+    monkeypatch: pytest.MonkeyPatch,
+    host: Literal["pi", "omp"],
+    command: list[str],
+) -> None:
     states = iter([PackageState("0.34.0", "npm"), None])
     monkeypatch.setattr(module, "inspect_host_package", lambda *_: next(states))
     calls: list[list[str]] = []

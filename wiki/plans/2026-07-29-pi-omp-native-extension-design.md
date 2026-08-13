@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed. This design requires a feature-request issue and a core maintainer's approval before implementation, as required by `CONTRIBUTING.md`.
+Approved for a first global-only durable release. The approved topology keeps transient `headroom wrap pi|omp`, adds opt-in `headroom init -g pi|omp`, pins the extension to the exact Headroom release version, and leaves project-local durable setup for a later release. Durable OMP setup never modifies `models.yml`; the existing OMP wrapper remains the sole owner of its Anthropic inference override.
 
 ## Problem
 
@@ -21,7 +21,7 @@ The integration must preserve Headroom's safety invariant: never drop user or as
 - Preserve the raw session transcript; transform only the copied provider context.
 - Make every lossy omission retrievable through `headroom_retrieve`.
 - Fail open when Headroom is absent, unhealthy, slow, restarted, or returns malformed data.
-- Let `headroom deploy`, `headroom wrap`, `headroom doctor`, and `headroom unwrap` own installation and lifecycle.
+- Let global `headroom init`, `headroom wrap`, `headroom doctor`, and ownership-aware init removal own installation and lifecycle.
 - Coexist with the existing Anthropic inference-proxy wrapper without changing its provider routing or lifecycle.
 
 ## Non-goals
@@ -367,24 +367,36 @@ Health retry uses bounded exponential backoff with jitter. `context` never waits
 
 ### Persistent setup
 
-`headroom deploy` gains `pi` and `omp` targets. Auto mode selects them when their binaries exist.
+The first durable release is global-only. Project-local durable setup is not supported:
 
-For each detected host:
+```bash
+headroom init -g pi
+headroom init -g omp
+```
 
-1. Start or reuse the persistent Headroom service.
-2. Detect whether the package is already installed.
-3. Install the tested package version with the host-native command:
+The measured lifecycle gate exercises exact extension pins `0.34.0` and `0.35.0`, including idempotent reruns, upgrades, rollback, and removal. Packed-host CI covers Pi `0.80.10`, `0.82.1`, and `0.84.1`, plus OMP `17.1.8`.
+
+Bare `headroom init -g` auto-selects either host when its binary exists. Local `headroom init pi|omp` fails before changing files or deployment state.
+
+For each selected host:
+
+1. Create or update the shared `init-user` persistent profile.
+2. Install an OS task/watchdog for that profile when either Pi or OMP is present; the extension never starts a subprocess.
+3. Detect whether the extension package is already installed and whether Headroom owns it.
+4. Install the exact tested release with the host-native command only when no compatible package exists:
 
 ```bash
 pi install npm:@headroomlabs/pi-extension-headroom@<version>
-omp plugin install npm:@headroomlabs/pi-extension-headroom@<version>
+omp plugin install @headroomlabs/pi-extension-headroom@<version>
 ```
 
-4. Write the host-neutral endpoint/config file for the deployment port.
-5. Record package ownership and prior configuration in the deployment manifest.
-6. Run a health, compression, and retrieval round-trip.
+1. Merge `baseUrl: http://127.0.0.1:<port>` into the host-neutral config file, preserving unrelated fields and recording the exact prior bytes.
+2. Record package ownership, pinned version, config ownership, and task artifacts in the deployment manifest.
+3. Start or recover the shared local proxy and run a health, compression, and retrieval round-trip.
 
-The Python release records the tested extension version instead of installing an unconstrained latest release.
+Re-running init is idempotent. A Headroom-owned older package is upgraded to the exact current release; installing an older released Headroom CLI and rerunning both commands performs the supported rollback. A compatible pre-existing package is preserved and recorded as user-owned. An incompatible or unpinned pre-existing package produces an actionable error instead of being overwritten.
+
+Release automation publishes and verifies `@headroomlabs/pi-extension-headroom@<version>` before the matching Python package can reach PyPI. The Python package never installs an unconstrained npm version. A source/dev Headroom build cannot durable-init an unpublished extension version.
 
 ### One-session setup
 
@@ -393,7 +405,7 @@ headroom wrap pi
 headroom wrap omp
 ```
 
-These commands idempotently ensure the extension exists, start or reuse Headroom, and launch the host. They do not rewrite provider endpoints.
+These commands start or reuse the transient proxy and pass the selected endpoint to an already-installed extension. They do not claim package ownership. `wrap pi` changes no provider endpoint; the existing `wrap omp` continues to own its independently reversible Anthropic `models.yml` route.
 
 ### Doctor
 
@@ -410,15 +422,23 @@ These commands idempotently ensure the extension exists, start or reuse Headroom
 
 ### Removal
 
-`headroom unwrap pi|omp` and deployment removal:
+Global durable removal is explicit and independent from wrapper cleanup:
 
-- remove only config blocks and package installations owned by Headroom;
-- never uninstall a package that predated Headroom setup;
-- leave pre-existing manual configuration untouched;
-- stop no shared service still used by another target;
-- never change provider routing or `models.yml` when installing or removing the extension; the existing wrapper retains its byte-for-byte restore contract.
+```bash
+headroom init -g remove pi
+headroom init -g remove omp
+```
 
-`headroom install stop` leaves the extension installed and harmless; its health check fails open until the service restarts.
+Removal:
+
+- uninstalls only a package recorded as Headroom-owned;
+- never uninstalls a package that predated Headroom setup;
+- restores the exact prior config only when the current file still matches Headroom's last managed bytes;
+- preserves the shared config, task, and proxy while the other native host still uses them;
+- removes the task and stops the runtime only when no remaining target needs them;
+- never changes provider routing or `models.yml`; `headroom unwrap omp` remains exclusively responsible for the wrapper's byte-for-byte route restoration.
+
+`init-user` uses persistent-task scheduling and therefore does not expose manual `headroom install stop`; explicit `headroom init -g remove pi|omp` owns teardown. Killing or losing the proxy still leaves the extension harmless because its health and compression paths fail open.
 
 ## Existing OMP wrapper coexistence
 
@@ -485,11 +505,13 @@ Run `npm run benchmark:live` against the loopback Headroom proxy. The command em
 
 ### Installer and coexistence tests
 
+The real-Click lifecycle test runs with isolated `HOME`, `HEADROOM_WORKSPACE_DIR`, `PI_CODING_AGENT_DIR`, and `PATH`. Fake hosts implement only the package commands used by production and persist versions in JSON; only network readiness and detached runtime boundaries are patched.
+
 - Detect Pi and OMP independently.
 - Do not overwrite or later remove pre-existing installations.
 - Track Headroom-owned installations.
-- Keep installed extensions harmless after `install stop`.
-- Remove only Headroom-owned state during unwrap.
+- Keep installed extensions harmless when the managed proxy is stopped or unavailable.
+- Remove only Headroom-owned durable state during `headroom init -g remove pi|omp`; keep wrapper cleanup independent.
 - Leave the managed OMP wrapper route and backup unchanged.
 - Never modify an unmarked user-authored `models.yml`.
 - Diagnose package, API, proxy, and retrieval failures separately.
@@ -502,14 +524,13 @@ Before publication, confirm the selected peer-version ranges against the oldest 
 
 ## Rollout
 
-1. Open a feature-request issue with a concise summary of this spec and obtain a core maintainer's approval.
-2. Implement the extension under `integrations/pi-extension/` on a focused branch.
-3. Validate local package loading in Pi and OMP.
-4. Run unit, live Headroom, and dual-host tests.
-5. Add Headroom CLI setup, doctor, and ownership-aware removal without changing the existing wrapper.
-6. Publish a beta package and verify package-registry discovery.
-7. Update compatibility documentation with measured behavior.
-8. Verify the existing wrapper route and native extension operate and can be removed independently.
+1. Implement the approved global-only init, ownership, and release path on the focused branch.
+2. Validate local package loading in Pi and OMP.
+3. Run unit, live Headroom, dual-host, upgrade, rollback, and coexistence tests.
+4. Publish a beta package and verify package-registry discovery before publishing the matching Python beta.
+5. Update compatibility documentation with measured behavior.
+6. Verify the existing wrapper route and native extension operate and can be removed independently.
+7. Gate general availability on the separate typed compression outcomes, `/metrics`, observability, load/soak, SLO, canary, alerting, and incident-response evidence. The lifecycle proof alone is not a production-readiness claim.
 
 The deprecated MIT-licensed Pi extension is prior art only. If implementation copies any code, preserve its license and attribution; otherwise credit it in the PR as design inspiration.
 

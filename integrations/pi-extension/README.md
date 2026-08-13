@@ -6,24 +6,43 @@ Provider-independent context compression for [Pi](https://github.com/earendil-wo
 
 - Node.js 20 or newer
 - Pi 0.80 or newer, or OMP 17.1 or newer
-- A running Headroom proxy
+- A running Headroom proxy, or the Headroom CLI to launch Pi/OMP with one
 
-The packed-host lifecycle gate runs against the oldest supported Pi release tested here (`0.80.10`), current Pi `0.82.1`, and OMP `17.1.8`. These are the exact tested host versions for this release.
+The packed-host lifecycle gate runs against Pi `0.80.10`, `0.82.1`, and `0.84.1`, plus OMP `17.1.8`. These are the exact tested host versions for this release.
 
-Start the local proxy on the extension's default endpoint:
+Headroom's official wrappers start or reuse the proxy and pass its endpoint to the extension (currently from a Headroom checkout until this PR ships):
+
+```bash
+uv run headroom wrap pi
+uv run headroom wrap omp
+```
+
+Install the extension first as shown below. The OMP wrapper still applies its existing Anthropic inference route; `HEADROOM_PI_BASE_URL` separately enables provider-independent extension compression. For an unwrapped host session, start the proxy manually:
 
 ```bash
 headroom proxy --port 8787 --stateless --no-embedding-server
 ```
 
-## Install
+## Durable setup
 
-After the package is published:
+The first durable release is current-user/global only; project-local durable setup is not supported. The lifecycle test covers Headroom `0.34.0` and `0.35.0` exact extension pins, upgrades, and rollback, using isolated Pi/OMP command contracts. Packed-host CI separately covers Pi `0.80.10`, `0.82.1`, and `0.84.1`, plus OMP `17.1.8`.
+
+After the matching extension version is published:
 
 ```bash
-pi install npm:@headroomlabs/pi-extension-headroom
-omp plugin install npm:@headroomlabs/pi-extension-headroom
+headroom init -g pi
+headroom init -g omp
 ```
+
+Both hosts share one loopback proxy, config, and scheduled task. Re-running either command is idempotent. To roll back, install the older released Headroom CLI and rerun the same commands; durable init pins the extension to that CLI's exact release version:
+
+```bash
+uv tool install --force "headroom-ai==0.34.0"
+headroom init -g pi
+headroom init -g omp
+```
+
+A source/dev Headroom build cannot durable-init an unpublished extension version. It fails rather than installing `latest`. The extension fails open when the shared loopback proxy is unavailable.
 
 From a Headroom source checkout:
 
@@ -37,7 +56,7 @@ omp --extension "$PWD/src/index.ts"
 
 ### Persistent OMP development setup
 
-The extension does not start the Headroom proxy. To load the extension from a source checkout in every normal OMP session and keep the local proxy running under the operating system's service supervisor:
+The extension does not spawn a subprocess itself; wrappers and durable installs own proxy lifecycle. To load the extension from a source checkout in every normal OMP session and keep the local proxy running under the operating system's service supervisor:
 
 1. Install the source dependencies from the repository root:
 
@@ -96,11 +115,11 @@ The default configuration needs no file or environment variables. New sessions c
 ## Remove
 
 ```bash
-pi remove npm:@headroomlabs/pi-extension-headroom
-omp plugin uninstall @headroomlabs/pi-extension-headroom
+headroom init -g remove pi
+headroom init -g remove omp
 ```
 
-Removing the package deletes no Headroom proxy state. Remove `~/.headroom/integrations/pi-extension.json` separately only if its settings are no longer needed.
+Removal uninstalls only packages recorded as Headroom-owned. Removing one host preserves the shared proxy, config, and task for the other. Removing the final native host restores or removes owned config and tears down its runtime state. Durable OMP operations never touch `models.yml` or its wrapper backup: OMP's native compression remains separate from `headroom wrap omp` Anthropic inference routing and `headroom unwrap omp` cleanup.
 
 ## Verify
 

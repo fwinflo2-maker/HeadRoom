@@ -247,6 +247,24 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 | ZCode        | ✅              | starts proxy and prints base URLs for ZCode settings |
 
 Any OpenAI-compatible client works via `headroom proxy`. MCP-native: `headroom mcp install`.
+
+### Durable Pi / Oh My Pi setup
+
+The first durable Pi/OMP release is global/current-user only; project-local durable setup is not supported. Packed-host CI covers Pi `0.80.10`, `0.82.1`, and `0.84.1`, plus OMP `17.1.8`. The durable lifecycle gate covers exact Headroom/extension pins `0.34.0` and `0.35.0`, including idempotent reruns, upgrade, rollback, ownership-aware removal, and wrapper coexistence.
+
+```bash
+headroom init -g pi
+headroom init -g omp
+
+# explicit removal
+headroom init -g remove pi
+headroom init -g remove omp
+```
+
+Both hosts share a loopback proxy, config, and scheduled task, and fail open when that proxy is unavailable. Durable init installs the extension version exactly matching the released Headroom CLI; it never installs `latest`. A source/dev build therefore cannot durable-init an unpublished extension version. To roll back, install the older released CLI and rerun both init commands, for example `uv tool install --force "headroom-ai==0.34.0"` followed by the commands above.
+
+Pi and OMP native extension compression is provider-independent. `headroom wrap omp` remains a separate Anthropic inference-routing layer; durable init/removal never changes its `models.yml` or backup bytes.
+
 Undo durable wrapping with `headroom unwrap <tool>` (supports: `claude`, `copilot`, `codex`, `grok`, `kimi`, `omp`, `opencode`, `openclaw`, `zcode`).
 Registry authors can use the canonical [`server.json`](server.json) in the repo root instead of reconstructing the `headroom mcp serve` contract from prose.
 

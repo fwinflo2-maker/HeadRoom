@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import pytest
 
+from headroom.providers.dsh.install import build_install_env
 from headroom.providers.dsh.runtime import (
     DEFAULT_API_URL,
     build_launch_env,
     proxy_base_url,
     resolve_dsh_command,
 )
+from headroom.providers.install_registry import build_install_target_envs
 
 
 def test_proxy_base_url_includes_v1() -> None:
@@ -31,16 +33,12 @@ def test_build_launch_env_sets_deepseek_base_url_and_passes_key(
 
 
 def test_resolve_dsh_command_web_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "headroom.providers.dsh.runtime.shutil.which", lambda _name: "/usr/bin/dsh"
-    )
+    monkeypatch.setattr("headroom.providers.dsh.runtime.shutil.which", lambda _name: "/usr/bin/dsh")
     assert resolve_dsh_command() == ["/usr/bin/dsh", "web"]
 
 
 def test_resolve_dsh_command_headless(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "headroom.providers.dsh.runtime.shutil.which", lambda _name: "/usr/bin/dsh"
-    )
+    monkeypatch.setattr("headroom.providers.dsh.runtime.shutil.which", lambda _name: "/usr/bin/dsh")
     assert resolve_dsh_command(profile="headless", task_args=("explain foo",)) == [
         "/usr/bin/dsh",
         "--profile",
@@ -50,22 +48,14 @@ def test_resolve_dsh_command_headless(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_resolve_dsh_command_explicit_command_wins(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "headroom.providers.dsh.runtime.shutil.which", lambda _name: "/usr/bin/dsh"
-    )
+    monkeypatch.setattr("headroom.providers.dsh.runtime.shutil.which", lambda _name: "/usr/bin/dsh")
     assert resolve_dsh_command(command="pnpm dsh") == ["pnpm", "dsh", "web"]
 
 
 def test_resolve_dsh_command_missing_binary_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "headroom.providers.dsh.runtime.shutil.which", lambda _name: None
-    )
+    monkeypatch.setattr("headroom.providers.dsh.runtime.shutil.which", lambda _name: None)
     with pytest.raises(RuntimeError, match="not found in PATH"):
         resolve_dsh_command()
-
-
-from headroom.providers.dsh.install import build_install_env
-from headroom.providers.install_registry import build_install_target_envs
 
 
 def test_dsh_build_install_env_sets_deepseek_base_url() -> None:

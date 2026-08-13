@@ -3684,7 +3684,9 @@ def _ensure_proxy_unlocked(
                         if running_openai_url != requested_openai_url:
                             missing.append("openai-api-url")
                     if deepseek_api_url:
-                        if _normalize_proxy_api_url(running_config.get("deepseek_api_url")) != _normalize_proxy_api_url(deepseek_api_url):
+                        if _normalize_proxy_api_url(
+                            running_config.get("deepseek_api_url")
+                        ) != _normalize_proxy_api_url(deepseek_api_url):
                             missing.append("deepseek-api-url")
                     if not missing:
                         click.echo(f"  Proxy already running on port {port}")
@@ -3751,7 +3753,9 @@ def _ensure_proxy_unlocked(
                         if running_openai_url != requested_openai_url:
                             missing.append("openai-api-url")
                     if deepseek_api_url:
-                        if _normalize_proxy_api_url(running_config.get("deepseek_api_url")) != _normalize_proxy_api_url(deepseek_api_url):
+                        if _normalize_proxy_api_url(
+                            running_config.get("deepseek_api_url")
+                        ) != _normalize_proxy_api_url(deepseek_api_url):
                             missing.append("deepseek-api-url")
 
                     if missing:
@@ -3849,7 +3853,9 @@ def _ensure_proxy_unlocked(
                     if running_openai_url != requested_openai_url:
                         missing.append("openai-api-url")
                 if deepseek_api_url:
-                    if _normalize_proxy_api_url(running_config.get("deepseek_api_url")) != _normalize_proxy_api_url(deepseek_api_url):
+                    if _normalize_proxy_api_url(
+                        running_config.get("deepseek_api_url")
+                    ) != _normalize_proxy_api_url(deepseek_api_url):
                         missing.append("deepseek-api-url")
                 if vertex_api_url or clear_vertex_api_url:
                     running_vertex_url = _normalize_proxy_api_url(
@@ -7411,7 +7417,7 @@ def dsh(
         argv = resolve_dsh_command(profile=profile, command=command, task_args=dsh_args)
     except RuntimeError as exc:
         click.echo(f"Error: {exc}")
-        raise SystemExit(1)
+        raise SystemExit(1) from exc
 
     env, env_vars_display = build_launch_env(port, os.environ)
 

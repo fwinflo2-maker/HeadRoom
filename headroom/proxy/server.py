@@ -101,9 +101,9 @@ from headroom.providers.proxy_routes import register_provider_routes
 from headroom.providers.registry import (
     DEFAULT_ANTHROPIC_API_URL,
     DEFAULT_CLOUDCODE_API_URL,
+    DEFAULT_DEEPSEEK_API_URL,
     DEFAULT_GEMINI_API_URL,
     DEFAULT_OPENAI_API_URL,
-    DEFAULT_DEEPSEEK_API_URL,
     DEFAULT_VERTEX_API_URL,
     build_proxy_provider_runtime,
     create_proxy_backend,

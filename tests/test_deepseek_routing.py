@@ -13,9 +13,7 @@ def _headers(*pairs: tuple[str, str]) -> dict[str, str]:
 
 
 def test_is_deepseek_request_header() -> None:
-    assert _is_deepseek_request(
-        _headers(("x-deepseek-harness-user-id", "anon")), model=None
-    )
+    assert _is_deepseek_request(_headers(("x-deepseek-harness-user-id", "anon")), model=None)
 
 
 def test_is_deepseek_request_model_prefix() -> None:
@@ -46,18 +44,13 @@ def test_resolve_openai_upstream_deepseek_header() -> None:
 def test_resolve_openai_upstream_deepseek_model() -> None:
     mix = _mix()
     req = SimpleNamespace(headers={})
-    assert (
-        mix._resolve_openai_upstream(req, model="deepseek-v4-pro")
-        == "https://api.deepseek.com"
-    )
+    assert mix._resolve_openai_upstream(req, model="deepseek-v4-pro") == "https://api.deepseek.com"
 
 
 def test_resolve_openai_upstream_openai_default() -> None:
     mix = _mix()
     req = SimpleNamespace(headers={})
-    assert (
-        mix._resolve_openai_upstream(req, model="gpt-4o") == "https://api.openai.com"
-    )
+    assert mix._resolve_openai_upstream(req, model="gpt-4o") == "https://api.openai.com"
 
 
 def test_resolve_openai_upstream_custom_base_url_wins_when_not_deepseek() -> None:

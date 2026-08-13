@@ -11,8 +11,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 from headroom.providers.claude import DEFAULT_API_URL as DEFAULT_ANTHROPIC_API_URL
 from headroom.providers.codex import DEFAULT_API_URL as DEFAULT_OPENAI_API_URL
-from headroom.providers.gemini import DEFAULT_API_URL as DEFAULT_GEMINI_API_URL
 from headroom.providers.dsh.runtime import DEFAULT_API_URL as DEFAULT_DEEPSEEK_API_URL
+from headroom.providers.gemini import DEFAULT_API_URL as DEFAULT_GEMINI_API_URL
 
 DEFAULT_CLOUDCODE_API_URL = "https://cloudcode-pa.googleapis.com"
 DEFAULT_VERTEX_API_URL = "https://us-central1-aiplatform.googleapis.com"

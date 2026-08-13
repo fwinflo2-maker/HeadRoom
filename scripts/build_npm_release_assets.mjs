@@ -16,6 +16,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 const sdkDir = path.join(rootDir, "sdk", "typescript");
 const openClawDir = path.join(rootDir, "plugins", "openclaw");
+const piExtensionDir = path.join(rootDir, "integrations", "pi-extension");
 
 const rawArgs = process.argv.slice(2);
 const flags = new Set(rawArgs.filter((arg) => arg.startsWith("--")));
@@ -27,9 +28,9 @@ if (!version || flags.has("--help") || flags.has("-h")) {
     [
       "Usage: node scripts/build_npm_release_assets.mjs <version> [assets-dir] [--skip-install] [--no-verify]",
       "",
-      "Builds the TypeScript SDK and OpenClaw npm release tarballs, rewrites",
-      "OpenClaw release metadata to depend on the just-built SDK version,",
-      "regenerates dist/package.json, and verifies the resulting assets.",
+      "Builds the TypeScript SDK, OpenClaw, and Pi extension npm release",
+      "tarballs, rewrites OpenClaw release metadata to depend on the just-built",
+      "SDK version, regenerates dist/package.json, and verifies the assets.",
     ].join("\n"),
   );
   process.exit(flags.has("--help") || flags.has("-h") ? 0 : 2);
@@ -52,6 +53,8 @@ const trackedFiles = [
   path.join(openClawDir, "package.json"),
   path.join(openClawDir, "package-lock.json"),
   path.join(openClawDir, "dist", "package.json"),
+  path.join(piExtensionDir, "package.json"),
+  path.join(piExtensionDir, "package-lock.json"),
 ];
 
 const snapshots = new Map(
@@ -185,6 +188,19 @@ try {
   runNode(["prepare-dist.mjs"], openClawDir);
   runNpm(["pack", "--pack-destination", assetsDir], openClawDir);
   assertTarballBuilt("headroom-openclaw");
+
+  if (!flags.has("--skip-install")) {
+    runNpm(["ci"], piExtensionDir);
+  }
+  runNpm(["test"], piExtensionDir);
+  runNpm(["run", "typecheck"], piExtensionDir);
+  runNpm(["run", "build"], piExtensionDir);
+  runNpm(
+    ["version", version, "--no-git-tag-version", "--allow-same-version"],
+    piExtensionDir,
+  );
+  runNpm(["pack", "--pack-destination", assetsDir], piExtensionDir);
+  assertTarballBuilt("headroomlabs-pi-extension-headroom");
 
   if (!flags.has("--no-verify")) {
     runNode(["scripts/verify_npm_release_assets.mjs", assetsDir, version], rootDir);

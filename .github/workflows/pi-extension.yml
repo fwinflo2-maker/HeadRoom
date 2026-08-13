@@ -58,7 +58,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pi-version: ["0.80.10", "0.82.1"]
+        pi-version: ["0.80.10", "0.82.1", "0.84.1"]
     defaults:
       run:
         working-directory: integrations/pi-extension

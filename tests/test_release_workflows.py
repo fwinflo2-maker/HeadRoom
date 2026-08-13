@@ -105,7 +105,7 @@ def test_create_release_requires_successful_build_and_pypi_publish() -> None:
     # success in the `if:` block (otherwise `always()` would let the
     # release proceed even when the smoke gate failed).
     assert (
-        "needs: [detect-version, build, build-wheels, collect-dist, smoke-import-wheels, publish-pypi, publish-npm, publish-github-packages, publish-docker]"
+        "needs: [detect-version, build, build-wheels, collect-dist, smoke-import-wheels, verify-pi-extension, publish-pypi, publish-npm, publish-github-packages, publish-docker]"
         in content
     )
     assert "always()" in content
@@ -628,6 +628,64 @@ def test_release_workflow_uses_local_npm_asset_builder() -> None:
     assert "scripts/verify_npm_release_assets.mjs" in content
     assert "scripts/verify_npm_release_assets.mjs" in builder
     assert "registerHeadroomPlugin" in verifier
+    assert "pi-extension-headroom" in builder
+    assert "pi-extension-headroom" in verifier
+
+
+def test_npm_release_verifier_requires_pi_extension_tarball() -> None:
+    verifier = (ROOT / "scripts" / "verify_npm_release_assets.mjs").read_text(encoding="utf-8")
+
+    assert "@headroomlabs/pi-extension-headroom" in verifier
+    assert "headroomlabs-pi-extension-headroom-${version}.tgz" in verifier
+    assert 'extensions: ["./src/index.ts"]' in verifier
+    assert '"package/src/index.ts"' in verifier
+
+
+def test_pi_extension_publish_blocks_pypi() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
+    jobs = workflow["jobs"]
+
+    assert "publish-pi-extension" in jobs
+    assert "verify-pi-extension" in jobs
+    assert jobs["verify-pi-extension"]["needs"] == [
+        "detect-version",
+        "build",
+        "publish-pi-extension",
+    ]
+    assert "verify-pi-extension" in jobs["publish-pypi"]["needs"]
+    assert "verify-pi-extension" in jobs["create-release"]["needs"]
+    assert "needs.verify-pi-extension.result == 'success'" in jobs["create-release"]["if"]
+
+
+def test_pi_extension_registry_gate_uses_exact_version() -> None:
+    content = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+
+    assert "@headroomlabs/pi-extension-headroom@${version}" in content
+    assert "HEADROOM_EXTENSION_SPEC" in content
+    assert "npm view" in content
+    assert "sha512" in content
+    assert 'HEADROOM_CCR_SQLITE_PATH="${RUNNER_TEMP}/pi-extension-ccr.db"' in content
+
+
+def test_pi_extension_host_load_accepts_exact_external_spec() -> None:
+    host_load = (ROOT / "integrations/pi-extension/e2e/host-load.mjs").read_text(
+        encoding="utf-8"
+    )
+
+    assert "process.env.HEADROOM_EXTENSION_SPEC" in host_load
+    install = '["install", "--ignore-scripts", "--no-audit", "--no-fund", extensionSpec]'
+    assert install in host_load
+    assert host_load.index("if (extensionSpec)") < host_load.index(install)
+    assert host_load.index("} else {") < host_load.index('"pack",')
+
+
+def test_pi_extension_compatibility_ci_keeps_pinned_hosts() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/pi-extension.yml").read_text())
+    matrix = workflow["jobs"]["live-contract-and-hosts"]["strategy"]["matrix"]
+
+    assert matrix["pi-version"] == ["0.80.10", "0.82.1", "0.84.1"]
+    content = (ROOT / ".github/workflows/pi-extension.yml").read_text(encoding="utf-8")
+    assert "@oh-my-pi/pi-coding-agent@17.1.8" in content
 
 
 def test_npm_release_builder_regenerates_openclaw_dist_metadata_after_rewrite() -> None:

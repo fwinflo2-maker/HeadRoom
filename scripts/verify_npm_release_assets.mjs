@@ -26,6 +26,11 @@ const packages = [
       "headroom-ai": `^${version}`,
     },
   },
+  {
+    name: "@headroomlabs/pi-extension-headroom",
+    tarball: `headroomlabs-pi-extension-headroom-${version}.tgz`,
+    extensions: ["./src/index.ts"],
+  },
 ];
 
 const tarballPaths = new Map();
@@ -36,6 +41,16 @@ function extractPackageJson(tarballPath) {
 
 function extractDistPackageJson(tarballPath) {
   return extractJsonFromTarball(tarballPath, "package/dist/package.json");
+}
+
+function listTarball(tarballPath) {
+  const result = spawnSync("tar", ["-tzf", tarballPath], { encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(
+      `tar failed for ${tarballPath}: ${result.stderr || result.stdout || "unknown error"}`,
+    );
+  }
+  return new Set(result.stdout.split(/\r?\n/).filter(Boolean));
 }
 
 function extractJsonFromTarball(tarballPath, packageJsonPath) {
@@ -126,6 +141,17 @@ for (const expected of packages) {
     }
   }
 
+  if (expected.extensions) {
+    if (JSON.stringify(pkg.pi?.extensions) !== JSON.stringify(expected.extensions)) {
+      throw new Error(
+        `${pkg.name} pi.extensions mismatch: expected ${JSON.stringify(expected.extensions)}, got ${JSON.stringify(pkg.pi?.extensions)}`,
+      );
+    }
+    if (!listTarball(tarballPath).has("package/src/index.ts")) {
+      throw new Error(`${expected.tarball} is missing package/src/index.ts`);
+    }
+  }
+
   if (expected.name === "headroom-openclaw") {
     const distPkg = extractDistPackageJson(tarballPath);
     if (distPkg.name !== expected.name) {
@@ -155,8 +181,7 @@ try {
       "--ignore-scripts",
       "--no-audit",
       "--no-fund",
-      `./${packages[0].tarball}`,
-      `./${packages[1].tarball}`,
+      ...packages.map((expected) => `./${expected.tarball}`),
     ],
     installDir,
   );

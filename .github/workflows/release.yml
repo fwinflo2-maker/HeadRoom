@@ -13,6 +13,7 @@ env:
   NPM_SDK_PACKAGE: headroom-ai
   NPM_OPENCLAW_PACKAGE: headroom-openclaw
   NPM_OPENCODE_PACKAGE: headroom-opencode
+  NPM_PI_EXTENSION_PACKAGE: "@headroomlabs/pi-extension-headroom"
 
   # GitHub Package Registry
   GITHUB_PACKAGES_REGISTRY_URL: https://npm.pkg.github.com
@@ -53,6 +54,7 @@ on:
       - "scripts/version-sync.py"
       - "scripts/build_npm_release_assets.mjs"
       - "scripts/verify_npm_release_assets.mjs"
+      - "integrations/pi-extension/**"
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:
@@ -760,8 +762,179 @@ jobs:
           # Same staged smoke script as the other host/container paths.
           venv\Scripts\python.exe "$env:RUNNER_TEMP\smoke_import.py"
 
+  publish-pi-extension:
+    needs: [detect-version, build]
+    if: >-
+      github.event_name != 'pull_request' &&
+      github.event.inputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      spec: ${{ steps.publish.outputs.spec }}
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: ${{ env.NPM_REGISTRY_URL }}
+
+      - name: Download verified npm release assets
+        uses: actions/download-artifact@v8
+        with:
+          name: release-assets
+          path: release-assets/
+
+      - name: Publish or prove exact Pi extension artifact
+        id: publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${{ needs.detect-version.outputs.npm_version }}"
+          spec="@headroomlabs/pi-extension-headroom@${version}"
+          tarball="release-assets/headroomlabs-pi-extension-headroom-${version}.tgz"
+          digest="$(
+            openssl dgst -sha512 -binary "$tarball" | openssl base64 -A
+          )"
+          local_integrity="sha512-${digest}"
+
+          if npm view "$spec" version >/dev/null 2>&1; then
+            registry_integrity="$(npm view "$spec" dist.integrity)"
+            if [ "$registry_integrity" != "$local_integrity" ]; then
+              echo "Integrity mismatch for $spec" >&2
+              echo "local:    $local_integrity" >&2
+              echo "registry: $registry_integrity" >&2
+              exit 1
+            fi
+          else
+            npm publish "$tarball" --access public
+          fi
+
+          for attempt in $(seq 1 12); do
+            registry_integrity="$(
+              npm view "$spec" dist.integrity 2>/dev/null || true
+            )"
+            if [ "$registry_integrity" = "$local_integrity" ]; then
+              echo "spec=$spec" >> "$GITHUB_OUTPUT"
+              echo "Verified $spec at $local_integrity"
+              exit 0
+            fi
+            echo "Waiting for $spec propagation ($attempt/12)"
+            sleep 5
+          done
+          echo "Registry did not expose $spec with the expected integrity" >&2
+          exit 1
+
+  verify-pi-extension:
+    needs: [detect-version, build, publish-pi-extension]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        pi-version: ["0.80.10", "0.82.1", "0.84.1"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: integrations/pi-extension/package-lock.json
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Download verified npm release assets
+        uses: actions/download-artifact@v8
+        with:
+          name: release-assets
+          path: release-assets/
+
+      - name: Verify exact release assets
+        run: |
+          node scripts/verify_npm_release_assets.mjs \
+            release-assets \
+            "${{ needs.detect-version.outputs.npm_version }}"
+
+      - name: Install Headroom and extension test dependencies
+        run: |
+          uv sync --frozen --extra proxy
+          npm ci --prefix integrations/pi-extension
+
+      - name: Install tested Pi and OMP versions
+        run: |
+          npm install --global \
+            @earendil-works/pi-coding-agent@${{ matrix.pi-version }}
+          bun install --global @oh-my-pi/pi-coding-agent@17.1.8
+          echo "PI_BIN=$(command -v pi)" >> "$GITHUB_ENV"
+          echo "OMP_BIN=$(command -v omp)" >> "$GITHUB_ENV"
+          pi --version
+          omp --version
+
+      - name: Start source-built Headroom proxy with isolated CCR
+        run: |
+          export HEADROOM_CCR_SQLITE_PATH="${RUNNER_TEMP}/pi-extension-ccr.db"
+          uv run headroom proxy \
+            --port 8787 \
+            --stateless \
+            --no-embedding-server \
+            > "${RUNNER_TEMP}/headroom-proxy.log" 2>&1 &
+          echo $! > "${RUNNER_TEMP}/headroom-proxy.pid"
+          python - <<'PY'
+          import json
+          import time
+          import urllib.request
+
+          deadline = time.monotonic() + 120
+          while time.monotonic() < deadline:
+              try:
+                  with urllib.request.urlopen(
+                      "http://127.0.0.1:8787/readyz", timeout=2
+                  ) as response:
+                      ready = json.load(response).get("ready") is True
+                      if response.status == 200 and ready:
+                          break
+              except Exception:
+                  time.sleep(0.5)
+          else:
+              raise SystemExit(
+                  "Headroom proxy did not become ready within 120 seconds"
+              )
+          PY
+
+      - name: Run live contract and benchmark
+        working-directory: integrations/pi-extension
+        env:
+          HEADROOM_LIVE_BASE_URL: http://127.0.0.1:8787
+        run: |
+          npm run test:live
+          npm run benchmark:live
+
+      - name: Run deterministic dual-host gate against exact registry spec
+        working-directory: integrations/pi-extension
+        env:
+          HEADROOM_EXTENSION_SPEC: >-
+            @headroomlabs/pi-extension-headroom@${{
+            needs.detect-version.outputs.npm_version }}
+          HEADROOM_LIVE_BASE_URL: http://127.0.0.1:8787
+        run: npm run test:hosts
+
+      - name: Show proxy log after failure
+        if: failure()
+        run: cat "${RUNNER_TEMP}/headroom-proxy.log"
+
+      - name: Stop proxy
+        if: always()
+        run: kill "$(cat "${RUNNER_TEMP}/headroom-proxy.pid")" || true
+
   publish-pypi:
-    needs: [collect-dist, smoke-import-wheels]
+    needs: [collect-dist, smoke-import-wheels, verify-pi-extension]
     # X2: skip on pull_request — dry-run only verifies build+smoke,
     # never publishes. The other two predicates remain (workflow_dispatch
     # dry_run, vars-level skip).
@@ -1001,7 +1174,7 @@ jobs:
       enable_ref_tags: false
 
   create-release:
-    needs: [detect-version, build, build-wheels, collect-dist, smoke-import-wheels, publish-pypi, publish-npm, publish-github-packages, publish-docker]
+    needs: [detect-version, build, build-wheels, collect-dist, smoke-import-wheels, verify-pi-extension, publish-pypi, publish-npm, publish-github-packages, publish-docker]
     if: >-
       ${{
         always() &&
@@ -1012,6 +1185,7 @@ jobs:
         needs.build-wheels.result == 'success' &&
         needs.collect-dist.result == 'success' &&
         needs.smoke-import-wheels.result == 'success' &&
+        needs.verify-pi-extension.result == 'success' &&
         (vars.PYPI_SKIP == 'true' || needs.publish-pypi.result == 'success')
       }}
     runs-on: ubuntu-latest

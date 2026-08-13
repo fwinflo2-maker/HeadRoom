@@ -151,17 +151,25 @@ function probeHost(name, executable, args) {
 }
 
 try {
-  const packOutput = command("npm", ["pack", "--pack-destination", temporaryDirectory]);
-  const tarballName = packOutput.split(/\r?\n/).at(-1);
-  if (!tarballName) throw new Error("npm pack did not report a tarball");
-  const tarballPath = join(temporaryDirectory, tarballName);
-
+  const extensionSpec = process.env.HEADROOM_EXTENSION_SPEC;
   command("npm", ["init", "--yes"], temporaryDirectory);
-  command(
-    "npm",
-    ["install", "--ignore-scripts", "--no-audit", "--no-fund", tarballPath],
-    temporaryDirectory,
-  );
+  if (extensionSpec) {
+    command(
+      "npm",
+      ["install", "--ignore-scripts", "--no-audit", "--no-fund", extensionSpec],
+      temporaryDirectory,
+    );
+  } else {
+    const packOutput = command("npm", ["pack", "--pack-destination", temporaryDirectory]);
+    const tarballName = packOutput.split(/\r?\n/).at(-1);
+    if (!tarballName) throw new Error("npm pack did not report a tarball");
+    const tarballPath = join(temporaryDirectory, tarballName);
+    command(
+      "npm",
+      ["install", "--ignore-scripts", "--no-audit", "--no-fund", tarballPath],
+      temporaryDirectory,
+    );
+  }
 
   const extensionPath = join(
     temporaryDirectory,

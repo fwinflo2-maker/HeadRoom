@@ -10,7 +10,7 @@ Provider-independent context compression for [Pi](https://github.com/earendil-wo
 
 The packed-host lifecycle gate runs against Pi `0.80.10`, `0.82.1`, and `0.84.1`, plus OMP `17.1.8`. These are the exact tested host versions for this release.
 
-Headroom's official wrappers start or reuse the proxy and pass its endpoint to the extension (currently from a Headroom checkout until this PR ships):
+Headroom's official wrappers start or reuse the proxy and pass its endpoint to the extension:
 
 ```bash
 uv run headroom wrap pi

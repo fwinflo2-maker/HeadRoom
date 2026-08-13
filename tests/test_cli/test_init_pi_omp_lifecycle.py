@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import stat
+import sys
 from pathlib import Path
 from typing import Any, cast
 
@@ -29,6 +31,8 @@ def isolated_hosts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str,
 
     host_state.write_text("{}\n", encoding="utf-8")
     host_log.write_text("", encoding="utf-8")
+    python = bin_dir / "python3"
+    python.symlink_to(Path(sys.executable))
     fake_host = bin_dir / "fake-host"
     fake_host.write_text(
         """#!/usr/bin/env python3
@@ -122,7 +126,7 @@ else:
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
     monkeypatch.setenv("PI_CODING_AGENT_DIR", str(agent))
-    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    monkeypatch.setenv("PATH", str(bin_dir))
     monkeypatch.setenv("HEADROOM_TEST_HOST_STATE", str(host_state))
     monkeypatch.setenv("HEADROOM_TEST_HOST_LOG", str(host_log))
     monkeypatch.setenv("HEADROOM_TEST_CRONTAB", str(scheduler))
@@ -134,8 +138,13 @@ else:
     init_globals = inspect.unwrap(callback).__globals__
     monkeypatch.setattr(init_globals["sys"], "platform", "linux")
     monkeypatch.setattr(supervisors.sys, "platform", "linux")
-    monkeypatch.setitem(init_globals, "_install_headroom_mcp_for_targets", lambda **kwargs: None)
-    monkeypatch.setitem(init_globals, "_start_profile_strict_locked", lambda manifest: None)
+
+    def start_runtime(manifest: Any) -> None:
+        path = pid_path(manifest.profile)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("424242", encoding="utf-8")
+
+    monkeypatch.setitem(init_globals, "_start_profile_strict_locked", start_runtime)
     monkeypatch.setitem(
         init_globals,
         "stop_runtime",
@@ -167,6 +176,11 @@ def _manifest() -> dict[str, Any]:
     return payload
 
 
+def _assert_wrapper_unchanged(models: Path, models_bytes: bytes, backup_bytes: bytes) -> None:
+    assert models.read_bytes() == models_bytes
+    assert backup_path(models).read_bytes() == backup_bytes
+
+
 def test_pi_omp_durable_lifecycle_is_idempotent_and_wrapper_safe(
     monkeypatch: pytest.MonkeyPatch, isolated_hosts: dict[str, Path]
 ) -> None:
@@ -178,18 +192,46 @@ def test_pi_omp_durable_lifecycle_is_idempotent_and_wrapper_safe(
     backup_bytes = b"providers:\n  anthropic:\n    baseUrl: https://api.anthropic.com\n"
     models.write_bytes(models_bytes)
     backup_path(models).write_bytes(backup_bytes)
+    assert Path.home() == isolated_hosts["home"]
+    assert isolated_hosts["workspace"] / "deploy" / "init-user" == profile_root("init-user")
+    assert isolated_hosts["home"].parent / "bin" == Path(os.environ["PATH"])
 
     monkeypatch.setitem(init_globals, "_HEADROOM_VERSION", "0.34.0")
     _invoke("pi")
+    _assert_wrapper_unchanged(models, models_bytes, backup_bytes)
+    assert pid_path("init-user").is_file()
     config_034 = extension_config_path().read_bytes()
+    assert json.loads(config_034) == {"baseUrl": "http://127.0.0.1:8787"}
     task_marker = b"# >>> headroom init-user >>>"
     assert json.loads(isolated_hosts["host_state"].read_text()) == {"pi": "0.34.0"}
     assert _operations(isolated_hosts["host_log"]) == [
         {"host": "pi", "action": "install", "version": "0.34.0"}
     ]
-    assert _manifest()["targets"] == ["pi"]
+    manifest = _manifest()
+    assert manifest["profile"] == "init-user"
+    assert manifest["targets"] == ["pi"]
+    assert manifest["supervisor_kind"] == "task"
+    package = next(item for item in manifest["artifacts"] if item["kind"] == "pi-extension-package")
+    assert package == {
+        "kind": "pi-extension-package",
+        "path": "pi",
+        "metadata": {
+            "package": PACKAGE_NAME,
+            "version": "0.34.0",
+            "owned": True,
+            "source": "npm",
+        },
+    }
+    config = next(item for item in manifest["artifacts"] if item["kind"] == "pi-extension-config")
+    assert config["path"] == str(extension_config_path().absolute())
+    assert config["metadata"]["previous_exists"] is False
+    assert config["metadata"]["previous_base64"] == ""
+    assert config["metadata"]["managed_sha256"]
+    assert {item["kind"] for item in manifest["artifacts"]} >= {"script", "crontab"}
 
     _invoke("pi")
+    _assert_wrapper_unchanged(models, models_bytes, backup_bytes)
+    assert pid_path("init-user").is_file()
     artifacts = _manifest()["artifacts"]
     assert len({(item["kind"], item["path"]) for item in artifacts}) == len(artifacts)
     assert extension_config_path().read_bytes() == config_034
@@ -197,6 +239,8 @@ def test_pi_omp_durable_lifecycle_is_idempotent_and_wrapper_safe(
     assert len(_operations(isolated_hosts["host_log"])) == 1
 
     _invoke("omp")
+    _assert_wrapper_unchanged(models, models_bytes, backup_bytes)
+    assert pid_path("init-user").is_file()
     assert json.loads(isolated_hosts["host_state"].read_text()) == {
         "pi": "0.34.0",
         "omp": "0.34.0",
@@ -207,7 +251,11 @@ def test_pi_omp_durable_lifecycle_is_idempotent_and_wrapper_safe(
 
     monkeypatch.setitem(init_globals, "_HEADROOM_VERSION", "0.35.0")
     _invoke("pi")
+    _assert_wrapper_unchanged(models, models_bytes, backup_bytes)
+    assert pid_path("init-user").is_file()
     _invoke("omp")
+    _assert_wrapper_unchanged(models, models_bytes, backup_bytes)
+    assert pid_path("init-user").is_file()
     assert json.loads(isolated_hosts["host_state"].read_text()) == {
         "pi": "0.35.0",
         "omp": "0.35.0",
@@ -215,26 +263,31 @@ def test_pi_omp_durable_lifecycle_is_idempotent_and_wrapper_safe(
 
     monkeypatch.setitem(init_globals, "_HEADROOM_VERSION", "0.34.0")
     _invoke("pi")
+    _assert_wrapper_unchanged(models, models_bytes, backup_bytes)
+    assert pid_path("init-user").is_file()
     _invoke("omp")
+    _assert_wrapper_unchanged(models, models_bytes, backup_bytes)
+    assert pid_path("init-user").is_file()
     assert json.loads(isolated_hosts["host_state"].read_text()) == {
         "pi": "0.34.0",
         "omp": "0.34.0",
     }
 
     _invoke("remove", "pi")
+    _assert_wrapper_unchanged(models, models_bytes, backup_bytes)
+    assert pid_path("init-user").is_file()
     assert json.loads(isolated_hosts["host_state"].read_text()) == {"omp": "0.34.0"}
     assert _manifest()["targets"] == ["omp"]
     assert extension_config_path().read_bytes() == config_034
     assert isolated_hosts["scheduler"].read_bytes().count(task_marker) == 1
 
     _invoke("remove", "omp")
+    _assert_wrapper_unchanged(models, models_bytes, backup_bytes)
     assert json.loads(isolated_hosts["host_state"].read_text()) == {}
     assert not extension_config_path().exists()
     assert isolated_hosts["scheduler"].read_bytes() == b""
     assert not profile_root("init-user").exists()
     assert not pid_path("init-user").exists()
-    assert models.read_bytes() == models_bytes
-    assert backup_path(models).read_bytes() == backup_bytes
 
     versions = [
         entry["version"]

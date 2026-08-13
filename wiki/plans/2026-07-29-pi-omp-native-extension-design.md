@@ -2,7 +2,7 @@
 
 ## Status
 
-Approved for a first global-only durable release. The approved topology keeps transient `headroom wrap pi|omp`, adds opt-in `headroom init -g pi|omp`, pins the extension to the exact Headroom release version, and leaves project-local durable setup for a later release. Durable OMP setup never modifies `models.yml`; the existing OMP wrapper remains the sole owner of its Anthropic inference override.
+The design and global-only scope are approved; the feature is not release-ready. The approved topology keeps transient `headroom wrap pi|omp`, adds opt-in `headroom init -g pi|omp`, pins the extension to the exact Headroom release version, and leaves project-local durable setup for a later release. Durable OMP setup never modifies `models.yml`; the existing OMP wrapper remains the sole owner of its Anthropic inference override. Release remains blocked on the independent production gates listed under Rollout.
 
 ## Problem
 
@@ -392,7 +392,7 @@ omp plugin install @headroomlabs/pi-extension-headroom@<version>
 
 1. Merge `baseUrl: http://127.0.0.1:<port>` into the host-neutral config file, preserving unrelated fields and recording the exact prior bytes.
 2. Record package ownership, pinned version, config ownership, and task artifacts in the deployment manifest.
-3. Start or recover the shared local proxy and run a health, compression, and retrieval round-trip.
+3. Start or recover the shared local proxy and wait for readiness. Compression and retrieval are covered by separate live-contract evidence, not by durable init.
 
 Re-running init is idempotent. A Headroom-owned older package is upgraded to the exact current release; installing an older released Headroom CLI and rerunning both commands performs the supported rollback. A compatible pre-existing package is preserved and recorded as user-owned. An incompatible or unpinned pre-existing package produces an actionable error instead of being overwritten.
 

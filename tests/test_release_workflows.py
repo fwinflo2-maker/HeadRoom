@@ -676,6 +676,21 @@ def test_pi_extension_registry_gate_uses_exact_version() -> None:
     assert 'HEADROOM_CCR_SQLITE_PATH="${RUNNER_TEMP}/pi-extension-ccr.db"' in content
 
 
+def test_pi_extension_verify_proxy_cleanup_is_strict() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
+    steps = workflow["jobs"]["verify-pi-extension"]["steps"]
+    stop = next(step for step in steps if step.get("name") == "Stop proxy")
+
+    assert stop["if"] == "always()"
+    assert 'kill "$(cat "${RUNNER_TEMP}/headroom-proxy.pid")" || true' not in stop["run"]
+    assert 'if [ ! -s "$pid_file" ]' in stop["run"]
+    assert 'case "$pid" in' in stop["run"]
+    assert "kill -0" in stop["run"]
+    assert 'if ! kill "$pid"' in stop["run"]
+    assert 'if ! kill -0 "$pid"' in stop["run"]
+    assert 'echo "Proxy PID $pid remained alive after SIGTERM"' in stop["run"]
+
+
 def test_pi_extension_host_load_accepts_exact_external_spec() -> None:
     host_load = (ROOT / "integrations/pi-extension/e2e/host-load.mjs").read_text(encoding="utf-8")
 

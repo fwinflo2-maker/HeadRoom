@@ -624,6 +624,116 @@ def test_conflicting_user_base_url_is_not_overwritten(
     assert path.read_bytes() == before
 
 
+def test_config_create_preserves_file_created_during_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    user_bytes = b'{"enabled":false}\n'
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+    publish = module._publish_staged
+
+    def create_before_publish(staged: Path, destination: Path) -> bool:
+        destination.write_bytes(user_bytes)
+        return publish(staged, destination)
+
+    monkeypatch.setattr(module, "_publish_staged", create_before_publish)
+
+    with pytest.raises(click.ClickException, match="changed during configuration"):
+        ensure_extension_config(8787, None)
+
+    assert path.read_bytes() == user_bytes
+
+
+def test_config_update_preserves_file_changed_during_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    user_bytes = b'{"baseUrl":"http://127.0.0.1:9999"}\n'
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+    artifact = ensure_extension_config(8787, None)
+    displace = module._displace_candidate
+
+    def change_before_displace(candidate: Path, displaced: Path) -> None:
+        candidate.write_bytes(user_bytes)
+        displace(candidate, displaced)
+
+    monkeypatch.setattr(module, "_displace_candidate", change_before_displace)
+
+    with pytest.raises(click.ClickException, match="changed during configuration"):
+        ensure_extension_config(9444, artifact)
+
+    assert path.read_bytes() == user_bytes
+
+
+def test_config_restore_preserves_file_changed_during_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    path.write_bytes(b'{"enabled":false}\n')
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+    artifact = ensure_extension_config(8787, None)
+    user_bytes = b'{"baseUrl":"http://127.0.0.1:9999"}\n'
+    displace = module._displace_candidate
+
+    def change_before_displace(candidate: Path, displaced: Path) -> None:
+        candidate.write_bytes(user_bytes)
+        displace(candidate, displaced)
+
+    monkeypatch.setattr(module, "_displace_candidate", change_before_displace)
+
+    assert remove_owned_extension_config(artifact) == "preserved"
+    assert path.read_bytes() == user_bytes
+
+
+def test_config_remove_preserves_file_changed_during_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+    artifact = ensure_extension_config(8787, None)
+    user_bytes = b'{"enabled":false}\n'
+    displace = module._displace_candidate
+
+    def change_before_displace(candidate: Path, displaced: Path) -> None:
+        candidate.write_bytes(user_bytes)
+        displace(candidate, displaced)
+
+    monkeypatch.setattr(module, "_displace_candidate", change_before_displace)
+
+    assert remove_owned_extension_config(artifact) == "preserved"
+    assert path.read_bytes() == user_bytes
+
+
+def test_config_remove_preserves_file_created_after_displacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+    artifact = ensure_extension_config(8787, None)
+    user_bytes = b'{"enabled":false}\n'
+    displace = module._displace_candidate
+
+    def create_after_displace(candidate: Path, displaced: Path) -> None:
+        displace(candidate, displaced)
+        candidate.write_bytes(user_bytes)
+
+    monkeypatch.setattr(module, "_displace_candidate", create_after_displace)
+
+    assert remove_owned_extension_config(artifact) == "preserved"
+    assert path.read_bytes() == user_bytes
+
+
+def test_config_remove_reports_absent_directly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pi-extension.json"
+    monkeypatch.setattr(module, "extension_config_path", lambda: path)
+    artifact = ensure_extension_config(8787, None)
+    path.unlink()
+
+    assert remove_owned_extension_config(artifact) == "absent"
+
+
 def test_config_lifecycle_has_no_omp_models_path_dependency(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

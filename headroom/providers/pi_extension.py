@@ -6,6 +6,9 @@ import base64
 import hashlib
 import json
 import os
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from subprocess import CalledProcessError
@@ -26,6 +29,13 @@ HostName = Literal["pi", "omp"]
 class PackageState:
     version: str
     source: str | None
+
+
+@dataclass(frozen=True)
+class _ConfigCandidate:
+    content: bytes
+    device: int
+    inode: int
 
 
 def extension_release_version(version_label: str) -> str:
@@ -53,6 +63,130 @@ def extension_config_path() -> Path:
 
 def _sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+@contextmanager
+def _extension_config_lock(path: Path) -> Iterator[None]:
+    lock_path = path.parent / ".pi-extension.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_file:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt_any = cast(Any, msvcrt)
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            lock_file.seek(0)
+            msvcrt_any.locking(lock_file.fileno(), msvcrt_any.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt_any = cast(Any, msvcrt)
+                lock_file.seek(0)
+                msvcrt_any.locking(lock_file.fileno(), msvcrt_any.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _capture_candidate(path: Path) -> _ConfigCandidate | None:
+    try:
+        before = path.lstat()
+        content = path.read_bytes()
+        after = path.lstat()
+    except FileNotFoundError:
+        return None
+    if (
+        (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or before.st_ctime_ns != after.st_ctime_ns
+    ):
+        raise click.ClickException(f"Pi extension config at {path} changed while being read.")
+    return _ConfigCandidate(content, after.st_dev, after.st_ino)
+
+
+def _stage_bytes(path: Path, content: bytes, suffix: str) -> Path:
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=suffix)
+    os.close(fd)
+    staged = Path(name)
+    try:
+        write_text(staged, content.decode("utf-8"))
+    except BaseException:
+        staged.unlink(missing_ok=True)
+        raise
+    return staged
+
+
+def _publish_staged(staged: Path, destination: Path) -> bool:
+    try:
+        os.link(staged, destination)
+    except FileExistsError:
+        return False
+    return True
+
+
+def _displace_candidate(candidate: Path, displaced: Path) -> None:
+    os.replace(candidate, displaced)
+
+
+def _candidate_matches(path: Path, expected: _ConfigCandidate) -> bool:
+    try:
+        stat = path.lstat()
+        content = path.read_bytes()
+    except FileNotFoundError:
+        return False
+    return (
+        stat.st_dev == expected.device
+        and stat.st_ino == expected.inode
+        and content == expected.content
+    )
+
+
+def _commit_config(path: Path, expected: _ConfigCandidate | None, desired: bytes | None) -> bool:
+    staged = _stage_bytes(path, desired, ".stage") if desired is not None else None
+    displaced: Path | None = None
+    try:
+        if expected is None:
+            return staged is not None and _publish_staged(staged, path)
+
+        displaced = _stage_bytes(path, b"", ".recovery")
+        displaced.unlink()
+        try:
+            _displace_candidate(path, displaced)
+        except FileNotFoundError:
+            return False
+        if not _candidate_matches(displaced, expected):
+            if _publish_staged(displaced, path):
+                displaced.unlink()
+            return False
+        if staged is None:
+            try:
+                os.link(displaced, path)
+                path.unlink()
+            except FileExistsError:
+                displaced.unlink()
+                return False
+            displaced.unlink()
+            return True
+        if not _publish_staged(staged, path):
+            displaced.unlink()
+            return False
+        displaced.unlink()
+        return True
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
 
 
 def _config_payload(content: bytes, path: Path) -> dict[str, Any]:
@@ -113,46 +247,46 @@ def ensure_extension_config(port: int, existing_artifact: ArtifactRecord | None)
     path = extension_config_path().absolute()
     requested_url = f"http://127.0.0.1:{port}"
 
-    if existing_artifact is None:
-        previous_exists = path.exists()
-        try:
-            previous = path.read_bytes() if previous_exists else b""
-        except OSError as exc:
-            raise click.ClickException(
-                f"Could not read Pi extension config at {path}: {exc}"
-            ) from exc
-        payload = _config_payload(previous, path)
-    else:
-        previous_exists, previous, managed_sha256 = _owned_config_metadata(existing_artifact, path)
-        try:
-            current = path.read_bytes()
-        except FileNotFoundError as exc:
-            raise click.ClickException(
-                f"Refusing to recreate changed Pi extension config at {path}."
-            ) from exc
-        except OSError as exc:
-            raise click.ClickException(
-                f"Could not read Pi extension config at {path}: {exc}"
-            ) from exc
-        payload = _config_payload(current, path)
-        if _sha256(current) != managed_sha256:
+    with _extension_config_lock(path):
+        candidate = _capture_candidate(path)
+        current = candidate.content if candidate is not None else b""
+        if existing_artifact is None:
+            previous_exists = candidate is not None
+            previous = current
+            payload = _config_payload(current, path)
+        else:
+            previous_exists, previous, managed_sha256 = _owned_config_metadata(
+                existing_artifact, path
+            )
+            if candidate is None:
+                raise click.ClickException(
+                    f"Refusing to recreate changed Pi extension config at {path}."
+                )
+            payload = _config_payload(current, path)
+            if _sha256(current) != managed_sha256:
+                if payload.get("baseUrl") == requested_url:
+                    return existing_artifact
+                raise click.ClickException(
+                    f"Refusing to overwrite changed Pi extension config at {path}; "
+                    f"baseUrl does not match {requested_url}."
+                )
             if payload.get("baseUrl") == requested_url:
                 return existing_artifact
-            raise click.ClickException(
-                f"Refusing to overwrite changed Pi extension config at {path}; "
-                f"baseUrl does not match {requested_url}."
-            )
-        if payload.get("baseUrl") == requested_url:
-            return existing_artifact
 
-    payload["baseUrl"] = requested_url
-    managed = (json.dumps(payload, indent=2) + "\n").encode()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        write_text(path, managed.decode())
-    except OSError as exc:
-        raise click.ClickException(f"Could not write Pi extension config at {path}: {exc}") from exc
-    return _config_artifact(path, previous_exists, previous, managed)
+        payload["baseUrl"] = requested_url
+        managed = (json.dumps(payload, indent=2) + "\n").encode()
+        try:
+            committed = _commit_config(path, candidate, managed)
+        except OSError as exc:
+            raise click.ClickException(
+                f"Could not write Pi extension config at {path}: {exc}"
+            ) from exc
+        if not committed:
+            raise click.ClickException(
+                f"Pi extension config at {path} changed during configuration; "
+                "the competing file was preserved."
+            )
+        return _config_artifact(path, previous_exists, previous, managed)
 
 
 def remove_owned_extension_config(
@@ -161,31 +295,21 @@ def remove_owned_extension_config(
     """Undo config ownership only while the managed bytes remain unchanged."""
     path = extension_config_path().absolute()
     previous_exists, previous, managed_sha256 = _owned_config_metadata(artifact, path)
-    try:
-        current = path.read_bytes()
-    except FileNotFoundError:
-        return "absent"
-    except OSError as exc:
-        raise click.ClickException(f"Could not read Pi extension config at {path}: {exc}") from exc
-    if _sha256(current) != managed_sha256:
-        return "preserved"
-    if not previous_exists:
-        try:
-            path.unlink()
-        except FileNotFoundError:
+    with _extension_config_lock(path):
+        candidate = _capture_candidate(path)
+        if candidate is None:
             return "absent"
-        except OSError as exc:
+        if _sha256(candidate.content) != managed_sha256:
+            return "preserved"
+        try:
+            committed = _commit_config(path, candidate, previous if previous_exists else None)
+        except (OSError, UnicodeDecodeError) as exc:
             raise click.ClickException(
                 f"Could not remove Pi extension config at {path}: {exc}"
             ) from exc
-        return "removed"
-    try:
-        write_text(path, previous.decode("utf-8"))
-    except (OSError, UnicodeDecodeError) as exc:
-        raise click.ClickException(
-            f"Could not restore Pi extension config at {path}: {exc}"
-        ) from exc
-    return "restored"
+        if not committed:
+            return "preserved"
+        return "restored" if previous_exists else "removed"
 
 
 def _npm_state(source: str) -> PackageState | None:

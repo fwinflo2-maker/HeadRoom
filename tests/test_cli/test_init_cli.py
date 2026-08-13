@@ -1155,7 +1155,9 @@ def test_native_runtime_state_restored_on_rollback(monkeypatch, was_running: boo
     monkeypatch.setattr(init_cli, "_save_manifest_verified", lambda value: None)
     monkeypatch.setattr(init_cli, "_restore_manifest_snapshot", lambda *args: None)
     monkeypatch.setattr(init_cli, "stop_runtime", lambda value: calls.append("stop"))
-    monkeypatch.setattr(init_cli, "_start_profile_strict", lambda value: calls.append("restart"))
+    monkeypatch.setattr(
+        init_cli, "_start_profile_strict_locked", lambda value: calls.append("restart")
+    )
 
     with pytest.raises(click.ClickException, match="boom"):
         init_cli._init_native_hosts(
@@ -1167,6 +1169,69 @@ def test_native_runtime_state_restored_on_rollback(monkeypatch, was_running: boo
         )
 
     assert calls == (["stop", "restart"] if was_running else ["stop"])
+
+
+def test_native_ready_runtime_rollback_reuses_held_start_lock(monkeypatch) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    previous = init_cli._build_runtime_manifest(
+        profile="init-user",
+        existing=None,
+        targets=["claude"],
+        port=8787,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        memory=False,
+    )
+    manifest = init_cli._build_runtime_manifest(
+        profile="init-user",
+        existing=previous,
+        targets=["pi"],
+        port=8787,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        memory=False,
+    )
+    lock_held = False
+
+    @contextmanager
+    def non_reentrant_lock(profile):
+        nonlocal lock_held
+        if lock_held:
+            yield False
+            return
+        lock_held = True
+        try:
+            yield True
+        finally:
+            lock_held = False
+
+    statuses = iter(["running", "running", "stopped", "stopped", "stopped"])
+    monkeypatch.setattr(init_cli, "acquire_runtime_start_lock", non_reentrant_lock)
+    monkeypatch.setattr(init_cli, "runtime_status", lambda value: next(statuses))
+    monkeypatch.setattr(init_cli, "wait_ready", lambda value, timeout_seconds: True)
+    monkeypatch.setattr(init_cli, "inspect_host_package", lambda host, binary: None)
+    monkeypatch.setattr(
+        init_cli,
+        "ensure_extension_config",
+        lambda port, existing: (_ for _ in ()).throw(RuntimeError("initiating")),
+    )
+    monkeypatch.setattr(init_cli, "remove_supervisor", lambda value: None)
+    monkeypatch.setattr(init_cli, "_restore_manifest_snapshot", lambda *args: None)
+    monkeypatch.setattr(init_cli, "stop_runtime", lambda value: None)
+    monkeypatch.setattr(init_cli, "start_detached_agent", lambda profile: None)
+
+    with pytest.raises(click.ClickException, match="initiating") as exc_info:
+        init_cli._init_native_hosts(
+            hosts=[("pi", "/bin/pi")],
+            release="1.2.3",
+            manifest=manifest,
+            manifest_snapshot=(True, b"prior", previous),
+            port=8787,
+        )
+
+    assert "already being started" not in str(exc_info.value)
 
 
 def test_native_strict_startup_failure_leaves_no_native_claims(monkeypatch) -> None:

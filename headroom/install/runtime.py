@@ -26,6 +26,8 @@ CONTAINER_BIND_HOST = "0.0.0.0"  # noqa: S104 — container-internal bind, publi
 # proxy_args always starts with the host flag/value pair (see planner.py); we
 # drop it and substitute CONTAINER_BIND_HOST for the in-container bind.
 _PROXY_ARGS_HOST_PAIR_LEN = 2
+_STOP_TIMEOUT_SECONDS = 10
+_STOP_POLL_SECONDS = 0.1
 
 PASSTHROUGH_ENV_PREFIXES = (
     "HEADROOM_",
@@ -379,7 +381,17 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
     except (OSError, SystemError):
         # SystemError covers the Windows WinError 87 surfacing described in #1544.
         pass
-    _clear_pid(manifest.profile)
+    for _ in range(round(_STOP_TIMEOUT_SECONDS / _STOP_POLL_SECONDS)):
+        if not pid_alive(pid):
+            _clear_pid(manifest.profile)
+            return
+        time.sleep(_STOP_POLL_SECONDS)
+    if not pid_alive(pid):
+        _clear_pid(manifest.profile)
+        return
+    raise RuntimeError(
+        f"Runtime process {pid} did not stop within {_STOP_TIMEOUT_SECONDS} seconds."
+    )
 
 
 def wait_ready(manifest: DeploymentManifest, timeout_seconds: int = 30) -> bool:

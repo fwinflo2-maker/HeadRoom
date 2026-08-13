@@ -992,7 +992,9 @@ def _start_profile_strict(manifest: Any) -> None:
         _start_profile_strict_locked(manifest)
 
 
-def _restore_runtime_state(manifest: Any, status: str, was_ready: bool) -> None:
+def _restore_runtime_state(
+    manifest: Any, status: str, was_ready: bool, *, assume_start_lock: bool = False
+) -> None:
     if getattr(manifest, "preset", None):
         current_status = runtime_status(manifest)
         stop_runtime(manifest)
@@ -1007,7 +1009,10 @@ def _restore_runtime_state(manifest: Any, status: str, was_ready: bool) -> None:
             f"Cannot restore unknown runtime state {status!r} for profile {manifest.profile}."
         )
     if was_ready:
-        _start_profile_strict(manifest)
+        if assume_start_lock:
+            _start_profile_strict_locked(manifest)
+        else:
+            _start_profile_strict(manifest)
         return
     start_detached_agent(manifest.profile)
     if not _wait_runtime_status(manifest, "running"):
@@ -1178,7 +1183,12 @@ def _init_native_hosts_locked(
             lambda: _restore_files(task_files_snapshot),
             lambda: _restore_manifest_snapshot(manifest.profile, manifest_existed, manifest_bytes),
             lambda: (
-                _restore_runtime_state(previous_manifest, prior_runtime_status, prior_runtime_ready)
+                _restore_runtime_state(
+                    previous_manifest,
+                    prior_runtime_status,
+                    prior_runtime_ready,
+                    assume_start_lock=True,
+                )
                 if previous_manifest is not None
                 else stop_runtime(manifest)
                 if getattr(manifest, "preset", None) is not None

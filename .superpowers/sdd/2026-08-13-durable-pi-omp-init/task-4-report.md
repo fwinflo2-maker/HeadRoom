@@ -141,3 +141,22 @@ Native init holds the profile start lock across provisional persistence, supervi
 - Ruff format/check on all four scoped files: passed.
 - mypy on both changed production files: passed.
 - `git diff --check`: passed.
+
+## Fix Round 5
+
+### RED
+
+- Added a live-process regression using a real Python child that delays exit after SIGTERM. Before the fix, `stop_runtime()` returned and cleared its PID file while the child was still alive.
+- Added a ready-runtime rollback regression with a non-reentrant fake start lock while leaving `_start_profile_strict` unmocked. It exposed rollback attempting to reacquire the lock held by `_init_native_hosts`.
+
+### Corrections
+
+`stop_runtime()` now polls the targeted PID for up to 10 seconds after SIGTERM, clears the PID file only after confirmed death, and raises while retaining the PID file when the process does not exit. Ready-runtime rollback accepts the already-held native-init start lock and calls the locked strict-start path instead of reacquiring it.
+
+### GREEN
+
+- Full init/supervisor/runtime suite: 177 passed.
+- Focused Fix Round 5 regressions: 3 passed.
+- Ruff format/check on all five covered files: passed.
+- mypy on both changed production files: passed.
+- `git diff --check`: passed.

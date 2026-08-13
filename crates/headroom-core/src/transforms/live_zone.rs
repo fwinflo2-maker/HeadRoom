@@ -660,26 +660,38 @@ fn disabled_arms() -> &'static HashSet<ContentType> {
 
 /// Reverse of [`ContentType::as_str`]. `ContentType` (content_detector.rs)
 /// has no public `from_str`-style constructor and this kill switch isn't
-/// reason enough to grow its public API, so this small private mapping
-/// mirrors each variant's string tag instead.
+/// reason enough to grow the crate's curated public API, so this small
+/// mapping mirrors each variant's string tag instead of living on
+/// `ContentType` itself. `pub` (not re-exported from
+/// `transforms::{...}`'s curated list in `mod.rs`) purely so
+/// `live_zone_arm_properties.rs`'s exhaustive round-trip test can reach
+/// it via the full `transforms::live_zone::content_type_from_name` path
+/// — the same convention already used for [`DEFAULT_MODEL`] in the
+/// existing integration tests.
 ///
-/// `PlainText` accepts both its `as_str()` tag (`"text"`, for consistency
-/// with log/metric field values elsewhere) and `"plain_text"` — the
-/// operator-facing example this module's own doc comment and the
-/// original task brief both use (`HEADROOM_LIVE_ZONE_DISABLE_ARMS=
-/// source_code,plain_text`). Without this alias that documented example
-/// silently no-ops: `"plain_text"` doesn't match `"text"`, so it falls
-/// through to the unknown-token branch and the PlainText arm never
-/// actually gets disabled. Caught by
+/// Several variants accept both their `as_str()` tag (for consistency
+/// with log/metric field values elsewhere) and a natural-name alias — the
+/// operator-facing spelling a human is more likely to write. `PlainText`
+/// accepts `"text"` and `"plain_text"`: `"plain_text"` is the example this
+/// module's own doc comment and the original task brief both use
+/// (`HEADROOM_LIVE_ZONE_DISABLE_ARMS=source_code,plain_text`). Without
+/// that alias the documented example silently no-ops: `"plain_text"`
+/// doesn't match `"text"`, so it falls through to the unknown-token
+/// branch and the PlainText arm never actually gets disabled. The same
+/// trap applies to `SearchResults` (`"search"` / `"search_results"`),
+/// `BuildOutput` (`"build"` / `"build_output"`), and `GitDiff`
+/// (`"diff"` / `"git_diff"`) — each gets the identical additive alias.
+/// Caught by
 /// `live_zone_disable_arms.rs::disabled_arms_route_to_no_op_others_unaffected`'s
-/// PlainText assertion block.
-fn content_type_from_name(name: &str) -> Option<ContentType> {
+/// PlainText assertion block, and by
+/// `live_zone_arm_properties.rs`'s round-trip test across all variants.
+pub fn content_type_from_name(name: &str) -> Option<ContentType> {
     match name {
         "json_array" => Some(ContentType::JsonArray),
         "source_code" => Some(ContentType::SourceCode),
-        "search" => Some(ContentType::SearchResults),
-        "build" => Some(ContentType::BuildOutput),
-        "diff" => Some(ContentType::GitDiff),
+        "search" | "search_results" => Some(ContentType::SearchResults),
+        "build" | "build_output" => Some(ContentType::BuildOutput),
+        "diff" | "git_diff" => Some(ContentType::GitDiff),
         "html" => Some(ContentType::Html),
         "text" | "plain_text" => Some(ContentType::PlainText),
         _ => None,

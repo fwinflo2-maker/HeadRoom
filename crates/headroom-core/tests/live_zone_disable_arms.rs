@@ -84,6 +84,24 @@ fn python_module_source(n: usize) -> String {
     code
 }
 
+/// Build repetitive plain prose at least `min_bytes` long. Same
+/// repetition style as `live_zone_dispatch.rs`'s Kompress fixture
+/// (duplicated, not shared — see module doc for why this file must
+/// stand alone).
+fn plain_prose(min_bytes: usize) -> String {
+    let mut text = String::new();
+    let mut i = 0usize;
+    while text.len() < min_bytes {
+        text.push_str(&format!(
+            "City officials announced today that the downtown revitalization \
+             project will proceed as planned despite budget concerns raised \
+             during round {i} of public comment. "
+        ));
+        i += 1;
+    }
+    text
+}
+
 #[test]
 fn disabled_arms_route_to_no_op_others_unaffected() {
     // `source_code, plain_text, bogus_type` — the internal spaces
@@ -125,7 +143,39 @@ fn disabled_arms_route_to_no_op_others_unaffected() {
         "disabled SourceCode arm must yield NoCompressionApplied, got {code_action:?}"
     );
 
-    // (b) Other arms unaffected: a >512-byte JSON-array tool_result must
+    // (b) PlainText arm disabled: a >5120-byte plain-prose tool_result
+    // must NOT reach the PlainText compressor (Kompress) — NoCompressionApplied,
+    // not Compressed. The fixture MUST clear THRESHOLD_PLAIN_TEXT (5120
+    // bytes in live_zone.rs) — below that, `compress_one_block`'s
+    // byte-threshold gate short-circuits before dispatch even runs, and
+    // the assertion below would pass regardless of the kill switch. Do
+    // NOT shrink this fixture below 5120 bytes.
+    let prose = plain_prose(5200);
+    assert!(
+        prose.len() > 5120,
+        "fixture must clear the PlainText byte threshold (5120); got {} bytes",
+        prose.len()
+    );
+    let prose_out = dispatch(&body_with_tool_result(&prose));
+    let prose_manifest = match &prose_out {
+        LiveZoneOutcome::NoChange { manifest } => manifest,
+        LiveZoneOutcome::Modified { manifest, .. } => panic!(
+            "disabled PlainText arm must not rewrite bytes; got Modified. manifest: {manifest:?}"
+        ),
+    };
+    let prose_action = prose_manifest
+        .block_outcomes
+        .iter()
+        .find(|b| b.block_type == "tool_result")
+        .expect("tool_result block present in manifest")
+        .action
+        .clone();
+    assert!(
+        matches!(prose_action, BlockAction::NoCompressionApplied { .. }),
+        "disabled PlainText arm must yield NoCompressionApplied, got {prose_action:?}"
+    );
+
+    // (c) Other arms unaffected: a >512-byte JSON-array tool_result must
     // still compress via smart_crusher (the kill switch only guards the
     // SourceCode / PlainText arms).
     let array_of_dicts: Vec<Value> = (0..200)

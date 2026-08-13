@@ -662,6 +662,17 @@ fn disabled_arms() -> &'static HashSet<ContentType> {
 /// has no public `from_str`-style constructor and this kill switch isn't
 /// reason enough to grow its public API, so this small private mapping
 /// mirrors each variant's string tag instead.
+///
+/// `PlainText` accepts both its `as_str()` tag (`"text"`, for consistency
+/// with log/metric field values elsewhere) and `"plain_text"` — the
+/// operator-facing example this module's own doc comment and the
+/// original task brief both use (`HEADROOM_LIVE_ZONE_DISABLE_ARMS=
+/// source_code,plain_text`). Without this alias that documented example
+/// silently no-ops: `"plain_text"` doesn't match `"text"`, so it falls
+/// through to the unknown-token branch and the PlainText arm never
+/// actually gets disabled. Caught by
+/// `live_zone_disable_arms.rs::disabled_arms_route_to_no_op_others_unaffected`'s
+/// PlainText assertion block.
 fn content_type_from_name(name: &str) -> Option<ContentType> {
     match name {
         "json_array" => Some(ContentType::JsonArray),
@@ -670,7 +681,7 @@ fn content_type_from_name(name: &str) -> Option<ContentType> {
         "build" => Some(ContentType::BuildOutput),
         "diff" => Some(ContentType::GitDiff),
         "html" => Some(ContentType::Html),
-        "text" => Some(ContentType::PlainText),
+        "text" | "plain_text" => Some(ContentType::PlainText),
         _ => None,
     }
 }

@@ -1,3 +1,4 @@
+# mypy: disable-error-code="no-untyped-def,func-returns-value"
 from __future__ import annotations
 
 from pathlib import Path
@@ -264,6 +265,43 @@ def test_render_runner_scripts_writes_windows_scripts(monkeypatch, tmp_path: Pat
         "ensure-headroom.ps1",
         "ensure-headroom.cmd",
     ]
+
+
+def test_native_init_selects_task_supervisor(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "linux")
+    monkeypatch.setattr(
+        "headroom.install.supervisors.render_runner_scripts",
+        lambda manifest: [
+            type(
+                "Record",
+                (),
+                {
+                    "kind": "script",
+                    "path": (tmp_path / "ensure-headroom.sh").as_posix(),
+                },
+            )(),
+        ],
+    )
+    monkeypatch.setattr(
+        "headroom.install.supervisors._linux_task_spec",
+        lambda manifest, script: (
+            None,
+            "# >>> headroom init-user >>>\n@reboot ensure\n# <<< headroom init-user <<<\n",
+        ),
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs):
+        calls.append(command)
+        return type("Result", (), {"returncode": 1, "stdout": ""})()
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+    records = install_supervisor(
+        _manifest(profile="init-user", supervisor=SupervisorKind.TASK.value)
+    )
+
+    assert records[-1].kind == "crontab"
+    assert calls == [["crontab", "-l"], ["crontab", "-"]]
 
 
 def test_install_supervisor_none_returns_runner_records(monkeypatch, tmp_path: Path) -> None:

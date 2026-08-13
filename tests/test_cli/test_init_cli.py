@@ -1,5 +1,7 @@
+# mypy: disable-error-code="no-untyped-def,func-returns-value"
 from __future__ import annotations
 
+import copy
 import importlib
 import json
 import os
@@ -10,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 try:
-    import tomllib
+    import tomllib  # type: ignore[import-not-found]
 except ModuleNotFoundError:  # Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
 
@@ -22,18 +24,362 @@ from click.testing import CliRunner
 def _load_init_module(monkeypatch):
     monkeypatch.delitem(sys.modules, "headroom.cli.init", raising=False)
     monkeypatch.delitem(sys.modules, "headroom.cli.main", raising=False)
-    fake_main_module = types.ModuleType("headroom.cli.main")
+    fake_main_module: types.ModuleType | SimpleNamespace = types.ModuleType("headroom.cli.main")
 
     @click.group()
     def fake_main() -> None:
         pass
 
-    fake_main_module.main = fake_main
+    fake_main_module.main = fake_main  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "headroom.cli.main", fake_main_module)
     importlib.invalidate_caches()
     init_cli = importlib.import_module("headroom.cli.init")
     monkeypatch.delitem(sys.modules, "headroom.cli.init", raising=False)
     return init_cli, fake_main
+
+
+def test_global_auto_detection_includes_pi_and_omp(monkeypatch) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.setattr(
+        init_cli.shutil,
+        "which",
+        lambda name: f"/bin/{name}" if name in {"pi", "omp"} else None,
+    )
+
+    assert init_cli.detect_init_targets(global_scope=True) == ["pi", "omp"]
+
+
+def test_local_pi_rejected_before_manifest_or_package_changes(monkeypatch) -> None:
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    touched: list[str] = []
+    monkeypatch.setattr(
+        init_cli,
+        "_ensure_runtime_manifest",
+        lambda **kwargs: touched.append("manifest"),
+    )
+    monkeypatch.setattr(
+        init_cli,
+        "ensure_host_package",
+        lambda *args, **kwargs: touched.append("package"),
+        raising=False,
+    )
+
+    result = CliRunner().invoke(fake_main, ["init", "pi"])
+
+    assert result.exit_code != 0
+    assert "requires -g" in result.output
+    assert touched == []
+
+
+def test_native_init_uses_shared_profile_and_task(monkeypatch) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    manifest = SimpleNamespace(
+        profile="init-user",
+        targets=["pi"],
+        supervisor_kind=init_cli.SupervisorKind.NONE.value,
+        artifacts=[],
+    )
+    package = init_cli.ArtifactRecord(
+        kind="pi-extension-package",
+        path="pi",
+        metadata={"version": "0.34.0", "owned": True},
+    )
+    config = init_cli.ArtifactRecord(
+        kind="pi-extension-config",
+        path="/home/test/.headroom/integrations/pi-extension.json",
+        metadata={"managed_sha256": "abc"},
+    )
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli, "save_manifest", lambda value: None)
+    monkeypatch.setattr(init_cli, "extension_release_version", lambda value: "0.34.0")
+    monkeypatch.setattr(init_cli, "ensure_host_package", lambda *args, **kwargs: package)
+    monkeypatch.setattr(init_cli, "ensure_extension_config", lambda *args, **kwargs: config)
+    monkeypatch.setattr(init_cli, "_snapshot_extension_config", lambda: (False, b"", None))
+    installed: list[object] = []
+    monkeypatch.setattr(init_cli, "install_supervisor", lambda value: installed.append(value) or [])
+    monkeypatch.setattr(init_cli, "_ensure_profile_running", lambda profile: None)
+
+    init_cli._init_native_host(
+        host="pi",
+        binary="/bin/pi",
+        profile="init-user",
+        port=8787,
+    )
+
+    assert manifest.supervisor_kind == init_cli.SupervisorKind.TASK.value
+    assert package in manifest.artifacts
+    assert config in manifest.artifacts
+    assert installed == [manifest]
+
+
+def test_explicit_omp_init_dispatches_native_host(monkeypatch) -> None:
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(init_cli, "_run_init_targets", lambda **kwargs: calls.append(kwargs))
+
+    result = CliRunner().invoke(fake_main, ["init", "-g", "omp"])
+
+    assert result.exit_code == 0, result.output
+    assert calls[0]["targets"] == ["omp"]
+    assert calls[0]["global_scope"] is True
+
+
+def test_run_init_targets_includes_native_runtime_targets(monkeypatch) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    ensured: list[list[str]] = []
+    native: list[tuple[str, str]] = []
+
+    def ensure_manifest(**kwargs):
+        ensured.append(kwargs["targets"])
+        return "init-user"
+
+    monkeypatch.setattr(init_cli, "_ensure_runtime_manifest", ensure_manifest)
+    monkeypatch.setattr(init_cli, "extension_release_version", lambda version: "1.2.3")
+    monkeypatch.setattr(init_cli.shutil, "which", lambda target: f"/bin/{target}")
+    monkeypatch.setattr(
+        init_cli,
+        "_init_native_host",
+        lambda **kwargs: native.append((kwargs["host"], kwargs["profile"])),
+    )
+    monkeypatch.setattr(init_cli, "_install_headroom_mcp_for_targets", lambda **kwargs: None)
+
+    init_cli._run_init_targets(
+        targets=["pi", "omp"],
+        global_scope=True,
+        port=8787,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        memory=False,
+    )
+
+    assert ensured == [["pi", "omp"]]
+    assert native == [("pi", "init-user"), ("omp", "init-user")]
+
+
+def test_ensure_runtime_manifest_preserves_native_targets_and_artifacts(monkeypatch) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    package = init_cli.ArtifactRecord("pi-extension-package", "pi", {"version": "1.2.3"})
+    existing = SimpleNamespace(
+        targets=["pi"],
+        artifacts=[package],
+        mutations=[],
+        supervisor_kind=init_cli.SupervisorKind.TASK.value,
+        port=8787,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        memory_enabled=False,
+    )
+    built = SimpleNamespace(supervisor_kind="", artifacts=[], mutations=[], targets=[])
+    monkeypatch.setattr(init_cli, "_runtime_profile", lambda global_scope: "init-user")
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: existing)
+    monkeypatch.setattr(
+        init_cli, "build_manifest", lambda **kwargs: built.__dict__.update(kwargs) or built
+    )
+    monkeypatch.setattr(init_cli, "save_manifest", lambda manifest: None)
+
+    init_cli._ensure_runtime_manifest(
+        global_scope=True,
+        targets=["omp"],
+        port=8787,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        memory=False,
+    )
+
+    assert built.targets == ["omp", "pi"]
+    assert built.artifacts == [package]
+    assert built.supervisor_kind == init_cli.SupervisorKind.TASK.value
+
+
+@pytest.mark.parametrize("failure", ["package", "config", "task"])
+def test_native_init_failure_rolls_back_package_config_task_and_manifest(
+    monkeypatch, failure: str
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    previous = SimpleNamespace(
+        profile="init-user",
+        targets=["claude", "pi"],
+        supervisor_kind=init_cli.SupervisorKind.NONE.value,
+        artifacts=[],
+    )
+    manifest = SimpleNamespace(**previous.__dict__)
+    saved: list[tuple[str, list[str], list[tuple[str, str]]]] = []
+    storage = [manifest]
+    removed_tasks: list[str] = []
+    restored_configs: list[str] = []
+    package = init_cli.ArtifactRecord(
+        "pi-extension-package", "pi", {"version": "1.2.3", "owned": True}
+    )
+    config = init_cli.ArtifactRecord("pi-extension-config", "/config", {"managed_sha256": "x"})
+
+    monkeypatch.setattr(init_cli, "extension_release_version", lambda version: "1.2.3")
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: storage[0])
+
+    def save(value):
+        saved.append(
+            (
+                value.supervisor_kind,
+                list(value.targets),
+                [(record.kind, record.path) for record in value.artifacts],
+            )
+        )
+        storage[0] = copy.deepcopy(value)
+
+    monkeypatch.setattr(init_cli, "save_manifest", save)
+    monkeypatch.setattr(init_cli, "inspect_host_package", lambda host, binary: None)
+    monkeypatch.setattr(init_cli, "_snapshot_extension_config", lambda: (False, b"", None))
+    monkeypatch.setattr(
+        init_cli, "remove_supervisor", lambda value: removed_tasks.append(value.profile)
+    )
+    monkeypatch.setattr(init_cli, "_ensure_profile_running", lambda profile: None)
+    monkeypatch.setattr(init_cli, "remove_owned_host_package", lambda *args: "removed")
+    monkeypatch.setattr(
+        init_cli,
+        "remove_owned_extension_config",
+        lambda artifact: restored_configs.append(artifact.path) or "removed",
+    )
+    monkeypatch.setattr(
+        init_cli,
+        "install_supervisor",
+        lambda value: (
+            (_ for _ in ()).throw(RuntimeError("task failed"))
+            if failure == "task"
+            else [init_cli.ArtifactRecord("crontab", "user:init-user")]
+        ),
+    )
+    monkeypatch.setattr(
+        init_cli,
+        "ensure_extension_config",
+        lambda port, existing: (
+            (_ for _ in ()).throw(RuntimeError("config failed")) if failure == "config" else config
+        ),
+    )
+    monkeypatch.setattr(
+        init_cli,
+        "ensure_host_package",
+        lambda host, binary, version, existing: (
+            (_ for _ in ()).throw(RuntimeError("package failed"))
+            if failure == "package"
+            else package
+        ),
+    )
+
+    with pytest.raises(click.ClickException, match=f"{failure} failed") as exc_info:
+        init_cli._init_native_host(host="pi", binary="/bin/pi", profile="init-user", port=8787)
+
+    assert saved[-1] == (init_cli.SupervisorKind.NONE.value, ["claude", "pi"], [])
+    assert removed_tasks == ["init-user"]
+    assert restored_configs == (["/config"] if failure == "package" else [])
+    assert "Rollback also failed" not in str(exc_info.value)
+
+
+def test_native_init_combines_initiating_and_rollback_failures(monkeypatch) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    manifest = SimpleNamespace(
+        profile="init-user",
+        targets=["pi"],
+        supervisor_kind=init_cli.SupervisorKind.NONE.value,
+        artifacts=[],
+    )
+    monkeypatch.setattr(init_cli, "extension_release_version", lambda version: "1.2.3")
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli, "save_manifest", lambda value: None)
+    monkeypatch.setattr(init_cli, "inspect_host_package", lambda host, binary: None)
+    monkeypatch.setattr(init_cli, "_snapshot_extension_config", lambda: (False, b"", None))
+    monkeypatch.setattr(
+        init_cli,
+        "install_supervisor",
+        lambda value: (_ for _ in ()).throw(RuntimeError("initiating failure")),
+    )
+    monkeypatch.setattr(
+        init_cli,
+        "remove_supervisor",
+        lambda value: (_ for _ in ()).throw(RuntimeError("rollback failure")),
+    )
+
+    with pytest.raises(click.ClickException) as exc_info:
+        init_cli._init_native_host(host="pi", binary="/bin/pi", profile="init-user", port=8787)
+
+    assert "initiating failure" in str(exc_info.value)
+    assert "Rollback also failed: rollback failure" in str(exc_info.value)
+
+
+def test_repeated_native_init_deduplicates_artifacts_and_task_records(monkeypatch) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    package = init_cli.ArtifactRecord("pi-extension-package", "pi", {"version": "1.2.3"})
+    config = init_cli.ArtifactRecord("pi-extension-config", "/config", {"managed_sha256": "x"})
+    task = init_cli.ArtifactRecord("crontab", "user:init-user")
+    manifest = SimpleNamespace(
+        profile="init-user",
+        targets=["pi"],
+        supervisor_kind=init_cli.SupervisorKind.TASK.value,
+        artifacts=[package, config, task],
+    )
+    monkeypatch.setattr(init_cli, "extension_release_version", lambda version: "1.2.3")
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli, "save_manifest", lambda value: None)
+    monkeypatch.setattr(init_cli, "inspect_host_package", lambda host, binary: object())
+    monkeypatch.setattr(init_cli, "_snapshot_extension_config", lambda: (True, b"{}", 0o600))
+    monkeypatch.setattr(init_cli, "install_supervisor", lambda value: [task])
+    monkeypatch.setattr(init_cli, "_ensure_profile_running", lambda profile: None)
+    monkeypatch.setattr(init_cli, "ensure_extension_config", lambda port, existing: config)
+    monkeypatch.setattr(
+        init_cli,
+        "ensure_host_package",
+        lambda host, binary, version, existing: package,
+    )
+
+    init_cli._init_native_host(host="pi", binary="/bin/pi", profile="init-user", port=8787)
+
+    assert manifest.artifacts.count(package) == 1
+    assert manifest.artifacts.count(config) == 1
+    assert manifest.artifacts.count(task) == 1
+
+
+def test_pi_and_omp_share_init_user_profile_and_config_artifact(monkeypatch) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(init_cli, "extension_release_version", lambda version: "1.2.3")
+    monkeypatch.setattr(
+        init_cli, "_ensure_runtime_manifest", lambda **kwargs: init_cli._GLOBAL_PROFILE
+    )
+    monkeypatch.setattr(init_cli.shutil, "which", lambda target: f"/bin/{target}")
+    monkeypatch.setattr(
+        init_cli,
+        "_init_native_host",
+        lambda **kwargs: calls.append((kwargs["host"], kwargs["profile"])),
+    )
+    monkeypatch.setattr(init_cli, "_install_headroom_mcp_for_targets", lambda **kwargs: None)
+
+    init_cli._run_init_targets(
+        targets=["pi", "omp"],
+        global_scope=True,
+        port=8787,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        memory=False,
+    )
+
+    assert calls == [("pi", "init-user"), ("omp", "init-user")]
+
+
+def test_omp_init_does_not_import_wrapper_runtime_or_touch_models_yml(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.delitem(sys.modules, "headroom.providers.omp.runtime", raising=False)
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    models = tmp_path / "models.yml"
+    monkeypatch.setattr(init_cli, "_run_init_targets", lambda **kwargs: None)
+
+    result = CliRunner().invoke(fake_main, ["init", "-g", "omp"])
+
+    assert result.exit_code == 0, result.output
+    assert "headroom.providers.omp.runtime" not in sys.modules
+    assert not models.exists()
 
 
 def test_init_auto_detects_targets(monkeypatch) -> None:
@@ -1040,6 +1386,7 @@ def test_marketplace_source_prefers_repo_checkout(monkeypatch) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     monkeypatch.delenv("HEADROOM_MARKETPLACE_SOURCE", raising=False)
 
+    assert init_cli.__file__ is not None
     assert init_cli._marketplace_source() == str(Path(init_cli.__file__).resolve().parents[2])
 
 

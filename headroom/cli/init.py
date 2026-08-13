@@ -12,11 +12,13 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from copy import deepcopy
 from hashlib import sha1
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from headroom._subprocess import run
+from headroom._version import __version__ as _HEADROOM_VERSION
 
 try:
     import tomllib
@@ -25,8 +27,24 @@ except ModuleNotFoundError:  # Python < 3.11
 
 import click
 
-from headroom.install.models import ConfigScope, InstallPreset, RuntimeKind, SupervisorKind
-from headroom.install.paths import claude_settings_path, codex_config_path, validate_profile_name
+from headroom.install.models import (
+    ArtifactRecord,
+    ConfigScope,
+    InstallPreset,
+    RuntimeKind,
+    SupervisorKind,
+)
+from headroom.install.paths import (
+    claude_settings_path,
+    codex_config_path,
+    unix_ensure_script_path,
+    unix_run_script_path,
+    validate_profile_name,
+    windows_ensure_cmd_path,
+    windows_ensure_script_path,
+    windows_run_cmd_path,
+    windows_run_script_path,
+)
 from headroom.install.planner import build_manifest
 from headroom.install.providers import _apply_unix_env_scope, _apply_windows_env_scope
 from headroom.install.runtime import (
@@ -39,10 +57,23 @@ from headroom.install.runtime import (
     wait_ready,
 )
 from headroom.install.state import ManifestError, load_manifest, save_manifest
-from headroom.install.supervisors import start_supervisor
+from headroom.install.supervisors import (
+    install_supervisor,
+    remove_supervisor,
+    start_supervisor,
+)
 from headroom.providers.claude import TOOL_SEARCH_DEFAULT, TOOL_SEARCH_ENV
 from headroom.providers.codex.install import codex_uses_chatgpt_auth
 from headroom.providers.codex.threads import retag_to_headroom
+from headroom.providers.pi_extension import (
+    ensure_extension_config,
+    ensure_host_package,
+    extension_config_path,
+    extension_release_version,
+    inspect_host_package,
+    remove_owned_extension_config,
+    remove_owned_host_package,
+)
 
 from .main import main
 
@@ -58,9 +89,10 @@ _CODEX_PROVIDER_MARKER_START = "# --- Headroom init provider ---"
 _CODEX_PROVIDER_MARKER_END = "# --- end Headroom init provider ---"
 _CODEX_FEATURE_MARKER_START = "# --- Headroom init features ---"
 _CODEX_FEATURE_MARKER_END = "# --- end Headroom init features ---"
-_SUPPORTED_TARGETS = ("claude", "copilot", "codex", "openclaw")
+_SUPPORTED_TARGETS = ("claude", "copilot", "codex", "openclaw", "pi", "omp")
 _LOCAL_TARGETS = {"claude", "codex"}
-_GLOBAL_TARGETS = {"claude", "copilot", "codex", "openclaw"}
+_GLOBAL_TARGETS = {"claude", "copilot", "codex", "openclaw", "pi", "omp"}
+_NATIVE_EXTENSION_TARGETS = {"pi", "omp"}
 _STARTUP_READY_TIMEOUT_SECONDS = 15
 _TOML_TABLE_HEADER_RE = re.compile(r"^[ \t]*(?:\[\[[^\]\r\n]+\]\]|\[[^\]\r\n]+\])[ \t]*(?:#.*)?$")
 _TOML_FEATURES_NAME_RE = r"(?:features|\"features\"|'features')"
@@ -580,8 +612,12 @@ def _ensure_runtime_manifest(
         telemetry_enabled=True,
         image="ghcr.io/headroomlabs-ai/headroom:latest",
     )
-    manifest.supervisor_kind = SupervisorKind.NONE.value
-    manifest.artifacts = []
+    manifest.supervisor_kind = (
+        getattr(existing, "supervisor_kind", SupervisorKind.NONE.value)
+        if existing
+        else SupervisorKind.NONE.value
+    )
+    manifest.artifacts = list(getattr(existing, "artifacts", [])) if existing else []
     manifest.mutations = existing.mutations if existing else []
     if existing is not None and _manifest_changed(
         existing,
@@ -597,6 +633,188 @@ def _ensure_runtime_manifest(
             pass
     save_manifest(manifest)
     return profile
+
+
+def _artifact_key(artifact: ArtifactRecord) -> tuple[str, str]:
+    return artifact.kind, artifact.path
+
+
+def _upsert_artifacts(manifest: Any, records: list[ArtifactRecord]) -> None:
+    replacements = {_artifact_key(record): record for record in records}
+    manifest.artifacts = [
+        artifact for artifact in manifest.artifacts if _artifact_key(artifact) not in replacements
+    ] + list(replacements.values())
+
+
+def _save_manifest_verified(manifest: Any) -> None:
+    save_manifest(manifest)
+    persisted = load_manifest(manifest.profile)
+    if (
+        persisted is None
+        or persisted.targets != manifest.targets
+        or persisted.artifacts != manifest.artifacts
+    ):
+        raise click.ClickException(
+            f"Could not verify persisted ownership state for profile {manifest.profile}."
+        )
+
+
+def _task_file_paths(manifest: Any) -> set[Path]:
+    paths = {
+        Path(artifact.path)
+        for artifact in manifest.artifacts
+        if artifact.kind in {"script", "service-unit", "cron", "plist"}
+    }
+    if sys.platform == "win32":
+        paths.update(
+            {
+                windows_run_script_path(manifest.profile),
+                windows_run_cmd_path(manifest.profile),
+                windows_ensure_script_path(manifest.profile),
+                windows_ensure_cmd_path(manifest.profile),
+            }
+        )
+    else:
+        paths.update(
+            {
+                unix_run_script_path(manifest.profile),
+                unix_ensure_script_path(manifest.profile),
+            }
+        )
+    return paths
+
+
+def _snapshot_files(paths: set[Path]) -> dict[Path, tuple[bytes, int] | None]:
+    snapshot: dict[Path, tuple[bytes, int] | None] = {}
+    for path in paths:
+        try:
+            snapshot[path] = (path.read_bytes(), path.stat().st_mode & 0o777)
+        except FileNotFoundError:
+            snapshot[path] = None
+    return snapshot
+
+
+def _restore_files(snapshot: dict[Path, tuple[bytes, int] | None]) -> None:
+    for path, prior in snapshot.items():
+        if prior is None:
+            path.unlink(missing_ok=True)
+            continue
+        content, mode = prior
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        path.chmod(mode)
+
+
+def _snapshot_extension_config() -> tuple[bool, bytes, int | None]:
+    path = extension_config_path().absolute()
+    try:
+        return True, path.read_bytes(), path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        return False, b"", None
+
+
+def _restore_extension_config(
+    snapshot: tuple[bool, bytes, int | None], artifact: ArtifactRecord
+) -> None:
+    result = remove_owned_extension_config(artifact)
+    if result == "preserved":
+        raise click.ClickException("Pi extension config changed during rollback; it was preserved.")
+    existed, content, mode = snapshot
+    path = extension_config_path().absolute()
+    if not existed:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    if mode is not None:
+        path.chmod(mode)
+
+
+def _restore_native_package(
+    *,
+    host: Literal["pi", "omp"],
+    binary: str,
+    previous: Any,
+    current_artifact: ArtifactRecord | None,
+) -> None:
+    if current_artifact is None:
+        return
+    if previous is None:
+        result = remove_owned_host_package(host, binary, current_artifact)
+        if result == "preserved":
+            raise click.ClickException(f"Could not roll back the {host} package install.")
+        return
+    ensure_host_package(host, binary, previous.version, current_artifact)
+
+
+def _init_native_host(*, host: Literal["pi", "omp"], binary: str, profile: str, port: int) -> None:
+    release = extension_release_version(_HEADROOM_VERSION)
+    manifest = load_manifest(profile)
+    if manifest is None:
+        raise click.ClickException(f"Deployment profile {profile!r} was not created.")
+
+    previous_manifest = deepcopy(manifest)
+    previous_package = inspect_host_package(host, binary)
+    config_snapshot = _snapshot_extension_config()
+    task_files_snapshot = _snapshot_files(_task_file_paths(manifest))
+    previous_config = next(
+        (artifact for artifact in manifest.artifacts if artifact.kind == "pi-extension-config"),
+        None,
+    )
+    package_artifact: ArtifactRecord | None = None
+    config_artifact: ArtifactRecord | None = None
+
+    try:
+        manifest.supervisor_kind = SupervisorKind.TASK.value
+        _save_manifest_verified(manifest)
+        task_artifacts = install_supervisor(manifest)
+        _upsert_artifacts(manifest, task_artifacts)
+        _save_manifest_verified(manifest)
+        _ensure_profile_running(profile)
+
+        config_artifact = ensure_extension_config(port, previous_config)
+        previous_host_artifact = next(
+            (
+                artifact
+                for artifact in manifest.artifacts
+                if artifact.kind == "pi-extension-package" and artifact.path == host
+            ),
+            None,
+        )
+        package_artifact = ensure_host_package(host, binary, release, previous_host_artifact)
+        _upsert_artifacts(manifest, [config_artifact, package_artifact])
+        _save_manifest_verified(manifest)
+    except BaseException as initiating_error:
+        rollback_errors: list[str] = []
+        for restore in (
+            lambda: _restore_native_package(
+                host=host,
+                binary=binary,
+                previous=previous_package,
+                current_artifact=package_artifact,
+            ),
+            lambda: (
+                _restore_extension_config(config_snapshot, config_artifact)
+                if config_artifact is not None
+                else None
+            ),
+            lambda: remove_supervisor(manifest),
+            lambda: (
+                install_supervisor(previous_manifest)
+                if previous_manifest.supervisor_kind != SupervisorKind.NONE.value
+                else None
+            ),
+            lambda: _restore_files(task_files_snapshot),
+            lambda: _save_manifest_verified(previous_manifest),
+        ):
+            try:
+                restore()
+            except BaseException as rollback_error:
+                rollback_errors.append(str(rollback_error))
+        message = str(initiating_error)
+        if rollback_errors:
+            message += " Rollback also failed: " + "; ".join(rollback_errors)
+        raise click.ClickException(message) from initiating_error
 
 
 def _env_manifest(values: dict[str, str]) -> Any:
@@ -896,6 +1114,11 @@ def _run_init_targets(
         backend,
         memory,
     )
+    native_targets = _NATIVE_EXTENSION_TARGETS.intersection(targets)
+    if not global_scope and native_targets:
+        raise click.ClickException("Durable Pi/OMP init requires -g (current-user scope).")
+    if native_targets:
+        extension_release_version(_HEADROOM_VERSION)
     runtime_targets = [target for target in targets if target != "openclaw"]
     profile = _ensure_runtime_manifest(
         global_scope=global_scope,
@@ -917,6 +1140,16 @@ def _run_init_targets(
             _init_codex(global_scope=global_scope, profile=profile, port=port)
         elif target == "openclaw":
             _init_openclaw(global_scope=global_scope, port=port)
+        elif target in _NATIVE_EXTENSION_TARGETS:
+            binary = shutil.which(target)
+            if not binary:
+                raise click.ClickException(f"'{target}' not found in PATH. Install {target} first.")
+            _init_native_host(
+                host=cast(Literal["pi", "omp"], target),
+                binary=binary,
+                profile=profile,
+                port=port,
+            )
 
     # Register the headroom MCP server with every targeted agent that has
     # a registrar implemented. Wave 1 covers Claude Code; subsequent waves
@@ -1063,6 +1296,36 @@ def init_codex(ctx: click.Context) -> None:
     """Install Codex durable hooks and provider routing."""
     _run_init_targets(
         targets=["codex"],
+        global_scope=bool(_ctx_value(ctx, "global_scope")),
+        port=int(_ctx_value(ctx, "port") or 8787),
+        backend=str(_ctx_value(ctx, "backend") or "anthropic"),
+        anyllm_provider=_ctx_value(ctx, "anyllm_provider"),
+        region=_ctx_value(ctx, "region"),
+        memory=bool(_ctx_value(ctx, "memory")),
+    )
+
+
+@init.command("pi")
+@click.pass_context
+def init_pi(ctx: click.Context) -> None:
+    """Install the durable Pi Headroom extension for the current user."""
+    _run_init_targets(
+        targets=["pi"],
+        global_scope=bool(_ctx_value(ctx, "global_scope")),
+        port=int(_ctx_value(ctx, "port") or 8787),
+        backend=str(_ctx_value(ctx, "backend") or "anthropic"),
+        anyllm_provider=_ctx_value(ctx, "anyllm_provider"),
+        region=_ctx_value(ctx, "region"),
+        memory=bool(_ctx_value(ctx, "memory")),
+    )
+
+
+@init.command("omp")
+@click.pass_context
+def init_omp(ctx: click.Context) -> None:
+    """Install the durable OMP Headroom extension for the current user."""
+    _run_init_targets(
+        targets=["omp"],
         global_scope=bool(_ctx_value(ctx, "global_scope")),
         port=int(_ctx_value(ctx, "port") or 8787),
         backend=str(_ctx_value(ctx, "backend") or "anthropic"),

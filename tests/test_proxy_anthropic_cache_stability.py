@@ -666,33 +666,27 @@ def test_output_shaper_pins_the_level_the_frozen_prefix_was_built_at(monkeypatch
             assert fake_tracker.output_shaping_level == 2
 
 
-@pytest.mark.parametrize(
-    ("drift_env", "drift_value"),
-    [
-        # The shaper is switched off live mid-conversation.
-        ("HEADROOM_OUTPUT_SHAPER", "0"),
-        # The live holdout moves the conversation's arm into control.
-        ("HEADROOM_OUTPUT_HOLDOUT", "1"),
-    ],
-)
-def test_output_shaper_replays_pinned_tail_when_shaping_stops(
-    monkeypatch, drift_env: str, drift_value: str
-) -> None:
-    """Turning shaping off mid-conversation must not drop an established tail.
+@pytest.mark.parametrize("drift", ["shaper_disabled", "arm_control"])
+def test_output_shaper_replays_pinned_tail_when_shaping_stops(monkeypatch, drift: str) -> None:
+    """Shaping stopping mid-conversation must not drop an established tail.
 
     The pin is consulted before the enablement and arm gates: a conversation
     that froze with an L2 tail keeps sending those exact system bytes even once
     the shaper is disabled or its arm drifts into control. Dropping the tail
-    would invalidate the whole provider prefix, the same bust as adding one.
-    Experiment attribution stays with the live assignment — a replay records no
-    treatment label.
+    invalidates the whole provider prefix, the same bust as adding one.
+    Experiment attribution stays with the live assignment — a replay never
+    records a treatment label.
     """
     from headroom.proxy import runtime_env
     from headroom.proxy.output_savings_policy import _STRATUM_LABEL
     from headroom.proxy.output_verbosity_policy import STEERING_SENTINEL
+    from headroom.rollout import resolve_rollout
 
     runtime_env.clear_overrides()
     monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    # Rollout-gated as in the tests above: beta is required for the shaper to
+    # run at all.
+    monkeypatch.setenv("HEADROOM_ROLLOUT_CHANNEL", "beta")
     monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "2")
 
     captured = {}
@@ -755,12 +749,23 @@ def test_output_shaper_replays_pinned_tail_when_shaping_stops(
 
         # Turn N: the prefix is frozen and shaping stops for this conversation.
         fake_tracker._frozen_count = 1
-        monkeypatch.setenv(drift_env, drift_value)
+        if drift == "shaper_disabled":
+            # Enablement is a resolved snapshot since #1490, so a live disable
+            # reaches the handler as a re-resolved gate with the legacy alias
+            # falsey — the same route a rollout-channel demotion takes.
+            proxy.config.rollout = resolve_rollout(
+                {"HEADROOM_ROLLOUT_CHANNEL": "beta", "HEADROOM_OUTPUT_SHAPER": "0"}
+            )
+        else:
+            monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "1")
         transforms = _post()
         assert captured["body"]["system"] == established
         assert fake_tracker.output_shaping_level == 2
 
-        # A cache replay is not a treatment observation.
+        # The treatment path is unreachable in both drifts, so surviving bytes
+        # can only have come from the replay. The missing treatment label is
+        # what proves the drift actually took effect — and that a cache replay
+        # is never counted as a treatment observation.
         assert _STRATUM_LABEL not in transforms
 
 

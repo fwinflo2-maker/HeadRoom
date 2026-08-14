@@ -1,7 +1,7 @@
-"""Startup eager-preload must defer Kompress native loading before binding.
+"""Startup loads Kompress before accepting requests.
 
-Regression for the production crash where ``eager_load_compressors`` entered
-the cached Kompress native stack on the blocking startup/lifespan path.
+The model download and native initialization run off the event loop with a
+startup timeout, so the first request does not trigger a cold model load.
 """
 
 from __future__ import annotations
@@ -101,15 +101,9 @@ class _StubCompressor:
 
     def preload(self, *, allow_download: bool = True) -> str:
         self.preload_calls.append(allow_download)
-        if self._cached:
+        if self._cached or allow_download:
             return "onnx"
         raise KompressModelNotCached("org/model")
-
-
-class _FatalPreloadCompressor(_StubCompressor):
-    def preload(self, *, allow_download: bool = True) -> str:
-        self.preload_calls.append(allow_download)
-        raise SystemExit("native Kompress preload")
 
 
 def _router_kompress_only() -> ContentRouter:
@@ -123,18 +117,17 @@ def _router_kompress_only() -> ContentRouter:
 
 
 @pytest.mark.parametrize("cache_state", ["cached", "uncached"])
-def test_eager_load_defers_kompress_regardless_of_cache_state(monkeypatch, cache_state):
+def test_eager_load_preloads_kompress_regardless_of_cache_state(monkeypatch, cache_state):
     router = _router_kompress_only()
     stub = _StubCompressor(cached=cache_state == "cached")
     monkeypatch.setattr(router, "_get_kompress", lambda: stub)
-    # Artifact prefetch is files-only, but it still reaches the network — keep it
-    # out of this assertion so the test stays about the native-preload boundary.
     monkeypatch.setattr(router, "_prefetch_kompress_artifacts_async", lambda _cfg: False)
 
     status = router.eager_load_compressors()
 
-    assert status["kompress"] == "deferred"
-    assert stub.preload_calls == []
+    assert status["kompress"] == "enabled"
+    assert status["kompress_backend"] == "onnx"
+    assert stub.preload_calls == [True]
 
 
 def test_eager_load_keeps_disabled_kompress_disabled(monkeypatch):
@@ -163,7 +156,7 @@ def test_eager_load_reports_unavailable_kompress(monkeypatch):
     assert status["kompress"] == "unavailable"
 
 
-def test_non_kompress_warmups_continue_when_kompress_is_deferred(monkeypatch):
+def test_non_kompress_warmups_continue_when_kompress_is_preloaded(monkeypatch):
     router = _router_kompress_only()
     stub = _StubCompressor(cached=True)
     monkeypatch.setattr(router, "_get_kompress", lambda: stub)
@@ -173,37 +166,24 @@ def test_non_kompress_warmups_continue_when_kompress_is_deferred(monkeypatch):
 
     status = router.eager_load_compressors()
 
-    assert status["kompress"] == "deferred"
+    assert status["kompress"] == "enabled"
     assert status["magika"] == "enabled"
-    assert stub.preload_calls == []
+    assert stub.preload_calls == [True]
 
 
-# ── Startup artifact prefetch (files only, never native init) ──────────────────
-# The cold-start cost #2001 left behind: the ~4-minute model download began on the
-# FIRST REQUEST, so every request in that window went silently uncompressed.
-# Prefetching FILES at startup is safe because it is plain huggingface_hub HTTP —
-# it never constructs an InferenceSession, which is the boundary that segfaults in
-# libarrow/jemalloc on RHEL/CentOS 7-family hosts (#1908).
+# ── Startup model preload ──────────────────────────────────────────────────────
 
 
-def test_eager_load_starts_artifact_prefetch_without_native_preload(monkeypatch):
+def test_eager_load_preloads_native_kompress_model(monkeypatch):
     router = _router_kompress_only()
     stub = _StubCompressor(cached=False)
     monkeypatch.setattr(router, "_get_kompress", lambda: stub)
-    prefetch_calls: list[object] = []
-    monkeypatch.setattr(
-        router,
-        "_prefetch_kompress_artifacts_async",
-        lambda cfg: (prefetch_calls.append(cfg), True)[1],
-    )
 
     status = router.eager_load_compressors()
 
-    assert status["kompress_artifacts"] == "prefetching"
-    # The #2001 invariant still holds: no native preload on the startup path.
-    assert status["kompress"] == "deferred"
-    assert stub.preload_calls == []
-    assert len(prefetch_calls) == 1
+    assert status["kompress"] == "enabled"
+    assert status["kompress_backend"] == "onnx"
+    assert stub.preload_calls == [True]
 
 
 def test_prefetch_never_constructs_a_session_or_imports_transformers(monkeypatch):
@@ -247,7 +227,7 @@ def test_background_prefetch_is_noop_when_model_already_cached(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_proxy_startup_does_not_enter_cached_kompress_native_loader(monkeypatch):
+async def test_proxy_startup_preloads_cached_kompress_model(monkeypatch):
     pytest.importorskip("httpx")
     from headroom.proxy.server import HeadroomProxy, ProxyConfig
 
@@ -261,14 +241,48 @@ async def test_proxy_startup_does_not_enter_cached_kompress_native_loader(monkey
         )
     )
     router = _router_kompress_only()
-    stub = _FatalPreloadCompressor(cached=True)
+    stub = _StubCompressor(cached=True)
     monkeypatch.setattr(router, "_get_kompress", lambda: stub)
     proxy.anthropic_pipeline.transforms = [router]
     proxy.openai_pipeline.transforms = [router]
 
     await proxy.startup()
     try:
-        assert stub.preload_calls == []
-        assert proxy.warmup.kompress.info["source_status"] == "deferred"
+        assert stub.preload_calls == [True]
+        assert proxy._kompress_status == "enabled"
+    finally:
+        await proxy.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_proxy_startup_preloads_kompress_when_eager_preload_is_disabled(monkeypatch):
+    pytest.importorskip("httpx")
+    from headroom.proxy.server import HeadroomProxy, ProxyConfig
+
+    proxy = HeadroomProxy(
+        ProxyConfig(
+            optimize=False,
+            kompress_enabled=True,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            code_aware_enabled=False,
+        )
+    )
+    router = _router_kompress_only()
+    preload_calls: list[int] = []
+    monkeypatch.setattr(
+        router,
+        "preload_kompress",
+        lambda: (preload_calls.append(1), "onnx")[1],
+        raising=False,
+    )
+    proxy.anthropic_pipeline.transforms = [router]
+    proxy.openai_pipeline.transforms = [router]
+
+    await proxy.startup()
+    try:
+        assert preload_calls == [1]
+        assert proxy._kompress_status == "enabled"
     finally:
         await proxy.shutdown()

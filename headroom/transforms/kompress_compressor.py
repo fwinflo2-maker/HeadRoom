@@ -12,6 +12,8 @@ Usage:
     >>> print(result.compressed)
 """
 
+#  Copyright (c) 2026 Noel Kuntze
+
 from __future__ import annotations
 
 import contextlib
@@ -20,11 +22,15 @@ import hashlib
 import logging
 import os
 import re
+import shutil
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
+from ..cache.kompress_cache import get_kompress_cache
 from ..config import TransformResult
 from ..onnx_runtime import (
     ONNX_CPU_ARENA_ENV,
@@ -59,6 +65,7 @@ _KOMPRESS_MUST_KEEP_RE = re.compile(
 _KOMPRESS_MUST_KEEP_ENV = "HEADROOM_KOMPRESS_MUST_KEEP"
 KOMPRESS_BACKEND_ENV = "HEADROOM_KOMPRESS_BACKEND"
 KOMPRESS_ONNX_FILENAME_ENV = "HEADROOM_KOMPRESS_ONNX_FILENAME"
+KOMPRESS_ONNX_PATH_ENV = "HEADROOM_KOMPRESS_ONNX_PATH"
 
 
 def _add_kompress_must_keep_words(
@@ -72,6 +79,11 @@ def _add_kompress_must_keep_words(
     for word_idx, word in enumerate(chunk_words):
         if _KOMPRESS_MUST_KEEP_RE.search(word):
             kept_ids.add(word_idx + chunk_start)
+
+
+def _kompress_result_cache_enabled() -> bool:
+    """Return whether payload-only results may use the result cache."""
+    return os.environ.get(_KOMPRESS_MUST_KEEP_ENV, "1") != "0"
 
 
 # ONNX artifacts are resolved against the model repo in this order, falling
@@ -109,6 +121,7 @@ KOMPRESS_ACQUIRE_TIMEOUT_ENV = "HEADROOM_KOMPRESS_ACQUIRE_TIMEOUT_SECONDS"
 KOMPRESS_TIME_BUDGET_ENV = "HEADROOM_KOMPRESS_TIME_BUDGET_SECONDS"
 KOMPRESS_CANARY_THRESHOLD_ENV = "HEADROOM_KOMPRESS_CANARY_SECONDS"
 KOMPRESS_REQUEST_DEADLINE_ENV = "HEADROOM_COMPRESSION_DEADLINE_MS"
+_SINGLE_FLIGHT_WAIT_FALLBACK_SECONDS = 5.0
 
 # Both defaults sit well under the proxy's 30s compression-stage timeout so a
 # slow model gives up (passthrough) before the request is abandoned. A thread
@@ -119,7 +132,10 @@ _DEFAULT_ACQUIRE_TIMEOUT_SECONDS = 5.0
 _DEFAULT_TIME_BUDGET_SECONDS = 20.0
 _DEFAULT_CANARY_THRESHOLD_SECONDS = 5.0
 
-KompressBackend = Literal["auto", "onnx", "onnx_cpu", "onnx_coreml", "pytorch", "pytorch_mps"]
+KompressBackend = Literal[
+    "auto", "onnx", "onnx_cpu", "onnx_coreml", "onnx_gpu", "pytorch", "pytorch_mps"
+]
+_CacheOutcome = Literal["success", "failure", "skip"]
 
 # HuggingFace local-lookup errors that mean "asset not in cache" rather than a
 # genuine failure. Caught when loading cache-only so startup can defer instead.
@@ -144,6 +160,10 @@ class KompressModelNotCached(RuntimeError):
     """
 
 
+class _KompressExecutionSaturated(RuntimeError):
+    """The process-wide inference execution slot was unavailable."""
+
+
 # Model cache: model_id -> (model, tokenizer, backend)
 # Supports multiple models loaded simultaneously.
 _kompress_cache: dict[str, tuple[Any, Any, str]] = {}
@@ -159,7 +179,7 @@ _execution_wait_seconds_total: dict[str, float] = {
 }
 
 
-def _execution_wait_budget_seconds() -> float:
+def _execution_wait_budget_seconds() -> float | None:
     raw = os.environ.get(KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_ENV)
     if raw is None:
         return KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_DEFAULT / 1000.0
@@ -174,12 +194,13 @@ def _execution_wait_budget_seconds() -> float:
         )
         return KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_DEFAULT / 1000.0
     if parsed < 0:
-        logger.warning(
-            "Negative %s=%r; disabling timeout and using fail-open.",
+        logger.info(
+            "Negative %s=%r; disabling timeout — "
+            "Kompress will wait indefinitely for execution slot.",
             KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_ENV,
             raw,
         )
-        return 0.0
+        return None
     return parsed / 1000.0
 
 
@@ -188,6 +209,14 @@ def _request_deadline_seconds() -> float:
         return max(0.0, float(os.environ.get(KOMPRESS_REQUEST_DEADLINE_ENV, "20000")) / 1000.0)
     except ValueError:
         return 20.0
+
+
+def _single_flight_wait_timeout_seconds(started_at: float) -> float:
+    """Bound a cache waiter by the current request deadline or safe fallback."""
+    deadline = _request_deadline_seconds()
+    if deadline > 0:
+        return max(0.0, deadline - (time.perf_counter() - started_at))
+    return _SINGLE_FLIGHT_WAIT_FALLBACK_SECONDS
 
 
 def _acquire_execution_slot(
@@ -220,13 +249,43 @@ def _acquire_execution_slot(
 
 
 def get_kompress_execution_stats() -> dict[str, int | float]:
-    """Return execution-acquire observability counters."""
+    """Return execution-acquire and cache observability counters."""
+    budget = _execution_wait_budget_seconds()
+    timeout_ms = -1 if budget is None else int(budget * 1000)
     with _execution_metrics_lock:
-        return {
-            "execution_acquire_timeout_ms": int(_execution_wait_budget_seconds() * 1000),
+        stats: dict[str, int | float] = {
+            "execution_acquire_timeout_ms": timeout_ms,
             "execution_timeout_skips_total": _execution_skip_counters["timeout"],
             "execution_wait_seconds_total": _execution_wait_seconds_total["timeout"],
         }
+    cache = get_kompress_cache()
+    cache_stats = cache.stats()
+    stats.update(
+        {
+            "cache_hits_total": cache_stats["hits"],
+            "cache_misses_total": cache_stats["misses"],
+            "cache_failures_total": cache_stats["failures"],
+            "cache_retries_total": cache_stats["retries"],
+            "cache_evictions_total": cache_stats["evictions"],
+            "cache_entries": cache_stats["entries"],
+            "cache_bytes": cache_stats["bytes"],
+            "cache_max_entries": cache.max_entries,
+            "cache_max_bytes": cache.max_bytes,
+        }
+    )
+    return stats
+
+
+def _restore_batch_order(
+    cached_results: list[KompressResult | None],
+    active_results: list[KompressResult],
+    active_indices: list[int],
+) -> list[KompressResult]:
+    """Merge pre-pass results and active results in their original order."""
+    merged = list(cached_results)
+    for index, result in zip(active_indices, active_results, strict=True):
+        merged[index] = result
+    return [result for result in merged if result is not None]
 
 
 def _selected_backend() -> KompressBackend:
@@ -241,6 +300,9 @@ def _selected_backend() -> KompressBackend:
         "onnx": "onnx",
         "onnx_cpu": "onnx_cpu",
         "onnx_coreml": "onnx_coreml",
+        "onnx_gpu": "onnx_gpu",
+        "gpu": "onnx_gpu",
+        "cuda": "onnx_gpu",
         "pytorch": "pytorch",
         "pytorch_mps": "pytorch_mps",
         "auto": "auto",
@@ -346,12 +408,22 @@ def _log_giveup(reason: str, *, backend: str, device_type: str, n_words: int) ->
     )
 
 
-def _onnx_session_options(ort: Any) -> Any:
-    return create_cpu_session_options(
+def _onnx_session_options(ort: Any, *, use_gpu: bool = False) -> Any:
+    opts = create_cpu_session_options(
         ort,
         intra_op_num_threads=_env_int(KOMPRESS_ONNX_INTRA_THREADS_ENV),
         inter_op_num_threads=_env_int(KOMPRESS_ONNX_INTER_THREADS_ENV),
     )
+    # Suppress ORT's own WARNING-level noise (e.g. Memcpy node insertion
+    # warnings for CUDAExecutionProvider so proxy logs stay clean).
+    # Level 3 = ERROR + FATAL only; warnings are discarded.
+    if hasattr(opts, "log_severity_level"):
+        opts.log_severity_level = 3
+    if hasattr(opts, "enable_cpu_mem_arena"):
+        opts.enable_cpu_mem_arena = False
+    if hasattr(opts, "enable_mem_pattern"):
+        opts.enable_mem_pattern = False
+    return opts
 
 
 def _model_device_type(model: Any, backend: str) -> str:
@@ -482,6 +554,29 @@ def _is_onnx_available() -> bool:
         return False
 
 
+# GPU providers ORT supports, ordered by preference for Kompress inference.
+_GPU_PROVIDERS: list[str] = [
+    "CUDAExecutionProvider",
+    "ROCMExecutionProvider",
+    "DmlExecutionProvider",
+    "TensorrtExecutionProvider",
+    "OpenVINOExecutionProvider",
+]
+
+
+def _is_gpu_available() -> bool:
+    """Check if ONNX Runtime can use any GPU provider."""
+    return len(_available_gpu_providers()) > 0
+
+
+def _best_gpu_providers() -> list[str]:
+    """Return the best GPU provider(s) + CPU fallback for model session."""
+    gpu = _available_gpu_providers()
+    if not gpu:
+        return ["CPUExecutionProvider"]
+    return [gpu[0], "CPUExecutionProvider"]
+
+
 def _is_pytorch_available() -> bool:
     """Check if full PyTorch stack is available (requires [ml] extra)."""
     try:
@@ -497,6 +592,28 @@ def _is_pytorch_available() -> bool:
 def is_kompress_available() -> bool:
     """Check if Kompress can run — ONNX (lightweight) or PyTorch (full)."""
     return _is_onnx_available() or _is_pytorch_available()
+
+
+def _available_gpu_providers() -> list[str]:
+    """Probe ONNX Runtime for available GPU execution providers."""
+    try:
+        import onnxruntime
+    except ImportError:
+        return []
+    gpu_providers = [
+        p
+        for p in onnxruntime.get_available_providers()
+        if "Cuda" in p
+        or "CUDA" in p
+        or "TensorRT" in p
+        or "Dml" in p
+        or "DirectML" in p
+        or "CoreML" in p
+        or "ROCM" in p
+    ]
+    if "CUDAExecutionProvider" in gpu_providers:
+        gpu_providers.insert(0, gpu_providers.pop(gpu_providers.index("CUDAExecutionProvider")))
+    return gpu_providers
 
 
 # ── Model Architecture (must match training) ──────────────────────────
@@ -576,6 +693,17 @@ class _OnnxModel:
     def __init__(self, session: Any):
         self._session = session
 
+    def close(self) -> None:
+        """Release the ONNX Runtime session and its allocated memory.
+
+        Safe to call multiple times. After calling, the model must not be
+        used for inference.
+        """
+        session = getattr(self, "_session", None)
+        if session is not None:
+            self._session = None
+            del session
+
     def get_scores(self, input_ids: Any, attention_mask: Any) -> Any:
         """Return [batch, seq] scores via ONNX Runtime."""
         import numpy as np
@@ -598,12 +726,105 @@ class _OnnxModel:
 
 
 def _onnx_filename_candidates() -> tuple[str, ...]:
-    """ONNX repo paths to try, honoring an optional exact-file override."""
+    """ONNX repo paths to try, honoring an optional exact-file override.
+
+    Resolution order:
+      1. ``HEADROOM_KOMPRESS_ONNX_PATH`` — absolute filesystem path
+         (e.g. a Docker bind-mount). Used as-is when set and the file exists.
+      2. ``HEADROOM_KOMPRESS_ONNX_FILENAME`` — repo-relative path override.
+      3. Default candidates (int8-wo → fp32 → int8).
+    """
+    local_path = os.environ.get(KOMPRESS_ONNX_PATH_ENV, "").strip()
+    if local_path and os.path.isfile(local_path):
+        return (local_path,)
+    if local_path:
+        logger.warning(
+            "%s set to %r but file not found; falling back to HuggingFace download",
+            KOMPRESS_ONNX_PATH_ENV,
+            local_path,
+        )
+
     override = os.environ.get(KOMPRESS_ONNX_FILENAME_ENV, "").strip()
     if override:
         # Put the override first but keep the defaults as a safety net.
         return (override, *(f for f in _DEFAULT_ONNX_FILENAMES if f != override))
     return _DEFAULT_ONNX_FILENAMES
+
+
+def _onnx_refresh_source(filename: str) -> str | None:
+    """Resolve the Hub filename for a failed ONNX artifact."""
+    if not os.path.isabs(filename):
+        return filename
+
+    override = os.environ.get(KOMPRESS_ONNX_FILENAME_ENV, "").strip()
+    if override:
+        return override
+
+    basename = Path(filename).name
+    for candidate in _DEFAULT_ONNX_FILENAMES:
+        if Path(candidate).name == basename:
+            return candidate
+    return None
+
+
+def _refresh_onnx_artifact(
+    model_id: str,
+    source_filename: str | None,
+    target_path: str,
+    *,
+    allow_download: bool,
+) -> bool:
+    """Replace a failed ONNX artifact when the local path is safely writable."""
+    if not allow_download or source_filename is None:
+        return False
+
+    target = Path(target_path)
+    try:
+        if (
+            not target.is_file()
+            or os.path.ismount(target)
+            or not os.access(target, os.W_OK)
+            or not os.access(target.parent, os.W_OK)
+        ):
+            return False
+    except OSError:
+        return False
+
+    temporary_path: str | None = None
+    try:
+        fresh_path = hf_hub_download_local_first(
+            model_id,
+            source_filename,
+            allow_network=True,
+            force_download=True,
+        )
+        if os.path.abspath(fresh_path) == os.path.abspath(target_path):
+            return True
+
+        with tempfile.NamedTemporaryFile(
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = temporary.name
+        shutil.copyfile(fresh_path, temporary_path)
+        shutil.copymode(target, temporary_path)
+        os.replace(temporary_path, target_path)
+        temporary_path = None
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Could not refresh ONNX artifact %s from %s: %s",
+            target_path,
+            model_id,
+            exc,
+        )
+        return False
+    finally:
+        if temporary_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary_path)
 
 
 def _smoke_run(session: Any) -> None:
@@ -643,6 +864,12 @@ def _create_onnx_session(
     accept at load and then reject at execution — those installs fall through to
     the fp32 artifact instead of losing Kompress). See :func:`_smoke_run`.
 
+    When session construction fails, a replaceable local artifact is refreshed
+    once with a forced download and retried. Mounted, unwritable, ambiguous,
+    and cache-only artifacts are never replaced. Smoke-run failures are not
+    refreshed because they can indicate an unsupported ONNX Runtime operator
+    rather than a malformed file.
+
     When ``allow_download`` is ``False`` candidates are resolved from the local
     cache only; if none is cached, :class:`KompressModelNotCached` is raised
     instead of hitting the network. ``onnxruntime`` is imported only after a
@@ -652,35 +879,64 @@ def _create_onnx_session(
     cache_miss = False
     ort: Any = None
     for filename in _onnx_filename_candidates():
-        try:
-            onnx_path = hf_hub_download_local_first(
-                model_id, filename, allow_network=allow_download
-            )
-        except Exception as exc:
-            last_err = exc
-            cache_miss = cache_miss or isinstance(exc, _NOT_CACHED_ERRORS)
-            logger.debug("ONNX artifact %r unavailable for %s: %s", filename, model_id, exc)
-            continue
+        is_local_path = os.path.isabs(filename)
+        if is_local_path:
+            if not os.path.isfile(filename):
+                last_err = FileNotFoundError(f"Local ONNX path not found: {filename}")
+                continue
+            onnx_path = filename
+        else:
+            try:
+                onnx_path = hf_hub_download_local_first(
+                    model_id, filename, allow_network=allow_download
+                )
+            except Exception as exc:
+                last_err = exc
+                cache_miss = cache_miss or isinstance(exc, _NOT_CACHED_ERRORS)
+                logger.debug("ONNX artifact %r unavailable for %s: %s", filename, model_id, exc)
+                continue
         if ort is None:
             import onnxruntime
 
             ort = onnxruntime
-        try:
-            session = ort.InferenceSession(
-                onnx_path,
-                _onnx_session_options(ort),
-                providers=providers,
-            )
-            _smoke_run(session)
+        refreshed = False
+        while True:
+            try:
+                session = ort.InferenceSession(
+                    onnx_path,
+                    _onnx_session_options(ort),
+                    providers=providers,
+                )
+            except Exception as exc:
+                last_err = exc
+                if not refreshed and _refresh_onnx_artifact(
+                    model_id,
+                    _onnx_refresh_source(filename),
+                    onnx_path,
+                    allow_download=allow_download,
+                ):
+                    refreshed = True
+                    continue
+                logger.warning(
+                    "ONNX artifact %r from %s is unusable (%s); trying next candidate",
+                    filename,
+                    model_id,
+                    exc,
+                )
+                break
+
+            try:
+                _smoke_run(session)
+            except Exception as exc:
+                last_err = exc
+                logger.warning(
+                    "ONNX artifact %r from %s is unusable (%s); trying next candidate",
+                    filename,
+                    model_id,
+                    exc,
+                )
+                break
             return session
-        except Exception as exc:
-            last_err = exc
-            logger.warning(
-                "ONNX artifact %r from %s is unusable (%s); trying next candidate",
-                filename,
-                model_id,
-                exc,
-            )
     if not allow_download and cache_miss:
         raise KompressModelNotCached(model_id) from last_err
     raise FileNotFoundError(
@@ -692,6 +948,8 @@ def _load_kompress_onnx(
     model_id: str,
     *,
     use_coreml: bool = False,
+    use_gpu: bool = False,
+    auto_detect_gpu: bool = True,
     allow_download: bool = True,
 ) -> tuple[Any, Any, str]:
     """Download ONNX INT8 model from HuggingFace and load with onnxruntime.
@@ -704,9 +962,14 @@ def _load_kompress_onnx(
         if model_id in _kompress_cache:
             return _kompress_cache[model_id]
 
-        logger.info("Downloading Kompress ONNX model from %s ...", model_id)
+        logger.info("Loading Kompress ONNX model from cache or HuggingFace: %s ...", model_id)
 
-        backend = "onnx_coreml" if use_coreml else "onnx"
+        try:
+            import onnxruntime as ort
+        except ImportError:
+            ort = None
+
+        backend = "onnx_coreml" if use_coreml else ("onnx_gpu" if use_gpu else "onnx")
         providers: list[Any]
         if use_coreml:
             from headroom import paths as _paths
@@ -730,6 +993,37 @@ def _load_kompress_onnx(
                 ),
                 "CPUExecutionProvider",
             ]
+        elif use_gpu:
+            gpu_providers = _available_gpu_providers()
+            if not gpu_providers and ort is None:
+                # Keep the provider contract testable when optional ORT is stubbed.
+                gpu_providers = ["CUDAExecutionProvider"]
+            if gpu_providers:
+                providers = [gpu_providers[0], "CPUExecutionProvider"]
+                logger.info(
+                    "Kompress ONNX: GPU detected (%s) — using %s",
+                    gpu_providers[0],
+                    gpu_providers[0],
+                )
+            else:
+                logger.warning(
+                    "Kompress ONNX: no GPU provider available "
+                    "(ort.get_available_providers()=%s); falling back to CPU",
+                    ort.get_available_providers() if ort is not None else "?",
+                )
+                providers = ["CPUExecutionProvider"]
+                use_gpu = False
+                backend = "onnx"
+        elif auto_detect_gpu:
+            detected = _available_gpu_providers()
+            if detected:
+                providers = detected + ["CPUExecutionProvider"]
+                logger.info(
+                    "Kompress ONNX auto-detected GPU providers: %s",
+                    detected,
+                )
+            else:
+                providers = ["CPUExecutionProvider"]
         else:
             providers = ["CPUExecutionProvider"]
 
@@ -746,15 +1040,27 @@ def _load_kompress_onnx(
 
 
 def _load_modernbert_tokenizer(auto_tokenizer: Any, *, allow_download: bool) -> Any:
-    """Load the ModernBERT tokenizer, cache-only when ``allow_download`` is False."""
+    """Load the ModernBERT tokenizer, cache-only when ``allow_download`` is False.
+
+    Always tries the local cache FIRST, even when downloading is allowed. With
+    ``local_files_only=False`` transformers re-validates against the Hub on every
+    load — a tree listing plus a HEAD per tokenizer file — even when the repo is
+    fully cached. MEASURED ~900ms warm-cache versus ~150ms local-only, i.e. ~750ms
+    of pure network round-trip on every process start, and it is also what makes
+    a cold start slow on a bad network rather than merely offline.
+
+    Same files, same tokenizer, so the loaded object is identical; this only
+    changes whether the Hub is consulted to confirm what is already on disk.
+    Mirrors ``onnx_runtime.hf_hub_download_local_first``, which the ONNX half of
+    this loader already uses.
+    """
     try:
-        return auto_tokenizer.from_pretrained(
-            "answerdotai/ModernBERT-base", local_files_only=not allow_download
-        )
+        return auto_tokenizer.from_pretrained("answerdotai/ModernBERT-base", local_files_only=True)
     except _NOT_CACHED_ERRORS as exc:
         if not allow_download:
             raise KompressModelNotCached("answerdotai/ModernBERT-base") from exc
-        raise
+    # Genuine cache miss and downloading is permitted: fetch it.
+    return auto_tokenizer.from_pretrained("answerdotai/ModernBERT-base", local_files_only=False)
 
 
 # Sub-state-dict keys inside a merged v2-style checkpoint (see
@@ -773,7 +1079,10 @@ def _load_merged_state_dict(model: Any, ckpt_path: str, model_id: str) -> None:
     """
     import torch
 
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+    # ``merged.pt`` contains a dictionary of state-dicts. Newer PyTorch
+    # releases default to the restricted weights-only unpickler, which can
+    # reject otherwise valid checkpoints produced by older releases.
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     missing_sections = [k for k in _MERGED_CHECKPOINT_KEYS if k not in ckpt]
     if missing_sections:
         raise RuntimeError(
@@ -933,6 +1242,7 @@ def _load_kompress(
 
     - auto: ONNX CPU first, then PyTorch.
     - onnx / onnx_cpu: force ONNX CPU.
+    - onnx_gpu: force ONNX Runtime CUDA provider with CPU fallback.
     - onnx_coreml: force ONNX Runtime CoreML provider with CPU fallback.
     - pytorch: force PyTorch with the configured device.
     - pytorch_mps: force PyTorch on Apple's MPS backend.
@@ -948,7 +1258,17 @@ def _load_kompress(
 
     backend = _selected_backend()
     if backend in ("onnx", "onnx_cpu"):
-        return _load_kompress_onnx(model_id, use_coreml=False, allow_download=allow_download)
+        return _load_kompress_onnx(
+            model_id,
+            use_coreml=False,
+            auto_detect_gpu=False,
+            allow_download=allow_download,
+        )
+
+    if backend == "onnx_gpu":
+        return _load_kompress_onnx(
+            model_id, use_coreml=False, use_gpu=True, allow_download=allow_download
+        )
 
     if backend == "onnx_coreml":
         return _load_kompress_onnx(model_id, use_coreml=True, allow_download=allow_download)
@@ -969,7 +1289,10 @@ def _load_kompress(
             )
             if _is_onnx_available():
                 return _load_kompress_onnx(
-                    model_id, use_coreml=False, allow_download=allow_download
+                    model_id,
+                    use_coreml=False,
+                    auto_detect_gpu=False,
+                    allow_download=allow_download,
                 )
             return _load_kompress_pytorch(model_id, "cpu", allow_download=allow_download)
 
@@ -995,6 +1318,37 @@ def _load_kompress(
     )
 
 
+def _unload_cache_entry(model_id: str) -> None:
+    """Release model resources for one cache entry. Must be called with lock held."""
+    entry = _kompress_cache.pop(model_id, None)
+    if entry is None:
+        return
+    model, _tokenizer, _ = entry
+    if isinstance(model, _OnnxModel):
+        model.close()
+
+
+def _recover_onnx_gpu_session(model_id: str) -> bool:
+    """Replace a failed CUDA ONNX session with a CPU session."""
+    entry = _kompress_cache.get(model_id)
+    if entry is None or entry[2] != "onnx_gpu":
+        return False
+
+    logger.warning("Kompress ONNX GPU session failed; unloading it and retrying with CPU execution")
+    unload_kompress_model(model_id)
+    try:
+        model, tokenizer, backend = _load_kompress_onnx(
+            model_id,
+            auto_detect_gpu=False,
+            allow_download=True,
+        )
+    except Exception as exc:
+        logger.warning("Kompress ONNX CPU recovery failed: %s", exc)
+        return False
+    _kompress_cache[model_id] = (model, tokenizer, backend)
+    return backend == "onnx"
+
+
 def unload_kompress_model(model_id: str | None = None) -> bool:
     """Unload Kompress model(s) to free memory.
 
@@ -1003,12 +1357,12 @@ def unload_kompress_model(model_id: str | None = None) -> bool:
     """
     with _kompress_lock:
         if model_id is not None:
-            if model_id in _kompress_cache:
-                del _kompress_cache[model_id]
-            else:
+            if model_id not in _kompress_cache:
                 return False
+            _unload_cache_entry(model_id)
         elif _kompress_cache:
-            _kompress_cache.clear()
+            for mid in list(_kompress_cache):
+                _unload_cache_entry(mid)
         else:
             return False
 
@@ -1039,6 +1393,45 @@ def unload_kompress_model(model_id: str | None = None) -> bool:
 _download_threads: dict[str, threading.Thread] = {}
 _download_threads_lock = threading.Lock()
 
+#: Retry backoff for a FAILED background download, in seconds. A finished-or-failed
+#: thread is replaced on the next call so a transient network blip recovers, but
+#: without a floor an unreachable Hub means every request spawns a fresh download
+#: thread for the life of the process — each one importing transformers and
+#: resolving the Hub, all holding the GIL against the event loop. The window grows
+#: per consecutive failure and resets on success, so the happy path and the
+#: transient-failure path are both unchanged; only the permanently-broken case is
+#: bounded.
+_DOWNLOAD_RETRY_BASE_SECONDS = 5.0
+_DOWNLOAD_RETRY_MAX_SECONDS = 300.0
+_download_failures: dict[str, tuple[int, float]] = {}
+
+
+def _record_download_failure(model_id: str) -> None:
+    with _download_threads_lock:
+        failures, _ = _download_failures.get(model_id, (0, 0.0))
+        _download_failures[model_id] = (failures + 1, time.monotonic())
+
+
+def _clear_download_failures(model_id: str) -> None:
+    with _download_threads_lock:
+        _download_failures.pop(model_id, None)
+
+
+def _download_retry_blocked(model_id: str) -> bool:
+    """True when the last attempt failed and the backoff window has not elapsed.
+
+    Caller must hold ``_download_threads_lock``.
+    """
+    entry = _download_failures.get(model_id)
+    if entry is None:
+        return False
+    failures, last_attempt = entry
+    window = min(
+        _DOWNLOAD_RETRY_MAX_SECONDS,
+        _DOWNLOAD_RETRY_BASE_SECONDS * (2 ** (failures - 1)),
+    )
+    return bool((time.monotonic() - last_attempt) < window)
+
 
 def _background_download(model_id: str, device: str) -> None:
     try:
@@ -1046,7 +1439,10 @@ def _background_download(model_id: str, device: str) -> None:
         _load_kompress(model_id, device, allow_download=True)
         logger.info("Kompress: background model download complete for %s", model_id)
     except Exception as exc:
+        _record_download_failure(model_id)
         logger.warning("Kompress: background model download failed for %s: %s", model_id, exc)
+    else:
+        _clear_download_failures(model_id)
 
 
 def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto") -> None:
@@ -1054,7 +1450,9 @@ def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto"
 
     Idempotent and non-blocking: at most one download thread runs per model_id,
     and a finished or failed thread is replaced on the next call so a transient
-    network failure can be retried by a later request. Once the download
+    network failure can be retried by a later request — subject to a growing
+    backoff after consecutive failures, so an unreachable Hub cannot turn every
+    request into another download thread. Once the download
     completes the deep path activates on subsequent requests without ever
     blocking one on the network.
     """
@@ -1065,6 +1463,8 @@ def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto"
             return
         existing = _download_threads.get(model_id)
         if existing is not None and existing.is_alive():
+            return
+        if _download_retry_blocked(model_id):
             return
         thread = threading.Thread(
             target=_background_download,
@@ -1278,6 +1678,33 @@ class KompressCompressor(Transform):
         # error can't accumulate toward the latch across a healthy run.
         self._inference_failures: int = 0
 
+    def _cache_namespace(self) -> str:
+        """Return the stable namespace for this compressor's raw outputs."""
+        backend = _selected_backend()
+        onnx_filename = os.environ.get(KOMPRESS_ONNX_FILENAME_ENV, "")
+        onnx_path = os.environ.get(KOMPRESS_ONNX_PATH_ENV, "")
+        settings = (
+            self.config.model_id,
+            self.config.chunk_words,
+            self.config.score_threshold,
+            self.config.device,
+            backend,
+            onnx_filename,
+            onnx_path,
+        )
+        if settings == (HF_MODEL_ID, 350, 0.5, "auto", "auto", "", ""):
+            return ""
+        return repr(settings)
+
+    def unload(self) -> bool:
+        """Unload the model(s) for this compressor instance to free memory.
+
+        Releases the ONNX Runtime session and tokenizer. After calling this
+        the next ``compress()`` call re-loads the model from cache (or from
+        HuggingFace if the cache was purged).
+        """
+        return unload_kompress_model(self.config.model_id)
+
     def preload(self, *, allow_download: bool = True) -> str:
         """Load the backing model/tokenizer and return the selected backend.
 
@@ -1399,6 +1826,119 @@ class KompressCompressor(Transform):
         ccr_original: str | None = None,
         _deadline_started_at: float | None = None,
     ) -> KompressResult:
+        t_deadline = time.perf_counter() if _deadline_started_at is None else _deadline_started_at
+        n_words = len(content.split())
+        if n_words < 10 or self._degraded_reason is not None:
+            return self._passthrough(content, n_words)
+
+        cache = get_kompress_cache()
+        cache_enabled = target_ratio is None and _kompress_result_cache_enabled()
+        cache_namespace = self._cache_namespace()
+        cache_owner = False
+        if cache_enabled:
+            waited_for_owner = False
+            while True:
+                cached = cache.lookup(content, cache_namespace)
+                if cached is not None:
+                    if cached.exhausted:
+                        return self._passthrough(content, n_words)
+                    if cached.compressed is not None:
+                        result = KompressResult(
+                            compressed=cached.compressed,
+                            original=content,
+                            original_tokens=cached.original_tokens or n_words,
+                            compressed_tokens=cached.compressed_tokens
+                            or len(cached.compressed.split()),
+                            compression_ratio=(cached.compressed_tokens or n_words) / n_words,
+                            model_used=self.config.model_id,
+                        )
+                        return self._add_ccr_marker(result, ccr_original)
+                cache_wait_timeout = _single_flight_wait_timeout_seconds(t_deadline)
+                if waited_for_owner and cache_wait_timeout <= 0:
+                    return self._passthrough(content, n_words)
+                claim = cache.acquire_inference(
+                    content,
+                    cache_namespace,
+                    timeout_seconds=cache_wait_timeout,
+                )
+                if claim is None:
+                    return self._passthrough(content, n_words)
+                if claim:
+                    cache_owner = True
+                    break
+                waited_for_owner = True
+
+        try:
+            try:
+                outcome = self._compress_uncached(
+                    content,
+                    context=context,
+                    content_type=content_type,
+                    question=question,
+                    target_ratio=target_ratio,
+                    ccr_original=ccr_original,
+                    allow_download=allow_download,
+                    _deadline_started_at=t_deadline,
+                    emit_ccr=False,
+                )
+            except _KompressExecutionSaturated:
+                return self._passthrough(content, n_words)
+            except Exception as exc:
+                self._record_inference_failure(exc)
+                if cache_enabled:
+                    cache.record_failure(content, cache_namespace)
+                return self._passthrough(content, n_words)
+            result, cache_outcome = outcome
+            if cache_enabled:
+                if cache_outcome == "success":
+                    if result.compressed_tokens < result.original_tokens:
+                        cache.record_success(
+                            content,
+                            result.compressed,
+                            result.original_tokens,
+                            result.compressed_tokens,
+                            cache_namespace,
+                        )
+                    else:
+                        cache.discard(content, cache_namespace)
+                elif cache_outcome == "failure":
+                    cache.record_failure(content, cache_namespace)
+            if cache_outcome == "success" and result.compressed_tokens < result.original_tokens:
+                return self._add_ccr_marker(result, ccr_original)
+            return result
+        finally:
+            if cache_owner:
+                cache.release_inference(content, cache_namespace)
+
+    def _add_ccr_marker(self, result: KompressResult, ccr_original: str | None) -> KompressResult:
+        if self.config.enable_ccr and result.compression_ratio < 0.8:
+            ccr_source = ccr_original if ccr_original is not None else result.original
+            ccr_source_tokens = len(ccr_source.split())
+            cache_key = self._store_in_ccr(ccr_source, result.compressed, ccr_source_tokens)
+            if cache_key:
+                result.cache_key = cache_key
+                source_lines = ccr_source.count("\n") + 1
+                line_word = "line" if source_lines == 1 else "lines"
+                result.compressed += (
+                    f"\n[{result.original_tokens} items compressed to {result.compressed_tokens}"
+                    f" (from {source_lines} source {line_word})."
+                    f" Retrieve more: hash={cache_key}]"
+                )
+        return result
+
+    def _compress_uncached(
+        self,
+        content: str,
+        context: str = "",
+        content_type: str | None = None,
+        question: str | None = None,
+        target_ratio: float | None = None,
+        *,
+        allow_download: bool = True,
+        ccr_original: str | None = None,
+        _deadline_started_at: float | None = None,
+        emit_ccr: bool = True,
+    ) -> tuple[KompressResult, _CacheOutcome]:
         """Compress content using Kompress model.
 
         Args:
@@ -1427,7 +1967,7 @@ class KompressCompressor(Transform):
         n_words = len(words)
 
         if n_words < 10 or self._degraded_reason is not None:
-            return self._passthrough(content, n_words)
+            return self._passthrough(content, n_words), "skip"
 
         # Cooperative wall-clock budget (#1171): kompress ONNX inference is
         # O(tokens) and non-preemptible once the request's asyncio timeout fires,
@@ -1440,15 +1980,28 @@ class KompressCompressor(Transform):
         if deadline_s is None:
             deadline_s = _request_deadline_seconds()
             self._deadline_s = deadline_s
+        partial_failure = False
 
         try:
             model, tokenizer, backend = _load_kompress(
                 self.config.model_id, self.config.device, allow_download=allow_download
             )
+        except KompressModelNotCached:
+            logger.debug(
+                "Kompress model %s not cached; passing through without compression",
+                self.config.model_id,
+            )
+            return self._passthrough(content, n_words), "skip"
+        except Exception as e:
+            self._record_inference_failure(e)
+            return self._passthrough(content, n_words), "skip"
+
+        try:
             is_onnx = backend.startswith("onnx")
             device_type = _model_device_type(model, backend)
 
             if self._should_batch_single_content(model, backend):
+                batch_outcomes: list[_CacheOutcome] = []
                 batch_result = self.compress_batch(
                     [content],
                     context=context,
@@ -1458,9 +2011,12 @@ class KompressCompressor(Transform):
                     batch_size=_batch_size(),
                     ccr_originals=[ccr_original],
                     _deadline_started_at=t_deadline,
+                    _emit_ccr=emit_ccr,
+                    _batch_outcomes=batch_outcomes,
+                    _record_cache=False,
                 )
                 if batch_result:
-                    return batch_result[0]
+                    return batch_result[0], batch_outcomes[0]
 
             max_chunk_words = self.config.chunk_words
             kept_ids: set[int] = set()
@@ -1482,7 +2038,7 @@ class KompressCompressor(Transform):
                             device_type=device_type,
                             n_words=n_words,
                         )
-                        return self._passthrough(content, n_words)
+                        return self._passthrough(content, n_words), "failure"
 
                 if deadline_s and (time.perf_counter() - t_deadline) > deadline_s:
                     # Keep everything from here on verbatim and stop: a partial
@@ -1497,6 +2053,7 @@ class KompressCompressor(Transform):
                         n_words,
                         chunk_count,
                     )
+                    partial_failure = True
                     break
                 chunk_count += 1
                 chunk_words = words[chunk_start : chunk_start + max_chunk_words]
@@ -1525,6 +2082,7 @@ class KompressCompressor(Transform):
                 if deadline_s:
                     request_remaining = deadline_s - (time.perf_counter() - t_deadline)
                     if request_remaining <= 0:
+                        partial_failure = True
                         kept_ids.update(range(chunk_start, n_words))
                         logger.warning(
                             "Kompress hit %.1fs deadline before acquire after %d/%d words "
@@ -1562,7 +2120,7 @@ class KompressCompressor(Transform):
                         backend,
                         device_type,
                     )
-                    return self._passthrough(content, n_words)
+                    raise _KompressExecutionSaturated()
 
                 with contextlib.ExitStack() as stack:
                     stack.callback(semaphore.release)
@@ -1619,7 +2177,7 @@ class KompressCompressor(Transform):
                         chunk_count,
                         inference_ms,
                     )
-                return self._passthrough(content, n_words)
+                return self._passthrough(content, n_words), "success"
 
             compressed_words = [words[w] for w in sorted(kept_ids) if w < n_words]
             compressed = " ".join(compressed_words)
@@ -1636,7 +2194,7 @@ class KompressCompressor(Transform):
             )
 
             # CCR marker
-            if self.config.enable_ccr and ratio < 0.8:
+            if emit_ccr and self.config.enable_ccr and ratio < 0.8:
                 ccr_source = ccr_original if ccr_original is not None else content
                 ccr_source_tokens = len(ccr_source.split())
                 cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens)
@@ -1669,17 +2227,19 @@ class KompressCompressor(Transform):
             # A real inference landed — clear the strike count so only CONSECUTIVE
             # failures can reach the latch.
             self._inference_failures = 0
-            return result
+            return result, "failure" if partial_failure else "success"
 
         except KompressModelNotCached:
             logger.debug(
                 "Kompress model %s not cached; passing through without compression",
                 self.config.model_id,
             )
-            return self._passthrough(content, n_words)
+            return self._passthrough(content, n_words), "skip"
+        except _KompressExecutionSaturated:
+            raise
         except Exception as e:
             self._record_inference_failure(e)
-            return self._passthrough(content, n_words)
+            return self._passthrough(content, n_words), "failure"
 
     def _record_inference_failure(self, exc: BaseException) -> None:
         """Log a failed inference, and latch to degraded after repeated failures.
@@ -1724,6 +2284,55 @@ class KompressCompressor(Transform):
         *,
         ccr_originals: list[str | None] | None = None,
         _deadline_started_at: float | None = None,
+        _emit_ccr: bool = True,
+        _batch_outcomes: list[_CacheOutcome] | None = None,
+        _record_cache: bool = True,
+    ) -> list[KompressResult]:
+        """Compress a batch and always release claims owned by this call."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if not contents:
+            return []
+        if ccr_originals is not None and len(ccr_originals) != len(contents):
+            raise ValueError("ccr_originals must have the same length as contents")
+
+        cache = get_kompress_cache()
+        cache_namespace = self._cache_namespace()
+        claimed_contents: set[str] = set()
+        try:
+            return self._compress_batch_impl(
+                contents,
+                context=context,
+                content_type=content_type,
+                question=question,
+                target_ratio=target_ratio,
+                batch_size=batch_size,
+                ccr_originals=ccr_originals,
+                _deadline_started_at=_deadline_started_at,
+                _emit_ccr=_emit_ccr,
+                _batch_outcomes=_batch_outcomes,
+                _record_cache=_record_cache,
+                _claimed_contents=claimed_contents,
+            )
+        finally:
+            for content in tuple(claimed_contents):
+                cache.release_inference(content, cache_namespace)
+
+    def _compress_batch_impl(
+        self,
+        contents: list[str],
+        context: str = "",
+        content_type: str | None = None,
+        question: str | None = None,
+        target_ratio: float | list[float | None] | None = None,
+        batch_size: int = 32,
+        *,
+        ccr_originals: list[str | None] | None = None,
+        _deadline_started_at: float | None = None,
+        _emit_ccr: bool = True,
+        _batch_outcomes: list[_CacheOutcome] | None = None,
+        _record_cache: bool = True,
+        _claimed_contents: set[str] | None = None,
     ) -> list[KompressResult]:
         """Compress multiple texts. Uses batched inference on GPU, sequential on CPU.
 
@@ -1784,6 +2393,8 @@ class KompressCompressor(Transform):
         n = len(contents)
         if n == 0:
             return []
+        if _batch_outcomes is not None:
+            _batch_outcomes.extend(["skip" for _ in range(n)])
         t_deadline = time.perf_counter() if _deadline_started_at is None else _deadline_started_at
 
         # Normalize target_ratio to a per-text list
@@ -1809,16 +2420,72 @@ class KompressCompressor(Transform):
         else:
             ccr_sources = [None] * n
 
-        if getattr(self, "_degraded_reason", None) is not None:
-            return [self._passthrough(c, len(c.split())) for c in contents]
+        if self._degraded_reason is not None:
+            return [self._passthrough(content, len(content.split())) for content in contents]
+
+        cache = get_kompress_cache()
+        cache_enabled = _kompress_result_cache_enabled()
+        cache_namespace = self._cache_namespace()
+        record_cache = _record_cache and cache_enabled
+        cached_results: list[KompressResult | None] = [None] * n
+        active_indices: list[int] = []
+        original_indices = list(range(n))
+
+        def set_outcome(index: int, outcome: _CacheOutcome) -> None:
+            if _batch_outcomes is not None:
+                _batch_outcomes[original_indices[index]] = outcome
+
+        for i, content in enumerate(contents):
+            if len(content.split()) < 10 or ratios[i] is not None:
+                active_indices.append(i)
+                continue
+            if not cache_enabled:
+                active_indices.append(i)
+                continue
+            cached = cache.lookup(content, cache_namespace)
+            if cached is not None and cached.exhausted:
+                cached_results[i] = self._passthrough(content, len(content.split()))
+            elif cached is not None and cached.compressed is not None:
+                cached_result = KompressResult(
+                    compressed=cached.compressed,
+                    original=content,
+                    original_tokens=cached.original_tokens or len(content.split()),
+                    compressed_tokens=cached.compressed_tokens or len(cached.compressed.split()),
+                    compression_ratio=(cached.compressed_tokens or len(content.split()))
+                    / len(content.split()),
+                    model_used=self.config.model_id,
+                )
+                cached_results[i] = self._add_ccr_marker(cached_result, ccr_sources[i])
+            else:
+                active_indices.append(i)
+
+        if not active_indices:
+            return [result for result in cached_results if result is not None]
+
+        contents = [contents[i] for i in active_indices]
+        ratios = [ratios[i] for i in active_indices]
+        ccr_sources = [ccr_sources[i] for i in active_indices]
+        original_indices = active_indices
+        n = len(contents)
+        word_lists: list[list[str]] = [c.split() for c in contents]
+
+        if all(len(words) < 10 for words in word_lists):
+            active_results = [
+                self._passthrough(content, len(words))
+                for content, words in zip(contents, word_lists, strict=True)
+            ]
+            for i in range(n):
+                set_outcome(i, "success")
+            return _restore_batch_order(cached_results, active_results, active_indices)
 
         # Fast path: on backends where batch-dim parallelism does NOT help
         # (ONNX CPU, PyTorch CPU), fall back to sequential `compress()`
         # internally. This keeps the public API consistent while avoiding the
         # per-item slowdown measured on ONNX CPU (~0.7-0.9x vs sequential).
         # GPU users still benefit from the batched forward pass below.
-        if self._should_use_sequential_fallback():
-            return [
+        use_sequential_fallback = self._should_use_sequential_fallback()
+        if use_sequential_fallback:
+            active_results = [
                 self.compress(
                     content,
                     context=context,
@@ -1830,10 +2497,9 @@ class KompressCompressor(Transform):
                 )
                 for content, r, ccr_source in zip(contents, ratios, ccr_sources, strict=True)
             ]
+            return _restore_batch_order(cached_results, active_results, active_indices)
 
         results: list[KompressResult | None] = [None] * n
-        word_lists: list[list[str]] = [c.split() for c in contents]
-
         # Short texts short-circuit to passthrough — no model call needed.
         max_chunk_words = self.config.chunk_words
         chunk_queue: list[tuple[int, int, list[str], float | None]] = []
@@ -1847,21 +2513,110 @@ class KompressCompressor(Transform):
 
         if not chunk_queue:
             # Every input was short — all passthrough, no model needed.
-            return [r for r in results if r is not None]
+            return _restore_batch_order(
+                cached_results,
+                [r for r in results if r is not None],
+                active_indices,
+            )
 
         # Load model once for the whole batch.
         try:
             model, tokenizer, backend = _load_kompress(self.config.model_id, self.config.device)
+        except KompressModelNotCached as e:
+            logger.debug("Kompress model not cached for batch: %s", e)
+            for i in range(n):
+                if results[i] is None:
+                    results[i] = self._passthrough(contents[i], len(word_lists[i]))
+            return _restore_batch_order(
+                cached_results,
+                [r for r in results if r is not None],
+                active_indices,
+            )
         except Exception as e:
             logger.warning("Kompress load failed for batch: %s — passthrough all", e)
             for i in range(n):
                 if results[i] is None:
                     results[i] = self._passthrough(contents[i], len(word_lists[i]))
-            return [r for r in results if r is not None]
+            return _restore_batch_order(
+                cached_results,
+                [r for r in results if r is not None],
+                active_indices,
+            )
 
         is_onnx = backend.startswith("onnx")
         device_type = _model_device_type(model, backend)
         kept_ids_per_text: dict[int, set[int]] = {i: set() for i in range(n) if results[i] is None}
+        claimed_contents = _claimed_contents if _claimed_contents is not None else set()
+
+        def release_claim(content: str) -> None:
+            if content in claimed_contents:
+                claimed_contents.remove(content)
+                cache.release_inference(content, cache_namespace)
+
+        def record_failure_once(content: str, published_contents: set[str]) -> None:
+            if content in published_contents:
+                return
+            published_contents.add(content)
+            cache.record_failure(content, cache_namespace)
+
+        # The sequential fallback delegates to direct compress(), which owns
+        # its own single-flight claim. Only the actual GPU/MPS batch path claims
+        # misses here, after model selection has ruled out that fallback.
+        if record_cache and not use_sequential_fallback:
+            for text_idx, content in enumerate(contents):
+                if results[text_idx] is not None or ratios[text_idx] is not None:
+                    continue
+                if content in claimed_contents:
+                    continue
+                waited_for_owner = False
+                while True:
+                    cached = cache.lookup(content, cache_namespace)
+                    if cached is not None and cached.exhausted:
+                        results[text_idx] = self._passthrough(content, len(word_lists[text_idx]))
+                        kept_ids_per_text.pop(text_idx, None)
+                        break
+                    if cached is not None and cached.compressed is not None:
+                        cached_result = KompressResult(
+                            compressed=cached.compressed,
+                            original=content,
+                            original_tokens=cached.original_tokens or len(word_lists[text_idx]),
+                            compressed_tokens=cached.compressed_tokens
+                            or len(cached.compressed.split()),
+                            compression_ratio=(
+                                cached.compressed_tokens or len(word_lists[text_idx])
+                            )
+                            / len(word_lists[text_idx]),
+                            model_used=self.config.model_id,
+                        )
+                        results[text_idx] = self._add_ccr_marker(
+                            cached_result, ccr_sources[text_idx]
+                        )
+                        kept_ids_per_text.pop(text_idx, None)
+                        break
+
+                    cache_wait_timeout = _single_flight_wait_timeout_seconds(t_deadline)
+                    if waited_for_owner and cache_wait_timeout <= 0:
+                        results[text_idx] = self._passthrough(content, len(word_lists[text_idx]))
+                        set_outcome(text_idx, "skip")
+                        kept_ids_per_text.pop(text_idx, None)
+                        break
+                    claim = cache.acquire_inference(
+                        content,
+                        cache_namespace,
+                        timeout_seconds=cache_wait_timeout,
+                    )
+                    if claim is True:
+                        claimed_contents.add(content)
+                        break
+                    if claim is None:
+                        results[text_idx] = self._passthrough(content, len(word_lists[text_idx]))
+                        set_outcome(text_idx, "skip")
+                        kept_ids_per_text.pop(text_idx, None)
+                        break
+                    waited_for_owner = True
+
+            chunk_queue = [chunk for chunk in chunk_queue if results[chunk[0]] is None]
+
         inference_ms = 0.0
         deadline_s = getattr(self, "_deadline_s", None)
         if deadline_s is None:
@@ -1872,7 +2627,7 @@ class KompressCompressor(Transform):
         budget = _time_budget_seconds()
         deadline = time.monotonic() + budget if budget is not None else None
 
-        def _bail_remaining(reason: str, batch_start: int) -> None:
+        def _bail_remaining(reason: str, batch_start: int, cache_failure: bool = True) -> None:
             # A text with ANY unprocessed chunk must pass through whole —
             # compressing from partial chunk coverage would silently drop the
             # words of the chunks that never ran.
@@ -1882,11 +2637,19 @@ class KompressCompressor(Transform):
                 device_type=device_type,
                 n_words=sum(len(c[2]) for c in chunk_queue[batch_start:]),
             )
+            published_failures: set[str] = set()
             for text_idx, _, _, _ in chunk_queue[batch_start:]:
                 if results[text_idx] is None:
                     results[text_idx] = self._passthrough(
                         contents[text_idx], len(word_lists[text_idx])
                     )
+                    if cache_failure and ratios[text_idx] is None:
+                        set_outcome(text_idx, "failure")
+                        if record_cache:
+                            record_failure_once(contents[text_idx], published_failures)
+                    else:
+                        set_outcome(text_idx, "skip")
+                    release_claim(contents[text_idx])
                     kept_ids_per_text.pop(text_idx, None)
 
         for batch_start in range(0, len(chunk_queue), batch_size):
@@ -1952,7 +2715,9 @@ class KompressCompressor(Transform):
                         "passing through remaining batch inputs",
                         wait_ms,
                     )
-                    _bail_remaining("model busy (semaphore acquire timed out)", batch_start)
+                    _bail_remaining(
+                        "model busy (semaphore acquire timed out)", batch_start, cache_failure=False
+                    )
                     break
 
                 with contextlib.ExitStack() as stack:
@@ -1996,14 +2761,38 @@ class KompressCompressor(Transform):
                     )
 
             except Exception as e:
+                if backend == "onnx_gpu" and _recover_onnx_gpu_session(self.config.model_id):
+                    logger.warning(
+                        "Kompress recovered affected batch texts with ONNX CPU execution"
+                    )
+                    for text_idx, _, _, ratio in batch:
+                        if results[text_idx] is None:
+                            release_claim(contents[text_idx])
+                            results[text_idx] = self.compress(
+                                contents[text_idx],
+                                context=context,
+                                content_type=content_type,
+                                question=question,
+                                target_ratio=ratio,
+                            )
+                            kept_ids_per_text.pop(text_idx, None)
+                    continue
                 logger.warning(
                     "Kompress batch forward pass failed: %s — passthrough affected texts", e
                 )
+                published_failures: set[str] = set()
                 for text_idx, _, _, _ in batch:
                     if results[text_idx] is None:
                         results[text_idx] = self._passthrough(
                             contents[text_idx], len(word_lists[text_idx])
                         )
+                        if ratios[text_idx] is None:
+                            set_outcome(text_idx, "failure")
+                            if record_cache:
+                                record_failure_once(contents[text_idx], published_failures)
+                        else:
+                            set_outcome(text_idx, "skip")
+                        release_claim(contents[text_idx])
                         kept_ids_per_text.pop(text_idx, None)
 
         # Reconstruct compressed text for each non-passthrough result.
@@ -2016,6 +2805,13 @@ class KompressCompressor(Transform):
 
             if not kept_ids:
                 results[text_idx] = self._passthrough(content, n_words)
+                if ratios[text_idx] is None:
+                    set_outcome(text_idx, "success")
+                    if record_cache:
+                        cache.discard(content, cache_namespace)
+                    release_claim(content)
+                else:
+                    set_outcome(text_idx, "skip")
                 continue
 
             compressed_words = [words[w] for w in sorted(kept_ids) if w < n_words]
@@ -2032,7 +2828,26 @@ class KompressCompressor(Transform):
                 model_used=self.config.model_id,
             )
 
-            if self.config.enable_ccr and comp_ratio < 0.8:
+            if ratios[text_idx] is None:
+                set_outcome(text_idx, "success")
+                if compressed_count < n_words:
+                    if record_cache:
+                        cache.record_success(
+                            content,
+                            compressed,
+                            n_words,
+                            compressed_count,
+                            cache_namespace,
+                        )
+                    release_claim(content)
+                else:
+                    if record_cache:
+                        cache.discard(content, cache_namespace)
+                    release_claim(content)
+            else:
+                set_outcome(text_idx, "skip")
+
+            if _emit_ccr and self.config.enable_ccr and comp_ratio < 0.8:
                 ccr_source = ccr_sources[text_idx]
                 if ccr_source is None:
                     ccr_source = content
@@ -2058,6 +2873,8 @@ class KompressCompressor(Transform):
         for i, r in enumerate(results):
             if r is None:
                 final.append(self._passthrough(contents[i], len(word_lists[i])))
+                set_outcome(i, "skip")
+                release_claim(contents[i])
             else:
                 final.append(r)
         if inference_ms >= 1000.0:
@@ -2075,7 +2892,7 @@ class KompressCompressor(Transform):
                 inference_ms,
                 total_saved,
             )
-        return final
+        return _restore_batch_order(cached_results, final, active_indices)
 
     def _should_batch_single_content(self, model: Any, backend: str) -> bool:
         if backend != "pytorch":

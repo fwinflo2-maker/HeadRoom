@@ -31,7 +31,7 @@ def _make_crusher(max_items: int = 10, min_items: int = 3) -> SmartCrusher:
     return SmartCrusher(config=config)
 
 
-# Bug #1 (number array schema preservation) — invariant pinned by the
+# Bug #1 (number array schema preservation) -- invariant pinned by the
 # Rust port (`crates/headroom-core/src/transforms/smart_crusher/crushers.rs::
 # crush_number_array` + its unit tests) and the parity fixtures
 # (`tests/parity/fixtures/smart_crusher/number_array_40_changepoint*`).
@@ -167,7 +167,7 @@ class TestLosslessOnlyMode:
 # Python helpers (`_percentile_linear`, `_detect_sequential_pattern`,
 # `_detect_rare_status_values`, `_compute_k_split`) that were removed
 # along with the Python implementation in Stage 3c.1b. The Rust port
-# pins the same invariants — see the `bug1_*` / `bug2_*` / `bug3_*` /
+# pins the same invariants -- see the `bug1_*` / `bug2_*` / `bug3_*` /
 # `bug4_*` tests in `crates/headroom-core/src/transforms/smart_crusher/`
 # (notably `crushers.rs` and `analyzer.rs`). Parity fixtures
 # (`tests/parity/fixtures/smart_crusher/`) byte-compare the post-fix

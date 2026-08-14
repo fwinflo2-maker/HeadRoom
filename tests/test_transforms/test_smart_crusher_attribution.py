@@ -22,7 +22,7 @@ def _build_extension() -> None:
         from headroom._core import SmartCrusher  # noqa: F401
     except ImportError:
         pytest.skip(
-            "headroom._core not built — run `bash scripts/build_rust_extension.sh`",
+            "headroom._core not built -- run `bash scripts/build_rust_extension.sh`",
             allow_module_level=True,
         )
 
@@ -136,14 +136,14 @@ class TestSmartCrushAttribution:
             {
                 "role": "assistant",
                 "content": [
-                    {"type": "tool_use", "name": "NamelessRead"},  # no id → skipped
-                    {"type": "tool_use", "id": "u0"},  # no name → skipped
-                    {"type": "text", "text": "thinking..."},  # not tool_use → skipped
+                    {"type": "tool_use", "name": "NamelessRead"},  # no id -> skipped
+                    {"type": "tool_use", "id": "u0"},  # no name -> skipped
+                    {"type": "text", "text": "thinking..."},  # not tool_use -> skipped
                     {"type": "tool_use", "id": "u1", "name": "Grep", "input": {}},  # good
                 ],
                 "tool_calls": [
-                    {"id": "", "function": {"name": "Empty"}},  # no id → skipped
-                    {"id": "c1", "function": {"name": ""}},  # no name → skipped
+                    {"id": "", "function": {"name": "Empty"}},  # no id -> skipped
+                    {"id": "c1", "function": {"name": ""}},  # no name -> skipped
                 ],
             },
             {
@@ -160,7 +160,7 @@ class TestSmartCrushAttribution:
 
     def test_transform_tag_falls_back_when_no_names(self):
         """Crushed tool with no resolvable name keeps legacy ``smart_crush:<n>`` shape."""
-        # No assistant message → no name index entries.
+        # No assistant message -> no name index entries.
         messages = [
             {"role": "tool", "tool_call_id": "orphan", "content": json.dumps(_LARGE_A)},
         ]

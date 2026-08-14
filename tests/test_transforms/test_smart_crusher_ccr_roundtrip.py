@@ -2,13 +2,13 @@
 
 The Rust core integration test (`crates/headroom-core/tests/ccr_roundtrip.rs`)
 already pins the contract from the Rust side. These tests verify the same
-guarantee is reachable from Python — i.e. the Rust-side CCR store is
+guarantee is reachable from Python -- i.e. the Rust-side CCR store is
 exposed correctly through PyO3, the runtime can read originals back via
 `ccr_get`, and the wiring from the Python `SmartCrusher` shim hits the
 same store the Rust crate writes through.
 
 If these regress, the Python proxy's CCR retrieval tool is silently
-serving nothing — the `<<ccr:HASH ...>>` marker would point at a void.
+serving nothing -- the `<<ccr:HASH ...>>` marker would point at a void.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ def _build_extension() -> None:
         from headroom._core import SmartCrusher  # noqa: F401
     except ImportError:
         pytest.skip(
-            "headroom._core not built — run `bash scripts/build_rust_extension.sh`",
+            "headroom._core not built -- run `bash scripts/build_rust_extension.sh`",
             allow_module_level=True,
         )
 
@@ -53,8 +53,8 @@ def test_native_default_crusher_has_a_store() -> None:
 
 
 def test_native_lossy_crush_stores_original() -> None:
-    """The cornerstone roundtrip: lossy crush → store entry → retrieve
-    → original payload comes back intact."""
+    """The cornerstone roundtrip: lossy crush -> store entry -> retrieve
+    -> original payload comes back intact."""
     from headroom._core import SmartCrusher
 
     crusher = SmartCrusher(_force_lossy_config())
@@ -63,7 +63,7 @@ def test_native_lossy_crush_stores_original() -> None:
 
     result = crusher.crush(content, "", 1.0)
 
-    # Some store activity is expected — the lossy path fires through
+    # Some store activity is expected -- the lossy path fires through
     # `crush_array` which stashes the original.
     assert crusher.ccr_len() > 0, (
         f"expected store entries after lossy crush, got 0; "
@@ -85,7 +85,7 @@ def test_native_ccr_get_recovers_original_array() -> None:
     # The store should have at least one entry; iterate likely hashes
     # is impossible (no list API) so we walk the canonical hash space
     # by recomputing what the Rust side does. Easier: just verify that
-    # *something* round-trips by re-crushing identical input — same
+    # *something* round-trips by re-crushing identical input -- same
     # hash, same payload, no growth in store size.
     pre_len = crusher.ccr_len()
     crusher.crush(content, "", 1.0)
@@ -95,7 +95,7 @@ def test_native_ccr_get_recovers_original_array() -> None:
 
 
 def test_native_passthrough_does_not_grow_store() -> None:
-    """Below adaptive_k → no drop → no store write."""
+    """Below adaptive_k -> no drop -> no store write."""
     from headroom._core import SmartCrusher
 
     crusher = SmartCrusher()
@@ -125,7 +125,7 @@ def test_shim_exposes_ccr_get_and_ccr_len() -> None:
 
 def test_shim_lossy_crush_populates_store() -> None:
     """Same roundtrip as the native test but driven through the
-    `headroom.transforms.smart_crusher.SmartCrusher` shim — the path
+    `headroom.transforms.smart_crusher.SmartCrusher` shim -- the path
     the proxy actually uses."""
     from headroom.config import SmartCrusherConfig as PyConfig
     from headroom.transforms.smart_crusher import SmartCrusher
@@ -143,26 +143,55 @@ def test_shim_lossy_crush_populates_store() -> None:
     assert crusher.ccr_len() > 0
 
 
+def test_shim_mirrors_opaque_ccr_with_token_metadata(monkeypatch) -> None:
+    """Opaque CCR entries must not be mirrored with zero token counts."""
+    from unittest.mock import MagicMock
+
+    from headroom.config import SmartCrusherConfig as PyConfig
+    from headroom.transforms.smart_crusher import SmartCrusher
+
+    crusher = SmartCrusher(PyConfig(), with_compaction=False)
+    original = "x" * 5000
+    marker = "<<ccr:abc123>>"
+    fake_rust = MagicMock()
+    fake_rust.ccr_get.return_value = original
+    fake_rust.ccr_get_metadata.return_value = {"original_tokens": 0, "compressed_tokens": 0}
+    crusher._rust = fake_rust
+    store = MagicMock()
+    monkeypatch.setattr("headroom.cache.compression_store.get_compression_store", lambda: store)
+
+    crusher._mirror_single_hash_to_python_store(
+        "abc123",
+        strategy="string_ccr:string",
+        query_context="",
+        tool_name=None,
+    )
+
+    kwargs = store.store.call_args.kwargs
+    assert kwargs["original_tokens"] == len(original) // 4
+    assert kwargs["compressed_tokens"] == len(marker) // 4
+
+
 # ─── Explicit before/after roundtrip ───────────────────────────────────────
 #
 # These tests do the full user story end-to-end: take a payload,
 # crush it, fetch the original back from the CCR store by hash, and
 # assert the reconstructed list **equals the input element-for-element**.
-# If anything in compress → store → retrieve → reconstruct breaks,
+# If anything in compress -> store -> retrieve -> reconstruct breaks,
 # these tests yell loudly with both the before and after visible in
 # the failure message.
 
 
 def test_explicit_before_after_roundtrip_native() -> None:
-    """Full story: payload → crush → grab hash from result → ccr_get
-    → parse → byte-compare with original input."""
+    """Full story: payload -> crush -> grab hash from result -> ccr_get
+    -> parse -> byte-compare with original input."""
     from headroom._core import SmartCrusher, SmartCrusherConfig
 
     # Force the lossy path so the CCR store actually gets a write.
     cfg = SmartCrusherConfig(lossless_min_savings_ratio=0.99)
     crusher = SmartCrusher(cfg)
 
-    # The "before" payload — what the tool produced and the proxy is
+    # The "before" payload -- what the tool produced and the proxy is
     # about to send to the LLM.
     original = [{"id": i, "status": "ok", "tag": "alpha"} for i in range(60)]
     original_json = json.dumps(original)
@@ -321,7 +350,7 @@ def test_compact_document_via_shim() -> None:
 
 
 def test_distinct_payloads_have_distinct_hashes_and_separate_storage() -> None:
-    """Two different payloads → two different hashes → both
+    """Two different payloads -> two different hashes -> both
     independently retrievable. Pins the per-payload isolation."""
     from headroom._core import SmartCrusher, SmartCrusherConfig
 

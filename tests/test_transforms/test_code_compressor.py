@@ -1288,7 +1288,7 @@ class TestSemanticSymbolImportance:
         compressor = self._make_compressor()
         result = compressor.compress(_payment_processing_code(), language="python")
 
-        # validate_order is called by process_payment — should score higher
+        # validate_order is called by process_payment -- should score higher
         assert result.symbol_scores["validate_order"] > result.symbol_scores["_dead_helper"]
         assert result.symbol_scores["charge_customer"] > result.symbol_scores["_dead_helper"]
 
@@ -1325,7 +1325,7 @@ def _private_func():
         compressor = self._make_compressor()
         result = compressor.compress(_payment_processing_code(), language="python")
 
-        # _dead_helper has 0 references, private → score 0.0
+        # _dead_helper has 0 references, private -> score 0.0
         assert result.symbol_scores["_dead_helper"] < 0.1
 
         # Body should be fully omitted
@@ -1486,7 +1486,7 @@ function _internalDebug(msg) {
         result = compressor.compress(code, language="javascript")
 
         assert result.symbol_scores
-        # fetchUser is called by processUser — should score higher than _internalDebug
+        # fetchUser is called by processUser -- should score higher than _internalDebug
         if "fetchUser" in result.symbol_scores and "_internalDebug" in result.symbol_scores:
             assert result.symbol_scores["fetchUser"] > result.symbol_scores["_internalDebug"]
 

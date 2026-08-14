@@ -17,6 +17,8 @@ Uses trafilatura for robust extraction - it handles:
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -29,6 +31,27 @@ from trafilatura.settings import use_config
 logging.getLogger("trafilatura").setLevel(logging.CRITICAL)
 
 logger = logging.getLogger(__name__)
+
+# Keep trafilatura.core at its default level so genuine errors are observable;
+# expected noise around specific calls is suppressed at the call site instead.
+
+
+@contextmanager
+def _suppress_trafilatura_noise() -> Iterator[None]:
+    """Temporarily suppress trafilatura's ERROR-level diagnostics.
+
+    When we pass HTML that trafilatura cannot parse (e.g. short fragments,
+    non-article pages) it logs ``empty HTML tree`` at ERROR. We handle the
+    None/empty return ourselves at the call site, so these diagnostics are
+    just noise.
+    """
+    trafilatura_logger = logging.getLogger("trafilatura.core")
+    old_level = trafilatura_logger.level
+    trafilatura_logger.setLevel(logging.CRITICAL)
+    try:
+        yield
+    finally:
+        trafilatura_logger.setLevel(old_level)
 
 
 @dataclass
@@ -128,17 +151,18 @@ class HTMLExtractor:
             )
 
         # Extract content using trafilatura
-        extracted = trafilatura.extract(
-            html,
-            url=url,
-            include_links=self.config.include_links,
-            include_images=self.config.include_images,
-            include_tables=self.config.include_tables,
-            include_comments=self.config.include_comments,
-            include_formatting=self.config.include_formatting,
-            output_format=self.config.output_format,
-            config=self._trafilatura_config,
-        )
+        with _suppress_trafilatura_noise():
+            extracted = trafilatura.extract(
+                html,
+                url=url,
+                include_links=self.config.include_links,
+                include_images=self.config.include_images,
+                include_tables=self.config.include_tables,
+                include_comments=self.config.include_comments,
+                include_formatting=self.config.include_formatting,
+                output_format=self.config.output_format,
+                config=self._trafilatura_config,
+            )
 
         # Handle extraction failure
         if extracted is None:
@@ -155,7 +179,8 @@ class HTMLExtractor:
         metadata: dict[str, Any] = {}
 
         if self.config.extract_metadata:
-            meta = trafilatura.extract_metadata(html, default_url=url)
+            with _suppress_trafilatura_noise():
+                meta = trafilatura.extract_metadata(html, default_url=url)
             if meta:
                 title = meta.title
                 author = meta.author

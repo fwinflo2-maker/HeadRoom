@@ -18,11 +18,14 @@ docstring (per-mode rationale, why-a-struct, etc.).
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from dataclasses import dataclass
 
 from headroom.proxy.auth_mode import AuthMode
+
+logger = logging.getLogger(__name__)
 
 # ── F2.2 per-mode default values (CONSERVATIVE pending bake telemetry) ──
 # Mirrors the Rust ``pub(crate) const`` block in
@@ -164,6 +167,15 @@ class CompressionPolicy:
         # f32::max in the Rust source of truth — guard explicitly.
         reads = 0.0 if math.isnan(expected_reads) else max(expected_reads, 0.0)
         alive = 1.0 if math.isnan(p_alive) else min(max(p_alive, 0.0), 1.0)
+        logger.info(
+            "NetMutationGain w=%.2f r=%.2f dt=%d suffix=%d reads=%.2f alive=%.2f",
+            w,
+            r,
+            dt,
+            suffix,
+            reads,
+            alive,
+        )
         return float(dt) * (w + r * (reads - 1.0)) - alive * (w - r) * float(suffix + dt)
 
     def should_mutate_deep(

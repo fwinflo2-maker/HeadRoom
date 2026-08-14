@@ -41,6 +41,8 @@ fallback. Build it locally with `scripts/build_rust_extension.sh`
   Python bridge.
 """
 
+#  Copyright (c) 2026 Noel Kuntze
+
 from __future__ import annotations
 
 import json
@@ -56,7 +58,6 @@ from ..config import CCRConfig, TransformResult, is_tool_excluded
 from ..tokenizer import Tokenizer
 from ..utils import compute_short_hash, create_tool_digest_marker, deep_copy_messages
 from .base import Transform
-from .content_detector import normalize_concatenated_json
 
 logger = logging.getLogger(__name__)
 
@@ -169,8 +170,8 @@ class SmartCrusherConfig:
     """
 
     enabled: bool = True
-    min_items_to_analyze: int = 5
-    min_tokens_to_crush: int = 200
+    min_items_to_analyze: int = 3
+    min_tokens_to_crush: int = 80
     variance_threshold: float = 2.0
     uniqueness_threshold: float = 0.1
     similarity_threshold: float = 0.8
@@ -181,8 +182,8 @@ class SmartCrusherConfig:
     use_feedback_hints: bool = True
     toin_confidence_threshold: float = 0.5
     dedup_identical_items: bool = True
-    first_fraction: float = 0.3
-    last_fraction: float = 0.15
+    first_fraction: float = 0.2
+    last_fraction: float = 0.1
     # Minimum byte-savings ratio for the lossless Table/CSV compaction
     # path to win over the lossy path (0.15, matching the Rust default —
     # the two must stay in lockstep, see config.rs). Lossless output
@@ -191,13 +192,6 @@ class SmartCrusherConfig:
     # and KV experiments — KV repeats field names per row, so it clears
     # the gate less often than CSV.
     lossless_min_savings_ratio: float = 0.15
-    # Strict lossless mode. When True, lossless tabular compaction still
-    # applies, but any path that would otherwise emit a CCR marker — the
-    # lossy row-drop sentinel AND opaque-blob offload — leaves the content
-    # uncompacted instead. The output is always marker-free and fully
-    # byte-recoverable: rows are never dropped and opaque cells render
-    # inline. Default False (markers allowed). Mirrors the Rust default.
-    lossless_only: bool = False
 
     # Compaction heuristics (mirror Rust CompactConfig; see
     # crates/headroom-core/src/transforms/smart_crusher/compaction/compactor.rs).
@@ -237,6 +231,47 @@ class SmartCrusherConfig:
 
 
 # ─── Rust-backed SmartCrusher ─────────────────────────────────────────────
+
+
+# Cached probe: does the deployed ``headroom._core.SmartCrusherConfig`` accept
+# the ``lossless_only`` kwarg? Wheels built before commit b80a351e ("fix: add
+# missing lossless_only field ... to SmartCrusherConfig") lack the field in the
+# PyO3 constructor signature and raise ``TypeError`` on it. The probe is keyed
+# by the pyclass object so distinct interpreters / wheel reloads re-probe
+# correctly; the result is memoized to keep the per-instance hot path branch-free.
+_RUST_LOSSLESS_ONLY_PROBE: dict[int, bool] = {}
+_RUST_LOSSLESS_ONLY_WARNED: bool = False
+
+
+def _rust_supports_lossless_only(rust_config_cls: Any) -> bool:
+    """Return ``True`` if ``rust_config_cls`` accepts ``lossless_only=``.
+
+    Probes the constructor once per pyclass (cheap relative to a compression
+    call, and memoized so the request hot path pays nothing after the first
+    build). A constructor that rejects the kwarg yields ``False`` — callers
+    then omit it and let the Rust default (``lossless_only=False``) apply,
+    preserving the pre-field behaviour instead of crashing.
+    """
+    global _RUST_LOSSLESS_ONLY_WARNED
+    key = id(rust_config_cls)
+    cached = _RUST_LOSSLESS_ONLY_PROBE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        rust_config_cls(lossless_only=False)
+        supported = True
+    except TypeError:
+        supported = False
+        if not _RUST_LOSSLESS_ONLY_WARNED:
+            _RUST_LOSSLESS_ONLY_WARNED = True
+            logger.warning(
+                "headroom._core.SmartCrusherConfig does not accept "
+                "'lossless_only' (stale _core.pyd — rebuild with "
+                "`make verify-rust-core`). Strict-lossless mode is "
+                "silently degraded to the lossy path."
+            )
+    _RUST_LOSSLESS_ONLY_PROBE[key] = supported
+    return supported
 
 
 class SmartCrusher(Transform):
@@ -372,12 +407,8 @@ class SmartCrusher(Transform):
         # Build the Rust crusher with every field from the Python
         # config, plus the relevance_threshold default (0.3) — the
         # Python dataclass doesn't carry that field; it lives on
-        # `RelevanceScorerConfig` instead. Kept as a kwargs dict so the
-        # per-call `crush(..., lossless_only=...)` override can rebuild an
-        # alternate crusher with just that one field flipped.
-        self._RustSmartCrusher = _RustSmartCrusher
-        self._RustSmartCrusherConfig = _RustSmartCrusherConfig
-        self._rust_cfg_kwargs = {
+        # `RelevanceScorerConfig` instead.
+        self._rust_cfg_kwargs: dict[str, Any] = {
             "enabled": cfg.enabled,
             "min_items_to_analyze": cfg.min_items_to_analyze,
             "min_tokens_to_crush": cfg.min_tokens_to_crush,
@@ -397,10 +428,6 @@ class SmartCrusher(Transform):
             "enable_ccr_marker": (
                 self._ccr_config.enabled and self._ccr_config.inject_retrieval_marker
             ),
-            "lossless_only": self._lossless_only,
-            # getattr fallbacks: callers may pass the structurally-similar
-            # `headroom.config.SmartCrusherConfig` (MCP server, SDK) or a
-            # pre-existing config object that predates these fields.
             "lossless_min_savings_ratio": getattr(cfg, "lossless_min_savings_ratio", 0.15),
             "compaction_core_field_fraction": getattr(cfg, "compaction_core_field_fraction", 0.8),
             "compaction_heterogeneous_core_ratio": getattr(
@@ -412,6 +439,9 @@ class SmartCrusher(Transform):
             "compaction_min_buckets": getattr(cfg, "compaction_min_buckets", 2),
             "compaction_max_buckets": getattr(cfg, "compaction_max_buckets", 8),
         }
+        _rust_cfg = _RustSmartCrusherConfig(**self._rust_cfg_kwargs)
+        self._RustSmartCrusherConfig = _RustSmartCrusherConfig
+        self._RustSmartCrusher = _RustSmartCrusher
         # Default: lossless-first compaction (PR4). Lossless wins for
         # cleanly tabular input where it saves ≥ 30% bytes; otherwise
         # falls through to the lossy path with CCR-Dropped retrieval
@@ -449,7 +479,18 @@ class SmartCrusher(Transform):
         if cached is not None:
             return cached
         kwargs = dict(self._rust_cfg_kwargs)
-        kwargs["lossless_only"] = lossless_only
+        # Probe once whether the deployed Rust `SmartCrusherConfig` accepts
+        # the `lossless_only` kwarg. Wheels built before the field was
+        # added to the PyO3 signature (crates/headroom-py/src/lib.rs,
+        # "fix: add missing lossless_only field") reject it with a
+        # `TypeError`, which broke every SmartCrusher / tabular compression
+        # in the request path. When the field is unsupported we drop it —
+        # the Rust side defaults to `lossless_only=False` (the pre-field
+        # behaviour), so strict-lossless mode silently degrades to the
+        # lossy path rather than crashing the whole optimization step.
+        # See AGENTS.md "stale _core.pyd" handling precedent.
+        if _rust_supports_lossless_only(self._RustSmartCrusherConfig):
+            kwargs["lossless_only"] = lossless_only
         rust_cfg = self._RustSmartCrusherConfig(**kwargs)
         if not self._with_compaction:
             rust = self._RustSmartCrusher.without_compaction(rust_cfg)
@@ -484,13 +525,6 @@ class SmartCrusher(Transform):
         opaque-blob offload) leaves the content uncompacted instead.
         `None` (default) uses the instance's configured value.
         """
-        # Web search tools often return space-separated JSON objects
-        # (``{...} {...} {...}``) rather than a real array. The Rust crusher
-        # only compresses JSON arrays, so normalize that shape first —
-        # otherwise it passes through at 0% compression (#1741).
-        normalized = normalize_concatenated_json(content)
-        if normalized is not None:
-            content = normalized
         rust = (
             self._rust
             if lossless_only is None or bool(lossless_only) == self._lossless_only
@@ -1014,6 +1048,9 @@ class SmartCrusher(Transform):
         `rendered` may be a JSON string (the standard SmartCrusher
         output format) or arbitrary text. We try the structured walk
         first; if that fails we fall back to a non-regex token scan.
+
+        Token counts are read from the Rust store's metadata (stored at
+        put time) rather than estimated here.
         """
         # Cheap pre-filter — most outputs have no marker at all.
         if "<<ccr:" not in rendered:
@@ -1117,6 +1154,8 @@ class SmartCrusher(Transform):
         strategy: str,
         query_context: str,
         tool_name: str | None,
+        original_tokens: int = 0,
+        compressed_tokens: int = 0,
     ) -> None:
         """Mirror a single Rust-stored CCR entry into the Python
         compression_store, keyed by `ccr_hash`. Best-effort.
@@ -1132,6 +1171,24 @@ class SmartCrusher(Transform):
                 ccr_hash,
             )
             return
+        # Read actual token metadata from the Rust store (stored by the
+        # crusher at put time). Falls back to the heuristic estimates
+        # passed from the call site if metadata isn't available.
+        try:
+            meta = self._rust.ccr_get_metadata(ccr_hash)
+            if meta is not None:
+                original_tokens = meta["original_tokens"]
+                compressed_tokens = meta["compressed_tokens"]
+        except Exception:
+            pass
+        # Older/native CCR paths store opaque strings through ``put()`` and
+        # therefore expose zero-valued metadata. Keep the Python mirror's
+        # accounting useful by applying the same conservative estimate used
+        # by the Rust store when metadata is absent.
+        if original_tokens <= 0:
+            original_tokens = max(1, len(canonical) // 4)
+        if compressed_tokens <= 0:
+            compressed_tokens = max(1, len(f"<<ccr:{ccr_hash}>>") // 4)
         try:
             from ..cache.compression_store import get_compression_store
         except ImportError:
@@ -1160,6 +1217,8 @@ class SmartCrusher(Transform):
                 query_context=query_context if query_context else None,
                 compression_strategy=strategy,
                 explicit_hash=ccr_hash,
+                original_tokens=original_tokens,
+                compressed_tokens=compressed_tokens,
             )
         except ValueError:
             # explicit_hash validation failed — the marker had a

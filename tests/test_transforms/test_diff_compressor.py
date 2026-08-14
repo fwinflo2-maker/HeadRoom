@@ -9,8 +9,8 @@ Tests cover:
 
 Stage 3b note (2026-04-25): the Python `DiffCompressor` implementation
 was retired in favor of the Rust-backed shim (`headroom._core` via PyO3).
-Tests that probed Python-only internals — `_parse_diff`, `_score_hunks`,
-the `DiffHunk` / `DiffFile` parser dataclasses — were removed because
+Tests that probed Python-only internals -- `_parse_diff`, `_score_hunks`,
+the `DiffHunk` / `DiffFile` parser dataclasses -- were removed because
 the Rust crate has its own parallel coverage in
 `crates/headroom-core/tests`. Public-API tests (anything calling
 `compressor.compress(...)`) are preserved unchanged: they exercise the
@@ -727,7 +727,7 @@ class TestRoutingGapMergeDiffs:
 class TestRoutingGapDetectorScanWindow:
     """Routing gap (2026-04-25 follow-up): `_try_detect_diff` only scanned
     the first 50 lines, so `git log -p` outputs with long commit messages
-    pushed the diff past the detection window — input was misrouted away
+    pushed the diff past the detection window -- input was misrouted away
     from DiffCompressor entirely. Window widened to 500 lines.
     """
 
@@ -756,7 +756,7 @@ class TestRoutingGapDetectorScanWindow:
 
     def test_detect_recognizes_combined_diff_headers(self):
         """The detector also gained recognition for combined-diff hunk
-        headers (`@@@`+) — useful when the only signal in a snippet is
+        headers (`@@@`+) -- useful when the only signal in a snippet is
         the merge-style hunk."""
         from headroom.transforms.content_detector import (
             ContentType,

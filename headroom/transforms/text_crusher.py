@@ -17,8 +17,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from headroom._core import TextCrusher as _RustTextCrusher
-from headroom._core import TextCrusherConfig as _RustTextCrusherConfig
+try:
+    from headroom._core import TextCrusher as _RustTextCrusher  # type: ignore[attr-defined]
+    from headroom._core import (
+        TextCrusherConfig as _RustTextCrusherConfig,  # type: ignore[attr-defined]
+    )
+
+    _HAS_RUST_TEXTRUSHER = True
+except ImportError:
+    _RustTextCrusher = None  # type: ignore[assignment]
+    _RustTextCrusherConfig = None  # type: ignore[assignment]
+    _HAS_RUST_TEXTRUSHER = False
 
 
 @dataclass
@@ -40,20 +49,29 @@ class TextCrusher:
 
     def __init__(self, config: TextCrusherConfig | None = None) -> None:
         cfg = config or TextCrusherConfig()
-        self._rust = _RustTextCrusher(
-            _RustTextCrusherConfig(
-                target_ratio=cfg.target_ratio,
-                w_recency=cfg.w_recency,
-                w_relevance=cfg.w_relevance,
-                w_salience=cfg.w_salience,
-                min_segment_chars=cfg.min_segment_chars,
-                near_dup_threshold=cfg.near_dup_threshold,
-                min_segments_for_crush=cfg.min_segments_for_crush,
+        if _HAS_RUST_TEXTRUSHER:
+            assert _RustTextCrusher is not None and _RustTextCrusherConfig is not None
+            self._rust: Any = _RustTextCrusher(
+                _RustTextCrusherConfig(
+                    target_ratio=cfg.target_ratio,
+                    w_recency=cfg.w_recency,
+                    w_relevance=cfg.w_relevance,
+                    w_salience=cfg.w_salience,
+                    min_segment_chars=cfg.min_segment_chars,
+                    near_dup_threshold=cfg.near_dup_threshold,
+                    min_segments_for_crush=cfg.min_segments_for_crush,
+                )
             )
-        )
+        else:
+            self._rust = None
 
     def compress(self, content: str, context: str = "", target_ratio: float | None = None) -> Any:
         """Returns a ``TextCrusherResult`` (Rust pyclass) with ``.compressed``,
         ``.original_tokens``, ``.compressed_tokens``, ``.compression_ratio``,
         ``.kept_segments``, ``.total_segments``."""
+        if self._rust is None:
+            cls: Any = type(self)
+            raise RuntimeError(
+                f"{cls.__name__} requires headroom._core.TextCrusher (stale _core.pyd)"
+            )
         return self._rust.compress(content, context, target_ratio)

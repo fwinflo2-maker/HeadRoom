@@ -4,22 +4,22 @@ When SmartCrusher's Python implementation was retired in Stage 3c.1b,
 its inline `toin.record_compression()` call was lost. The Rust port
 doesn't know about TOIN, and `ContentRouter._record_to_toin` skips
 SmartCrusher on the assumption SmartCrusher records its own. The net
-result was a silent regression: JSON-array compressions — the
-highest-traffic strategy — stopped feeding the learning loop.
+result was a silent regression: JSON-array compressions -- the
+highest-traffic strategy -- stopped feeding the learning loop.
 
 The shim now bridges the gap. These tests assert that:
 
 1. Calling `SmartCrusher.crush(...)` on a JSON array of dicts produces a
    `record_compression` event in TOIN when the input is large enough to
    actually compress.
-2. Pass-through inputs (no modification) do NOT record — TOIN only
+2. Pass-through inputs (no modification) do NOT record -- TOIN only
    learns from real compression events.
 3. The recorded `tool_signature.structure_hash` is computed over the
    parsed items, so two compressions of structurally-similar inputs
    land on the same pattern.
 4. Calling `_smart_crush_content(...)` (the legacy `apply()` path) also
    records.
-5. TOIN failures are non-fatal — compression completes even if the
+5. TOIN failures are non-fatal -- compression completes even if the
    telemetry import or call raises.
 """
 
@@ -56,7 +56,7 @@ def _bigger_array(n: int = 60) -> str:
 
     Items use a low-uniqueness shape (`{"status": "ok", "tag": "x"}`)
     so the analyzer recommends compaction or row drops. We need at
-    least 200 tokens (`min_tokens_to_crush` default) to enter the
+    least 80 tokens (`min_tokens_to_crush` default) to enter the
     crusher; 60 items keeps us well above that.
     """
     items = [{"status": "ok", "tag": "x", "n": i} for i in range(n)]
@@ -76,7 +76,7 @@ def test_crush_records_to_toin_on_modification(fresh_toin):
     result = crusher.crush(payload, query="test query", bias=1.0)
 
     if not result.was_modified:
-        pytest.skip("payload didn't trigger compression — bump the size")
+        pytest.skip("payload didn't trigger compression -- bump the size")
     post = sum(p.total_compressions for p in fresh_toin._patterns.values())
     assert post > pre, "TOIN should have recorded a compression event"
 
@@ -87,7 +87,7 @@ def test_crush_does_not_record_on_passthrough(fresh_toin):
     from JSON whitespace re-canonicalization. The strategy stays
     `passthrough` in that case and we filter on it."""
     crusher = SmartCrusher(SmartCrusherConfig())
-    payload = '[{"id": 1}]'  # Single item — below min_items_to_analyze.
+    payload = '[{"id": 1}]'  # Single item -- below min_items_to_analyze.
     pre = sum(p.total_compressions for p in fresh_toin._patterns.values())
 
     result = crusher.crush(payload, query="", bias=1.0)
@@ -108,8 +108,8 @@ def test_crush_signature_groups_similar_inputs(fresh_toin):
     crusher.crush(payload_b, query="", bias=1.0)
 
     if not fresh_toin._patterns:
-        pytest.skip("neither payload compressed — bump the size")
-    # Both share field shape {status, tag, n} → same structure hash →
+        pytest.skip("neither payload compressed -- bump the size")
+    # Both share field shape {status, tag, n} -> same structure hash ->
     # one pattern with at least 2 recordings.
     pattern_counts = {h: p.total_compressions for h, p in fresh_toin._patterns.items()}
     assert max(pattern_counts.values()) >= 2, (
@@ -156,7 +156,7 @@ def test_toin_failure_does_not_break_compression(fresh_toin):
 
 
 def test_non_json_input_does_not_record(fresh_toin):
-    """Non-JSON input shouldn't blow up — it just doesn't record.
+    """Non-JSON input shouldn't blow up -- it just doesn't record.
     The Rust crusher returns `was_modified=False` for non-arrays;
     even if it didn't, the helper guards against `json.loads`
     failure."""
@@ -176,7 +176,7 @@ def test_ccr_inject_marker_false_suppresses_markers_in_output(fresh_toin):
     """`inject_retrieval_marker=False` is honored end-to-end now. The
     Rust crusher's `enable_ccr_marker` flips off and the lossy path
     skips both the `<<ccr:HASH>>` marker text and the CCR store write.
-    Compression itself still happens — rows still drop — just without
+    Compression itself still happens -- rows still drop -- just without
     a retrieval pointer in the prompt."""
     from headroom.config import CCRConfig
 
@@ -188,7 +188,7 @@ def test_ccr_inject_marker_false_suppresses_markers_in_output(fresh_toin):
     result = crusher.crush(payload, query="", bias=1.0)
 
     if result.strategy == "passthrough":
-        pytest.skip("payload didn't trigger compression — bump the size")
+        pytest.skip("payload didn't trigger compression -- bump the size")
 
     assert "<<ccr:" not in result.compressed, f"expected no marker, got: {result.compressed!r}"
     assert "_ccr_dropped" not in result.compressed
@@ -199,7 +199,7 @@ def test_ccr_inject_marker_false_suppresses_opaque_blob_markers(fresh_toin):
     *opaque-blob* CCR markers, not just the row-drop path.
 
     A long string cell (> opaque_min_bytes) used to be substituted with a
-    `<<ccr:HASH,string,KB>>` marker unconditionally — so no config produced
+    `<<ccr:HASH,string,KB>>` marker unconditionally -- so no config produced
     guaranteed-lossless output. This test pins both directions: with markers
     ON the opaque blob IS replaced by a marker (proving the input genuinely
     triggers the opaque path), and with markers OFF the blob survives verbatim
@@ -262,7 +262,7 @@ def test_ccr_enabled_false_suppresses_markers_in_output(fresh_toin):
 
     crusher = SmartCrusher(
         SmartCrusherConfig(),
-        # Note: inject_retrieval_marker stays True — we want to prove
+        # Note: inject_retrieval_marker stays True -- we want to prove
         # `enabled=False` alone is enough to suppress.
         ccr_config=CCRConfig(enabled=False, inject_retrieval_marker=True),
     )
@@ -270,7 +270,7 @@ def test_ccr_enabled_false_suppresses_markers_in_output(fresh_toin):
     result = crusher.crush(payload, query="", bias=1.0)
 
     if result.strategy == "passthrough":
-        pytest.skip("payload didn't trigger compression — bump the size")
+        pytest.skip("payload didn't trigger compression -- bump the size")
 
     assert "<<ccr:" not in result.compressed, f"expected no marker, got: {result.compressed!r}"
     assert "_ccr_dropped" not in result.compressed

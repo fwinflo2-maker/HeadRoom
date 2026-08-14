@@ -83,7 +83,7 @@ def test_rust_backend_matches_recorded_output(fixture_path: Path):
 def test_compress_with_stats_returns_python_dataclass_and_pyo3_stats():
     """The sidecar stats API returns a `(DiffCompressionResult,
     _core.DiffCompressorStats)` tuple. Verify both halves are usable from
-    Python — PyO3 doesn't auto-promote the stats class to a dataclass.
+    Python -- PyO3 doesn't auto-promote the stats class to a dataclass.
     """
     from headroom.transforms.diff_compressor import (
         DiffCompressionResult,
@@ -104,7 +104,7 @@ def test_compress_with_stats_returns_python_dataclass_and_pyo3_stats():
 
 def test_content_router_uses_rust_backend():
     """Stage 3b deletion check: ContentRouter._get_diff_compressor must
-    return the (now Rust-only) DiffCompressor — there's no other backend
+    return the (now Rust-only) DiffCompressor -- there's no other backend
     left, so this guards against an accidental re-introduction of a
     Python-side stub or fallback.
     """
@@ -114,6 +114,6 @@ def test_content_router_uses_rust_backend():
     router = ContentRouter(ContentRouterConfig())
     compressor = router._get_diff_compressor()
     assert isinstance(compressor, DiffCompressor)
-    # The Rust delegation handle must be live — guards against a
+    # The Rust delegation handle must be live -- guards against a
     # half-deleted shim that defines the class but not `_rust`.
     assert hasattr(compressor, "_rust")

@@ -275,7 +275,7 @@ def compress_batch_with_router(
             router_result=router_result,
         )
 
-    restored = restore_tags(compressed, protected_blocks)
+    restored, _had_tag_loss = restore_tags(compressed, protected_blocks)
     replacements = _parse_batch_envelope(restored, batch, nonce)
     if replacements is None:
         return _passthrough_batch_results(

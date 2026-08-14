@@ -150,37 +150,42 @@ class TestRestoreTags:
     def test_basic_restore(self):
         original = "Before <system-reminder>Rule</system-reminder> After"
         cleaned, protected = protect_tags(original)
-        restored = restore_tags(cleaned, protected)
+        restored, had_loss = restore_tags(cleaned, protected)
         assert "<system-reminder>Rule</system-reminder>" in restored
         assert "Before" in restored
         assert "After" in restored
+        assert not had_loss
 
     def test_restore_empty_protected(self):
         text = "No tags here"
-        assert restore_tags(text, []) == text
+        result, had_loss = restore_tags(text, [])
+        assert result == text
+        assert not had_loss
 
     def test_restore_multiple(self):
         original = "<thinking>A</thinking> gap <context>B</context>"
         cleaned, protected = protect_tags(original)
-        restored = restore_tags(cleaned, protected)
+        restored, had_loss = restore_tags(cleaned, protected)
         assert "<thinking>A</thinking>" in restored
         assert "<context>B</context>" in restored
+        assert not had_loss
 
     def test_lost_placeholder_discards_wrap(self):
         """Hotfix-A9: when compression strips a placeholder, the wrap
-        is DISCARDED — the compressed text is returned as-is and the
+        is DISCARDED -- the compressed text is returned as-is and the
         original tag bytes are NOT re-injected anywhere. The original
         "append at the trailing edge" fallback produced silently
         malformed XML (orphan opening tag with no closing tag) on
         ~350 production requests over 9 days; that bug is gone."""
         protected = [("{{HEADROOM_TAG_0}}", "<tag>data</tag>")]
         compressed = "text without placeholder"
-        result = restore_tags(compressed, protected)
+        result, had_loss = restore_tags(compressed, protected)
         # Compressed text returned unchanged; original tag NOT injected.
         assert result == compressed
         assert "<tag>" not in result
         assert "</tag>" not in result
         assert "<tag>data</tag>" not in result
+        assert had_loss
 
     def test_lost_placeholder_idempotent_when_all_missing(self):
         """Invariant: if every placeholder is missing from compressed,
@@ -191,7 +196,9 @@ class TestRestoreTags:
             ("{{HEADROOM_TAG_2}}", "<c>3</c>"),
         ]
         compressed = "compressor stripped every placeholder"
-        assert restore_tags(compressed, protected) == compressed
+        result, had_loss = restore_tags(compressed, protected)
+        assert result == compressed
+        assert had_loss
 
     def test_partial_loss_keeps_present_discards_lost(self):
         """Mixed case: some placeholders survive, others are lost.
@@ -201,10 +208,11 @@ class TestRestoreTags:
             ("{{HEADROOM_TAG_0}}", "<a>1</a>"),
             ("{{HEADROOM_TAG_1}}", "<lost>x</lost>"),
         ]
-        result = restore_tags("head {{HEADROOM_TAG_0}} tail", protected)
+        result, had_loss = restore_tags("head {{HEADROOM_TAG_0}} tail", protected)
         assert result == "head <a>1</a> tail"
         assert "<lost" not in result
         assert "</lost>" not in result
+        assert had_loss
 
     def test_roundtrip_preserves_content(self):
         original = (
@@ -212,9 +220,10 @@ class TestRestoreTags:
             "middle <tool_call>search(q='test')</tool_call> end"
         )
         cleaned, protected = protect_tags(original)
-        restored = restore_tags(cleaned, protected)
+        restored, had_loss = restore_tags(cleaned, protected)
         assert "<system-reminder>Rule 1: always validate</system-reminder>" in restored
         assert "<tool_call>search(q='test')</tool_call>" in restored
+        assert not had_loss
 
 
 class TestBugFixesPhase3e4:
@@ -237,7 +246,9 @@ class TestBugFixesPhase3e4:
         assert len(placeholders) == 2  # two DIFFERENT placeholders
         assert "<system-reminder>" not in cleaned
         # Roundtrip is exact byte-for-byte.
-        assert restore_tags(cleaned, protected) == text
+        restored, had_loss = restore_tags(cleaned, protected)
+        assert restored == text
+        assert not had_loss
 
     def test_fixed_in_3e4_handles_60_nested_custom_tags(self):
         """Bug #3: Python had a hard `max_iterations = 50` safety cap
@@ -246,11 +257,13 @@ class TestBugFixesPhase3e4:
         depth = 60
         text = "<lvl>" * depth + "core" + "</lvl>" * depth
         cleaned, protected = protect_tags(text)
-        # Outermost span eats everything → ONE placeholder, no leaks.
+        # Outermost span eats everything -> ONE placeholder, no leaks.
         assert "<lvl>" not in cleaned
         assert "</lvl>" not in cleaned
         assert len(protected) == 1
-        assert restore_tags(cleaned, protected) == text
+        restored, had_loss = restore_tags(cleaned, protected)
+        assert restored == text
+        assert not had_loss
 
     def test_fixed_in_3e4_self_closing_duplicates_distinct(self):
         """Bug #4: same first-occurrence-replace bug for self-closing
@@ -261,10 +274,12 @@ class TestBugFixesPhase3e4:
         assert len(protected) == 2
         assert protected[0][0] != protected[1][0]
         assert "<marker/>" not in cleaned
-        assert restore_tags(cleaned, protected) == text
+        restored, had_loss = restore_tags(cleaned, protected)
+        assert restored == text
+        assert not had_loss
 
     def test_fixed_in_3e4_placeholder_collision_avoided(self):
-        """Bug #5: input contains a literal `{{HEADROOM_TAG_…}}`
+        """Bug #5: input contains a literal `{{HEADROOM_TAG_...}}`
         substring. Python silently used the same prefix and let the
         collision break restoration. Rust salts the prefix when this
         happens."""
@@ -276,4 +291,6 @@ class TestBugFixesPhase3e4:
         # Placeholder picked must NOT collide with the user's literal.
         assert protected[0][0] != "{{HEADROOM_TAG_0}}"
         # Roundtrip is exact (the user's literal stays intact).
-        assert restore_tags(cleaned, protected) == text
+        restored, had_loss = restore_tags(cleaned, protected)
+        assert restored == text
+        assert not had_loss

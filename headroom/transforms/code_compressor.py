@@ -48,7 +48,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, cast
 
 from ..config import TransformResult
 from ..tokenizer import Tokenizer
@@ -59,31 +59,24 @@ logger = logging.getLogger(__name__)
 # Lazy import for optional dependency
 _tree_sitter_available: bool | None = None
 _tree_sitter_local = threading.local()
+# Global language-grammar cache shared across all threads. The Language
+# objects from tree_sitter_language_pack are read-only grammar tables —
+# safe to share. Only the Parser instance must be per-thread.
+_language_cache: dict[str, Any] = {}
 
 
 def _check_tree_sitter_available() -> bool:
-    """Check if tree-sitter is available *and actually parses*.
-
-    The mere presence of ``tree_sitter_language_pack`` is not enough: prior
-    versions of this code green-lit a code path that raised ``TypeError`` at
-    parse time and silently fell back to a lossy stripper.  To stop misleading
-    callers, we now verify an end-to-end parse of a tiny snippet and only
-    return ``True`` if it yields a real AST.
-    """
+    """Check if tree-sitter packages (core + language pack) are available."""
     global _tree_sitter_available
     if _tree_sitter_available is None:
         try:
+            import tree_sitter  # noqa: F401
+            import tree_sitter_language_pack  # noqa: F401
+
             parser = _get_parser("python")
-            tree = parser.parse(b"def _probe():\n    return 1\n")
-            root = tree.root_node
-            # A real parse yields a non-error root with children.
-            _tree_sitter_available = (
-                root is not None
-                and root.type == "module"
-                and root.child_count > 0
-                and not _has_syntax_issues(root)
-            )
-        except Exception:
+            parser.parse(b"def _headroom_probe():\n    return None\n")
+            _tree_sitter_available = True
+        except (ImportError, TypeError, ValueError, AttributeError):
             _tree_sitter_available = False
     return _tree_sitter_available
 
@@ -154,16 +147,35 @@ def _get_parser(language: str) -> Any:
             from tree_sitter import Parser
             from tree_sitter_language_pack import get_language
 
+            # Language grammars are read-only and shared across all threads.
+            # Only the Parser instances are per-thread (PyO3 unsendable).
+            if language not in _language_cache:
+                _language_cache[language] = get_language(cast(Any, language))
             parser = Parser()
             # `language` is a validated runtime str; get_language types its arg
             # as a Literal of supported names, which a dynamic str can't satisfy.
-            parser.language = get_language(language)  # type: ignore[arg-type]
+            parser.language = _language_cache[language]  # type: ignore[arg-type]
             parsers[language] = parser
             logger.debug(
                 "Loaded tree-sitter parser for %s (thread %s)",
                 language,
                 threading.current_thread().name,
             )
+        except ImportError as e:
+            raise ImportError(
+                "tree-sitter is not installed. Install with: pip install headroom-ai[code]\n"
+                "This adds ~50MB for tree-sitter grammars."
+            ) from e
+        except TypeError as e:
+            msg = str(e)
+            if "not builtins.Language" in msg or "tree_sitter.Language object" in msg:
+                raise ValueError(
+                    "Version mismatch between tree-sitter and "
+                    "tree-sitter-language-pack. Run: pip install "
+                    "'tree-sitter>=0.25.2' "
+                    "'tree-sitter-language-pack>=0.10.0,<0.12.0'"
+                ) from e
+            raise ValueError(f"tree-sitter type error for language {language!r}: {e}") from e
         except Exception as e:
             raise ValueError(
                 f"Language '{language}' is not supported by tree-sitter. "
@@ -542,6 +554,8 @@ class CodeCompressorConfig:
     # Language handling
     language_hint: str | None = None
     fallback_to_kompress: bool = True
+    # When False, skip Kompress fallback entirely (e.g. --no-kompress).
+    kompress_enabled: bool = True
 
     # Semantic analysis (symbol importance scoring)
     semantic_analysis: bool = True
@@ -1023,7 +1037,9 @@ class CodeAwareCompressor(Transform):
             ref_counts[qname] = max(0, count - short_name_def_count.get(short, 1))
 
         # Raw importance signals per symbol
-        context_words, context_lower, context_has_cjk = _query_context_tokens(context)
+        context_lower = context.lower() if context else ""
+        context_words = set(re.split(r"[\s,;:.()\[\]{}\"']+", context_lower)) if context else set()
+        context_words.discard("")
 
         raw_signals: dict[str, float] = {}
         for qname in definitions:
@@ -1044,9 +1060,13 @@ class CodeAwareCompressor(Transform):
                 if short and short[0].isupper():
                     raw += 1.0
 
-            # Context boost: the relevance query named this symbol.
-            if _symbol_in_context(short.lower(), context_words, context_lower, context_has_cjk):
-                raw += 3.0
+            # Context boost
+            if context_words:
+                name_lower = short.lower()
+                if name_lower in context_words or (
+                    len(name_lower) > 3 and name_lower in context_lower
+                ):
+                    raw += 3.0
 
             raw_signals[qname] = raw
 
@@ -1216,6 +1236,23 @@ class CodeAwareCompressor(Transform):
             logger.warning("tree-sitter not available. Install with: pip install headroom-ai[code]")
             if self.config.fallback_to_kompress:
                 return self._fallback_compress(code, original_tokens)
+            return CodeCompressionResult(
+                compressed=code,
+                original=code,
+                original_tokens=original_tokens,
+                compressed_tokens=original_tokens,
+                compression_ratio=1.0,
+                language=detected_lang,
+                language_confidence=confidence,
+                syntax_valid=True,
+            )
+
+        # For languages without a LangConfig (e.g. dockerfile), there is no
+        # data-driven extraction available — _extract_generic_structure is a
+        # no-op that preserves everything, so AST-based compression cannot
+        # produce any meaningful savings. Return the original immediately to
+        # avoid a useless parse/verify cycle and a misleading warning log.
+        if detected_lang not in _LANG_CONFIGS:
             return CodeCompressionResult(
                 compressed=code,
                 original=code,
@@ -1668,6 +1705,14 @@ class CodeAwareCompressor(Transform):
         if body_node is None:
             return node_text
 
+        # Tree-sitter reports Go function bodies as complete nodes whose closing
+        # brace is already part of the node range. The generic line slicer later
+        # appends that brace again, producing `}` after every function.
+        if language == CodeLanguage.GO and body_node.type == "block":
+            node_text = _get_node_text(node, code)
+            if self._verify_syntax(node_text, language):
+                return node_text
+
         # Use line numbers to slice: this preserves original indentation.
         # tree-sitter gives 0-based row numbers.
         node_start_line = node.start_point[0]
@@ -1705,11 +1750,7 @@ class CodeAwareCompressor(Transform):
             if _brace_in_signature:
                 # Opening brace already in signature line — just find closing
                 pass
-            elif body_lines and body_lines[0].strip().endswith("{"):
-                # Matches both a bare `{` line and a multi-line signature's
-                # closing line (e.g. Go's `) error {`), where the brace
-                # shares a line with the closing paren/return type rather
-                # than starting one of its own.
+            elif body_lines and body_lines[0].strip().startswith("{"):
                 opening_brace_line = body_lines[0]
                 body_lines = body_lines[1:]
             if body_lines and body_lines[-1].strip().endswith("}"):
@@ -1823,17 +1864,6 @@ class CodeAwareCompressor(Transform):
             # Skip unnamed tokens (tree-sitter anonymous nodes like braces)
             if not child.is_named:
                 continue
-            # Some grammars (e.g. Go) wrap all body statements in one generic
-            # list node instead of exposing them as direct siblings of the
-            # block. Treating that wrapper as a single statement makes its
-            # row range swallow the block's own closing brace line, causing
-            # a duplicated `}` later. Unwrap it into its real statements.
-            if child.type == "statement_list":
-                for inner in child.children:
-                    if inner.type in _SKIP_TYPES or not inner.is_named:
-                        continue
-                    body_stmts.append((inner.start_point[0], inner.end_point[0]))
-                continue
             body_stmts.append((child.start_point[0], child.end_point[0]))
 
         # Calculate lines per statement and keep whole statements until budget
@@ -1879,6 +1909,10 @@ class CodeAwareCompressor(Transform):
         if kept_lines:
             result_parts.extend(kept_lines)
 
+        has_body_content = (
+            bool(kept_lines) or bool(docstring_text) or opening_brace_line is not None
+        )
+
         if omitted_lines > 0:
             result_parts.append(
                 _make_omitted_comment(
@@ -1887,6 +1921,8 @@ class CodeAwareCompressor(Transform):
             )
             if lang_config.uses_colon_after_signature:
                 result_parts.append(f"{indent}pass")
+        elif not has_body_content and lang_config.uses_colon_after_signature:
+            result_parts.append(f"{indent}pass")
 
         if closing_brace_line is not None:
             result_parts.append(closing_brace_line)
@@ -2102,25 +2138,26 @@ class CodeAwareCompressor(Transform):
 
     def _fallback_compress(self, code: str, original_tokens: int) -> CodeCompressionResult:
         """Fall back to Kompress compression."""
-        try:
-            from .kompress_compressor import KompressCompressor, is_kompress_available
+        if self.config.kompress_enabled:
+            try:
+                from .kompress_compressor import KompressCompressor, is_kompress_available
 
-            if is_kompress_available():
-                compressor = KompressCompressor()
-                result = compressor.compress(code)
-                return CodeCompressionResult(
-                    compressed=result.compressed,
-                    original=code,
-                    original_tokens=result.original_tokens,
-                    compressed_tokens=result.compressed_tokens,
-                    compression_ratio=result.compression_ratio,
-                    language=CodeLanguage.UNKNOWN,
-                    language_confidence=0.0,
-                    # Kompress does NOT guarantee syntax validity
-                    syntax_valid=False,
-                )
-        except ImportError:
-            pass
+                if is_kompress_available():
+                    compressor = KompressCompressor()
+                    result = compressor.compress(code)
+                    return CodeCompressionResult(
+                        compressed=result.compressed,
+                        original=code,
+                        original_tokens=result.original_tokens,
+                        compressed_tokens=result.compressed_tokens,
+                        compression_ratio=result.compression_ratio,
+                        language=CodeLanguage.UNKNOWN,
+                        language_confidence=0.0,
+                        # Kompress does NOT guarantee syntax validity
+                        syntax_valid=False,
+                    )
+            except ImportError:
+                pass
 
         # No fallback available, return original
         return CodeCompressionResult(
@@ -2387,43 +2424,6 @@ def _get_definition_name(node: Any) -> str | None:
             text = child.text
             return text.decode("utf-8") if isinstance(text, bytes) else str(text)
     return None
-
-
-# Symbol names are ASCII identifiers; CJK relevance queries have no spaces and use
-# CJK/full-width punctuation, so the ASCII-only delimiter class would collapse the
-# whole query into one blob and never isolate an ASCII name the user asked to keep.
-_CONTEXT_DELIMS = re.compile(r"[\s,;:.()\[\]{}\"'，、；：。．！？（）【】「」『』《》〈〉·…—　]+")
-_CJK_CHARS = re.compile(r"[　-鿿가-힯＀-￯]")
-
-
-def _query_context_tokens(context: str) -> tuple[set[str], str, bool]:
-    """Tokenize a relevance query for symbol-name matching (CJK-aware).
-
-    Returns (word set, lowercased query, has_cjk). CJK/full-width punctuation and
-    the ideographic space are delimiters so an ASCII symbol name wrapped in CJK is
-    still isolated as its own token.
-    """
-    if not context:
-        return set(), "", False
-    lowered = context.lower()
-    words = set(_CONTEXT_DELIMS.split(lowered))
-    words.discard("")
-    return words, lowered, bool(_CJK_CHARS.search(lowered))
-
-
-def _symbol_in_context(name_lower: str, words: set[str], context_lower: str, has_cjk: bool) -> bool:
-    """Whether the relevance query names this symbol.
-
-    Exact token match, or a substring fallback gated by len>3 for ASCII queries
-    (avoids spurious short-name matches) but relaxed for CJK queries -- a short
-    ASCII name glued to CJK has no delimiter to isolate it, so exact-match can't
-    fire and the guard would wrongly drop it.
-    """
-    if not words or not name_lower:
-        return False
-    if name_lower in words:
-        return True
-    return name_lower in context_lower and (len(name_lower) > 3 or has_cjk)
 
 
 def _is_public_symbol(name: str, language: CodeLanguage) -> bool:

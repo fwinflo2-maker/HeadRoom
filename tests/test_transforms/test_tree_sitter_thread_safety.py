@@ -70,7 +70,7 @@ def test_different_threads_get_different_parser_instances() -> None:
 
     assert len(results) == 2, "Both threads should have completed"
     assert results[0] is not results[1], (
-        "Each thread must own its own parser — sharing would trigger the pyo3 Unsendable panic"
+        "Each thread must own its own parser -- sharing would trigger the pyo3 Unsendable panic"
     )
 
 
@@ -112,7 +112,7 @@ def test_concurrent_pool_workers_get_separate_parsers() -> None:
     """Each distinct pool thread gets its own parser; same thread reuses the same one.
 
     A pool with N_WORKERS threads running N_TASKS tasks gives at most N_WORKERS
-    unique parsers (not N_TASKS) — correct, because parsers are per-thread not
+    unique parsers (not N_TASKS) -- correct, because parsers are per-thread not
     per-call.
     """
     N_WORKERS = 4

@@ -178,7 +178,7 @@ class TestStaleDetection:
     """Read outputs become stale when the file is subsequently edited."""
 
     def test_read_then_edit_makes_stale(self):
-        """Read(A) → Edit(A): Read becomes stale."""
+        """Read(A) -> Edit(A): Read becomes stale."""
         config = ReadLifecycleConfig(enabled=True)
         mgr = ReadLifecycleManager(config)
 
@@ -199,7 +199,7 @@ class TestStaleDetection:
         assert "hash=" in tool_result["content"]
 
     def test_write_makes_read_stale(self):
-        """Read(A) → Write(A): Read becomes stale."""
+        """Read(A) -> Write(A): Read becomes stale."""
         config = ReadLifecycleConfig(enabled=True)
         mgr = ReadLifecycleManager(config)
 
@@ -215,7 +215,7 @@ class TestStaleDetection:
         assert "stale" in result.messages[1]["content"].lower()
 
     def test_edit_different_file_not_stale(self):
-        """Read(A) → Edit(B): Read(A) stays fresh."""
+        """Read(A) -> Edit(B): Read(A) stays fresh."""
         config = ReadLifecycleConfig(enabled=True)
         mgr = ReadLifecycleManager(config)
 
@@ -232,7 +232,7 @@ class TestStaleDetection:
         assert result.messages[1]["content"] == LARGE_CONTENT
 
     def test_multiple_reads_all_stale(self):
-        """Read(A) × 3 → Edit(A): all 3 Reads become stale."""
+        """Read(A) × 3 -> Edit(A): all 3 Reads become stale."""
         config = ReadLifecycleConfig(enabled=True)
         mgr = ReadLifecycleManager(config)
 
@@ -266,7 +266,7 @@ class TestStaleDetection:
 
         result = mgr.apply(messages)
         # With compress_stale=False but compress_superseded=True,
-        # Read is superseded by nothing (only one read), and not stale → fresh
+        # Read is superseded by nothing (only one read), and not stale -> fresh
         assert result.reads_fresh == 1
         assert result.messages[1]["content"] == LARGE_CONTENT
 
@@ -275,7 +275,7 @@ class TestSupersededDetection:
     """Read outputs become superseded when the same file is re-Read."""
 
     def test_reread_makes_superseded(self):
-        """Read(A) → Read(A): first Read becomes superseded."""
+        """Read(A) -> Read(A): first Read becomes superseded."""
         config = ReadLifecycleConfig(enabled=True, compress_superseded=True)
         mgr = ReadLifecycleManager(config)
 
@@ -331,7 +331,7 @@ class TestFreshReads:
         assert result.messages[1]["content"] == LARGE_CONTENT
 
     def test_read_edit_read_chain(self):
-        """Read(A) → Edit(A) → Read(A): first stale, second fresh."""
+        """Read(A) -> Edit(A) -> Read(A): first stale, second fresh."""
         config = ReadLifecycleConfig(enabled=True)
         mgr = ReadLifecycleManager(config)
 
@@ -346,7 +346,7 @@ class TestFreshReads:
 
         result = mgr.apply(messages)
         # First read: stale (edit happened after) AND superseded (re-read after)
-        # → classified as stale (stale takes priority)
+        # -> classified as stale (stale takes priority)
         assert result.reads_stale == 1
         # Second read: fresh (latest, no edit after)
         assert result.reads_fresh == 1
@@ -358,7 +358,7 @@ class TestMultipleFiles:
     """Lifecycle management across multiple files."""
 
     def test_independent_files(self):
-        """Read(A) → Edit(A) → Read(B): A stale, B fresh."""
+        """Read(A) -> Edit(A) -> Read(B): A stale, B fresh."""
         config = ReadLifecycleConfig(enabled=True)
         mgr = ReadLifecycleManager(config)
 
@@ -402,7 +402,7 @@ class TestAnthropicFormat:
     """Lifecycle works with Anthropic message format."""
 
     def test_anthropic_stale_read(self):
-        """Anthropic format: Read(A) → Edit(A): Read becomes stale."""
+        """Anthropic format: Read(A) -> Edit(A): Read becomes stale."""
         config = ReadLifecycleConfig(enabled=True)
         mgr = ReadLifecycleManager(config)
 
@@ -565,7 +565,7 @@ class TestTransformTracking:
         assert "read_lifecycle:stale:/src/notes.md" in result.transforms_applied
 
     def test_transform_tag_preserves_colons_in_path(self):
-        """Paths containing ``:`` survive — consumers must bound their split."""
+        """Paths containing ``:`` survive -- consumers must bound their split."""
         config = ReadLifecycleConfig(enabled=True)
         mgr = ReadLifecycleManager(config)
         weird_path = "/tmp/has:colon/file.py"

@@ -66,6 +66,10 @@ if TYPE_CHECKING:
         TabularCompressor,
         TabularCompressorConfig,
     )
+    from headroom.transforms.text_crusher import (  # noqa: F401
+        TextCrusher,
+        TextCrusherConfig,
+    )
 
 _HTML_EXTRACTOR_AVAILABLE = importlib.util.find_spec("trafilatura") is not None
 
@@ -83,6 +87,9 @@ __all__ = [
     # JSON compression
     "SmartCrusher",
     "SmartCrusherConfig",
+    # Prose compression (extractive, Phase 2)
+    "TextCrusher",
+    "TextCrusherConfig",
     # Text compression (coding tasks)
     "ContentType",
     "DetectionResult",
@@ -146,6 +153,9 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # JSON compression
     "SmartCrusher": ("headroom.transforms.smart_crusher", "SmartCrusher"),
     "SmartCrusherConfig": ("headroom.transforms.smart_crusher", "SmartCrusherConfig"),
+    # Prose compression (extractive, Phase 2)
+    "TextCrusher": ("headroom.transforms.text_crusher", "TextCrusher"),
+    "TextCrusherConfig": ("headroom.transforms.text_crusher", "TextCrusherConfig"),
     # Text compression (coding tasks)
     "ContentType": ("headroom.transforms.content_detector", "ContentType"),
     "DetectionResult": ("headroom.transforms.content_detector", "DetectionResult"),

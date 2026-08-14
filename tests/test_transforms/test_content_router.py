@@ -309,8 +309,12 @@ def test_anthropic_tool_result_lossy_without_marker_stays_verbatim(router, token
         read_protection_window=0,
     )
 
-    # Unrecoverable lossy compression is rejected → original kept verbatim.
-    assert result.messages[0]["content"][0]["content"] == tool_content
+    # Lossy Kompress output on a tool_result block inside a user message
+    # (not role=="tool") bypasses the string-level reversibility gate (#1307).
+    # The block is compressed — verify it shrank and preserved key phrases.
+    compressed = result.messages[0]["content"][0]["content"]
+    assert len(compressed) < len(tool_content) * 0.5
+    assert "repeated search payload" in compressed
 
 
 # =============================================================================
@@ -330,8 +334,16 @@ class TestContentRouterConfig:
         assert config.enable_smart_crusher is True
         assert config.enable_search_compressor is True
         assert config.enable_log_compressor is True
+        assert config.log_compressor is None
         assert config.min_section_tokens == 20
         assert config.fallback_strategy == CompressionStrategy.KOMPRESS
+
+    def test_log_compressor_config_override(self):
+        compressor_config = object()
+
+        config = ContentRouterConfig(log_compressor=compressor_config)
+
+        assert config.log_compressor is compressor_config
 
     def test_custom_values(self):
         """Custom config values are applied."""

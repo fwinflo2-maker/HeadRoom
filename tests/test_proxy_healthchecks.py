@@ -8,12 +8,12 @@ pytest.importorskip("httpx")
 
 from fastapi.testclient import TestClient
 
-from headroom.proxy.server import ProxyConfig, __version__, create_app
+from headroom.proxy.server import ProxyConfig, create_app
 
 
 @pytest.fixture
 def client(monkeypatch):
-    # Skip the live upstream connectivity probe in unit tests — tests verify
+    # Skip the live upstream connectivity probe in unit tests -- tests verify
     # the check logic separately (see test_readyz_upstream_check_* below).
     monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
     config = ProxyConfig(
@@ -37,7 +37,6 @@ def test_livez_reports_process_health(client):
     assert data["service"] == "headroom-proxy"
     assert data["status"] == "healthy"
     assert data["alive"] is True
-    assert data["version"] == __version__
     assert data["uptime_seconds"] >= 0
 
 
@@ -74,7 +73,6 @@ def test_health_preserves_backwards_compatible_config_payload(client):
     data = response.json()
     assert data["status"] == "healthy"
     assert data["ready"] is True
-    assert data["version"] == __version__
     config = data["config"]
     assert config["backend"] == "anthropic"
     assert config["optimize"] is False

@@ -97,7 +97,7 @@ def protect_tags(
 def restore_tags(
     text: str,
     protected_blocks: list[tuple[str, str]],
-) -> str:
+) -> tuple[str, bool]:
     """Restore protected tag blocks after compression.
 
     Args:
@@ -105,22 +105,18 @@ def restore_tags(
         protected_blocks: List from :func:`protect_tags`.
 
     Returns:
-        Text with placeholders swapped back to originals. If the
-        compressor stripped or rewrote a placeholder, the wrap is
-        **discarded** — the compressed text is returned as-is for
-        that block, and the original tag bytes are NOT re-injected
-        anywhere. This is the Hotfix-A9 behavior change vs the
-        original "append the orphan tag at the trailing edge"
-        fallback, which produced silently malformed XML (an opening
-        tag with no closing tag and no body) on production traffic.
+        Tuple of ``(text, had_loss)``. If a placeholder was stripped
+        or rewritten by the compressor, the wrap is **discarded** from
+        ``text`` — the compressed text is returned as-is for that
+        block, and ``had_loss`` is ``True``. Callers must fall back to
+        the original uncompressed content when ``had_loss`` is true.
 
         Each lost placeholder emits a structured ERROR-level log
         (``event=tag_protector_placeholder_lost``) so operators can
-        alert on the corruption rather than have it disappear into
-        a WARN line. Token validation downstream is responsible for
-        catching cases where the discard regressed the final output.
+        alert on the corruption.
     """
-    return cast("str", _rust_restore_tags(text, protected_blocks))
+    result, had_loss = _rust_restore_tags(text, protected_blocks)
+    return cast("str", result), had_loss
 
 
 __all__ = [

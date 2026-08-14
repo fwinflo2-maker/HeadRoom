@@ -32,6 +32,8 @@ Pipeline Usage:
     ... ])
 """
 
+#  Copyright (c) 2026 Noel Kuntze
+
 from __future__ import annotations
 
 import asyncio
@@ -160,6 +162,17 @@ def _estimate_tokens(text: str) -> int:
     return max(1, _TOKEN_ESTIMATOR.count_text(text))
 
 
+def _coerce_compressed_text(value: Any) -> str:
+    """Normalize native compressor result shapes to the router text contract."""
+    while isinstance(value, tuple):
+        if not value:
+            raise TypeError("compressor returned an empty tuple")
+        value = value[0]
+    if not isinstance(value, str):
+        raise TypeError(f"compressor returned non-text content: {type(value).__name__}")
+    return value
+
+
 def _compression_deadline_seconds() -> float:
     try:
         return max(
@@ -260,7 +273,10 @@ _BUILTIN_COMPRESSOR_DESCRIPTORS: tuple[CompressorDescriptor, ...] = (
 # they change no routing. Each invoker takes the owning router plus the pure-data
 # :class:`CompressInput` and returns the compressed string, or ``None`` when the
 # built-in is unavailable / not applicable to this str input (→ passthrough).
-_BuiltinInvoke = Callable[["ContentRouter", CompressInput], "str | None"]
+# A few legacy compressor methods return ``(text, metadata...)`` tuples; adapters
+# normalize those values before constructing the typed ``CompressOutput``.
+_RawCompressedText = str | tuple[Any, ...]
+_BuiltinInvoke = Callable[["ContentRouter", CompressInput], _RawCompressedText | None]
 
 
 def _adapter_bias(inp: CompressInput) -> float:
@@ -429,7 +445,7 @@ class _BuiltinCompressorEntry:
 
     def compress(self, inp: CompressInput) -> CompressOutput:
         tokens_before = _estimate_tokens(inp.content)
-        raw: str | None = None
+        raw: _RawCompressedText | None = None
         if self._router is not None:
             raw = self._invoke(self._router, inp)
         # A ``None`` from the invoker means the built-in did not compress — it
@@ -441,7 +457,7 @@ class _BuiltinCompressorEntry:
         # result. A non-``None`` result is a real compression → ``compressed``
         # stays True and byte-identical to before.
         did_compress = raw is not None
-        content = raw if raw is not None else inp.content
+        content = _coerce_compressed_text(raw) if raw is not None else inp.content
         return CompressOutput(
             content=content,
             tokens_before=tokens_before,
@@ -1120,6 +1136,11 @@ def _create_content_signature(
 # session-tracker cleanup TTL (``PrefixFreezeConfig.session_ttl_seconds``).
 _NET_COST_CACHE_TTL_SECONDS = 300.0
 
+# Sections compressed at once when Kompress runs remotely. Sized to be comfortably
+# above a typical section count so one turn folds into one request; the client's
+# max_batch is the real ceiling.
+_REMOTE_SECTION_WORKERS = 32
+
 
 def _net_cost_cache_ttl_seconds() -> float:
     """Provider cache TTL (seconds) used to decay P_alive from idle time.
@@ -1445,13 +1466,13 @@ class RouterCompressionResult:
             return (
                 f"Mixed content: {self.sections_processed} sections, "
                 f"routed to {strategies}. "
-                f"{self.total_original_tokens:,}→{self.total_compressed_tokens:,} tokens "
+                f"{self.total_original_tokens:,}->{self.total_compressed_tokens:,} tokens "
                 f"({self.savings_percentage:.0f}% saved)"
             )
         else:
             return (
                 f"Pure {self.strategy_used.value}: "
-                f"{self.total_original_tokens:,}→{self.total_compressed_tokens:,} tokens "
+                f"{self.total_original_tokens:,}->{self.total_compressed_tokens:,} tokens "
                 f"({self.savings_percentage:.0f}% saved)"
             )
 
@@ -1465,6 +1486,7 @@ class ContentRouterConfig:
         enable_smart_crusher: Enable JSON array compression.
         enable_search_compressor: Enable search result compression.
         enable_log_compressor: Enable build/test log compression.
+        log_compressor: Optional LogCompressorConfig override.
         enable_tabular_compressor: Enable CSV/TSV/markdown-table compression.
         enable_config_compressor: Enable YAML/TOML/INI config compression.
         enable_image_optimizer: Enable image token optimization.
@@ -1482,6 +1504,7 @@ class ContentRouterConfig:
     enable_smart_crusher: bool = True
     enable_search_compressor: bool = True
     enable_log_compressor: bool = True
+    log_compressor: Any | None = None
     enable_tabular_compressor: bool = True  # CSV/TSV/markdown tables via SmartCrusher
     enable_config_compressor: bool = True  # YAML/TOML/INI structural compression
     enable_html_extractor: bool = True  # HTML content extraction
@@ -1536,7 +1559,7 @@ class ContentRouterConfig:
 
     # Protection: Don't compress content that's likely the subject of analysis
     skip_user_messages: bool = True  # User messages contain what they want analyzed
-    protect_recent_code: int = 4  # Don't compress CODE in last N messages (0 = disabled)
+    protect_recent_code: int = 2  # Don't compress CODE in last N messages (0 = disabled)
     protect_analysis_context: bool = True  # Detect "analyze/review" intent, protect code
 
     # Protection: failed tool calls / error outputs stay verbatim (issue #847).
@@ -1565,7 +1588,7 @@ class ContentRouterConfig:
     # block is considered for compression. Below this, the overhead of
     # routing/detecting/caching exceeds any savings, so the block is
     # passed through verbatim.
-    min_chars_for_block_compression: int = 500
+    min_chars_for_block_compression: int = 200
 
     # Adaptive Read protection: fraction of total messages to protect from
     # compression.  At 10 msgs, protects ~5 Reads.  At 100 msgs, protects ~10.
@@ -1663,13 +1686,7 @@ class ContentRouterConfig:
     # dispatch threshold and compaction heuristics without constructing
     # the crusher themselves.
     smart_crusher: Any | None = None
-
-    # Structural compressor configuration overrides. None preserves each
-    # compressor's dataclass defaults. The proxy wires environment-backed
-    # overrides into these objects, while ccr_inject_marker/search grouping are
-    # still enforced by ContentRouter so global safety flags win consistently.
     search_compressor: Any | None = None
-    log_compressor: Any | None = None
     diff_compressor: Any | None = None
     text_crusher: Any | None = None
 
@@ -1790,6 +1807,14 @@ class ContentRouter(Transform):
         # request path stays byte-identical. Built-in registry entries are
         # filtered out here so they are only ever dispatched by the if/elif.
         self._active_external_compressors: list[Any] = self._resolve_active_external_compressors()
+
+        # Reuse workers across apply() calls. Creating a pool for every request
+        # adds avoidable startup overhead and can amplify executor contention.
+        pool_size = int(os.environ.get("HEADROOM_COMPRESS_WORKERS", "4"))
+        self._shared_executor = ThreadPoolExecutor(
+            max_workers=max(1, pool_size),
+            thread_name_prefix="hdr-cmp-blk",
+        )
 
         # Lazy-loaded compressors
         self._code_compressor: Any = None
@@ -1927,6 +1952,12 @@ class ContentRouter(Transform):
         # cache. Counting pins isolates the freeze's attributable payoff.
         self._freeze_pin_hits = 0
         self._freeze_pin_chars = 0
+
+    def __del__(self) -> None:
+        """Release the shared compression workers during interpreter teardown."""
+        executor = getattr(self, "_shared_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False)
 
     def _record_freeze_pin(self, content: str, cached_ratio: float) -> None:
         """Count one freeze divergence (thread-safe) and log it.
@@ -2388,6 +2419,25 @@ class ContentRouter(Transform):
 
         return strategy
 
+    def _mixed_section_workers(self, section_count: int) -> int:
+        """How many sections to compress at once.
+
+        One, unless Kompress is running remotely. Local compression has a single
+        execution slot, so overlap there buys nothing and costs contention. A remote
+        endpoint is ~470ms of round-trip per call regardless of size, and its client
+        coalesces concurrent calls into one request — so sections have to *arrive*
+        together for that fold to happen. This is the only reason the overlap exists.
+        """
+        try:
+            kompress = self._get_kompress()
+            if kompress is None or kompress.ready_backend() != "remote":
+                return 1
+            override = os.environ.get("HEADROOM_MIXED_SECTION_WORKERS")
+            limit = int(override) if override else _REMOTE_SECTION_WORKERS
+            return max(1, min(limit, section_count))
+        except Exception:
+            return 1
+
     def _compress_mixed(
         self,
         content: str,
@@ -2422,10 +2472,8 @@ class ContentRouter(Transform):
                 strategy_used=CompressionStrategy.PASSTHROUGH,
             )
 
-        compressed_sections: list[str] = []
-        routing_log: list[RoutingDecision] = []
-
-        for i, section in enumerate(sections):
+        def _compress_section(item: tuple[int, ContentSection]) -> tuple[str, RoutingDecision]:
+            i, section = item
             # Get strategy for this section
             strategy = self._strategy_from_detection_type(section.content_type)
 
@@ -2444,16 +2492,26 @@ class ContentRouter(Transform):
             if section.is_code_fence and section.language:
                 compressed_content = f"```{section.language}\n{compressed_content}\n```"
 
-            compressed_sections.append(compressed_content)
-            routing_log.append(
-                RoutingDecision(
-                    content_type=section.content_type,
-                    strategy=strategy,
-                    original_tokens=original_tokens,
-                    compressed_tokens=compressed_tokens,
-                    section_index=i,
-                )
+            return compressed_content, RoutingDecision(
+                content_type=section.content_type,
+                strategy=strategy,
+                original_tokens=original_tokens,
+                compressed_tokens=compressed_tokens,
+                section_index=i,
             )
+
+        workers = self._mixed_section_workers(len(sections))
+        if workers > 1:
+            # Overlap exists purely so the remote client can fold these sections
+            # into one request; see _mixed_section_workers.
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                # .map preserves input order, so section order is unaffected.
+                outcomes = list(pool.map(_compress_section, enumerate(sections)))
+        else:
+            outcomes = [_compress_section(item) for item in enumerate(sections)]
+
+        compressed_sections = [text for text, _ in outcomes]
+        routing_log: list[RoutingDecision] = [decision for _, decision in outcomes]
 
         return RouterCompressionResult(
             compressed="\n\n".join(compressed_sections),
@@ -2960,7 +3018,7 @@ class ContentRouter(Transform):
         entry = self.compressor_registry.get(name)
         if entry is None:
             return None
-        return entry.compress(
+        output = entry.compress(
             CompressInput(
                 content=content,
                 content_type=_CONTENT_TYPE_TO_MIME.get(
@@ -2971,6 +3029,9 @@ class ContentRouter(Transform):
                 budget={"bias": bias},
             )
         )
+        if not isinstance(output.content, str):
+            output = replace(output, content=_coerce_compressed_text(output.content))
+        return output
 
     def _registry_compress_content(
         self,
@@ -3093,6 +3154,14 @@ class ContentRouter(Transform):
         # never a marker-free lossy drop that could not be recovered.
         if self.config.lossless:
             if _ll_label is not None:
+                if self.config.relevance_split and strategy in (
+                    CompressionStrategy.LOG,
+                    CompressionStrategy.SEARCH,
+                ):
+                    kind = "log" if strategy is CompressionStrategy.LOG else "search"
+                    split = self._relevance_split_compress(content, kind, context)
+                    if split is not None:
+                        return split, _estimate_tokens(split), [_ll_label, "relevance_split"]
                 return _ll_content, _estimate_tokens(_ll_content), [_ll_label]
             return content, original_tokens, [CompressionStrategy.PASSTHROUGH.value]
 
@@ -3420,7 +3489,7 @@ class ContentRouter(Transform):
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
             decision_reason = "compression_exception"
-            logger.warning("Compression with %s failed: %s", strategy.value, e)
+            logger.info("Compression with %s failed: %s", strategy.value, e)
 
         # If compression succeeded, record to TOIN
         if compressed is not None and compressed_tokens is not None:
@@ -3670,7 +3739,9 @@ class ContentRouter(Transform):
             crusher = self._get_text_crusher()
             if crusher is not None:
                 try:
-                    out = crusher.compress(text_to_compress, context=context or "").compressed
+                    out = _coerce_compressed_text(
+                        crusher.compress(text_to_compress, context=context or "").compressed
+                    )
                 except Exception as e:
                     logger.warning(
                         "Kompress size-gate -> TextCrusher failed (%s); passing through", e
@@ -3687,7 +3758,9 @@ class ContentRouter(Transform):
                         )
                         out = text_to_compress
             if protected:
-                out = restore_tags(out, protected)
+                out, had_tag_loss = restore_tags(out, protected)
+                if had_tag_loss:
+                    out = content
             return out, _estimate_tokens(out)
 
         # Reached only when the gate is enabled and this eligible block is
@@ -3739,7 +3812,7 @@ class ContentRouter(Transform):
                         if protected:
                             compress_kwargs["ccr_original"] = content
                         result = compressor.compress(text_to_compress, **compress_kwargs)
-                        compressed = result.compressed
+                        compressed = _coerce_compressed_text(result.compressed)
                         compressed_tokens = result.compressed_tokens
                     except Exception as e:
                         logger.warning("Kompress failed: %s", e)
@@ -3749,7 +3822,9 @@ class ContentRouter(Transform):
 
         # Restore protected tag blocks into the compressed text
         if protected:
-            compressed = restore_tags(compressed, protected)
+            compressed, had_tag_loss = restore_tags(compressed, protected)
+            if had_tag_loss:
+                compressed = content
             compressed_tokens = _estimate_tokens(compressed)
 
         return compressed, compressed_tokens or _estimate_tokens(compressed)
@@ -3819,11 +3894,10 @@ class ContentRouter(Transform):
                 )
 
                 if _check_tree_sitter_available():
-                    self._code_compressor = CodeAwareCompressor(
-                        CodeCompressorConfig(
-                            enable_ccr=self.config.ccr_inject_marker,
-                        )
+                    cc_config = CodeCompressorConfig(
+                        kompress_enabled=self.config.enable_kompress,
                     )
+                    self._code_compressor = CodeAwareCompressor(config=cc_config)
                 else:
                     logger.debug("tree-sitter not available")
             except ImportError:
@@ -3866,9 +3940,7 @@ class ContentRouter(Transform):
             try:
                 from .search_compressor import SearchCompressor, SearchCompressorConfig
 
-                cfg = self.config.search_compressor or SearchCompressorConfig()
-                cfg = replace(
-                    cfg,
+                cfg = SearchCompressorConfig(
                     group_by_file=self.config.search_group_by_file,
                     enable_ccr=self.config.ccr_inject_marker,
                 )
@@ -3994,7 +4066,7 @@ class ContentRouter(Transform):
         result = "".join(out_parts)
         # Adopt only when it beats plain whole-block lossless compaction.
         baseline = compact_lossless(content, kind)
-        return result if len(result) < len(baseline) else None
+        return result if len(result) <= len(baseline) and result != baseline else None
 
     def _get_text_crusher(self) -> Any:
         """Get TextCrusher (Phase 2, lazy load). Returns None when disabled, or
@@ -4076,6 +4148,24 @@ class ContentRouter(Transform):
             logger.debug("Kompress artifact prefetch skipped: %s", e)
             return False
 
+    def start_background_kompress_prefetch(self) -> bool:
+        """Start the file-only Kompress prefetch for this router."""
+        if not self.config.enable_kompress:
+            return False
+        compressor = self._get_kompress()
+        if compressor is None or not hasattr(compressor, "preload"):
+            return False
+        return self._prefetch_kompress_artifacts_async(getattr(compressor, "config", None))
+
+    def preload_kompress(self) -> str | None:
+        """Load the Kompress model before serving requests."""
+        if not self.config.enable_kompress:
+            return None
+        compressor = self._get_kompress()
+        if compressor is None or not hasattr(compressor, "preload"):
+            return None
+        return compressor.preload(allow_download=True)
+
     def eager_load_compressors(self) -> dict[str, str]:
         """Pre-load compressors at startup to avoid first-request latency.
 
@@ -4089,19 +4179,9 @@ class ContentRouter(Transform):
 
         # 1. ML text compressor: Kompress.
         #
-        # Native model initialization stays out of the blocking startup/lifespan
-        # path. The existing lazy request path loads Kompress on first use. This is
-        # load-bearing, NOT laziness: on RHEL/CentOS 7-family hosts entering cached
-        # Kompress native init before the port binds segfaults in libarrow/jemalloc
-        # with no Python traceback (#1908, fixed by #2001) — a crash no try/except
-        # can catch. Do not call `preload()` here.
-        #
-        # What we CAN do at startup is prefetch the model FILES. Downloading is
-        # pure huggingface_hub HTTP — no ONNX session, no transformers import, so it
-        # never touches the native path that #1908 crashes on. That removes the real
-        # cold-start cost: previously the ~4-minute download began on the FIRST
-        # REQUEST, and every request in that window went silently uncompressed
-        # behind a single "model not ready" warning.
+        # Native model initialization is performed off the event loop by the
+        # proxy startup wrapper. This keeps startup responsive while ensuring
+        # the model and tokenizer are ready before requests are accepted.
         if self.config.enable_kompress:
             compressor = self._get_kompress()
             if compressor:
@@ -4109,10 +4189,14 @@ class ContentRouter(Transform):
                     status["kompress"] = "enabled"
                     status["kompress_backend"] = "unknown"
                 else:
-                    status["kompress"] = "deferred"
-                    if self._prefetch_kompress_artifacts_async(getattr(compressor, "config", None)):
-                        status["kompress_artifacts"] = "prefetching"
-                    logger.info("Kompress model preload deferred until first request")
+                    backend = self.preload_kompress()
+                    status["kompress"] = "enabled"
+                    if backend:
+                        status["kompress_backend"] = backend
+                    logger.info(
+                        "Kompress model loaded before serving requests (backend=%s)",
+                        backend or "unknown",
+                    )
             else:
                 status["kompress"] = "unavailable"
 
@@ -4149,47 +4233,54 @@ class ContentRouter(Transform):
                 )
                 status["ort_dylib"] = "unset"
 
-        # 3. CodeAware compressor + common tree-sitter parsers
+        # 3. CodeAware compressor
         if self.config.enable_code_aware:
             code_compressor = self._get_code_compressor()
             if code_compressor:
                 status["code_aware"] = "enabled"
-                # Pre-load tree-sitter parsers for common languages
-                # Each parser is ~50ms to load; doing it here avoids 500ms+ on first code hit
-                try:
-                    from .code_compressor import _check_tree_sitter_available, _get_parser
-
-                    if _check_tree_sitter_available():
-                        common_languages = [
-                            "python",
-                            "javascript",
-                            "typescript",
-                            "go",
-                            "rust",
-                            "java",
-                            "c",
-                            "cpp",
-                        ]
-                        loaded = []
-                        for lang in common_languages:
-                            try:
-                                _get_parser(lang)
-                                loaded.append(lang)
-                            except (ValueError, ImportError):
-                                pass  # Language not available, skip
-                        if loaded:
-                            logger.info("Tree-sitter parsers pre-loaded: %s", ", ".join(loaded))
-                            status["tree_sitter"] = f"loaded ({len(loaded)} languages)"
-                except Exception as e:
-                    logger.debug("Tree-sitter pre-load skipped: %s", e)
-                    status["tree_sitter"] = "skipped"
+                # Tree-sitter parsers are NOT pre-loaded here because they use
+                # `threading.local()`  and compression runs in a dedicated
+                # `ThreadPoolExecutor`. Loading them on the main thread would be
+                # wasted work — each pool thread creates its own lazy cache on
+                # first use. See `_get_parser` in `code_compressor.py`.
             else:
                 status["code_aware"] = "not installed"
 
-        # 4. SmartCrusher (lightweight init, but ensures import + TOIN ready)
+        # 4. SmartCrusher (lightweight init)
         smart_crusher = self._get_smart_crusher()
         if smart_crusher:
             status["smart_crusher"] = "ready"
+
+        # 5. HTML extractor.
+        #
+        # By far the most expensive lazy import in the transform tree: MEASURED
+        # 978ms for trafilatura -> htmldate -> dateparser and its timezone
+        # tables, against 1-20ms for every other compressor module. It fires
+        # from _get_html_extractor() on the first request carrying an HTML-ish
+        # block or mixed-content section, so a real user pays the full second
+        # mid-request. That is the single largest first-request stall in the
+        # pipeline, which is why it is worth a line here.
+        try:
+            if self._get_html_extractor() is not None:
+                status["html_extractor"] = "ready"
+            else:
+                status["html_extractor"] = "not installed"
+        except Exception as e:
+            logger.debug("HTML extractor pre-load skipped: %s", e)
+            status["html_extractor"] = "skipped"
+
+        # 6. TOIN singleton. Constructing it reads the learned-pattern file off
+        # disk (MEASURED ~150ms at 5MB, and it grows with use). SmartCrusher
+        # above does NOT pull it in, despite what a previous comment here
+        # claimed — the first request did.
+        try:
+            from ..telemetry.toin import get_toin
+
+            get_toin()
+            status["toin"] = "ready"
+        except Exception as e:
+            logger.debug("TOIN pre-load skipped: %s", e)
+            status["toin"] = "skipped"
 
         return status
 
@@ -4273,6 +4364,7 @@ class ContentRouter(Transform):
         if getattr(self, "_kompress_remote", None) is None:
             from .kompress_compressor import KompressConfig
             from .kompress_remote import (
+                DEFAULT_BATCH_PATH,
                 DEFAULT_ENDPOINT_PATH,
                 RemoteKompressCompressor,
                 parse_endpoint_headers,
@@ -4289,6 +4381,11 @@ class ContentRouter(Transform):
                 path=os.environ.get("HEADROOM_KOMPRESS_ENDPOINT_PATH", DEFAULT_ENDPOINT_PATH),
                 headers=parse_endpoint_headers(
                     os.environ.get("HEADROOM_KOMPRESS_ENDPOINT_HEADERS")
+                ),
+                # Empty value disables coalescing for an endpoint that has no
+                # batch route (it would 404 on every fold and fall back).
+                batch_path=os.environ.get(
+                    "HEADROOM_KOMPRESS_ENDPOINT_BATCH_PATH", DEFAULT_BATCH_PATH
                 ),
             )
             logger.info("Kompress: using remote endpoint %s", self._kompress_remote.url)
@@ -4448,6 +4545,7 @@ class ContentRouter(Transform):
         transforms_applied: list[str],
         batch_state: dict[str, int | None] | None = None,
         p_alive_override: float | None = None,
+        model: str = "",
     ) -> bool:
         """Break-even gate for one candidate mutation (#856 P2, flag-gated).
 
@@ -4532,9 +4630,21 @@ class ContentRouter(Transform):
                 p_alive = _p_alive
             except ValueError:
                 logger.warning("HEADROOM_NET_COST_P_ALIVE malformed; using 1.0")
+        w = 1.25  # CACHE_WRITE_MULTIPLIER
+        r = 0.1  # CACHE_READ_MULTIPLIER
+        logger.debug(
+            "NetCostPolicy pre-calc model=%s w=%.2f r=%.2f delta_t=%d suffix=%d reads=%.1f p_alive=%.2f",
+            model,
+            w,
+            r,
+            delta_t,
+            suffix,
+            reads,
+            p_alive,
+        )
         gain = float(policy.net_mutation_gain(delta_t, suffix, reads, p_alive))
         allowed = gain > 0.0
-        logger.info(
+        logger.debug(
             "NetCostPolicy slot=%d delta_t=%d suffix=%d reads=%.1f p_alive=%.2f "
             "idle_derived=%s gain=%.0f batch_reclaim=%s -> %s",
             slot_idx,
@@ -5170,8 +5280,10 @@ class ContentRouter(Transform):
             # (#1307). Partition its cache namespace so a gated tool entry is never
             # served from — or poisons — an ungated entry for byte-identical content.
             enforce_reversibility = role == "tool"
-            if enforce_reversibility:
+            if enforce_reversibility and not force_kompress:
                 content_key = hash((content_key, True))
+            elif enforce_reversibility:
+                enforce_reversibility = False
 
             # Tier 1: skip set — instant rejection
             if self._cache.is_skipped(content_key):
@@ -5213,6 +5325,7 @@ class ContentRouter(Transform):
                         transforms_applied=transforms_applied,
                         batch_state=netcost_batch_state,
                         p_alive_override=netcost_p_alive_override,
+                        model=tokenizer.model,
                     ):
                         # Net-cost gate: mutation would cost more in cache
                         # invalidation than it saves — leave untouched.
@@ -5308,14 +5421,14 @@ class ContentRouter(Transform):
                     compress_ms = (time.perf_counter() - t0) * 1000
                     task_results.append((r, compress_ms))
             else:
-                # Parallel compression via thread pool
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = []
-                    for _, task_content, task_ctx, task_bias, _, _ in pending_tasks:
-                        futures.append(
-                            executor.submit(self._timed_compress, task_content, task_ctx, task_bias)
-                        )
-                    task_results = [f.result() for f in futures]
+                # Parallel compression via the router's shared thread pool.
+                futures = [
+                    self._shared_executor.submit(
+                        self._timed_compress, task_content, task_ctx, task_bias
+                    )
+                    for _, task_content, task_ctx, task_bias, _, _ in pending_tasks
+                ]
+                task_results = [future.result() for future in futures]
 
             parallel_ms = (time.perf_counter() - t_parallel_start) * 1000
             compressor_timing["parallel_compress_total"] = parallel_ms
@@ -5390,6 +5503,7 @@ class ContentRouter(Transform):
                         transforms_applied=transforms_applied,
                         batch_state=netcost_batch_state,
                         p_alive_override=netcost_p_alive_override,
+                        model=tokenizer.model,
                     ):
                         result_slots[slot_idx] = message
                         continue
@@ -5550,7 +5664,18 @@ class ContentRouter(Transform):
             try:
                 # A registered provider is authoritative for excluded-tool
                 # compaction; fall back to the built-in folds only if it raises.
-                return provider(content)
+                supplied = provider(content)
+                if supplied is None:
+                    return None
+                if (
+                    isinstance(supplied, tuple | list)
+                    and len(supplied) == 2
+                    and isinstance(supplied[0], str)
+                    and isinstance(supplied[1], str)
+                    and supplied[0].strip()
+                ):
+                    return supplied[0], supplied[1]
+                logger.debug("lossless provider returned malformed excluded output")
             except Exception:  # noqa: BLE001
                 logger.debug(
                     "lossless provider failed; using built-in compaction",
@@ -5975,11 +6100,11 @@ class ContentRouter(Transform):
                 # Enrich the relevance query with the triggering tool call's
                 # args (grep pattern, read path, …) — the sharpest, per-output
                 # signal. Gated so default behavior is byte-identical.
-                block_context = context
+                _block_context = context
                 if self.config.relevance_split and tool_use_id:
                     call_args = self._tool_call_args.get(tool_use_id, "")
                     if call_args:
-                        block_context = build_relevance_query(context, tool_name, call_args)
+                        _block_context = build_relevance_query(context, tool_name, call_args)
 
                 tool_content = block.get("content", "")
 
@@ -6065,10 +6190,11 @@ class ContentRouter(Transform):
                         continue
 
                     # Two-tier compression cache → shared helper
-                    compressed_content, was_compressed = self._compress_block_content(
+                    compression_future = self._shared_executor.submit(
+                        self._compress_block_content,
                         content=tool_text,
                         content_key=hash((tool_text, getattr(self, "_runtime_target_ratio", None))),
-                        context=block_context,
+                        context=_block_context,
                         bias=bias,
                         min_ratio=min_ratio,
                         compressor_timing=compressor_timing,
@@ -6077,8 +6203,8 @@ class ContentRouter(Transform):
                         compressed_details=compressed_details,
                         strategy_label="tool_result",
                         details_prefix="tool",
-                        enforce_reversibility=True,
                     )
+                    compressed_content, was_compressed = compression_future.result()
                     if compressed_content is not None:
                         new_blocks.append(
                             {

@@ -99,7 +99,7 @@ def test_warmup_registry_to_dict_has_expected_keys():
 
 
 # -------------------------------------------------------------------
-# Startup orchestration tests — use HeadroomProxy + stubbed transforms
+# Startup orchestration tests -- use HeadroomProxy + stubbed transforms
 # -------------------------------------------------------------------
 
 
@@ -205,7 +205,7 @@ async def test_startup_memory_embedder_warmup_encodes_once(tmp_path, monkeypatch
     proxy = HeadroomProxy(config)
 
     # Swap in a hand-rolled MemoryHandler whose backend exposes a mock
-    # embedder. We don't want real ONNX here — just a spy.
+    # embedder. We don't want real ONNX here -- just a spy.
     handler = MemoryHandler(
         MemoryConfig(enabled=True, backend="local", db_path=str(tmp_path / "mem.db"))
     )
@@ -262,7 +262,7 @@ async def test_startup_memory_backend_error_surfaced_and_health_degraded(tmp_pat
     handler.ensure_initialized = _boom  # type: ignore[assignment]
     proxy.memory_handler = handler
 
-    # Startup must NOT raise — the memory slot must report error and the
+    # Startup must NOT raise -- the memory slot must report error and the
     # rest of the startup pipeline keeps going (quota registry etc.).
     await proxy.startup()
     try:

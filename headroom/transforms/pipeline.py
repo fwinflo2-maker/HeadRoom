@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import threading
 import time
 from collections.abc import Callable
@@ -41,6 +42,21 @@ MAX_WASTE_SIGNAL_DETECTION_TOKENS = 100_000
 # A token saving below this is treated as noise — waste-signal detection only
 # runs when compression saved more than this many tokens.
 _MIN_TOKENS_SAVED_FOR_WASTE_SIGNALS = 100
+
+
+def _waste_sampling_check() -> bool:
+    """Return whether this request is sampled for waste-signal telemetry."""
+    try:
+        rate = float(os.environ.get("HEADROOM_WASTE_SIGNAL_SAMPLE_RATE", "1.0"))
+    except (TypeError, ValueError):
+        logger.warning("Invalid HEADROOM_WASTE_SIGNAL_SAMPLE_RATE; defaulting to 1.0")
+        rate = 1.0
+    if rate <= 0:
+        return False
+    if rate >= 1:
+        return True
+    return random.random() < rate
+
 
 # OTel GenAI semantic conventions (open-telemetry/semantic-conventions-genai).
 # The compression-pipeline span carries this gen_ai.* attribute alongside the
@@ -254,7 +270,7 @@ class TransformPipeline:
         """
         record_metrics = kwargs.pop("record_metrics", True)
         waste_messages = kwargs.pop("waste_messages", None)
-        waste_signal_token_limit = int(
+        _waste_signal_token_limit = int(
             kwargs.pop("waste_signal_token_limit", MAX_WASTE_SIGNAL_DETECTION_TOKENS)
         )
         tokenizer = self._get_tokenizer(model)
@@ -408,7 +424,8 @@ class TransformPipeline:
                     # Log transform results
                     if result.transforms_applied:
                         logger.info(
-                            "Transform %s: %d -> %d tokens (saved %d) [%.1fms]",
+                            "%sTransform %s: %d -> %d tokens (saved %d) [%.1fms]",
+                            log_prefix,
                             transform.name,
                             tokens_before_transform,
                             tokens_after_transform,
@@ -417,7 +434,10 @@ class TransformPipeline:
                         )
                     else:
                         logger.debug(
-                            "Transform %s: no changes [%.1fms]", transform.name, duration_ms
+                            "%sTransform %s: no changes [%.1fms]",
+                            log_prefix,
+                            transform.name,
+                            duration_ms,
                         )
 
                     # Record diff if enabled
@@ -484,7 +504,7 @@ class TransformPipeline:
                 tokens_before > tokens_after
                 and (tokens_before - tokens_after) > _MIN_TOKENS_SAVED_FOR_WASTE_SIGNALS
             )
-            if saved_enough and tokens_before > waste_signal_token_limit:
+            if saved_enough and tokens_before > _waste_signal_token_limit:
                 # Telemetry-only re-parse would risk the compression timeout on a
                 # request this large (#296); skip it and keep the result.
                 logger.debug(
@@ -492,9 +512,9 @@ class TransformPipeline:
                     "(limit=%d) to keep the compression result on the critical path",
                     log_prefix,
                     tokens_before,
-                    waste_signal_token_limit,
+                    _waste_signal_token_limit,
                 )
-            elif saved_enough:
+            elif saved_enough and _waste_sampling_check():
                 try:
                     from ..parser import parse_messages
 

@@ -1,7 +1,7 @@
 """Smoke tests for the PR4 lossless-first default behavior.
 
 Verifies that `SmartCrusher()` (default constructor, no args) produces
-the lossless compaction output for cleanly tabular input — the
+the lossless compaction output for cleanly tabular input -- the
 user-visible win from PR4. Complements the legacy parity fixtures in
 `test_smart_crusher_rust_parity.py` which exercise `without_compaction()`.
 """
@@ -18,7 +18,7 @@ def _build_extension() -> None:
         from headroom._core import SmartCrusher  # noqa: F401
     except ImportError:
         pytest.skip(
-            "headroom._core not built — run `bash scripts/build_rust_extension.sh`",
+            "headroom._core not built -- run `bash scripts/build_rust_extension.sh`",
             allow_module_level=True,
         )
 
@@ -27,7 +27,7 @@ _build_extension()
 
 
 def test_default_lossless_wins_on_uniform_tabular() -> None:
-    """50 uniform tabular dicts → CSV+schema beats threshold (>=30%)
+    """50 uniform tabular dicts -> CSV+schema beats threshold (>=30%)
     by a wide margin. Default `SmartCrusher()` ships the compacted
     string in place of the array."""
     from headroom._core import SmartCrusher
@@ -51,11 +51,11 @@ def test_default_lossless_wins_on_uniform_tabular() -> None:
 
 
 def test_default_falls_through_to_lossy_when_below_threshold() -> None:
-    """Heterogeneous / non-tabular input → compactor declines (or
-    savings below threshold) → lossy path runs."""
+    """Heterogeneous / non-tabular input -> compactor declines (or
+    savings below threshold) -> lossy path runs."""
     from headroom._core import SmartCrusher
 
-    # 30 unique-id objects with no schema redundancy → not enough
+    # 30 unique-id objects with no schema redundancy -> not enough
     # tabular signal for lossless to clear 30% by itself.
     items = [{"id": i, "user_unique_field_name": f"u_{i}"} for i in range(30)]
     content = json.dumps(items)
@@ -79,7 +79,7 @@ def test_without_compaction_preserves_pre_pr4_behavior() -> None:
     crusher = SmartCrusher.without_compaction()
     result = crusher.crush(content, "", 1.0)
 
-    # No lossless attempt → output stays JSON-array-shaped
+    # No lossless attempt -> output stays JSON-array-shaped
     # (pre-PR4 contract).
     parsed = json.loads(result.compressed)
     assert isinstance(parsed, list), (

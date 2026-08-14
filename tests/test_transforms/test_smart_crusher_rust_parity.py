@@ -1,6 +1,6 @@
 """Parity test: PyO3-backed `SmartCrusher` vs recorded fixtures.
 
-Stage 3c.1b verification — guards the PyO3 bridge against regressions
+Stage 3c.1b verification -- guards the PyO3 bridge against regressions
 by replaying every recorded fixture in
 `tests/parity/fixtures/smart_crusher/` through `headroom._core.SmartCrusher`
 and asserting the output matches the recording byte-for-byte.
@@ -58,7 +58,7 @@ def test_at_least_17_fixtures_present():
 def test_rust_backend_matches_recorded_output(fixture_path: Path):
     """Replay each recorded input through the PyO3 bridge; every output
     field must match the recording. Any mismatch is a bridge bug or a
-    Rust regression — cross-check with `cargo run -p headroom-parity`.
+    Rust regression -- cross-check with `cargo run -p headroom-parity`.
     """
     from headroom._core import SmartCrusher, SmartCrusherConfig
 

@@ -550,7 +550,7 @@ def test_handle_openai_responses_chatgpt_codex_timeout_fails_open(monkeypatch):
     assert body["store"] is False
 
 
-def test_handle_openai_responses_api_auth_store_false_skips_memory_tools(monkeypatch):
+def test_handle_openai_responses_api_auth_store_false_injects_stateless_memory_tools(monkeypatch):
     request = _build_request(
         {"model": "gpt-4o-mini", "input": "hello", "store": False},
         {"Authorization": "Bearer sk-test", "x-headroom-user-id": "user-1"},
@@ -571,11 +571,12 @@ def test_handle_openai_responses_api_auth_store_false_skips_memory_tools(monkeyp
     _, url, _, body = handler.captured_request
     assert url == "https://api.openai.com/v1/responses"
     assert body["store"] is False
-    assert "tools" not in body
+    assert [tool["name"] for tool in body["tools"]] == ["memory_search"]
+    assert body["include"] == ["reasoning.encrypted_content"]
     assert memory_handler.compute_calls == 1
 
 
-@pytest.mark.parametrize("store", [pytest.param(None, id="omitted"), True])
+@pytest.mark.parametrize("store", [pytest.param(None, id="omitted"), True, False])
 @pytest.mark.parametrize(
     "include",
     [
@@ -646,7 +647,7 @@ def test_openai_responses_memory_continuation_is_zdr_safe(store, include, monkey
     assert first_body["previous_response_id"] == "resp-inherited"
     assert ("store" in first_body) is (store is not None)
     if store is not None:
-        assert first_body["store"] is True
+        assert first_body["store"] is store
     else:
         assert "store" not in first_body
     assert continuation_body["input"] == [
@@ -674,7 +675,7 @@ def test_openai_responses_memory_continuation_is_zdr_safe(store, include, monkey
     assert "previous_response_id" not in continuation_body
     assert ("store" in continuation_body) is (store is not None)
     if store is not None:
-        assert continuation_body["store"] is True
+        assert continuation_body["store"] is store
 
 
 def test_handle_openai_responses_routes_api_key_auth_direct_to_openai(monkeypatch):
@@ -695,6 +696,74 @@ def test_handle_openai_responses_routes_api_key_auth_direct_to_openai(monkeypatc
     assert headers.get("ChatGPT-Account-ID") is None
     assert body["input"] == "hello"
     assert response.status_code == 200
+
+
+def test_handle_openai_responses_non_stream_adapts_sse_upstream(monkeypatch):
+    """A ``stream: false`` request whose upstream replies ``200
+    text/event-stream`` must be adapted to the terminal response JSON, not
+    converted into a 502 proxy_error (#2613)."""
+    import httpx
+
+    sse = (
+        b"event: response.completed\n"
+        b'data: {"type":"response.completed","response":{"id":"resp_sse_repro",'
+        b'"output":[],"usage":{"input_tokens":2,"output_tokens":1}}}\n\n'
+    )
+
+    class _SSEUpstreamHandler(_DummyOpenAIHandler):
+        async def _retry_request(self, method, url, headers, body, **kwargs):
+            self.captured_request = (method, url, headers, body)
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=sse,
+            )
+
+    request = _build_request(
+        {"model": "gpt-5.4", "stream": False, "input": "hello"},
+        {"Authorization": "Bearer sk-test"},
+    )
+    handler = _SSEUpstreamHandler()
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert response.status_code == 200, response.body
+    payload = json.loads(response.body)
+    assert payload["id"] == "resp_sse_repro"
+    assert response.headers["content-type"].startswith("application/json")
+
+
+def test_handle_openai_responses_non_stream_passes_through_unparseable_sse(monkeypatch):
+    """A 200 SSE upstream body with no recognizable terminal response event
+    must be forwarded as-is — never converted into a 502 (#2613)."""
+    import httpx
+
+    sse = b"event: response.weird\ndata: not-json\n\n"
+
+    class _SSEUpstreamHandler(_DummyOpenAIHandler):
+        async def _retry_request(self, method, url, headers, body, **kwargs):
+            self.captured_request = (method, url, headers, body)
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=sse,
+            )
+
+    request = _build_request(
+        {"model": "gpt-5.4", "stream": False, "input": "hello"},
+        {"Authorization": "Bearer sk-test"},
+    )
+    handler = _SSEUpstreamHandler()
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert response.status_code == 200, response.body
+    assert response.body == sse
+    assert response.headers["content-type"] == "text/event-stream"
 
 
 def test_handle_openai_responses_stream_skips_python_compression(monkeypatch):

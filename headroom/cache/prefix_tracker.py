@@ -633,9 +633,31 @@ def _breakpoint_index(
     return relation.stable_prefix_blocks - 1
 
 
+def _client_marker_positions(
+    client_messages: list[dict[str, Any]],
+) -> list[tuple[int, int, dict[str, Any]]]:
+    """(message index, block index, marker) for every CLIENT cache_control.
+
+    Block-level, not one-per-message: clients mark multiple blocks within a
+    single long message (Claude Code does this on 1-2-message requests with a
+    large first message), and the ~20-block lookback applies within a message
+    just as it does across messages. Only block-style content carries markers.
+    """
+    positions: list[tuple[int, int, dict[str, Any]]] = []
+    for i, msg in enumerate(client_messages):
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for bi, b in enumerate(content):
+            if isinstance(b, dict) and isinstance(b.get("cache_control"), dict):
+                positions.append((i, bi, b["cache_control"]))
+    return positions
+
+
 def normalize_message_cache_control(
     messages: list[dict[str, Any]],
     previous_forwarded_messages: list[dict[str, Any]] | None = None,
+    client_messages: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Own message-level cache_control placement so breakpoints stay bounded.
 
@@ -645,25 +667,35 @@ def normalize_message_cache_control(
     hard-errors at **>4 cache_control blocks total** (system + tools + messages),
     so on a long conversation the accumulation eventually 400s.
 
-    Fix: strip EVERY message-level cache_control and re-place a **single**
-    ephemeral breakpoint. Pure append-only growth keeps it on the newest block,
-    which both reads the prior write and writes the appended tail. If last turn's
-    counterpart proves that the tail was rewritten, it is placed at the end of
-    the byte-stable leading run instead. One breakpoint caches the prefix up to
-    it, and — because the provider's cache key is message CONTENT, not marker
-    presence (moving the
-    breakpoint forward is the documented client pattern and it hits) — stripping
-    and re-placing markers never busts. system/tools breakpoints live outside
-    ``messages`` and are left untouched (they still count toward the 4 limit, so
-    holding messages to one breakpoint leaves room for them).
+    Fix: strip EVERY message-level cache_control, then re-place markers at the
+    positions the CLIENT's current request marks (``client_messages``). The
+    client's positions are load-bearing, not redundant: Anthropic resolves each
+    breakpoint by walking back **at most ~20 content blocks** for a prior cache
+    entry, and agentic clients (Claude Code) keep a marker on the previous
+    turn's newest message precisely so the new turn's write can chain to the
+    old entry. Collapsing to a single newest-block marker breaks that chain
+    whenever one turn adds >20 blocks (typical for tool-heavy turns): the
+    lookback misses, the entire message history silently re-bills as cache
+    creation, and a marker anchored short of the final block leaves the tail
+    billing as fully uncached input. Mirroring the client's positions bounds
+    accumulation identically (the client manages its own 4-marker budget) while
+    preserving its read/write chaining.
 
-    Headroom owns WHERE the breakpoint goes; the client still owns WHAT it says:
-    the re-placed marker reuses the newest client marker verbatim, so an explicit
-    ``ttl`` (e.g. ``"1h"``) survives consolidation instead of silently
-    downgrading to the 5-minute default (#2375).
+    The provider's cache key is message CONTENT, not marker presence (moving
+    the breakpoint forward is the documented client pattern and it hits), so
+    stripping replay leftovers and re-placing markers never busts. system/tools
+    breakpoints live outside ``messages`` and are left untouched.
 
-    Only block-style (list) content can carry cache_control; string content is
-    left as-is. Returns the input unchanged when there is nothing to normalize.
+    Headroom owns WHICH BLOCK carries each marker; the client owns the message
+    positions and the marker values, so an explicit ``ttl`` (e.g. ``"1h"``)
+    survives per position instead of silently downgrading (#2375). The newest
+    position uses stable-run anchoring for proven rewritten tails; earlier
+    positions go on their message's last block.
+
+    Without ``client_messages`` (or when the transformed list no longer aligns
+    with it), falls back to the legacy single-marker consolidation. Only
+    block-style (list) content can carry cache_control; string content is left
+    as-is. Returns the input unchanged when there is nothing to normalize.
     """
     changed = False
     out: list[dict[str, Any]] = []
@@ -690,22 +722,75 @@ def normalize_message_cache_control(
                 last_block_idx = i
         else:
             out.append(msg)
-    # Re-place exactly one breakpoint on the last block-style message.
-    if last_block_idx >= 0:
-        msg = out[last_block_idx]
-        content = list(msg["content"])
-        marker = dict(last_marker) if last_marker else {"type": "ephemeral"}
-        breakpoint_index = _breakpoint_index(
-            content, msg, last_block_idx, previous_forwarded_messages
-        )
+
+    def _place(
+        target_idx: int,
+        marker: dict[str, Any],
+        *,
+        anchor: bool,
+        block_idx: int | None = None,
+    ) -> bool:
+        msg = out[target_idx]
+        content = msg.get("content")
+        if not isinstance(content, list) or not content:
+            return False
+        content = list(content)
+        if block_idx is not None and 0 <= block_idx < len(content):
+            # Transforms can shift block indices (e.g. a dropped thinking
+            # block); a slightly-off placement still lands on a stable block
+            # in the same message, which is harmless — markers are not part
+            # of the provider's cache key.
+            breakpoint_index = block_idx
+        elif anchor:
+            breakpoint_index = _breakpoint_index(
+                content, msg, target_idx, previous_forwarded_messages
+            )
+        else:
+            breakpoint_index = len(content) - 1
         # Anthropic content blocks are dictionaries, but callers can still
-        # supply mixed list content.  The newest block is known to be a dict
-        # from the scan above; fall back to it rather than attempting ``**``
-        # on a scalar stable-boundary element.
+        # supply mixed list content. Fall back to the newest block rather than
+        # attempting ``**`` on a scalar stable-boundary element, and skip the
+        # message entirely when even that is not a dict.
         if not isinstance(content[breakpoint_index], dict):
             breakpoint_index = len(content) - 1
-        content[breakpoint_index] = {**content[breakpoint_index], "cache_control": marker}
-        out[last_block_idx] = {**msg, "content": content}
+        if not isinstance(content[breakpoint_index], dict):
+            return False
+        content[breakpoint_index] = {**content[breakpoint_index], "cache_control": dict(marker)}
+        out[target_idx] = {**msg, "content": content}
+        return True
+
+    # Preferred: mirror the client's marker positions 1:1, block-level. The
+    # transform pipeline preserves message count, so index alignment is the
+    # invariant; fall back to legacy consolidation if it ever does not hold,
+    # or when the client marked nothing (legacy still places one so the
+    # prefix caches). The newest client marker keeps stable-run anchoring
+    # when the client placed it on its message's final block (intent: "cache
+    # through the end"); an explicit mid-message marker is honored verbatim.
+    if client_messages is not None and len(client_messages) == len(messages):
+        positions = _client_marker_positions(client_messages)
+        if positions:
+            placed_any = False
+            newest_mi, newest_bi, _ = positions[-1]
+            newest_client_content = client_messages[newest_mi].get("content")
+            newest_on_final_block = (
+                isinstance(newest_client_content, list)
+                and newest_bi == len(newest_client_content) - 1
+            )
+            for mi, bi, marker in positions:
+                is_newest = (mi, bi) == (newest_mi, newest_bi)
+                if is_newest and newest_on_final_block:
+                    placed = _place(mi, marker, anchor=True)
+                else:
+                    placed = _place(mi, marker, anchor=False, block_idx=bi)
+                placed_any = placed or placed_any
+            if placed_any or changed:
+                return out
+            return messages
+
+    # Legacy: re-place exactly one breakpoint on the last block-style message.
+    if last_block_idx >= 0:
+        marker = dict(last_marker) if last_marker else {"type": "ephemeral"}
+        _place(last_block_idx, marker, anchor=True)
         changed = True
     return out if changed else messages
 

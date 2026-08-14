@@ -152,19 +152,21 @@ messages = [
     {
         "role": "assistant",
         "content": None,
-        "tool_calls": [{
-            "id": "call_1",
-            "type": "function",
-            "function": {"name": "search", "arguments": '{"q": "python"}'},
-        }],
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "search", "arguments": '{"q": "python"}'},
+            }
+        ],
     },
     {
         "role": "tool",
         "tool_call_id": "call_1",
         # This is where Headroom shines - compressing large outputs
-        "content": json.dumps({
-            "results": [{"title": f"Result {i}", "score": 100-i} for i in range(500)]
-        }),
+        "content": json.dumps(
+            {"results": [{"title": f"Result {i}", "score": 100 - i} for i in range(500)]}
+        ),
     },
     {"role": "user", "content": "What are the top 3 results?"},
 ]
@@ -191,7 +193,9 @@ plan = client.chat.completions.simulate(
 
 print(f"Tokens before: {plan.tokens_before}")
 print(f"Tokens after: {plan.tokens_after}")
-print(f"Would save: {plan.tokens_saved} tokens ({plan.tokens_saved/plan.tokens_before*100:.0f}%)")
+print(
+    f"Would save: {plan.tokens_saved} tokens ({plan.tokens_saved / plan.tokens_before * 100:.0f}%)"
+)
 print(f"Transforms: {plan.transforms}")
 print(f"Estimated savings: {plan.estimated_savings}")
 ```
@@ -230,6 +234,7 @@ print(response.content[0].text)
 
 ```python
 import logging
+
 logging.basicConfig(level=logging.INFO)
 
 # Now you'll see:
@@ -350,6 +355,7 @@ print(stats["config"]["mode"])  # Should be "optimize"
 
 # 2. Enable logging to see what's happening
 import logging
+
 logging.basicConfig(level=logging.DEBUG)
 ```
 

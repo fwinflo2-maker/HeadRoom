@@ -46,6 +46,115 @@ from headroom.proxy.outcome import RequestOutcome
 logger = logging.getLogger("headroom.proxy")
 
 
+class _AnthropicTurnHookUsage:
+    """Usage from hook-triggered Anthropic calls the main response omits.
+
+    The handler accounts for the response ultimately returned to the client.
+    A turn hook may make additional, billed calls before selecting that final
+    response, so retain every response and settle by object identity. This is
+    the Anthropic counterpart of OpenAI's ``TurnHookUsage`` and includes the
+    provider's disjoint uncached/read/write input buckets.
+    """
+
+    __slots__ = (
+        "_seen",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "cache_write_5m_tokens",
+        "cache_write_1h_tokens",
+        "extra_calls",
+    )
+
+    def __init__(self) -> None:
+        self._seen: list[tuple[Any, int, int, int, int, int, int]] = []
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.cache_read_tokens = 0
+        self.cache_write_tokens = 0
+        self.cache_write_5m_tokens = 0
+        self.cache_write_1h_tokens = 0
+        self.extra_calls = 0
+
+    @staticmethod
+    def _int(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def record(self, payload: Any) -> None:
+        usage = payload.get("usage") if isinstance(payload, dict) else None
+        if not isinstance(usage, dict):
+            self._seen.append((payload, 0, 0, 0, 0, 0, 0))
+            return
+        cache_read = self._int(usage.get("cache_read_input_tokens"))
+        cache_write = self._int(usage.get("cache_creation_input_tokens"))
+        creation = usage.get("cache_creation")
+        cache_write_5m = (
+            self._int(creation.get("ephemeral_5m_input_tokens"))
+            if isinstance(creation, dict)
+            else 0
+        )
+        cache_write_1h = (
+            self._int(creation.get("ephemeral_1h_input_tokens"))
+            if isinstance(creation, dict)
+            else 0
+        )
+        self._seen.append(
+            (
+                payload,
+                _anthropic_provider_input_tokens(usage),
+                self._int(usage.get("output_tokens")),
+                cache_read,
+                cache_write,
+                cache_write_5m,
+                cache_write_1h,
+            )
+        )
+
+    def settle(self, final: Any) -> None:
+        self.input_tokens = self.output_tokens = 0
+        self.cache_read_tokens = self.cache_write_tokens = 0
+        self.cache_write_5m_tokens = self.cache_write_1h_tokens = 0
+        self.extra_calls = 0
+        dropped = False
+        for (
+            payload,
+            input_tokens,
+            output_tokens,
+            cache_read,
+            cache_write,
+            cache_write_5m,
+            cache_write_1h,
+        ) in self._seen:
+            if not dropped and payload is final:
+                dropped = True
+                continue
+            self.extra_calls += 1
+            self.input_tokens += input_tokens
+            self.output_tokens += output_tokens
+            self.cache_read_tokens += cache_read
+            self.cache_write_tokens += cache_write
+            self.cache_write_5m_tokens += cache_write_5m
+            self.cache_write_1h_tokens += cache_write_1h
+
+
+def _anthropic_provider_input_tokens(usage: Any) -> int:
+    """Provider-scaled prompt total across Anthropic's disjoint buckets."""
+    if not isinstance(usage, dict):
+        return 0
+    return sum(
+        _AnthropicTurnHookUsage._int(usage.get(key))
+        for key in (
+            "input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        )
+    )
+
+
 def _strip_streaming_only_content_fields(messages: Any) -> None:
     """Remove streaming-only ``index`` keys from request content blocks, in place.
 
@@ -866,6 +975,9 @@ class AnthropicHandlerMixin:
             # body is undecipherable → 502.
             headers.pop("accept-encoding", None)
             tags = extract_tags(headers)
+            from headroom.proxy.savings_attribution import bind_scope
+
+            bind_scope(tags, request.scope)
             # Identify the harness (codex / claude-code / aider / etc.)
             # from User-Agent or X-Client. Surfaced via the funnel into
             # PERF logs and RequestLog.tags — see RequestOutcome.client.
@@ -2652,6 +2764,9 @@ class AnthropicHandlerMixin:
                     tools = _ts_after
                     tags["tool_search_deferred_tools"] = len(_ts_deferred)
                     tags["tool_search_deferred_tokens"] = _ts_saved_tokens
+                    from headroom.proxy.savings_attribution import record_savings
+
+                    record_savings(tags, "tool_search", tokens=_ts_saved_tokens)
                     transforms_applied.append(
                         f"router:tool_search_deferral:{len(_ts_deferred)}tools:"
                         f"{_ts_saved_tokens}tok"
@@ -2668,6 +2783,7 @@ class AnthropicHandlerMixin:
             )
 
             _pre_hook_tokens: int | None = None
+            _req_ctx: TurnContext | None = None
             if registered_turn_hooks():
                 _req_ctx = TurnContext(
                     provider="anthropic",
@@ -2675,6 +2791,9 @@ class AnthropicHandlerMixin:
                     messages=optimized_messages,
                     tools=body.get("tools"),
                     config=self.config,
+                    tags=tags,
+                    count_messages=tokenizer.count_messages,
+                    count_tools=_count_tool_tokens,
                 )
                 # Snapshot BEFORE the hook (same tokenizer) so we can tell whether the
                 # hook itself folded — comparing against the pipeline's optimized_tokens
@@ -2685,7 +2804,7 @@ class AnthropicHandlerMixin:
                     _pre_hook_tokens = None
                 _th_tools_before = body.get("tools")
                 _th_tok_before = _count_tool_tokens(_th_tools_before) if _th_tools_before else 0
-                run_request_hooks(_req_ctx)
+                run_request_hooks(_req_ctx, stream_safe_only=bool(stream))
                 if _req_ctx.messages is not optimized_messages:
                     optimized_messages = _req_ctx.messages
                     body["messages"] = optimized_messages
@@ -2735,6 +2854,28 @@ class AnthropicHandlerMixin:
                     "(tools array cannot resolve their tool_reference entries)",
                     request_id,
                     _ts_stripped,
+                )
+
+            # CCR retrieve history repair (#2814). Run beside the tool-search
+            # repair and after both normal CCR injection and turn hooks, so it
+            # validates against the final outbound tools array. A side-request
+            # that does not declare headroom_retrieve cannot retain historical
+            # tool_use/tool_result references that Anthropic would reject.
+            from headroom.proxy.helpers import strip_unsupported_ccr_retrieve_blocks
+
+            _ccr_repaired, _ccr_neutralized = strip_unsupported_ccr_retrieve_blocks(
+                body.get("messages"), body.get("tools")
+            )
+            if _ccr_neutralized:
+                body["messages"] = _ccr_repaired
+                optimized_messages = _ccr_repaired
+                body_mutation_tracker.mark_mutated("ccr_retrieve_history_repair")
+                transforms_applied.append(f"router:ccr_retrieve_repair:{_ccr_neutralized}blocks")
+                logger.info(
+                    "[%s] CCR: neutralized %d headroom_retrieve history block(s) "
+                    "(tools array does not declare the tool this turn)",
+                    request_id,
+                    _ccr_neutralized,
                 )
 
             # Consistency: report tok_before/tok_after with ONE tokenizer. The pipeline
@@ -3092,6 +3233,9 @@ class AnthropicHandlerMixin:
                                 output_tokens=output_tokens,
                                 tokens_saved=tokens_saved,
                                 attempted_input_tokens=attempted_input_tokens,
+                                provider_input_tokens=(
+                                    uncached_input_tokens + cr_tokens + cw_tokens
+                                ),
                                 cache_read_tokens=cr_tokens,
                                 cache_write_tokens=cw_tokens,
                                 cache_write_5m_tokens=cw_5m_tokens,
@@ -3590,26 +3734,6 @@ class AnthropicHandlerMixin:
                                 )
                                 # Update response content with final response
                                 resp_json = final_resp_json
-                                # Turn hooks (opt-in extensions) may inspect the turn or
-                                # re-drive the model before we hand back the response.
-                                # Inert when no hook is registered.
-                                from headroom.proxy.turn_hooks import (
-                                    TurnContext,
-                                    run_response_hooks,
-                                )
-
-                                final_resp_json = await run_response_hooks(
-                                    TurnContext(
-                                        provider="anthropic",
-                                        model=str(model),
-                                        messages=optimized_messages,
-                                        tools=tools,
-                                        config=self.config,
-                                    ),
-                                    final_resp_json,
-                                    api_call_fn,
-                                )
-                                resp_json = final_resp_json
                                 # Remove encoding headers since content is now uncompressed JSON
                                 ccr_response_headers = {
                                     k: v
@@ -3723,6 +3847,47 @@ class AnthropicHandlerMixin:
                                 )
                                 # Continue with original response
 
+                        # Buffered response hooks run for every successful turn,
+                        # not only the CCR branch. Reuse the request context so
+                        # observers close the exact turn they opened and a
+                        # search/reload hook can consume its synthetic tool call.
+                        _hook_usage = _AnthropicTurnHookUsage()
+                        if _req_ctx is not None and resp_json and response.status_code == 200:
+                            from headroom.proxy.turn_hooks import run_response_hooks
+
+                            _hook_usage.record(resp_json)
+
+                            async def _turn_hook_call_model(
+                                hook_messages: list[dict[str, Any]],
+                            ) -> dict[str, Any]:
+                                continuation_body = {**body, "messages": hook_messages}
+                                continuation_response = await self._retry_request(
+                                    "POST",
+                                    url,
+                                    headers,
+                                    continuation_body,
+                                    timeout=self._anthropic_buffered_request_timeout(),
+                                )
+                                continuation_json = continuation_response.json()
+                                _hook_usage.record(continuation_json)
+                                return continuation_json
+
+                            hooked_json = await run_response_hooks(
+                                _req_ctx, resp_json, _turn_hook_call_model
+                            )
+                            _hook_usage.settle(hooked_json)
+                            if hooked_json is not resp_json:
+                                resp_json = hooked_json
+                                response = httpx.Response(
+                                    status_code=200,
+                                    content=json.dumps(resp_json).encode(),
+                                    headers={
+                                        key: value
+                                        for key, value in response.headers.items()
+                                        if key.lower() not in ("content-encoding", "content-length")
+                                    },
+                                )
+
                         total_latency = (time.time() - start_time) * 1000
 
                         # Parse response for output token count and cache metrics
@@ -3735,12 +3900,23 @@ class AnthropicHandlerMixin:
                         if resp_json:
                             usage = resp_json.get("usage", {})
                             output_tokens = int(usage.get("output_tokens", 0) or 0)
+                            output_tokens += _hook_usage.output_tokens
                             cr_tokens = int(usage.get("cache_read_input_tokens", 0) or 0)
+                            cr_tokens += _hook_usage.cache_read_tokens
                             cw_tokens = int(usage.get("cache_creation_input_tokens", 0) or 0)
+                            cw_tokens += _hook_usage.cache_write_tokens
                             cw_5m_tokens, cw_1h_tokens = self._extract_anthropic_cache_ttl_metrics(
                                 usage
                             )
+                            cw_5m_tokens += _hook_usage.cache_write_5m_tokens
+                            cw_1h_tokens += _hook_usage.cache_write_1h_tokens
                             uncached_input_tokens = int(usage.get("input_tokens", 0) or 0)
+                            uncached_input_tokens += max(
+                                0,
+                                _hook_usage.input_tokens
+                                - _hook_usage.cache_read_tokens
+                                - _hook_usage.cache_write_tokens,
+                            )
 
                         # Track cache bust: tokens that lost their cache discount due to compression.
                         # If we had X tokens cached last turn and only Y hit cache this turn,
@@ -3872,6 +4048,9 @@ class AnthropicHandlerMixin:
                                 status_code=response.status_code,
                                 original_tokens=original_tokens,
                                 optimized_tokens=optimized_tokens,
+                                provider_input_tokens=(
+                                    uncached_input_tokens + cr_tokens + cw_tokens
+                                ),
                                 output_tokens=output_tokens,
                                 tokens_saved=tokens_saved,
                                 attempted_input_tokens=optimized_tokens + tokens_saved,
@@ -4016,6 +4195,25 @@ class AnthropicHandlerMixin:
                                 headers=relay_headers,
                             )
 
+                        if buffered_stream_ccr and response.status_code == 200 and not resp_json:
+                            logger.warning(
+                                f"[{request_id}] CCR: rejecting malformed buffered 200 reply "
+                                f"(content-type={response.headers.get('content-type')!r}, "
+                                f"body_bytes={len(response.content)})"
+                            )
+                            return Response(
+                                content=json.dumps(
+                                    {
+                                        "error": {
+                                            "type": "upstream_protocol_error",
+                                            "message": "Upstream returned an invalid buffered response.",
+                                        }
+                                    }
+                                ),
+                                status_code=502,
+                                media_type="application/json",
+                            )
+
                         if buffered_stream_ccr and response.status_code == 200 and resp_json:
                             sse_headers = {
                                 k: v
@@ -4114,122 +4312,50 @@ class AnthropicHandlerMixin:
 
                     class _BufferedCCRResponse(Response):
                         async def __call__(self, scope, receive, send):  # noqa: ANN001
-                            await asyncio.sleep(0)
-                            loop = asyncio.get_running_loop()
-                            keepalive_deadline = loop.time() + 1.0
-                            started = False
+                            # Send nothing until the buffered operation resolves.
+                            # The previous keepalive preamble committed
+                            # `200 text/event-stream` after 1s, i.e. before the
+                            # outcome was known: any upstream reply that then
+                            # failed to become SSE (non-200, unparseable body)
+                            # reached the client as a 200 whose body carried no
+                            # `message_start`, which Claude Code reports as "API
+                            # returned an empty or malformed response (HTTP 200) —
+                            # check for a proxy or gateway intercepting the
+                            # request". The real status was lost with it, so
+                            # client-side 429/5xx backoff never fired. Clients
+                            # budget minutes for a turn (Claude Code sends
+                            # `x-stainless-timeout: 600`), so waiting is free.
                             try:
-                                while True:
-                                    timeout = (
-                                        0.25
-                                        if started
-                                        else max(0.0, keepalive_deadline - loop.time())
-                                    )
-                                    done, _ = await asyncio.wait({operation}, timeout=timeout)
-                                    if done:
-                                        try:
-                                            result = operation.result()
-                                        except Exception as e:
-                                            await record_failed(provider=provider_name)
-                                            logger.error(
-                                                f"[{request_id}] Request failed: {type(e).__name__}: {e}"
-                                            )
-                                            if not started:
-                                                await send(
-                                                    {
-                                                        "type": "http.response.start",
-                                                        "status": 502,
-                                                        "headers": [
-                                                            (b"content-type", b"application/json")
-                                                        ],
-                                                    }
-                                                )
-                                                await send(
-                                                    {
-                                                        "type": "http.response.body",
-                                                        "body": json.dumps(
-                                                            {
-                                                                "type": "error",
-                                                                "error": {
-                                                                    "type": "api_error",
-                                                                    "message": "An error occurred while processing your request. Please try again.",
-                                                                },
-                                                            }
-                                                        ).encode(),
-                                                        "more_body": False,
-                                                    }
-                                                )
-                                                return
-                                            await send(
-                                                {
-                                                    "type": "http.response.body",
-                                                    "body": b'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"An error occurred while processing the request."}}\n\n',
-                                                    "more_body": False,
-                                                }
-                                            )
-                                            return
-
-                                        if not started:
-                                            await result(scope, receive, send)
-                                            return
-
-                                        body_iterator = getattr(result, "body_iterator", None)
-                                        if body_iterator is not None:
-                                            async for chunk in body_iterator:
-                                                await send(
-                                                    {
-                                                        "type": "http.response.body",
-                                                        "body": chunk,
-                                                        "more_body": True,
-                                                    }
-                                                )
-                                            await send(
-                                                {
-                                                    "type": "http.response.body",
-                                                    "body": b"",
-                                                    "more_body": False,
-                                                }
-                                            )
-                                            return
-
-                                        await send(
+                                result = await operation
+                            except Exception as e:
+                                await record_failed(provider=provider_name)
+                                logger.error(
+                                    f"[{request_id}] Request failed: {type(e).__name__}: {e}"
+                                )
+                                await send(
+                                    {
+                                        "type": "http.response.start",
+                                        "status": 502,
+                                        "headers": [(b"content-type", b"application/json")],
+                                    }
+                                )
+                                await send(
+                                    {
+                                        "type": "http.response.body",
+                                        "body": json.dumps(
                                             {
-                                                "type": "http.response.body",
-                                                "body": b'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"An error occurred while processing the request."}}\n\n',
-                                                "more_body": False,
+                                                "type": "error",
+                                                "error": {
+                                                    "type": "api_error",
+                                                    "message": "An error occurred while processing your request. Please try again.",
+                                                },
                                             }
-                                        )
-                                        return
-
-                                    if not started:
-                                        await send(
-                                            {
-                                                "type": "http.response.start",
-                                                "status": 200,
-                                                "headers": [
-                                                    (b"content-type", b"text/event-stream")
-                                                ],
-                                            }
-                                        )
-                                        started = True
-                                    await send(
-                                        {
-                                            "type": "http.response.body",
-                                            "body": b'event: ping\ndata: {"type":"ping"}\n\n',
-                                            "more_body": True,
-                                        }
-                                    )
-                            except asyncio.CancelledError:
-                                raise
-                            finally:
-                                if not operation.done():
-                                    operation.cancel()
-                                try:
-                                    await operation
-                                except asyncio.CancelledError:
-                                    pass
-                                except Exception:
-                                    pass
+                                        ).encode(),
+                                        "more_body": False,
+                                    }
+                                )
+                                return
+                            await result(scope, receive, send)
 
                     return _BufferedCCRResponse(media_type="text/event-stream")
                 return await _buffered_ccr_operation()

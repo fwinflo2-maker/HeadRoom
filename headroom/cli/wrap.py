@@ -77,6 +77,8 @@ from headroom.providers.claude import (
     REMOTE_CONTROL_BASE_URL_ENV,
     TOOL_SEARCH_DEFAULT,
     TOOL_SEARCH_ENV,
+    claude_auth_conflict_message,
+    claude_auth_conflict_sources,
     claude_user_settings_path,
     configure_vscode_claude_settings,
     detect_claude_code_version,
@@ -259,6 +261,30 @@ def _read_settings_for_write(path: Path) -> dict[str, Any]:
             f"{path} does not contain a JSON object. Fix or move it, then re-run."
         )
     return cast("dict[str, Any]", payload)
+
+
+def _claude_settings_env(path: Path) -> dict[str, object]:
+    """Read a Claude settings env block for preflight validation."""
+    env = _read_settings_for_write(path).get("env")
+    return dict(env) if isinstance(env, dict) else {}
+
+
+def _raise_on_claude_auth_conflict(
+    *,
+    user_settings_path: Path,
+    project_settings_path: Path,
+    project_local_settings_path: Path,
+    environ: dict[str, str],
+) -> None:
+    """Refuse an auth state Claude Code rejects before mutating wrap state."""
+    conflict = claude_auth_conflict_sources(
+        (str(user_settings_path), _claude_settings_env(user_settings_path)),
+        (str(project_settings_path), _claude_settings_env(project_settings_path)),
+        (str(project_local_settings_path), _claude_settings_env(project_local_settings_path)),
+        ("shell environment", environ),
+    )
+    if conflict is not None:
+        raise click.ClickException(claude_auth_conflict_message(conflict))
 
 
 def _append_text(path: Path, content: str) -> None:
@@ -452,6 +478,8 @@ def _resolved_tool_search_mode(flag_value: str | None) -> str:
     existing = os.environ.get(_TOOL_SEARCH_ENV)
     if existing is not None:
         probe[_TOOL_SEARCH_ENV] = existing
+    if os.environ.get("CLAUDE_CODE_USE_FOUNDRY"):
+        probe["CLAUDE_CODE_USE_FOUNDRY"] = os.environ["CLAUDE_CODE_USE_FOUNDRY"]
     written = _configure_tool_search_env(probe, flag_value)
     return written if written is not None else probe.get(_TOOL_SEARCH_ENV, "")
 
@@ -801,7 +829,7 @@ _RETIRED_CONTEXT_TOOL_MESSAGE = (
     "rewrote shell commands through a third-party binary Headroom no longer "
     "manages. Drop --context-tool / --no-context-tool and unset "
     f"{_RETIRED_CONTEXT_TOOL_ENV}; `headroom wrap` uninstalls what they left "
-    "behind on first run."
+    "behind automatically."
 )
 
 
@@ -861,8 +889,10 @@ def _report_context_tool_purge() -> None:
     default: the Claude ``PreToolUse`` hook, the vendored binaries and the
     injected hint-file guidance are all durable on disk. Running this once per
     ``wrap`` / ``unwrap`` invocation is what actually makes the tools go away.
-    Silent when there is nothing to do, which is the steady state after the first
-    run, and never fatal — a cleanup failure must not block launching the tool.
+    Silent when there is nothing to do — the common case once the machine-global
+    half is stamped done, though the project- and config-directory-scoped half
+    still runs every launch — and never fatal: a cleanup failure must not block
+    launching the tool.
 
     Reports on **stderr**: some subcommands (``wrap/unwrap openclaw
     --prepare-only``) emit machine-readable JSON on stdout as their entire
@@ -1480,6 +1510,36 @@ def _write_claude_wrap_base_url(
     if port is not None:
         _write_wrap_marker(path, port=port, key=key, previous=previous)
     return previous
+
+
+def _write_claude_wrap_tool_search(value: str, *, settings_path: Path | None = None) -> str | None:
+    """Persist the resolved tool-search mode for daemon-spawned workers.
+
+    Claude Code workers read project settings afresh rather than inheriting
+    the parent process environment (#2492). Keep this separate from the proxy
+    URL crash marker: a stale tool-search mode cannot route traffic to a dead
+    process, and is restored transactionally when the wrap session exits.
+    """
+    path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
+    payload = _read_settings_for_write(path)
+    env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
+    previous = env_map.get(_TOOL_SEARCH_ENV)
+    env_map[_TOOL_SEARCH_ENV] = value
+    payload["env"] = env_map
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_text(path, json.dumps(payload, indent=2) + "\n")
+    return previous
+
+
+def _restore_claude_wrap_tool_search(
+    previous: str | None, *, settings_path: Path | None = None
+) -> None:
+    """Restore the project-local tool-search value written for this session."""
+    _restore_claude_wrap_base_url(
+        previous,
+        settings_path=settings_path,
+        _key_override=_TOOL_SEARCH_ENV,
+    )
 
 
 def _restore_claude_wrap_base_url(
@@ -4726,6 +4786,8 @@ def claude(
 
     proxy_holder: list[subprocess.Popen | None] = [None]
     _saved_base_url: list[str | None] = [None]  # previous settings.json value for restore
+    _tool_search_not_written = object()
+    _saved_tool_search: list[object | str | None] = [_tool_search_not_written]
     _settings_foundry: list[bool] = [False]
     port_holder: list[int] = [port]
     _settings_vertex: list[bool] = [False]
@@ -4734,6 +4796,12 @@ def claude(
     # early proxy-start failure would make the finally raise UnboundLocalError,
     # masking the real error and skipping cleanup(). Mirrors the holders above.
     _wrap_settings_path = Path.cwd() / ".claude" / "settings.local.json"
+    _raise_on_claude_auth_conflict(
+        user_settings_path=claude_user_settings_path(),
+        project_settings_path=Path.cwd() / ".claude" / "settings.json",
+        project_local_settings_path=_wrap_settings_path,
+        environ=dict(os.environ),
+    )
     cleanup = _make_cleanup(proxy_holder, port_holder)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
     signal.signal(signal.SIGTERM, cleanup)
@@ -4957,6 +5025,11 @@ def claude(
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.
         _tool_search_value = _configure_tool_search_env(env, tool_search)
+        _resolved_tool_search_value = env.get(_TOOL_SEARCH_ENV, "")
+        _saved_tool_search[0] = _write_claude_wrap_tool_search(
+            _resolved_tool_search_value,
+            settings_path=_wrap_settings_path,
+        )
         if _tool_search_value is not None:
             # Describe what the written value actually does: --tool-search
             # false/0/no/off turns deferral OFF, and the banner must say so
@@ -5002,6 +5075,11 @@ def claude(
         click.echo(f"  Error: {e}")
         raise SystemExit(1) from e
     finally:
+        if _saved_tool_search[0] is not _tool_search_not_written:
+            _restore_claude_wrap_tool_search(
+                cast(str | None, _saved_tool_search[0]),
+                settings_path=_wrap_settings_path,
+            )
         _restore_claude_wrap_base_url(
             _saved_base_url[0],
             foundry_mode=_settings_foundry[0],
@@ -5458,8 +5536,8 @@ def vscode_copilot(
 ) -> None:
     """Run Headroom for GitHub Copilot inside Visual Studio Code.
 
-    Transparently overrides Copilot's proxy endpoint, preserving the model
-    selected in VS Code. It does not edit Codex settings.
+    Transparently overrides Copilot's proxy and CAPI endpoints, preserving the
+    model selected in VS Code. It does not edit Codex settings.
     """
     resolution = _require_copilot_subscription_resolution()
     target_settings = settings_file or vscode_settings_path()
@@ -5478,6 +5556,9 @@ def vscode_copilot(
         click.echo("  Add these user settings to VS Code:")
         click.echo(
             f'  "github.copilot.advanced.debug.overrideProxyUrl": "{vscode_proxy_url(actual_port, _project_name_from_cwd())}",'
+        )
+        click.echo(
+            f'  "github.copilot.advanced.debug.overrideCapiUrl": "{vscode_proxy_url(actual_port, _project_name_from_cwd())}",'
         )
         click.echo('  "github.copilot.advanced.debug.overrideAuthType": "token"')
 

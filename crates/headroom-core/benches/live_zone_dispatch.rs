@@ -17,10 +17,6 @@
 //!   the cost of the gate itself, i.e. the overhead every small block
 //!   pays whether or not compression ever fires.
 //!
-//! Retention observation (`HEADROOM_RETENTION_OBSERVE`) is left at its
-//! default (off), so these numbers reflect the production hot path, not
-//! the experiment-instrumented one.
-//!
 //! Deliberately NOT wired into CI — benchmarks in shared CI runners
 //! generate noise, not signal. Run manually:
 //!
@@ -36,8 +32,11 @@
 //! `docs/content/docs/troubleshooting.mdx`, "Windows ML DLL" entry). A
 //! hung benchmark is strictly worse than a refused one, so on Windows
 //! this harness exits early with instructions when the variable is
-//! missing. Other platforms resolve the library normally and are not
-//! gated.
+//! missing AND the Kompress model cache is warm — the only state where
+//! the hang is reachable. Cache-cold it proceeds (no ONNX session is
+//! ever created; the plain_text case then measures the deterministic
+//! no-op path, a valid mode in its own right). Other platforms resolve
+//! the library normally and are not gated.
 
 use std::hint::black_box;
 
@@ -184,13 +183,27 @@ fn bench_dispatch(c: &mut Criterion) {
     group.finish();
 }
 
-/// Refuse to run on Windows without `ORT_DYLIB_PATH` — see the module
-/// doc comment. A hung benchmark process gives no diagnostic; this
-/// message does.
+/// Refuse to run on Windows without `ORT_DYLIB_PATH` — but only when the
+/// hang it guards against is actually reachable. The `ort`-init deadlock
+/// needs a warm Kompress model cache: cache-cold, `Kompress::from_cache`
+/// resolves `Ok(None)` before any ONNX session exists, no `ort` code
+/// runs, and the cache-cold measurement mode the module doc advertises
+/// is perfectly safe — refusing it would block a legitimate
+/// configuration to guard against a hang it cannot have. A hung
+/// benchmark process gives no diagnostic; this message does.
 #[cfg(windows)]
 fn check_ort_dylib_path() {
     match std::env::var("ORT_DYLIB_PATH") {
         Ok(v) if !v.trim().is_empty() => {}
+        _ if !kompress_model_cached() => {
+            eprintln!(
+                "live_zone_dispatch bench: ORT_DYLIB_PATH is not set, but the \
+                 Kompress model cache is cold — no ONNX session will be \
+                 created, so the Windows ort-init hang cannot occur. \
+                 Proceeding in cache-cold mode (the plain_text case measures \
+                 the deterministic no-op path)."
+            );
+        }
         _ => {
             eprintln!(
                 "live_zone_dispatch bench: ORT_DYLIB_PATH is not set.\n\n\
@@ -206,6 +219,63 @@ fn check_ort_dylib_path() {
             std::process::exit(2);
         }
     }
+}
+
+/// True when the Kompress ONNX artifact and tokenizer are cache-resident
+/// under any production HF cache root (mirrors `kompress.rs`'s
+/// `hf_hub_roots` + `ONNX_CANDIDATES`; duplicated — benches, like
+/// integration tests, only see the crate's public API).
+#[cfg(windows)]
+fn kompress_model_cached() -> bool {
+    fn any_snapshot_has(repo_dir: &str, candidates: &[&[&str]]) -> bool {
+        let mut roots = Vec::new();
+        for (var, suffix) in [
+            ("HF_HUB_CACHE", &[][..]),
+            ("HF_HOME", &["hub"][..]),
+            ("HOME", &[".cache", "huggingface", "hub"][..]),
+            ("USERPROFILE", &[".cache", "huggingface", "hub"][..]),
+        ] {
+            if let Ok(v) = std::env::var(var) {
+                if !v.is_empty() {
+                    let mut p = std::path::PathBuf::from(v);
+                    for s in suffix {
+                        p = p.join(s);
+                    }
+                    roots.push(p);
+                }
+            }
+        }
+        for root in roots {
+            let snapshots = root.join(repo_dir).join("snapshots");
+            let Ok(entries) = std::fs::read_dir(&snapshots) else {
+                continue;
+            };
+            for snap in entries.filter_map(|e| e.ok()) {
+                for rel in candidates {
+                    let mut cand = snap.path();
+                    for part in *rel {
+                        cand = cand.join(part);
+                    }
+                    if cand.exists() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+    any_snapshot_has(
+        "models--answerdotai--ModernBERT-base",
+        &[&["tokenizer.json"]],
+    ) && any_snapshot_has(
+        "models--chopratejas--kompress-v2-base",
+        &[
+            &["onnx", "kompress-fp32-static512.onnx"],
+            &["onnx", "kompress-int8-wo.onnx"],
+            &["onnx", "kompress-fp32.onnx"],
+            &["onnx", "kompress-int8.onnx"],
+        ],
+    )
 }
 
 criterion_group!(benches, bench_dispatch);

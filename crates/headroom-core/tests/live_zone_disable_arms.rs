@@ -102,6 +102,63 @@ fn plain_prose(min_bytes: usize) -> String {
     text
 }
 
+/// True when the Kompress ONNX artifact and ModernBERT tokenizer are
+/// cache-resident under any production HF cache root — the same
+/// resolution `kompress.rs::hf_hub_roots` + `ONNX_CANDIDATES` use
+/// (duplicated, not shared — see module doc for why this file stands
+/// alone). Used only for the honesty note after assertion (b).
+fn kompress_model_cached() -> bool {
+    fn any_snapshot_has(repo_dir: &str, candidates: &[&[&str]]) -> bool {
+        let mut roots = Vec::new();
+        for (var, suffix) in [
+            ("HF_HUB_CACHE", &[][..]),
+            ("HF_HOME", &["hub"][..]),
+            ("HOME", &[".cache", "huggingface", "hub"][..]),
+            ("USERPROFILE", &[".cache", "huggingface", "hub"][..]),
+        ] {
+            if let Ok(v) = std::env::var(var) {
+                if !v.is_empty() {
+                    let mut p = std::path::PathBuf::from(v);
+                    for s in suffix {
+                        p = p.join(s);
+                    }
+                    roots.push(p);
+                }
+            }
+        }
+        for root in roots {
+            let snapshots = root.join(repo_dir).join("snapshots");
+            let Ok(entries) = std::fs::read_dir(&snapshots) else {
+                continue;
+            };
+            for snap in entries.filter_map(|e| e.ok()) {
+                for rel in candidates {
+                    let mut cand = snap.path();
+                    for part in *rel {
+                        cand = cand.join(part);
+                    }
+                    if cand.exists() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+    any_snapshot_has(
+        "models--answerdotai--ModernBERT-base",
+        &[&["tokenizer.json"]],
+    ) && any_snapshot_has(
+        "models--chopratejas--kompress-v2-base",
+        &[
+            &["onnx", "kompress-fp32-static512.onnx"],
+            &["onnx", "kompress-int8-wo.onnx"],
+            &["onnx", "kompress-fp32.onnx"],
+            &["onnx", "kompress-int8.onnx"],
+        ],
+    )
+}
+
 #[test]
 fn disabled_arms_route_to_no_op_others_unaffected() {
     // `source_code, plain_text, bogus_type` — the internal spaces
@@ -145,11 +202,22 @@ fn disabled_arms_route_to_no_op_others_unaffected() {
 
     // (b) PlainText arm disabled: a >5120-byte plain-prose tool_result
     // must NOT reach the PlainText compressor (Kompress) — NoCompressionApplied,
-    // not Compressed. The fixture MUST clear THRESHOLD_PLAIN_TEXT (5120
-    // bytes in live_zone.rs) — below that, `compress_one_block`'s
-    // byte-threshold gate short-circuits before dispatch even runs, and
-    // the assertion below would pass regardless of the kill switch. Do
-    // NOT shrink this fixture below 5120 bytes.
+    // not Compressed. TWO vacuity traps here, not one:
+    //
+    // 1. The fixture MUST clear THRESHOLD_PLAIN_TEXT (5120 bytes in
+    //    live_zone.rs) — below that, `compress_one_block`'s
+    //    byte-threshold gate short-circuits before dispatch even runs,
+    //    and the assertion below would pass regardless of the kill
+    //    switch. Do NOT shrink this fixture below 5120 bytes.
+    // 2. On a COLD HuggingFace cache this assertion cannot fail either:
+    //    the enabled arm's cache-cold path returns the identical no-op,
+    //    so a deleted kill-switch guard would still pass here (and in
+    //    upstream CI, which never primes the Kompress cache). The
+    //    warm-host discrimination comes from this assertion PAIRED with
+    //    `live_zone_dispatch.rs::plain_text_routes_to_kompress_when_model_cached`,
+    //    which proves the same prose shape DOES compress when the arm is
+    //    enabled; the cold-cache honesty note after (b) says which case
+    //    a given run actually exercised.
     let prose = plain_prose(5200);
     assert!(
         prose.len() > 5120,
@@ -174,6 +242,14 @@ fn disabled_arms_route_to_no_op_others_unaffected() {
         matches!(prose_action, BlockAction::NoCompressionApplied { .. }),
         "disabled PlainText arm must yield NoCompressionApplied, got {prose_action:?}"
     );
+    if !kompress_model_cached() {
+        eprintln!(
+            "NOTE: cold HF cache — assertion (b) passed but could not discriminate \
+             the PlainText kill switch from an absent model this run (the enabled \
+             arm's cache-cold path yields the same no-op). Warm-host coverage: \
+             live_zone_dispatch.rs::plain_text_routes_to_kompress_when_model_cached."
+        );
+    }
 
     // (c) Other arms unaffected: a >512-byte JSON-array tool_result must
     // still compress via smart_crusher (the kill switch only guards the

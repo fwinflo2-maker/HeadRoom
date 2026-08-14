@@ -441,22 +441,55 @@ fn plain_text_below_threshold_no_op() {
     }
 }
 
-/// Locate a HuggingFace Hub cache artifact under `$HOME/.cache/huggingface/hub`.
-/// Mirrors the runtime-skip helper in `kompress_parity.rs` (kompress_parity.rs:20-36)
-/// so this test degrades gracefully instead of downloading the model.
-fn hf_cache_file(repo_dir: &str, rel: &[&str]) -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let snapshots = std::path::Path::new(&home)
-        .join(".cache/huggingface/hub")
-        .join(repo_dir)
-        .join("snapshots");
-    for snap in std::fs::read_dir(snapshots).ok()?.filter_map(|e| e.ok()) {
-        let mut cand = snap.path();
-        for part in rel {
-            cand = cand.join(part);
+/// HuggingFace hub cache roots, mirroring the RUNTIME loader's resolution
+/// (`kompress.rs::hf_hub_roots`): `HF_HUB_CACHE` → `HF_HOME/hub` →
+/// `{HOME|USERPROFILE}/.cache/huggingface/hub`. The skip check MUST agree
+/// with production or the skip is a lie: a `$HOME`-only check silently
+/// skips on every Windows host (a PowerShell environment exports no
+/// `HOME`) and on any host relocating its cache via `HF_HOME` /
+/// `HF_HUB_CACHE` — machines where `Kompress::from_cache` loads the model
+/// happily, leaving the routing assertion below green without ever
+/// running.
+fn hf_hub_roots() -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    for (var, suffix) in [
+        ("HF_HUB_CACHE", &[][..]),
+        ("HF_HOME", &["hub"][..]),
+        ("HOME", &[".cache", "huggingface", "hub"][..]),
+        ("USERPROFILE", &[".cache", "huggingface", "hub"][..]),
+    ] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.is_empty() {
+                let mut p = std::path::PathBuf::from(v);
+                for s in suffix {
+                    p = p.join(s);
+                }
+                roots.push(p);
+            }
         }
-        if cand.exists() {
-            return Some(cand);
+    }
+    roots
+}
+
+/// Locate a HuggingFace Hub cache artifact under any production cache
+/// root. Candidate-relative paths are tried in order, mirroring the
+/// runtime's own fallback list where the caller passes several.
+fn hf_cache_file(repo_dir: &str, candidates: &[&[&str]]) -> Option<std::path::PathBuf> {
+    for root in hf_hub_roots() {
+        let snapshots = root.join(repo_dir).join("snapshots");
+        let Ok(entries) = std::fs::read_dir(&snapshots) else {
+            continue;
+        };
+        for snap in entries.filter_map(|e| e.ok()) {
+            for rel in candidates {
+                let mut cand = snap.path();
+                for part in *rel {
+                    cand = cand.join(part);
+                }
+                if cand.exists() {
+                    return Some(cand);
+                }
+            }
         }
     }
     None
@@ -467,10 +500,21 @@ fn plain_text_routes_to_kompress_when_model_cached() {
     // RUNTIME-SKIP pattern (kompress_parity.rs:39-52): if the ModernBERT
     // tokenizer + kompress-v2-base ONNX artifact are not present in the
     // local HuggingFace cache, skip rather than download the model.
-    let tok = hf_cache_file("models--answerdotai--ModernBERT-base", &["tokenizer.json"]);
+    let tok = hf_cache_file(
+        "models--answerdotai--ModernBERT-base",
+        &[&["tokenizer.json"]],
+    );
+    // All four runtime candidates, in `kompress.rs::ONNX_CANDIDATES`
+    // order — a host holding only e.g. the fp32 artifact runs Kompress in
+    // production and must run this test too, not skip it.
     let onnx = hf_cache_file(
         "models--chopratejas--kompress-v2-base",
-        &["onnx", "kompress-int8-wo.onnx"],
+        &[
+            &["onnx", "kompress-fp32-static512.onnx"],
+            &["onnx", "kompress-int8-wo.onnx"],
+            &["onnx", "kompress-fp32.onnx"],
+            &["onnx", "kompress-int8.onnx"],
+        ],
     );
     if tok.is_none() || onnx.is_none() {
         eprintln!(

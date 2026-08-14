@@ -354,13 +354,19 @@ fn render_function(name: &str, index: usize, body_lines: usize) -> String {
 /// fixture in `byte_fidelity_outside_compressed_source_block` was
 /// SourceCode's only exercise anywhere in this file).
 ///
-/// Always classifies `SourceCode`: the fixed three-line header alone
-/// (`import json` / `import os` / `from typing import ...`) already
-/// clears `try_detect_code`'s 3-pattern-match, confidence >= 0.5 floor
-/// (see content_detector.rs's `try_detect_code`), independent of how
-/// many functions follow or how long their bodies are — so varying the
-/// body shape can't accidentally misclassify the sample away from
-/// SourceCode.
+/// Always classifies `SourceCode` — but NOT because of the header
+/// alone: `try_detect_code`'s confidence is
+/// `0.4 + (matching_lines / non_empty_lines) * 0.4 + matching_lines * 0.02`,
+/// so a fixed count of header matches DILUTES below the 0.5 floor once
+/// enough non-matching lines follow (~4 matches over 100 non-empty
+/// lines ≈ 0.496). What actually holds classification is that every
+/// `render_function` body emits `def ...:` / docstring lines that also
+/// match `CODE_PATTERNS`, keeping `matching_lines` roughly proportional
+/// to length. Consequence for future edits: rewriting `render_function`
+/// with shapes that DON'T match the detector's patterns (e.g.
+/// assignment-bound lambdas) would silently reclassify large samples as
+/// PlainText — `dispatch_reach_fractions_meet_floor` fails loudly when
+/// that happens; believe it, and look here first.
 ///
 /// Byte-length mechanism: pick a `target_bytes` first, then append
 /// functions from a pool of varied specs until the buffer crosses it

@@ -49,15 +49,16 @@
 //!
 //! - **PR-B2** shipped the dispatcher *skeleton*: identify live-zone
 //!   blocks, route to no-op compressors, always return `NoChange`.
-//! - **PR-B3** (this PR) wires per-content-type compressors:
+//! - **PR-B3** wired the first per-content-type compressors:
 //!   `JsonArray` → SmartCrusher; `BuildOutput` → LogCompressor;
-//!   `SearchResults` → SearchCompressor; `GitDiff` → DiffCompressor;
-//!   `SourceCode` / `PlainText` / `Html` → no-op (B4 + a Rust
-//!   code-compressor port follow-up).
-//! - **PR-B4** adds the tokenizer-validation gate (per-block
+//!   `SearchResults` → SearchCompressor; `GitDiff` → DiffCompressor —
+//!   leaving `SourceCode` / `PlainText` / `Html` as documented no-ops.
+//! - **PR-B4** (this PR) added the tokenizer-validation gate (per-block
 //!   `compressed.tokens >= original.tokens` → fall back) and the
-//!   per-content-type byte threshold below which compression is
-//!   skipped.
+//!   per-content-type byte thresholds, and wires the two remaining
+//!   compressor arms: `SourceCode` → CodeAwareCompressor (with a
+//!   cached-Kompress no-shrink fallback) and `PlainText` → cached
+//!   Kompress. `Html` stays no-op.
 //! - **PR-B7** wires CCR retrieval-marker injection.
 //!
 //! # Cache safety invariant
@@ -178,12 +179,14 @@ const THRESHOLD_GIT_DIFF: usize = 512;
 /// clear it.
 const THRESHOLD_SOURCE_CODE: usize = 2048;
 /// Plain-text blocks below this size route to no-op. Sourced from
-/// `REALIGNMENT/04-phase-B-live-zone.md::PR-B4` (5 KiB). PlainText's
-/// threshold gate already fires before dispatch; its compressor arm
-/// (Kompress) lands in a follow-up PR.
+/// `REALIGNMENT/04-phase-B-live-zone.md::PR-B4` (5 KiB). The threshold
+/// gate fires before dispatch, so sub-threshold prose never reaches the
+/// Kompress arm wired below.
 const THRESHOLD_PLAIN_TEXT: usize = 5120;
-/// HTML blocks have no compressor; threshold matches plain text so
-/// when an HTML compressor lands the value is already pinned.
+/// HTML blocks have no compressor. 512 was PlainText's pre-PR-B4 value;
+/// HTML deliberately keeps it rather than following PlainText to 5120,
+/// because `REALIGNMENT/04` pins no HTML threshold — when an HTML
+/// compressor lands, its threshold is that PR's own decision.
 const THRESHOLD_HTML: usize = 512;
 
 /// Map a content type to its byte threshold. Returning `usize` rather
@@ -623,9 +626,17 @@ fn kompress_or_noop(text: &str, content_type: ContentType) -> DispatchResult {
 // ─── Kill switch (env-var arm disable) ─────────────────────────────────
 //
 // Experiment control and rollback affordance for the PR-B4 arms: set
-// `HEADROOM_LIVE_ZONE_DISABLE_ARMS` to a comma-separated list of
-// `ContentType::as_str()` names to force those arms to a deterministic
-// no-op, bypassing their compressor entirely.
+// `HEADROOM_LIVE_ZONE_DISABLE_ARMS=source_code,plain_text` (a
+// comma-separated list of `ContentType::as_str()` names or their
+// natural-name aliases, see `content_type_from_name`) to force those
+// arms to a deterministic no-op, bypassing their compressor entirely.
+// Two operator-facing caveats, both logged below rather than silently
+// accepted: only the two PR-B4 arms consult the switch today — naming
+// any other arm parses but disables nothing — and granularity is per
+// ARM, not per compressor: `plain_text` alone does not stop Kompress
+// runs reached through the SourceCode arm's no-shrink fallback;
+// disabling `source_code` as well is what removes Kompress from traffic
+// entirely (at the cost of also disabling the code compressor).
 
 /// Arms disabled via `HEADROOM_LIVE_ZONE_DISABLE_ARMS` (comma-separated
 /// `ContentType::as_str()` names). Read once per process: the set is
@@ -648,6 +659,16 @@ fn disabled_arms() -> &'static HashSet<ContentType> {
                 }
                 match content_type_from_name(token) {
                     Some(ct) => {
+                        if !matches!(ct, ContentType::SourceCode | ContentType::PlainText) {
+                            // A valid-but-unconsulted name would otherwise be
+                            // the worst outcome: no warning, no effect — an
+                            // operator mid-incident believes the arm is off.
+                            tracing::warn!(
+                                event = "disable_arms_unconsulted_arm",
+                                token = %token,
+                                "only the source_code and plain_text arms consult the kill switch; this token parses but disables nothing"
+                            );
+                        }
                         set.insert(ct);
                     }
                     None => tracing::warn!(event = "disable_arms_unknown_token", token = %token),
@@ -672,8 +693,8 @@ fn disabled_arms() -> &'static HashSet<ContentType> {
 /// Several variants accept both their `as_str()` tag (for consistency
 /// with log/metric field values elsewhere) and a natural-name alias — the
 /// operator-facing spelling a human is more likely to write. `PlainText`
-/// accepts `"text"` and `"plain_text"`: `"plain_text"` is the example this
-/// module's own doc comment uses
+/// accepts `"text"` and `"plain_text"`: `"plain_text"` is the example the
+/// kill-switch section banner above uses
 /// (`HEADROOM_LIVE_ZONE_DISABLE_ARMS=source_code,plain_text`). Without
 /// that alias the documented example silently no-ops: `"plain_text"`
 /// doesn't match `"text"`, so it falls through to the unknown-token
@@ -681,10 +702,11 @@ fn disabled_arms() -> &'static HashSet<ContentType> {
 /// trap applies to `SearchResults` (`"search"` / `"search_results"`),
 /// `BuildOutput` (`"build"` / `"build_output"`), and `GitDiff`
 /// (`"diff"` / `"git_diff"`) — each gets the identical additive alias.
-/// Caught by
-/// `live_zone_disable_arms.rs::disabled_arms_route_to_no_op_others_unaffected`'s
-/// PlainText assertion block, and by
-/// `live_zone_arm_properties.rs`'s round-trip test across all variants.
+/// Caught by `live_zone_arm_properties.rs`'s round-trip test across all
+/// variants, and end-to-end — on a warm-cache host only — by
+/// `live_zone_disable_arms.rs`'s PlainText assertion (a cold-cache run
+/// cannot tell a disabled PlainText arm from an absent model; see the
+/// comments in that test).
 pub fn content_type_from_name(name: &str) -> Option<ContentType> {
     match name {
         "json_array" => Some(ContentType::JsonArray),
@@ -1473,14 +1495,15 @@ enum DispatchResult {
 
 /// Map `(text, content_type)` to the compressor result.
 ///
-/// Per spec PR-B3:
+/// Per spec PR-B3 (arms marked PR-B4 wired by that PR):
 ///
 /// - `JsonArray` (with `is_dict_array=true`) → SmartCrusher
 /// - `BuildOutput` → LogCompressor
 /// - `SearchResults` → SearchCompressor
 /// - `GitDiff` → DiffCompressor
-/// - `SourceCode` → CodeAwareCompressor (PR-B4)
-/// - `PlainText` → no-op (PR-B4 wires Kompress)
+/// - `SourceCode` → CodeAwareCompressor, cached-Kompress no-shrink
+///   fallback (PR-B4)
+/// - `PlainText` → cached Kompress, cache-cold → no-op (PR-B4)
 /// - `Html` → no-op (no compressor)
 fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult {
     if text.is_empty() {
@@ -1567,10 +1590,11 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
                 compressed: result.compressed,
             }
         }
-        // Cache-only lossless prose compressor (PR-B4). `kompress_or_noop`
-        // degrades to a deterministic no-op when the model isn't
-        // cache-resident (or the `ml` feature is off) — no network call
-        // ever happens on this path.
+        // Cache-only EXTRACTIVE prose compressor (PR-B4): Kompress drops
+        // low-salience words and rejoins on single spaces — lossy by
+        // design. `kompress_or_noop` degrades to a deterministic no-op
+        // when the model isn't cache-resident (or the `ml` feature is
+        // off) — no network call ever happens on this path.
         ContentType::PlainText => {
             if arm_disabled(ContentType::PlainText) {
                 return DispatchResult::NoOp {

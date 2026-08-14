@@ -43,6 +43,9 @@ class TestSQLiteVectorIndex:
         index = SQLiteVectorIndex(dimension=384, db_path=db_path)
         yield index
 
+        import asyncio
+
+        asyncio.run(index.close())
         if os.path.exists(db_path):
             os.unlink(db_path)
 
@@ -272,6 +275,10 @@ class TestSQLiteVectorIndexPersistence:
             assert len(results) == 1
             assert results[0].memory.id == memory_id
         finally:
+            if "index1" in locals():
+                await index1.close()  # type: ignore[possibly-unbound]
+            if "index2" in locals():
+                await index2.close()  # type: ignore[possibly-unbound]
             if os.path.exists(db_path):
                 os.unlink(db_path)
 
@@ -291,6 +298,9 @@ class TestSQLiteVectorIndexMemoryStats:
         index = SQLiteVectorIndex(dimension=384, db_path=db_path, page_cache_size_kb=4096)
         yield index
 
+        import asyncio
+
+        asyncio.run(index.close())
         if os.path.exists(db_path):
             os.unlink(db_path)
 
@@ -356,6 +366,9 @@ class TestSQLiteVectorIndexEdgeCases:
         index = SQLiteVectorIndex(dimension=384, db_path=db_path)
         yield index
 
+        import asyncio
+
+        asyncio.run(index.close())
         if os.path.exists(db_path):
             os.unlink(db_path)
 

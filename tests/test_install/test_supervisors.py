@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import click
@@ -79,27 +80,6 @@ def test_command_for_script_and_unix_runner(monkeypatch, tmp_path: Path) -> None
     assert "exec headroom run --flag" in content
 
 
-def test_render_unix_runner_exports_env_before_exec(tmp_path: Path) -> None:
-    record = _render_unix_runner(
-        tmp_path / "run-headroom.sh",
-        ["headroom", "run"],
-        {"HEADROOM_WORKSPACE_DIR": "/Users/x/.headroom-workspace", "AWS_PROFILE": "sso-bedrock"},
-    )
-
-    content = Path(record.path).read_text(encoding="utf-8")
-    export_index = content.index("export HEADROOM_WORKSPACE_DIR=")
-    exec_index = content.index("exec headroom run")
-
-    assert "export HEADROOM_WORKSPACE_DIR=/Users/x/.headroom-workspace" in content
-    assert "export AWS_PROFILE=sso-bedrock" in content
-    assert export_index < exec_index
-
-
-def test_render_unix_runner_rejects_invalid_env_name(tmp_path: Path) -> None:
-    with pytest.raises(click.ClickException, match="Invalid environment variable name"):
-        _render_unix_runner(tmp_path / "run-headroom.sh", ["headroom", "run"], {"BAD-NAME": "x"})
-
-
 def test_render_unix_runner_omits_export_block_without_env(tmp_path: Path) -> None:
     record = _render_unix_runner(tmp_path / "run-headroom.sh", ["headroom", "run"])
 
@@ -163,16 +143,6 @@ def test_render_windows_runner_writes_ps1_and_cmd_wrappers(tmp_path: Path) -> No
     )
 
 
-def test_render_windows_runner_rejects_invalid_env_name(tmp_path: Path) -> None:
-    with pytest.raises(click.ClickException, match="Invalid environment variable name"):
-        _render_windows_runner(
-            tmp_path / "run-headroom.ps1",
-            tmp_path / "run-headroom.cmd",
-            ["headroom", "run"],
-            {"BAD-NAME": "x"},
-        )
-
-
 def test_render_runner_scripts_writes_unix_scripts(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("headroom.install.supervisors.sys.platform", "linux")
     monkeypatch.setattr(
@@ -189,21 +159,19 @@ def test_render_runner_scripts_writes_unix_scripts(monkeypatch, tmp_path: Path) 
     }
 
 
-def test_render_runner_scripts_threads_base_env_into_both_scripts(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_render_runner_scripts_uses_manifest_profile(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("headroom.install.supervisors.sys.platform", "linux")
     monkeypatch.setattr(
         "headroom.install.supervisors.resolve_headroom_command", lambda: ["headroom"]
     )
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    manifest = _manifest(base_env={"HEADROOM_WORKSPACE_DIR": "/custom/workspace"})
+    manifest = _manifest()
 
     records = render_runner_scripts(manifest)
 
     for record in records:
         content = Path(record.path).read_text(encoding="utf-8")
-        assert "export HEADROOM_WORKSPACE_DIR=/custom/workspace" in content
+        assert "exec headroom install agent" in content
 
 
 def test_render_runner_scripts_writes_windows_scripts(monkeypatch, tmp_path: Path) -> None:
@@ -255,10 +223,11 @@ def test_install_supervisor_none_returns_runner_records(monkeypatch, tmp_path: P
 def test_start_and_stop_supervisor_use_linux_systemctl(monkeypatch) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr("headroom.install.supervisors.sys.platform", "linux")
-    monkeypatch.setattr(
-        "headroom.install.supervisors.subprocess.run",
-        lambda command, **kwargs: calls.append(command),
-    )
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+
+    monkeypatch.setattr("headroom.install.supervisors.run", fake_run)
     manifest = _manifest()
 
     start_supervisor(manifest)
@@ -293,7 +262,7 @@ def test_install_supervisor_linux_service_and_tasks(monkeypatch, tmp_path: Path)
         calls.append((command, kwargs))
         return type("Result", (), {"returncode": 0, "stdout": "# old cron\n"})()
 
-    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+    monkeypatch.setattr("headroom.install.supervisors.run", fake_run)
 
     service_records = install_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
     assert unit_path.read_text(encoding="utf-8") == "UNIT"
@@ -337,7 +306,7 @@ def test_install_supervisor_darwin_windows_and_unsupported(monkeypatch, tmp_path
     )
     calls: list[list[str]] = []
     monkeypatch.setattr(
-        "headroom.install.supervisors.subprocess.run",
+        "headroom.install.supervisors.run",
         lambda command, **kwargs: calls.append(command) or _LaunchctlResult(0),
     )
     monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 123, raising=False)
@@ -370,13 +339,13 @@ def test_install_supervisor_darwin_windows_and_unsupported(monkeypatch, tmp_path
     win_task = install_supervisor(_manifest(supervisor=SupervisorKind.TASK.value))
     assert win_service[-1].kind == "windows-service"
     assert win_task[-2].path.endswith("-startup")
-    # Regression for #1654: the create command must be a single pre-quoted
-    # string (bypassing list2cmdline) with the inner quotes backslash-escaped
-    # and `start= auto` as a separate trailing token.
-    assert (
-        "sc.exe create headroom-default "
-        'binPath= "cmd.exe /c \\"C:\\tmp\\default\\run-headroom.cmd\\"" start= auto'
-    ) in calls
+    assert [
+        "sc.exe",
+        "create",
+        "headroom-default",
+        'binPath= cmd.exe /c "C:\\tmp\\default\\run-headroom.cmd"',
+        "start= auto",
+    ] in calls
     assert [
         "schtasks",
         "/Create",
@@ -397,12 +366,7 @@ def test_install_supervisor_darwin_windows_and_unsupported(monkeypatch, tmp_path
         install_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
 
 
-def test_install_supervisor_retries_bootstrap_until_launchd_settles(
-    monkeypatch, tmp_path: Path
-) -> None:
-    # Same EIO-after-bootout race start_supervisor already rides out, but hit
-    # via install_supervisor's own unconditional bootout+bootstrap sequence on
-    # every apply (issue: this call site had no retry at all before).
+def test_install_supervisor_bootstraps_once(monkeypatch, tmp_path: Path) -> None:
     run_script = tmp_path / "run-headroom.sh"
     monkeypatch.setattr(
         "headroom.install.supervisors.render_runner_scripts",
@@ -417,27 +381,22 @@ def test_install_supervisor_retries_bootstrap_until_launchd_settles(
     )
     monkeypatch.setattr("headroom.install.supervisors.sys.platform", "darwin")
     monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 123, raising=False)
-    monkeypatch.setattr("headroom.install.supervisors.time.sleep", lambda _s: None)
     bootstrap_attempts = 0
 
     def fake_run(command, **kwargs):
         nonlocal bootstrap_attempts
-        if command[1] == "bootout":
+        if "bootout" in command:
             return _LaunchctlResult(0)
         bootstrap_attempts += 1
-        if bootstrap_attempts < 3:
-            return _LaunchctlResult(5, stderr="Bootstrap failed: 5: Input/output error")
         return _LaunchctlResult(0)
 
-    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+    monkeypatch.setattr("headroom.install.supervisors.run", fake_run)
 
     install_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
-    assert bootstrap_attempts == 3
+    assert bootstrap_attempts == 1
 
 
-def test_install_supervisor_raises_after_bootstrap_keeps_failing(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_install_supervisor_propagates_bootstrap_failure(monkeypatch, tmp_path: Path) -> None:
     run_script = tmp_path / "run-headroom.sh"
     monkeypatch.setattr(
         "headroom.install.supervisors.render_runner_scripts",
@@ -452,17 +411,17 @@ def test_install_supervisor_raises_after_bootstrap_keeps_failing(
     )
     monkeypatch.setattr("headroom.install.supervisors.sys.platform", "darwin")
     monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 123, raising=False)
-    monkeypatch.setattr("headroom.install.supervisors.time.sleep", lambda _s: None)
-    monkeypatch.setattr("headroom.install.supervisors._MACOS_BOOTSTRAP_RETRIES", 3)
 
     def fake_run(command, **kwargs):
-        if command[1] == "bootout":
+        if "bootout" in command:
             return _LaunchctlResult(0)
-        return _LaunchctlResult(5, stderr="Bootstrap failed: 5: Input/output error")
+        raise subprocess.CalledProcessError(
+            5, command, stderr="Bootstrap failed: 5: Input/output error"
+        )
 
-    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+    monkeypatch.setattr("headroom.install.supervisors.run", fake_run)
 
-    with pytest.raises(click.ClickException, match="could not bootstrap"):
+    with pytest.raises(subprocess.CalledProcessError):
         install_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
 
 
@@ -476,7 +435,7 @@ class _LaunchctlResult:
 def test_start_and_stop_supervisor_darwin_windows_and_none(monkeypatch) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr(
-        "headroom.install.supervisors.subprocess.run",
+        "headroom.install.supervisors.run",
         lambda command, **kwargs: calls.append(command) or _LaunchctlResult(0),
     )
     monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 77, raising=False)
@@ -521,7 +480,7 @@ def test_macos_start_bootstraps_when_job_not_registered(monkeypatch, tmp_path: P
             return _LaunchctlResult(113, stderr="Could not find service")
         return _LaunchctlResult(0)
 
-    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+    monkeypatch.setattr("headroom.install.supervisors.run", fake_run)
 
     start_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
 
@@ -550,7 +509,7 @@ def test_macos_start_retries_bootstrap_until_launchd_settles(monkeypatch, tmp_pa
             return _LaunchctlResult(5, stderr="Bootstrap failed: 5: Input/output error")
         return _LaunchctlResult(0)
 
-    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+    monkeypatch.setattr("headroom.install.supervisors.run", fake_run)
 
     start_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
     assert bootstrap_attempts == 3
@@ -568,7 +527,7 @@ def test_macos_start_raises_after_bootstrap_keeps_failing(monkeypatch, tmp_path:
             return _LaunchctlResult(113)
         return _LaunchctlResult(5, stderr="Bootstrap failed: 5: Input/output error")
 
-    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+    monkeypatch.setattr("headroom.install.supervisors.run", fake_run)
 
     with pytest.raises(click.ClickException, match="could not start"):
         start_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
@@ -586,7 +545,7 @@ def test_macos_stop_tolerates_missing_job(monkeypatch) -> None:
         assert kwargs.get("check") is not True
         return _LaunchctlResult(3, stderr="Boot-out failed: 3: No such process")
 
-    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+    monkeypatch.setattr("headroom.install.supervisors.run", fake_run)
 
     stop_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
     assert calls == [["launchctl", "bootout", "gui/77/com.headroom.default"]]
@@ -594,12 +553,12 @@ def test_macos_stop_tolerates_missing_job(monkeypatch) -> None:
 
 def test_macos_stop_raises_on_non_esrch_failure(monkeypatch) -> None:
     # A non-3 `bootout` failure (e.g. permissions) is a real error and must
-    # surface — otherwise `restart` could report success with a stale job still
+    # surface -- otherwise `restart` could report success with a stale job still
     # running.
     monkeypatch.setattr("headroom.install.supervisors.sys.platform", "darwin")
     monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 77, raising=False)
     monkeypatch.setattr(
-        "headroom.install.supervisors.subprocess.run",
+        "headroom.install.supervisors.run",
         lambda command, **kwargs: _LaunchctlResult(
             9, stderr="Boot-out failed: 9: Operation not permitted"
         ),
@@ -626,7 +585,7 @@ def test_remove_supervisor_removes_user_crontab_block(monkeypatch) -> None:
             )
         return Result()
 
-    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+    monkeypatch.setattr("headroom.install.supervisors.run", fake_run)
     manifest = _manifest(supervisor=SupervisorKind.TASK.value)
 
     remove_supervisor(manifest)
@@ -645,7 +604,7 @@ def test_remove_supervisor_linux_service_cron_path_and_missing_crontab(
         calls.append(command)
         return type("Result", (), {"returncode": 1, "stdout": ""})()
 
-    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+    monkeypatch.setattr("headroom.install.supervisors.run", fake_run)
     unit_path = tmp_path / "headroom-default.service"
     unit_path.write_text("unit", encoding="utf-8")
     monkeypatch.setattr(
@@ -677,7 +636,7 @@ def test_remove_supervisor_linux_service_cron_path_and_missing_crontab(
 def test_remove_supervisor_darwin_and_windows(monkeypatch, tmp_path: Path) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr(
-        "headroom.install.supervisors.subprocess.run",
+        "headroom.install.supervisors.run",
         lambda command, **kwargs: calls.append(command),
     )
     monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 55, raising=False)

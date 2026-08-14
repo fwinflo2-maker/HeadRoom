@@ -212,8 +212,7 @@ def acquire_runtime_start_lock(profile: str) -> Iterator[bool]:
             import fcntl
 
             try:
-                fcntl_any = cast(Any, fcntl)
-                fcntl_any.flock(lock_file.fileno(), fcntl_any.LOCK_EX | fcntl_any.LOCK_NB)
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
                 acquired = True
             except BlockingIOError:
                 yield False
@@ -238,8 +237,7 @@ def acquire_runtime_start_lock(profile: str) -> Iterator[bool]:
                 else:
                     import fcntl
 
-                    fcntl_any = cast(Any, fcntl)
-                    fcntl_any.flock(lock_file.fileno(), fcntl_any.LOCK_UN)
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
 
 
 def run_foreground(manifest: DeploymentManifest) -> int:

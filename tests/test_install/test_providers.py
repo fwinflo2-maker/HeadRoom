@@ -637,7 +637,7 @@ def test_headroom_provider_block_never_sets_requires_openai_auth(
 
     Bug 3 (#406): requires_openai_auth = true on a custom [model_providers.headroom]
     block forces codex to demand OpenAI OAuth login for headroom-routed traffic.
-    Headroom is a local proxy — it must not require OpenAI auth.
+    Headroom is a local proxy -- it must not require OpenAI auth.
     """
     for port in (8787, 9999):
         config_path = tmp_path / f"config_{port}.toml"
@@ -745,7 +745,7 @@ def test_unwrap_removes_top_level_openai_base_url(
         assert "openai_base_url" not in content, (
             f"openai_base_url must not remain in config.toml after unwrap; got:\n{content}"
         )
-    # Also verify via _strip_codex_headroom_blocks directly — the orphan-cleanup
+    # Also verify via _strip_codex_headroom_blocks directly -- the orphan-cleanup
     # path is exercised when there is no backup file (crash-recovery path).
     orphan_content = (
         'model = "gpt-4o"\n'
@@ -781,7 +781,7 @@ def test_apply_provider_scope_writes_openai_base_url(monkeypatch, tmp_path: Path
     assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in content, (
         f"openai_base_url missing from persistent-install config:\n{content}"
     )
-    # Must NOT be inside any [model_providers.*] block — the key must appear
+    # Must NOT be inside any [model_providers.*] block -- the key must appear
     # before the first [section] header that follows it.
     lines = content.splitlines()
     in_provider_section = False

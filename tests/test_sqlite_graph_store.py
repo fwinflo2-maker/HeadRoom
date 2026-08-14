@@ -37,6 +37,7 @@ class TestSQLiteGraphStoreEntityOperations:
         store = SQLiteGraphStore(db_path=db_path)
         yield store
         # Cleanup
+        store.close()
         if os.path.exists(db_path):
             os.unlink(db_path)
 
@@ -169,6 +170,7 @@ class TestSQLiteGraphStoreRelationshipOperations:
         yield store, alice, bob, charlie
 
         # Cleanup
+        store.close()
         if os.path.exists(db_path):
             os.unlink(db_path)
 
@@ -367,6 +369,7 @@ class TestSQLiteGraphStoreTraversal:
         yield store, {"A": a, "B": b, "C": c, "D": d, "E": e}
 
         # Cleanup
+        store.close()
         if os.path.exists(db_path):
             os.unlink(db_path)
 
@@ -469,6 +472,7 @@ class TestSQLiteGraphStoreUserManagement:
             db_path = f.name
         store = SQLiteGraphStore(db_path=db_path)
         yield store
+        store.close()
         if os.path.exists(db_path):
             os.unlink(db_path)
 
@@ -564,6 +568,8 @@ class TestSQLiteGraphStorePersistence:
             assert retrieved is not None
             assert retrieved.name == "Persistent"
         finally:
+            store1.close()
+            store2.close()
             if os.path.exists(db_path):
                 os.unlink(db_path)
 
@@ -596,6 +602,8 @@ class TestSQLiteGraphStorePersistence:
             assert len(rels) == 1
             assert rels[0].target_id == bob.id
         finally:
+            store1.close()
+            store2.close()
             if os.path.exists(db_path):
                 os.unlink(db_path)
 
@@ -610,6 +618,7 @@ class TestSQLiteGraphStoreMemoryStats:
             db_path = f.name
         store = SQLiteGraphStore(db_path=db_path, page_cache_size_kb=4096)
         yield store
+        store.close()
         if os.path.exists(db_path):
             os.unlink(db_path)
 
@@ -679,6 +688,7 @@ class TestSQLiteGraphStoreEdgeCases:
             db_path = f.name
         store = SQLiteGraphStore(db_path=db_path)
         yield store
+        store.close()
         if os.path.exists(db_path):
             os.unlink(db_path)
 
@@ -769,6 +779,7 @@ class TestSQLiteGraphStoreMemoryTrackerIntegration:
             db_path = f.name
         store = SQLiteGraphStore(db_path=db_path, page_cache_size_kb=4096)
         yield store
+        store.close()
         if os.path.exists(db_path):
             os.unlink(db_path)
 

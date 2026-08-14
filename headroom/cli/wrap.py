@@ -17,6 +17,8 @@ Usage:
     headroom wrap claude -- --model opus    # Pass args to claude
 """
 
+#  Copyright (c) 2026 Noel Kuntze
+
 from __future__ import annotations
 
 import errno
@@ -1553,7 +1555,8 @@ def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
     """
     import re
 
-    cfg = Path.home() / ".serena" / "serena_config.yml"
+    home = os.environ.get("HOME") or str(Path.home())
+    cfg = Path(home) / ".serena" / "serena_config.yml"
     key = "web_dashboard_open_on_launch"
     if not cfg.exists():
         # Let Serena bootstrap its own valid config; the MCP flag handles the popup.
@@ -1600,6 +1603,39 @@ def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
 # Injected only when Serena is the active code-memory engine (idempotent,
 # marker-guarded).
 _SERENA_MARKER = "<!-- headroom:serena-instructions -->"
+_CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
+_CONTEXT_TOOL_RTK = "rtk"
+_CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
+
+
+def _selected_context_tool() -> str:
+    """Return the configured optional context tool."""
+    value = os.environ.get(_CONTEXT_TOOL_ENV, "").strip().lower().replace("_", "-")
+    return _CONTEXT_TOOL_LEAN_CTX if value in {"lean-ctx", "leanctx"} else _CONTEXT_TOOL_RTK
+
+
+def _ensure_rtk_binary(verbose: bool = False) -> Path | None:
+    """Resolve the optional RTK binary without making setup mandatory."""
+    del verbose
+    try:
+        from headroom.rtk import get_rtk_path
+
+        return get_rtk_path()
+    except Exception:
+        return None
+
+
+def _setup_lean_ctx_agent(agent: str, verbose: bool = False) -> Path | None:
+    """Compatibility hook for the retired lean-ctx integration."""
+    del agent, verbose
+    return None
+
+
+def _inject_rtk_instructions(file_path: Path, verbose: bool = False) -> bool:
+    """Best-effort RTK instruction hook retained for wrapper compatibility."""
+    del file_path, verbose
+    return True
+
 
 SERENA_INSTRUCTIONS_BLOCK = """\
 <!-- headroom:serena-instructions -->
@@ -3416,6 +3452,61 @@ def _push_runtime_env(port: int, no_proxy: bool) -> None:
     click.echo(f"  Synced output settings to proxy: {', '.join(sorted(payload))}")
 
 
+def _reap_orphaned_proxy(port: int) -> bool:
+    """Reap a wrap-started proxy left behind by an abruptly-killed wrapper.
+
+    A wrapper that is SIGKILLed (or crashes) never runs its cleanup, so the
+    proxy it started keeps listening on ``port`` forever — an orphan. This
+    reaps it, but only when it is *provably* safe to do so:
+
+      * The proxy must identify itself as wrap-started (``config.stack``
+        starts with ``wrap_``). A manually-started ``headroom proxy`` is
+        never touched.
+      * It must have no live wrap-client markers (``_live_proxy_clients``
+        prunes stale ones, so a dead wrapper's marker does not protect it).
+      * It must have no active sessions (``_proxy_active_session_count``).
+      * It must not be a persistent deployment (``_find_persistent_manifest``)
+        — those are owned by a supervisor and must not be killed here.
+
+    Returns True if a proxy was reaped, False otherwise. Best-effort: any
+    failure to identify or stop the proxy leaves it running rather than
+    risking a false kill.
+    """
+    if not _check_proxy(port):
+        return False
+    if _find_persistent_manifest(port) is not None:
+        return False
+    if _live_proxy_clients(port, exclude_self=True):
+        return False
+
+    health_payload = _query_proxy_health(port)
+    running_config = _proxy_health_config(health_payload)
+    if running_config is None:
+        running_config = _query_proxy_config(port)
+    if running_config is None:
+        return False
+    if not str(running_config.get("stack") or "").startswith("wrap_"):
+        return False
+    if _proxy_active_session_count(health_payload) > 0:
+        return False
+
+    proxy_pid = running_config.get("pid")
+    if proxy_pid is None:
+        return False
+    try:
+        pid = int(proxy_pid)
+    except (TypeError, ValueError):
+        return False
+
+    if _kill_proxy_by_pid(pid, port):
+        click.echo(
+            f"  Reaped orphaned proxy (PID {pid}) on port {port} left behind "
+            "by an abruptly-exited wrapper."
+        )
+        return True
+    return False
+
+
 def _ensure_proxy(
     port: int,
     no_proxy: bool,
@@ -3601,134 +3692,144 @@ def _ensure_proxy(
             )
 
         if not isolated_copilot_subscription_proxy and helpers._check_proxy(port):
-            # Proxy is running — check if it has the features we need
-            needs_restart = False
-            health_payload = helpers._query_proxy_health(port)
-            running_config = helpers._proxy_health_config(health_payload)
-            if running_config is None:
-                running_config = helpers._query_proxy_config(port)
+            # Reap a wrap-started proxy left behind by an abruptly-killed
+            # wrapper (SIGKILL / crash runs no cleanup). Only kills when the
+            # proxy identifies as wrap-started AND has no live clients, no
+            # active sessions, and no persistent manifest — so a manually
+            # started `headroom proxy` or a busy shared proxy is never touched.
+            # After a successful reap the port is free and we fall through to
+            # start a fresh proxy below.
+            if helpers._reap_orphaned_proxy(port):
+                click.echo(f"  Starting a fresh proxy on port {port}...")
+            else:
+                # Proxy is running — check if it has the features we need
+                needs_restart = False
+                health_payload = helpers._query_proxy_health(port)
+                running_config = helpers._proxy_health_config(health_payload)
+                if running_config is None:
+                    running_config = helpers._query_proxy_config(port)
 
-            if helpers._proxy_needs_version_restart(health_payload):
-                running_version = helpers._proxy_version(health_payload) or "unknown"
-                active_sessions = helpers._proxy_active_session_count(health_payload)
-                other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
-                if active_sessions > 0 or other_wrappers:
-                    # active_sessions only counts Codex WebSocket relay; the
-                    # marker list also covers HTTP wrap clients. Either means a
-                    # live session is attached, so don't restart the shared
-                    # proxy out from under it — defer until idle.
-                    detail = (
-                        f"{active_sessions} active session(s)"
-                        if active_sessions > 0
-                        else f"{len(other_wrappers)} attached wrapper(s)"
-                    )
+                if helpers._proxy_needs_version_restart(health_payload):
+                    running_version = helpers._proxy_version(health_payload) or "unknown"
+                    active_sessions = helpers._proxy_active_session_count(health_payload)
+                    other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
+                    if active_sessions > 0 or other_wrappers:
+                        # active_sessions only counts Codex WebSocket relay; the
+                        # marker list also covers HTTP wrap clients. Either means a
+                        # live session is attached, so don't restart the shared
+                        # proxy out from under it — defer until idle.
+                        detail = (
+                            f"{active_sessions} active session(s)"
+                            if active_sessions > 0
+                            else f"{len(other_wrappers)} attached wrapper(s)"
+                        )
+                        click.echo(
+                            f"  Proxy on port {port} is running Headroom {running_version}; "
+                            f"current CLI is {_HEADROOM_VERSION}."
+                        )
+                        click.echo(
+                            f"  Leaving it running because {detail} "
+                            "are still attached; it will be restarted when idle."
+                        )
+                        return None, port
+
                     click.echo(
                         f"  Proxy on port {port} is running Headroom {running_version}; "
-                        f"current CLI is {_HEADROOM_VERSION}."
+                        f"restarting with {_HEADROOM_VERSION}..."
                     )
-                    click.echo(
-                        f"  Leaving it running because {detail} "
-                        "are still attached; it will be restarted when idle."
-                    )
-                    return None, port
-
-                click.echo(
-                    f"  Proxy on port {port} is running Headroom {running_version}; "
-                    f"restarting with {_HEADROOM_VERSION}..."
-                )
-                proxy_pid = running_config.get("pid") if running_config is not None else None
-                if proxy_pid is None:
-                    raise click.ClickException(
-                        f"Proxy on port {port} is stale but did not expose a PID. "
-                        "Stop it manually and retry."
-                    )
-                if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
-                    raise click.ClickException(
-                        f"Failed to stop stale proxy (PID {proxy_pid}) on port {port}. "
-                        "Stop it manually and retry."
-                    )
-                needs_restart = True
-
-            if running_config is not None:
-                missing = []
-                if memory and not running_config.get("memory"):
-                    missing.append("memory")
-                if learn and not running_config.get("learn"):
-                    missing.append("learn")
-                if code_graph and not running_config.get("code_graph"):
-                    missing.append("code_graph")
-                if copilot_subscription_seed_requested:
-                    missing.append("copilot-subscription-auth")
-                expected_savings_profile = helpers._wrap_agent_savings_profile(agent_type)
-                if (
-                    expected_savings_profile is not None
-                    and running_config.get("savings_profile") != expected_savings_profile
-                ):
-                    missing.append("savings-profile")
-                if openai_api_url:
-                    running_openai_url = _normalize_proxy_api_url(
-                        running_config.get("openai_api_url")
-                    )
-                    requested_openai_url = _normalize_proxy_api_url(openai_api_url)
-                    if running_openai_url != requested_openai_url:
-                        missing.append("openai-api-url")
-                if vertex_api_url or clear_vertex_api_url:
-                    running_vertex_url = _normalize_proxy_api_url(
-                        running_config.get("vertex_api_url")
-                    )
-                    requested_vertex_url = _normalize_proxy_api_url(vertex_api_url)
-                    if running_vertex_url != requested_vertex_url:
-                        missing.append("vertex-api-url")
-
-                if missing:
-                    flags_str = ", ".join(
-                        f if f.startswith("--") else f"--{f.replace('_', '-')}" for f in missing
-                    )
-                    other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
-                    if other_wrappers:
-                        # Another wrapper is attached to this proxy; restarting it
-                        # to add flags would drop their in-flight requests. Reuse
-                        # the running proxy as-is rather than disrupt them.
-                        click.echo(
-                            f"  Proxy on port {port} is missing: {flags_str}, but "
-                            f"{len(other_wrappers)} other wrapper(s) are attached."
+                    proxy_pid = running_config.get("pid") if running_config is not None else None
+                    if proxy_pid is None:
+                        raise click.ClickException(
+                            f"Proxy on port {port} is stale but did not expose a PID. "
+                            "Stop it manually and retry."
                         )
-                        click.echo(
-                            "  Leaving it running to avoid disrupting them; this "
-                            "session will use the existing proxy as-is."
+                    if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
+                        raise click.ClickException(
+                            f"Failed to stop stale proxy (PID {proxy_pid}) on port {port}. "
+                            "Stop it manually and retry."
                         )
-                    else:
-                        needs_restart = True
-                        click.echo(f"  Proxy on port {port} is missing: {flags_str}")
-                        click.echo("  Restarting proxy with upgraded configuration...")
+                    needs_restart = True
 
-                        # Merge: keep features the running proxy already has
-                        memory = memory or bool(running_config.get("memory"))
-                        learn = learn or bool(running_config.get("learn"))
-                        code_graph = code_graph or bool(running_config.get("code_graph"))
+                if running_config is not None:
+                    missing = []
+                    if memory and not running_config.get("memory"):
+                        missing.append("memory")
+                    if learn and not running_config.get("learn"):
+                        missing.append("learn")
+                    if code_graph and not running_config.get("code_graph"):
+                        missing.append("code_graph")
+                    if copilot_subscription_seed_requested:
+                        missing.append("copilot-subscription-auth")
+                    expected_savings_profile = helpers._wrap_agent_savings_profile(agent_type)
+                    if (
+                        expected_savings_profile is not None
+                        and running_config.get("savings_profile") != expected_savings_profile
+                    ):
+                        missing.append("savings-profile")
+                    if openai_api_url:
+                        running_openai_url = _normalize_proxy_api_url(
+                            running_config.get("openai_api_url")
+                        )
+                        requested_openai_url = _normalize_proxy_api_url(openai_api_url)
+                        if running_openai_url != requested_openai_url:
+                            missing.append("openai-api-url")
+                    if vertex_api_url or clear_vertex_api_url:
+                        running_vertex_url = _normalize_proxy_api_url(
+                            running_config.get("vertex_api_url")
+                        )
+                        requested_vertex_url = _normalize_proxy_api_url(vertex_api_url)
+                        if running_vertex_url != requested_vertex_url:
+                            missing.append("vertex-api-url")
 
-                        proxy_pid = running_config.get("pid")
-                        if proxy_pid is not None:
-                            if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
-                                raise click.ClickException(
-                                    f"Failed to stop existing proxy (PID {proxy_pid}) on port {port}. "
-                                    "Stop it manually and retry."
-                                )
+                    if missing:
+                        flags_str = ", ".join(
+                            f if f.startswith("--") else f"--{f.replace('_', '-')}" for f in missing
+                        )
+                        other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
+                        if other_wrappers:
+                            # Another wrapper is attached to this proxy; restarting it
+                            # to add flags would drop their in-flight requests. Reuse
+                            # the running proxy as-is rather than disrupt them.
+                            click.echo(
+                                f"  Proxy on port {port} is missing: {flags_str}, but "
+                                f"{len(other_wrappers)} other wrapper(s) are attached."
+                            )
+                            click.echo(
+                                "  Leaving it running to avoid disrupting them; this "
+                                "session will use the existing proxy as-is."
+                            )
                         else:
-                            click.echo(
-                                "  Warning: Running proxy does not expose PID. "
-                                "Cannot restart automatically."
-                            )
-                            click.echo(
-                                f"  Please stop the proxy on port {port} manually "
-                                f"and rerun with {flags_str}."
-                            )
-                            return None, port
+                            needs_restart = True
+                            click.echo(f"  Proxy on port {port} is missing: {flags_str}")
+                            click.echo("  Restarting proxy with upgraded configuration...")
 
-            if not needs_restart:
-                click.echo(f"  Proxy already running on port {port}")
-                click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
-                return None, port
+                            # Merge: keep features the running proxy already has
+                            memory = memory or bool(running_config.get("memory"))
+                            learn = learn or bool(running_config.get("learn"))
+                            code_graph = code_graph or bool(running_config.get("code_graph"))
+
+                            proxy_pid = running_config.get("pid")
+                            if proxy_pid is not None:
+                                if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
+                                    raise click.ClickException(
+                                        f"Failed to stop existing proxy (PID {proxy_pid}) on port {port}. "
+                                        "Stop it manually and retry."
+                                    )
+                            else:
+                                click.echo(
+                                    "  Warning: Running proxy does not expose PID. "
+                                    "Cannot restart automatically."
+                                )
+                                click.echo(
+                                    f"  Please stop the proxy on port {port} manually "
+                                    f"and rerun with {flags_str}."
+                                )
+                                return None, port
+
+                if not needs_restart:
+                    click.echo(f"  Proxy already running on port {port}")
+                    click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
+                    return None, port
 
         # Start (or restart) the proxy with the requested flags.
         # Subscription-seeded sessions must not claim the shared port even if
@@ -3738,7 +3839,13 @@ def _ensure_proxy(
         try:
             actual_port = helpers._find_available_port(port_search_start)
         except OSError as e:
-            raise click.ClickException(f"Port {port} is unavailable: {e}") from e
+            detail = f"Port {port} is unavailable: {e}"
+            if sys.platform == "win32":
+                detail += (
+                    " (Windows may reserve this port; try another port, e.g. "
+                    f"headroom wrap {agent_type} --port {port + 1}.)"
+                )
+            raise click.ClickException(detail) from e
         except RuntimeError as e:
             raise click.ClickException(str(e)) from e
 
@@ -6883,7 +6990,7 @@ def openclaw(
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--prepare-only", is_flag=True, hidden=True)
 @click.argument("opencode_args", nargs=-1, type=click.UNPROCESSED)
-def opencode(
+def opencode(  # noqa: F811 — overrides the simpler legacy opencode above
     port: int,
     no_mcp: bool,
     no_serena: bool,
@@ -6916,6 +7023,12 @@ def opencode(
         headroom wrap opencode --backend anyllm --anyllm-provider groq
         headroom wrap opencode --copilot-subscription # Use a GitHub Copilot subscription
     """
+    # Deprecated wrapper flags may arrive in the pass-through tuple when Click
+    # sees them after the command separator; never forward them to OpenCode.
+    opencode_args = tuple(
+        arg for arg in opencode_args if arg not in {"--no-rtk", "--no-context-tool"}
+    )
+
     subscription_resolution = None
     if copilot_subscription:
         effective_backend = backend or os.environ.get("HEADROOM_BACKEND")

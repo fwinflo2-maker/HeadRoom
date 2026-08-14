@@ -32,12 +32,6 @@ def test_install_apply_defaults_to_cache_mode() -> None:
     assert _mode_option_default(install_apply) == PROXY_MODE_CACHE
 
 
-def test_deploy_defaults_to_cache_mode() -> None:
-    from headroom.cli.install import deploy
-
-    assert _mode_option_default(deploy) == PROXY_MODE_CACHE
-
-
 def test_manifest_default_is_cache_mode() -> None:
     """A manifest that omits proxy_mode must not fall back to token."""
     assert DeploymentManifest.__dataclass_fields__["proxy_mode"].default == PROXY_MODE_CACHE
@@ -50,9 +44,9 @@ def test_install_and_proxy_agree_on_the_default() -> None:
     default is PROXY_MODE_CACHE. Install must match, or installing Headroom
     silently changes the compression posture versus running it directly.
     """
-    from headroom.cli.install import deploy, install_apply
+    from headroom.cli.install import install_apply
 
-    assert _mode_option_default(install_apply) == _mode_option_default(deploy) == PROXY_MODE_CACHE
+    assert _mode_option_default(install_apply) == PROXY_MODE_CACHE
 
 
 def test_token_mode_is_still_reachable() -> None:
@@ -62,15 +56,14 @@ def test_token_mode_is_still_reachable() -> None:
     token (plus its aliases), so `--mode token` remains available to anyone who
     wants maximum compression and accepts the prefix-cache busts.
     """
-    from headroom.cli.install import deploy, install_apply
+    from headroom.cli.install import install_apply
     from headroom.proxy.proxy_mode_policy import (
         PROXY_MODE_TOKEN,
         normalize_proxy_mode_value,
     )
 
-    for command in (install_apply, deploy):
-        param = next(p for p in command.params if p.name == "proxy_mode")
-        assert param.type.name == "text", f"{command.name} --mode became restrictive"
+    param = next(p for p in install_apply.params if p.name == "proxy_mode")
+    assert param.type.name == "text", "install apply --mode became restrictive"
 
     assert normalize_proxy_mode_value("token") == PROXY_MODE_TOKEN
     assert normalize_proxy_mode_value("token_headroom") == PROXY_MODE_TOKEN

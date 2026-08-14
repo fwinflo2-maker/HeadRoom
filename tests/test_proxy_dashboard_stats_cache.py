@@ -176,7 +176,7 @@ def test_dashboard_uses_cached_stats_and_lazy_history_feed_polling() -> None:
     html = get_dashboard_html()
 
     assert "fetch('/stats?cached=1')" in html
-    assert "statsPollMs: 15000" in html
+    assert "statsPollMs: 5000" in html
     assert "viewRefreshers:" in html
     assert "this.refreshActiveView(force)" in html
     assert "version: 'loading'" in html

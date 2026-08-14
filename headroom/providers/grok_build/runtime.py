@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from headroom.proxy.project_context import with_project_prefix
-
 
 def proxy_base_url(port: int) -> str:
     """Return the local proxy base URL for OpenAI-compatible Grok traffic."""
@@ -26,6 +24,8 @@ def build_proxy_targets(port: int, project: str | None = None) -> GrokBuildProxy
     base-URL prefix because Grok cannot send custom headers; the proxy
     strips it and attributes savings per project.
     """
+    from headroom.proxy.project_context import with_project_prefix
+
     return GrokBuildProxyTarget(
         base_url=with_project_prefix(proxy_base_url(port), project),
     )

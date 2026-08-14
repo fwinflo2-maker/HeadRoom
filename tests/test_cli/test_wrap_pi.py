@@ -33,6 +33,13 @@ def test_wrap_pi_launches_with_transient_provider_extension(
         args = kwargs["args"]
         assert isinstance(args, tuple)
         captured["extension_source"] = Path(args[1]).read_text(encoding="utf-8")
+        configure_launch = kwargs["configure_launch"]
+        fallback_args, _env, fallback_display = configure_launch(
+            9001, args, kwargs["env"], kwargs["env_vars_display"]
+        )
+        captured["fallback_args"] = fallback_args
+        captured["fallback_display"] = fallback_display
+        captured["fallback_extension_source"] = Path(fallback_args[1]).read_text(encoding="utf-8")
 
     with patch.object(wrap_mod.shutil, "which", return_value="pi"):
         with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
@@ -59,6 +66,12 @@ def test_wrap_pi_launches_with_transient_provider_extension(
     assert '"baseUrl": "http://127.0.0.1:9000/v1"' in extension_source
     assert '"X-Headroom-Project":' in extension_source
     assert tmp_path.name in extension_source
+
+    fallback_source = captured["fallback_extension_source"]
+    assert isinstance(fallback_source, str)
+    assert '"baseUrl": "http://127.0.0.1:9001"' in fallback_source
+    assert '"baseUrl": "http://127.0.0.1:9001/v1"' in fallback_source
+    assert any("127.0.0.1:9001" in line for line in captured["fallback_display"])
 
     assert not (tmp_path / "AGENTS.md").exists()
 

@@ -38,6 +38,29 @@ def test_write_preserves_other_env_keys(tmp_path: Path) -> None:
     assert payload["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8787"
 
 
+def test_tool_search_write_and_restore_reaches_daemon_worker_settings(tmp_path: Path) -> None:
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"env": {"ENABLE_TOOL_SEARCH": "true", "KEEP": "1"}}),
+        encoding="utf-8",
+    )
+
+    previous = wrap_cli._write_claude_wrap_tool_search("false", settings_path=path)
+
+    assert previous == "true"
+    assert json.loads(path.read_text(encoding="utf-8"))["env"] == {
+        "ENABLE_TOOL_SEARCH": "false",
+        "KEEP": "1",
+    }
+
+    wrap_cli._restore_claude_wrap_tool_search(previous, settings_path=path)
+    assert json.loads(path.read_text(encoding="utf-8"))["env"] == {
+        "ENABLE_TOOL_SEARCH": "true",
+        "KEEP": "1",
+    }
+
+
 def test_write_returns_none_when_key_absent(tmp_path: Path) -> None:
     path = _settings(tmp_path)
     prev = wrap_cli._write_claude_wrap_base_url("http://127.0.0.1:8787", settings_path=path)
@@ -301,6 +324,10 @@ def test_wrap_claude_project_settings_flag_writes_and_restores(tmp_path: Path) -
                 "headroom.cli.wrap._write_claude_wrap_base_url", return_value="old"
             ) as write_mock,
             patch("headroom.cli.wrap._restore_claude_wrap_base_url") as restore_mock,
+            patch(
+                "headroom.cli.wrap._write_claude_wrap_tool_search", return_value="old-tool-search"
+            ) as write_tool_search_mock,
+            patch("headroom.cli.wrap._restore_claude_wrap_tool_search") as restore_tool_search_mock,
             patch("headroom.cli.wrap._ensure_claude_wrap_selfheal_hook") as selfheal_mock,
             patch("headroom.cli.wrap.subprocess.run", return_value=completed),
         ):
@@ -326,6 +353,12 @@ def test_wrap_claude_project_settings_flag_writes_and_restores(tmp_path: Path) -
         assert write_kwargs["settings_path"].name == "settings.local.json"
         assert write_kwargs["settings_path"].parent.name == ".claude"
         selfheal_mock.assert_called_once_with(write_kwargs["settings_path"])
+        write_tool_search_mock.assert_called_once_with(
+            "true", settings_path=write_kwargs["settings_path"]
+        )
+        restore_tool_search_mock.assert_called_once_with(
+            "old-tool-search", settings_path=write_kwargs["settings_path"]
+        )
         restore_mock.assert_called_once_with(
             "old",
             foundry_mode=False,

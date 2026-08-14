@@ -130,7 +130,7 @@ def test_openai_responses_preflight_skips_executor_for_below_floor_output():
     assert attempted == 0
 
 
-def test_openai_responses_preflight_compresses_oversized_output_without_executor(
+def test_openai_responses_preflight_compresses_oversized_output_on_single_executor(
     monkeypatch,
 ):
     reset_compression_store()
@@ -153,10 +153,14 @@ def test_openai_responses_preflight_compresses_oversized_output_without_executor
         ],
     }
 
-    async def must_not_submit(*_args, **_kwargs):
-        raise AssertionError("oversized-only Responses payload should not enter executor")
+    submissions = 0
 
-    handler._run_compression_in_executor = must_not_submit
+    async def run_bounded(fn, **_kwargs):
+        nonlocal submissions
+        submissions += 1
+        return fn()
+
+    handler._run_compression_in_executor = run_bounded
 
     async def run():
         return await handler._compress_openai_responses_payload_in_executor(
@@ -179,6 +183,7 @@ def test_openai_responses_preflight_compresses_oversized_output_without_executor
     assert "Retrieve more: hash=" in compressed_output
     assert "openai:responses:large_text_ccr" in transforms
     assert "compression_inline_live_text" in timing
+    assert submissions == 1
 
 
 def test_openai_responses_preflight_does_not_call_stuck_router(monkeypatch):
@@ -201,10 +206,14 @@ def test_openai_responses_preflight_does_not_call_stuck_router(monkeypatch):
         ],
     }
 
-    async def must_not_submit(*_args, **_kwargs):
-        raise AssertionError("Responses live output should not enter proxy executor")
+    submissions = 0
 
-    handler._run_compression_in_executor = must_not_submit
+    async def run_bounded(fn, **_kwargs):
+        nonlocal submissions
+        submissions += 1
+        return fn()
+
+    handler._run_compression_in_executor = run_bounded
 
     async def run():
         with anyio.fail_after(1):
@@ -228,6 +237,7 @@ def test_openai_responses_preflight_does_not_call_stuck_router(monkeypatch):
     assert "Retrieve more: hash=" in compressed_output
     assert "openai:responses:large_text_ccr" in transforms
     assert "compression_inline_live_text" in timing
+    assert submissions == 1
 
 
 def test_openai_responses_preflight_compresses_medium_output_without_router():
@@ -251,10 +261,14 @@ def test_openai_responses_preflight_compresses_medium_output_without_router():
         ],
     }
 
-    async def must_not_submit(*_args, **_kwargs):
-        raise AssertionError("Responses live output should not enter proxy executor")
+    submissions = 0
 
-    handler._run_compression_in_executor = must_not_submit
+    async def run_bounded(fn, **_kwargs):
+        nonlocal submissions
+        submissions += 1
+        return fn()
+
+    handler._run_compression_in_executor = run_bounded
 
     async def run():
         with anyio.fail_after(1):
@@ -285,6 +299,7 @@ def test_openai_responses_preflight_compresses_medium_output_without_router():
     assert entry.original_content == original_output
     assert entry.tool_call_id == "call-medium"
     assert "compression_inline_live_text" in timing
+    assert submissions == 1
 
 
 def test_openai_responses_unit_cache_evicts_oldest_entry(monkeypatch):

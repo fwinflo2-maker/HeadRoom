@@ -14,6 +14,7 @@ Tests verify:
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 
 import pytest
@@ -24,6 +25,20 @@ from headroom.memory.adapters.graph_models import (
     RelationshipDirection,
 )
 from headroom.memory.adapters.sqlite_graph import SQLiteGraphStore
+
+
+@pytest.mark.asyncio
+async def test_read_only_store_queries_without_permitting_mutation(tmp_path) -> None:
+    db_path = tmp_path / "graph.db"
+    writable = SQLiteGraphStore(db_path)
+    entity = Entity(user_id="user1", name="Existing", entity_type="test")
+    await writable.add_entity(entity)
+
+    read_only = SQLiteGraphStore(db_path, initialize=False, read_only=True)
+    assert [item.id for item in await read_only.get_entities_for_user("user1")] == [entity.id]
+
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+        await read_only.add_entity(Entity(user_id="user1", name="Blocked", entity_type="test"))
 
 
 class TestSQLiteGraphStoreEntityOperations:

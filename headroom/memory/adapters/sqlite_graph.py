@@ -58,6 +58,8 @@ class SQLiteGraphStore:
         self,
         db_path: str | Path = "headroom_graph.db",
         page_cache_size_kb: int = 8192,  # 8MB default cache
+        initialize: bool = True,
+        read_only: bool = False,
     ) -> None:
         """Initialize the SQLite graph store.
 
@@ -65,11 +67,19 @@ class SQLiteGraphStore:
             db_path: Path to SQLite database file. Created if it doesn't exist.
             page_cache_size_kb: SQLite page cache size in KB. Higher = more memory,
                               faster queries. Set to -1 for default SQLite behavior.
+            initialize: Create or migrate graph tables and indexes. Read-only
+                        consumers of an existing graph can disable this.
+            read_only: Open the database with SQLite ``mode=ro``. This requires
+                       ``initialize=False`` and an existing database.
         """
         self.db_path = Path(db_path)
         self._page_cache_size_kb = page_cache_size_kb
+        self._read_only = read_only
         self._lock = RLock()
-        self._init_db()
+        if initialize and read_only:
+            raise ValueError("read_only=True requires initialize=False")
+        if initialize:
+            self._init_db()
 
     def _get_conn(self) -> sqlite3.Connection:
         """Get a new database connection (thread-safe pattern).
@@ -77,7 +87,12 @@ class SQLiteGraphStore:
         Returns:
             A new SQLite connection with row factory configured.
         """
-        conn = sqlite3.connect(str(self.db_path))
+        target = (
+            f"{self.db_path.expanduser().resolve().as_uri()}?mode=ro"
+            if self._read_only
+            else str(self.db_path)
+        )
+        conn = sqlite3.connect(target, uri=self._read_only)
         conn.row_factory = sqlite3.Row
 
         # Configure page cache size (negative = KB, positive = pages)

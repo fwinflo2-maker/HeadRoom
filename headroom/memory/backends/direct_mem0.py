@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import logging
 import uuid
 from collections import OrderedDict
@@ -155,6 +156,7 @@ class DirectMem0Adapter:
         """
         self._config = config or Mem0Config()
         self._mem0_client: Any = None
+        self._openai_client: Any = None
         self._embedder: Any = None
         self._neo4j_graph: Any = None
         self._neo4j_driver: Any = None
@@ -165,6 +167,7 @@ class DirectMem0Adapter:
         # Background task tracking
         self._background_tasks: dict[str, asyncio.Task[Memory]] = {}
         self._task_results: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
+        self._close_lock = asyncio.Lock()
 
     async def _ensure_initialized(self) -> None:
         """Ensure all clients are initialized."""
@@ -342,19 +345,17 @@ class DirectMem0Adapter:
         return f"task_{uuid.uuid4().hex[:12]}"
 
     def _prune_task_results(self, now: float | None = None) -> None:
-        """Remove expired task results and enforce the retention limit."""
+        """Expire old outcomes and keep completed-task retention bounded."""
         current_time = monotonic() if now is None else now
         while self._task_results:
             _task_id, (completed_at, _result) = next(iter(self._task_results.items()))
             if completed_at + _TASK_RESULT_TTL_SECONDS > current_time:
                 break
             self._task_results.popitem(last=False)
-
         while len(self._task_results) > _MAX_TASK_RESULTS:
             self._task_results.popitem(last=False)
 
     def _store_task_result(self, task_id: str, result: dict[str, Any]) -> None:
-        """Store a completed task result with bounded, time-limited retention."""
         completed_at = monotonic()
         self._prune_task_results(completed_at)
         self._task_results[task_id] = (completed_at, result)
@@ -365,31 +366,22 @@ class DirectMem0Adapter:
         task_id: str,
         task: asyncio.Future[Memory],
     ) -> None:
-        """Capture a background save outcome and release the task reference."""
+        """Capture an outcome immediately and release the completed task."""
         if self._background_tasks.get(task_id) is not task:
             return
-
         del self._background_tasks[task_id]
         if task.cancelled():
             self._store_task_result(task_id, {"status": "cancelled"})
             return
-
         try:
             result = task.result()
         except Exception as error:
             logger.warning("DirectMem0 background save failed task_id=%s: %s", task_id, error)
-            self._store_task_result(
-                task_id,
-                {"status": "failed", "error": str(error)},
-            )
+            self._store_task_result(task_id, {"status": "failed", "error": str(error)})
         else:
-            self._store_task_result(
-                task_id,
-                {"status": "completed", "result": result},
-            )
+            self._store_task_result(task_id, {"status": "completed", "result": result})
 
     def _track_background_task(self, task_id: str, task: asyncio.Task[Memory]) -> None:
-        """Track a background save until its completion callback runs."""
         self._background_tasks[task_id] = task
         task.add_done_callback(
             lambda completed_task: self._handle_background_task_done(task_id, completed_task)
@@ -443,6 +435,9 @@ class DirectMem0Adapter:
 
         task = self._background_tasks[task_id]
         try:
+            # A timeout must not cancel a save that may be awaiting
+            # ``asyncio.to_thread``.  Cancelling the asyncio task does not stop
+            # the underlying worker, and would hide that worker from close().
             await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
             return self.get_task_status(task_id)
         except asyncio.TimeoutError:
@@ -450,11 +445,11 @@ class DirectMem0Adapter:
         except Exception:
             return self.get_task_status(task_id)
 
-    async def flush_pending(self, timeout: float | None = 60.0) -> dict[str, Any]:
+    async def flush_pending(self, timeout: float = 60.0) -> dict[str, Any]:
         """Wait for all pending background tasks to complete.
 
         Args:
-            timeout: Maximum seconds to wait for all tasks, or None to wait indefinitely.
+            timeout: Maximum seconds to wait for all tasks.
 
         Returns:
             Summary of completed and failed tasks.
@@ -468,13 +463,14 @@ class DirectMem0Adapter:
         try:
             done, pending = await asyncio.wait(tasks, timeout=timeout)
 
-            completed = sum(1 for task in done if not task.cancelled() and task.exception() is None)
-            failed = len(done) - completed
-
+            completed = 0
+            failed = 0
             for task_id in task_ids:
-                task = self._background_tasks.get(task_id)
-                if task is not None and task.done():
-                    self._handle_background_task_done(task_id, task)
+                status = self.get_task_status(task_id)
+                if status["status"] == "completed":
+                    completed += 1
+                elif status["status"] == "failed":
+                    failed += 1
 
             return {
                 "completed": completed,
@@ -629,10 +625,9 @@ class DirectMem0Adapter:
         Returns:
             Memory object if sync, or dict with task_id if async/background.
         """
-        await self._ensure_initialized()
-
         if self._closing:
             raise RuntimeError("DirectMem0 adapter is closing")
+        await self._ensure_initialized()
 
         # Determine if we should run in background
         run_in_background = background if background is not None else self._config.async_writes
@@ -1007,16 +1002,65 @@ class DirectMem0Adapter:
         """Whether this backend supports vector search."""
         return True
 
-    async def close(self) -> None:
-        """Close connections and release resources."""
-        self._closing = True
-        try:
-            await self.flush_pending(timeout=None)
-            self._background_tasks.clear()
-            self._task_results.clear()
-            if self._neo4j_driver:
-                self._neo4j_driver.close()
-            self._mem0_client = None
-            self._initialized = False
-        finally:
-            self._closing = False
+    async def close(self, timeout: float = 60.0) -> None:
+        """Drain background writes and close all initialized resources.
+
+        Args:
+            timeout: Maximum seconds to wait for background writes to finish.
+
+        Raises:
+            TimeoutError: If background writes have not quiesced within
+                ``timeout``.  Tasks remain tracked and resources remain open so
+                callers can retry after the writes finish.
+        """
+        # Concurrent shutdown callers must observe one lifecycle transition.
+        # In particular, a second caller must not detach resources while the
+        # first is still waiting for executor-backed writes to quiesce.
+        async with self._close_lock:
+            self._closing = True
+            try:
+                if self._background_tasks:
+                    task_items = list(self._background_tasks.items())
+                    tasks = [task for _, task in task_items]
+                    _, pending = await asyncio.wait(tasks, timeout=timeout)
+
+                    if pending:
+                        pending_ids = [task_id for task_id, task in task_items if task in pending]
+                        raise TimeoutError(
+                            "Timed out waiting for DirectMem0 background writes: "
+                            + ", ".join(pending_ids)
+                        )
+
+                    for task_id, task in task_items:
+                        self._handle_background_task_done(task_id, task)
+
+                resources = [
+                    ("Mem0 client", self._mem0_client),
+                    ("OpenAI client", self._openai_client),
+                    ("Qdrant client", self._qdrant_client),
+                    ("Neo4j driver", self._neo4j_driver),
+                    ("embedder", self._embedder),
+                    ("Neo4j graph", self._neo4j_graph),
+                ]
+                self._mem0_client = None
+                self._openai_client = None
+                self._qdrant_client = None
+                self._neo4j_driver = None
+                self._embedder = None
+                self._neo4j_graph = None
+                self._initialized = False
+
+                for name, resource in resources:
+                    if resource is None:
+                        continue
+                    close = getattr(resource, "close", None) or getattr(resource, "aclose", None)
+                    if close is None:
+                        continue
+                    try:
+                        result = close()
+                        if inspect.isawaitable(result):
+                            await result
+                    except Exception as e:
+                        logger.warning("Failed to close %s: %s", name, e)
+            finally:
+                self._closing = False

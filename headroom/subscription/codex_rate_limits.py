@@ -96,10 +96,10 @@ class CodexRateLimitWindow:
     def to_dict(self) -> dict:
         return {
             "used_percent": self.used_percent,
-            "window_minutes": self.window_minutes,
+            "window_minutes": self.window_minutes or 0,
             "window_label": self.window_label,
-            "resets_at": self.resets_at,
-            "seconds_until_reset": self.seconds_until_reset,
+            "resets_at": self.resets_at or 0,
+            "seconds_until_reset": self.seconds_until_reset or 0,
         }
 
 
@@ -115,7 +115,7 @@ class CodexCreditsSnapshot:
         return {
             "has_credits": self.has_credits,
             "unlimited": self.unlimited,
-            "balance": self.balance,
+            "balance": self.balance or "",
         }
 
 
@@ -134,11 +134,11 @@ class CodexRateLimitSnapshot:
     def to_dict(self) -> dict:
         return {
             "limit_id": self.limit_id,
-            "limit_name": self.limit_name,
-            "primary": self.primary.to_dict() if self.primary else None,
-            "secondary": self.secondary.to_dict() if self.secondary else None,
-            "credits": self.credits.to_dict() if self.credits else None,
-            "promo_message": self.promo_message,
+            "limit_name": self.limit_name or "",
+            "primary": self.primary.to_dict() if self.primary else {},
+            "secondary": self.secondary.to_dict() if self.secondary else {},
+            "credits": self.credits.to_dict() if self.credits else {},
+            "promo_message": self.promo_message or "",
             "captured_at": self.captured_at,
         }
 

@@ -119,8 +119,12 @@ class RequestOutcome:
     status_code: int = 200
 
     # ── Timing ────────────────────────────────────────────────────────
-    # total_latency_ms: wall-clock end-to-end for this request
-    # overhead_ms: time spent in compression dispatch only (subset of total)
+    # total_latency_ms: wall-clock end-to-end from handler entry through
+    #     upstream API round-trip to response ready for client forwarding.
+    # overhead_ms: subset — time spent in pre-upstream processing only
+    #     (request read, JSON parse, tokenization, compression routing,
+    #     CCR/memory injection, pipeline extensions).
+    #   → upstream inference time ≈ total_latency_ms - overhead_ms
     # ttfb_ms: time to first upstream byte for streaming paths; 0 for
     #     non-streaming or when unmeasured (no None — convention is 0)
     # pipeline_timing: optional per-stage breakdown surfaced on dashboards
@@ -423,6 +427,19 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     #    beacon must never add latency to, or take down, the request path.
     record_outcome(outcome)
 
+    # GitHub Copilot: requests routed to the Copilot API travel on the OpenAI or
+    # Anthropic wire, so the handlers stamp the wire provider. Relabel to
+    # "copilot" here — the single outcome funnel — so the dashboard shows the
+    # real upstream instead of "openai"/"anthropic". Keyed on the per-request
+    # flag set in build_copilot_upstream_url; never touches non-Copilot traffic.
+    # Done before the 5xx guard so a failed Copilot request is attributed too.
+    # consume_* reads AND clears the flag (called unconditionally via short-circuit
+    # order) so it cannot leak onto a later outcome in the same execution context.
+    if consume_request_routed_to_copilot() and outcome.provider in ("openai", "anthropic"):
+        import dataclasses
+
+        outcome = dataclasses.replace(outcome, provider="copilot")
+
     # Upstream failure (>= 500, e.g. a 529 Overloaded surfaced after retry
     # exhaustion) must not feed the savings/cost/log success stats; that would
     # let a failed request inflate the save-rate. Record it as failed and stop,
@@ -578,3 +595,34 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         f"transforms={_summarize_transforms(list(outcome.transforms_applied))}"
         f"{client_part}"
     )
+
+    # Keep the same PERF data in memory when file logging is disabled. Import
+    # lazily to avoid the server/outcome module cycle.
+    try:
+        from headroom.perf.analyzer import PerfRecord
+        from headroom.proxy.server import store_inmemory_perf_record
+
+        store_inmemory_perf_record(
+            PerfRecord(
+                timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3],
+                request_id=outcome.request_id,
+                model=outcome.model,
+                client=outcome.client or "",
+                num_messages=outcome.num_messages,
+                tokens_before=outcome.original_tokens,
+                tokens_after=outcome.optimized_tokens,
+                tokens_saved=outcome.tokens_saved,
+                tool_saved=tool_saved,
+                cache_read=outcome.cache_read_tokens,
+                cache_write=outcome.cache_write_tokens,
+                cache_hit_pct=outcome.cache_hit_pct,
+                optimization_ms=outcome.overhead_ms,
+                transforms=list(outcome.transforms_applied),
+                total_ms=outcome.total_latency_ms,
+                tokens_out=outcome.output_tokens,
+                ttfb_ms=outcome.ttfb_ms,
+                stages=outcome.pipeline_timing or {},
+            )
+        )
+    except Exception:  # noqa: BLE001 - in-memory observability is best-effort
+        logger.debug("failed to store in-memory PERF record", exc_info=True)

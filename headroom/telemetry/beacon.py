@@ -23,9 +23,26 @@ thereby agreed to upload anything, and must not start doing so on upgrade.
 from __future__ import annotations
 
 import os
+from typing import Any
 
 _OFF_VALUES = frozenset(("off", "false", "0", "no", "disable", "disabled"))
 _ON_VALUES = frozenset(("on", "true", "1", "yes", "enable", "enabled"))
+
+
+def _build_pipeline_timing(stats: dict[str, Any]) -> dict[str, Any]:
+    """Flatten pipeline timings and attach non-empty strategy counters."""
+    timing: dict[str, Any] = {}
+    for name, value in (stats.get("pipeline_timing") or {}).items():
+        if isinstance(value, dict) and "average_ms" in value:
+            timing[name] = round(float(value["average_ms"]), 2)
+    compressions = stats.get("compressions_by_strategy") or {}
+    tokens_saved = stats.get("tokens_saved_by_strategy") or {}
+    if compressions or tokens_saved:
+        timing["_strategies"] = {
+            "compressions": dict(compressions),
+            "tokens_saved": dict(tokens_saved),
+        }
+    return timing
 
 
 def is_telemetry_enabled() -> bool:

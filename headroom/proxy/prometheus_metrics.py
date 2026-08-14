@@ -7,6 +7,8 @@ cumulative savings history.
 Extracted from server.py for maintainability.
 """
 
+#  Copyright (c) 2026 Noel Kuntze
+
 from __future__ import annotations
 
 import asyncio
@@ -417,13 +419,13 @@ class PrometheusMetrics:
             return total_input_tokens, total_input_cost_usd
 
         try:
-            cost_stats = self.cost_tracker.stats()
+            # totals() rather than stats(): identical numbers, without the
+            # 31-day cost-record walk that stats()["budget_basis"] performs and
+            # this caller throws away. See CostTracker.totals.
+            tracked_input_tokens, tracked_input_cost_usd = self.cost_tracker.totals()
         except Exception:
             logger.debug("Failed to read cost tracker totals for savings history", exc_info=True)
             return total_input_tokens, total_input_cost_usd
-
-        tracked_input_tokens = cost_stats.get("total_input_tokens")
-        tracked_input_cost_usd = cost_stats.get("total_input_cost_usd")
 
         if tracked_input_tokens is not None:
             try:
@@ -922,6 +924,14 @@ class PrometheusMetrics:
                 self.stage_timing_count[key] += 1
                 if ms_val > self.stage_timing_max[key]:
                     self.stage_timing_max[key] = ms_val
+
+    async def record_prefix_freeze(self, tokens_preserved: int, compression_foregone: int) -> None:
+        """Record prefix freeze savings: tokens kept in cache by freezing vs
+        estimated compression foregone by skipping those frozen messages."""
+        async with self._lock:
+            self.prefix_freeze_busts_avoided += 1
+            self.prefix_freeze_tokens_preserved += tokens_preserved
+            self.prefix_freeze_compression_foregone += compression_foregone
 
     async def record_cache_bust(self, tokens_lost: int) -> None:
         """Record tokens that lost their cache discount due to compression."""

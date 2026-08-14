@@ -94,15 +94,15 @@ class CopilotQuotaCategory:
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
-            "entitlement": self.entitlement,
-            "remaining": self.remaining,
-            "used": self.used,
-            "percent_remaining": self.percent_remaining,
-            "used_percent": self.used_percent,
+            "entitlement": self.entitlement or 0,
+            "remaining": self.remaining or 0,
+            "used": self.used or 0,
+            "percent_remaining": self.percent_remaining or 0.0,
+            "used_percent": self.used_percent or 0.0,
             "overage_count": self.overage_count,
             "overage_permitted": self.overage_permitted,
             "unlimited": self.unlimited,
-            "timestamp_utc": self.timestamp_utc,
+            "timestamp_utc": self.timestamp_utc or "",
         }
 
 
@@ -119,10 +119,10 @@ class CopilotQuotaSnapshot:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "login": self.login,
-            "copilot_plan": self.copilot_plan,
-            "access_type_sku": self.access_type_sku,
-            "quota_reset_date_utc": self.quota_reset_date_utc,
+            "login": self.login or "",
+            "copilot_plan": self.copilot_plan or "",
+            "access_type_sku": self.access_type_sku or "",
+            "quota_reset_date_utc": self.quota_reset_date_utc or "",
             "categories": {k: v.to_dict() for k, v in self.categories.items()},
             "fetched_at": self.fetched_at,
         }
@@ -138,9 +138,9 @@ class CopilotQuotaState:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "latest": self.latest.to_dict() if self.latest else None,
-            "last_error": self.last_error,
-            "last_updated": self.last_updated,
+            "latest": self.latest.to_dict() if self.latest else {},
+            "last_error": self.last_error or "",
+            "last_updated": self.last_updated or 0.0,
         }
 
 

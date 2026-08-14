@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -60,6 +61,7 @@ DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN = 3.0 / 1_000_000
 # also enforced on read, so accuracy never depends on compaction having run.
 # Small because retention is only 30 days — the file should never be large.
 _COMPACT_SIZE_BYTES = 1 * 1024 * 1024
+_LOCAL_LEDGER_LOCK = threading.RLock()
 
 
 def _utc_now() -> datetime:
@@ -168,20 +170,21 @@ def record_savings_event(
 
     target = _resolve_path(path)
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(event, separators=(",", ":")) + "\n"
-        with open(target, "a", encoding="utf-8") as handle:
-            if _HAS_FCNTL and fcntl is not None:
-                fcntl.flock(handle, fcntl.LOCK_EX)
-            try:
-                handle.write(line)
-            finally:
+        with _LOCAL_LEDGER_LOCK:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            line = json.dumps(event, separators=(",", ":")) + "\n"
+            with open(target, "a", encoding="utf-8") as handle:
                 if _HAS_FCNTL and fcntl is not None:
-                    fcntl.flock(handle, fcntl.LOCK_UN)
+                    fcntl.flock(handle, fcntl.LOCK_EX)
+                try:
+                    handle.write(line)
+                finally:
+                    if _HAS_FCNTL and fcntl is not None:
+                        fcntl.flock(handle, fcntl.LOCK_UN)
+            _maybe_compact(target)
     except Exception:
         return False
 
-    _maybe_compact(target)
     return True
 
 

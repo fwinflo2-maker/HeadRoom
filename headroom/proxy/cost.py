@@ -6,6 +6,8 @@ for prefix cache statistics, cost merging, and session summaries.
 Extracted from server.py for maintainability.
 """
 
+#  Copyright (c) 2026 Noel Kuntze
+
 from __future__ import annotations
 
 import importlib.util
@@ -48,6 +50,8 @@ def _get_litellm_module() -> Any | None:
         return None
 
     litellm = imported_litellm
+    if hasattr(litellm, "suppress_debug_info"):  # type: ignore[attr-defined]
+        litellm.suppress_debug_info = True
     return litellm
 
 
@@ -226,8 +230,9 @@ def build_prefix_cache_stats(
 
         # Calculate savings:
         # Cache reads save (1.0 - read_mult) per token vs uncached input price.
-        # Cache write premium stays visible as its own gross field, and net
-        # savings subtract it so the dashboard reflects billed cache impact.
+        # Cache write premium is NOT deducted — it's baseline cost that the
+        # client (e.g. Claude Code) pays regardless of Headroom. We track it
+        # for observability but don't penalise our savings number.
         read_tokens: int = pc["cache_read_tokens"]  # type: ignore[assignment]
         write_tokens: int = pc["cache_write_tokens"]  # type: ignore[assignment]
         write_5m_tokens: int = pc["cache_write_5m_tokens"]  # type: ignore[assignment]
@@ -240,7 +245,7 @@ def build_prefix_cache_stats(
         if input_price_per_token:
             # Savings from reads: tokens * price * (1.0 - read_multiplier)
             savings_usd = read_tokens * input_price_per_token * (1.0 - read_mult)
-            # Write premium is reported separately and subtracted from net savings.
+            # Write premium (observability only — not subtracted from savings)
             if write_mult > 1.0:
                 write_premium_usd = write_tokens * input_price_per_token * (write_mult - 1.0)
 
@@ -271,7 +276,7 @@ def build_prefix_cache_stats(
             "write_premium": f"{(write_mult - 1.0) * 100:.0f}%" if write_mult > 1.0 else "none",
             "savings_usd": round(savings_usd, 4),
             "write_premium_usd": round(write_premium_usd, 4),
-            "net_savings_usd": round(savings_usd - write_premium_usd, 4),
+            "net_savings_usd": round(savings_usd, 4),
             "label": str(econ["label"]),
             "observed_ttl_buckets": {
                 "5m": {
@@ -312,7 +317,7 @@ def build_prefix_cache_stats(
         totals["savings_usd"] += savings_usd
         totals["write_premium_usd"] += write_premium_usd
 
-    totals["net_savings_usd"] = round(totals["savings_usd"] - totals["write_premium_usd"], 4)
+    totals["net_savings_usd"] = round(totals["savings_usd"], 4)
     totals["savings_usd"] = round(totals["savings_usd"], 4)
     totals["write_premium_usd"] = round(totals["write_premium_usd"], 4)
     # Token-level hit rate across all providers
@@ -425,7 +430,8 @@ def build_prefix_cache_stats(
 def merge_cost_stats(
     cost_stats: dict | None,
     cache_stats: dict,
-) -> dict | None:
+    cli_tokens_avoided: int = 0,
+) -> dict:
     """Merge compression and cache savings into cost stats.
 
     Each savings layer is reported separately with its own scope:
@@ -439,7 +445,7 @@ def merge_cost_stats(
     bug (#83).
     """
     if cost_stats is None:
-        return None
+        return {}
 
     cache_net = cache_stats.get("totals", {}).get("net_savings_usd", 0.0)
     compression_savings = cost_stats.get("savings_usd", 0.0)
@@ -449,6 +455,10 @@ def merge_cost_stats(
         "savings_usd": round(compression_savings, 4),
         "compression_savings_usd": round(compression_savings, 4),
         "cache_savings_usd": round(cache_net, 4),
+        "cli_tokens_avoided": cli_tokens_avoided,
+        "cli_filtering_tokens_avoided": cli_tokens_avoided,
+        "cli_tokens_included_in_compression": cli_tokens_avoided > 0,
+        "cli_filtering_tokens_included_in_compression": cli_tokens_avoided > 0,
     }
 
 
@@ -508,6 +518,7 @@ def build_session_summary(
     metrics: Any,
     prefix_cache_stats: dict,
     total_tokens_before: int,
+    cli_tokens_avoided: int = 0,
 ) -> dict[str, Any]:
     """Build a human-readable session summary from metrics and request logs.
 
@@ -621,8 +632,19 @@ def build_session_summary(
             # message compression, so consumers can see the full picture.
             "tool_schema_tokens_saved": getattr(metrics, "tool_search_saved_total", 0),
             "total_tokens_saved_all_layers": (
-                metrics.tokens_saved_total + getattr(metrics, "tool_search_saved_total", 0)
+                metrics.tokens_saved_total
+                + getattr(metrics, "tool_search_saved_total", 0)
+                + cli_tokens_avoided
             ),
+            "cli_tokens_avoided": cli_tokens_avoided,
+            "cli_filtering_tokens_avoided": cli_tokens_avoided,
+            "total_tokens_saved_with_cli_filtering": (
+                metrics.tokens_saved_total + cli_tokens_avoided
+            ),
+            "total_tokens_before_with_cli_filtering": total_tokens_before,
+            "rtk_tokens_avoided": cli_tokens_avoided,
+            "total_tokens_saved_with_rtk": metrics.tokens_saved_total + cli_tokens_avoided,
+            "total_tokens_before_with_rtk": total_tokens_before,
         },
         "uncompressed_requests": {k: v for k, v in uncompressed_reasons.items() if v > 0},
         "cost": {
@@ -633,6 +655,8 @@ def build_session_summary(
             "breakdown": {
                 "cache_savings_usd": round(cache_net, 2),
                 "compression_savings_usd": round(compression_savings, 2),
+                "cli_filtering_savings_usd": 0.0,
+                "rtk_savings_usd": 0.0,
             },
         },
     }
@@ -761,6 +785,8 @@ class CostTracker:
             from headroom.pricing.litellm_pricing import resolve_litellm_model
 
             resolved_model = resolve_litellm_model(model)
+            if resolved_model.startswith("passthrough:") or resolved_model.startswith("internal:"):
+                return None
 
             # litellm.cost_per_token handles all token types natively:
             # prompt_tokens at input rate, cache_read at ~10%, cache_creation at ~125%
@@ -795,7 +821,15 @@ class CostTracker:
         cutoff = now - timedelta(hours=self.COST_RETENTION_HOURS)
 
         # Remove entries from the left (oldest) while they're older than cutoff
-        while self._costs and self._costs[0].timestamp < cutoff:
+        while (
+            self._costs
+            and (
+                self._costs[0].timestamp
+                if hasattr(self._costs[0], "timestamp")
+                else self._costs[0][0]
+            )
+            < cutoff
+        ):
             self._costs.popleft()
 
     def record_tokens(
@@ -828,19 +862,6 @@ class CostTracker:
                 total and from the write premium. Defaults False, which preserves
                 behaviour for providers that report disjoint buckets.
         """
-        # Post-guard invariant (all providers): Headroom never forwards a request
-        # larger than the original (handlers revert any inflation before sending),
-        # so compression savings are >= 0 by construction. A negative here is an
-        # intermediate/hook token-count artifact that never reached the model;
-        # clamp it so `total_tokens_removed` reflects actually-forwarded bytes
-        # instead of surfacing spurious negatives (verified clean on the wire).
-        if tokens_saved < 0:
-            logger.debug(
-                "record_tokens: clamping negative tokens_saved=%d to 0 for %s (artifact; wire not inflated)",
-                tokens_saved,
-                model,
-            )
-            tokens_saved = 0
         self._tokens_saved_by_model[model] = (
             self._tokens_saved_by_model.get(model, 0) + tokens_saved
         )
@@ -927,9 +948,13 @@ class CostTracker:
         """
         cutoff = self._period_cutoff()
         return sum(
-            entry.cost_usd
+            entry.cost_usd if hasattr(entry, "cost_usd") else entry[1]
             for entry in self._costs
-            if entry.timestamp >= cutoff and (basis is None or entry.basis == basis)
+            if (entry.timestamp if hasattr(entry, "timestamp") else entry[0]) >= cutoff
+            and (
+                basis is None
+                or (entry.basis if hasattr(entry, "basis") else COST_BASIS_MEASURED) == basis
+            )
         )
 
     def period_cost_breakdown(self) -> dict[str, Any]:
@@ -946,14 +971,17 @@ class CostTracker:
         records = 0
         estimated_records = 0
         for entry in self._costs:
-            if entry.timestamp < cutoff:
+            timestamp = entry.timestamp if hasattr(entry, "timestamp") else entry[0]
+            cost_usd = entry.cost_usd if hasattr(entry, "cost_usd") else entry[1]
+            basis = entry.basis if hasattr(entry, "basis") else COST_BASIS_MEASURED
+            if timestamp < cutoff:
                 continue
             records += 1
-            if entry.basis == COST_BASIS_ESTIMATED:
-                estimated_usd += entry.cost_usd
+            if basis == COST_BASIS_ESTIMATED:
+                estimated_usd += cost_usd
                 estimated_records += 1
             else:
-                measured_usd += entry.cost_usd
+                measured_usd += cost_usd
 
         total_usd = measured_usd + estimated_usd
         return {
@@ -1028,6 +1056,8 @@ class CostTracker:
             from headroom.pricing.litellm_pricing import resolve_litellm_model
 
             resolved = resolve_litellm_model(model)
+            if resolved.startswith("passthrough:") or resolved.startswith("internal:"):
+                return None
             info = litellm.model_cost.get(resolved, {})
             cost_per_token = info.get("input_cost_per_token")
             return cost_per_token * 1_000_000 if cost_per_token else None
@@ -1047,6 +1077,8 @@ class CostTracker:
             from headroom.pricing.litellm_pricing import resolve_litellm_model
 
             resolved = resolve_litellm_model(model)
+            if resolved.startswith("passthrough:") or resolved.startswith("internal:"):
+                return None
             info = litellm.model_cost.get(resolved, {})
             uncached = info.get("input_cost_per_token")
             if not uncached:
@@ -1056,6 +1088,39 @@ class CostTracker:
             return (cache_read, cache_write, uncached)
         except Exception:
             return None
+
+    def totals(self) -> tuple[int, float]:
+        """Return just ``(total_input_tokens, total_input_cost_usd)``.
+
+        The same two numbers ``stats()`` reports, computed without the rest of
+        it. ``stats()`` is called once per request by the metrics path, which
+        reads exactly these two fields and discards ``per_model``,
+        ``savings_usd``, ``cost_with_headroom_usd`` and — the expensive one —
+        ``budget_basis``, whose ``period_cost_breakdown()`` walks up to 31 days
+        of retained cost records. MEASURED 2.8ms at 20k records and 13.6ms at
+        100k, on the event loop and holding the metrics lock, so it degraded
+        with proxy uptime rather than with load.
+
+        This loop is over models, not records, so it is bounded by how many
+        models a deployment talks to.
+        """
+        total_input_tokens = 0
+        cost_with_headroom = 0.0
+        for model in self._tokens_saved_by_model:
+            sent = self._tokens_sent_by_model.get(model, 0)
+            cr = self._api_cache_read_by_model.get(model, 0)
+            cw = self._api_cache_write_by_model.get(model, 0)
+            uncached = self._api_uncached_by_model.get(model, 0)
+            total_input_tokens += sent
+
+            prices = self._get_cache_prices(model)
+            if prices:
+                cr_price, cw_price, uncached_price = prices
+                if cr + cw + uncached > 0:
+                    cost_with_headroom += cr * cr_price + cw * cw_price + uncached * uncached_price
+                else:
+                    cost_with_headroom += sent * uncached_price
+        return total_input_tokens, round(cost_with_headroom, 4)
 
     def stats(self) -> dict:
         """Get token statistics per model."""

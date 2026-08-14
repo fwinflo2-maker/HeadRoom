@@ -132,7 +132,7 @@ def test_render_after_reset_with_zero_local_tokens_renders_zero(
 
 
 def test_render_capped_at_100pct(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Local tokens exceed limit (rare): display caps at 100% — never higher.
+    """Local tokens exceed limit (rare): display caps at 100% -- never higher.
 
     We undercount tokens spent on Claude Code outside this proxy and must
     not produce >100% utilization on the dashboard.
@@ -220,12 +220,12 @@ async def test_maybe_poll_on_demand_singleton_60s_floor(
     await tracker.maybe_poll_on_demand()
     assert call_count == 1
 
-    # 30s later — still inside the 60s floor.
+    # 30s later -- still inside the 60s floor.
     clock["t"] = 1_000_030.0
     await tracker.maybe_poll_on_demand()
     assert call_count == 1
 
-    # 90s later — past the floor; another poll fires.
+    # 90s later -- past the floor; another poll fires.
     clock["t"] = 1_000_090.0
     await tracker.maybe_poll_on_demand()
     assert call_count == 2
@@ -235,7 +235,7 @@ async def test_maybe_poll_on_demand_singleton_60s_floor(
 async def test_maybe_poll_on_demand_does_not_raise_on_api_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Upstream errors must be swallowed — never propagate to the request handler."""
+    """Upstream errors must be swallowed -- never propagate to the request handler."""
     tracker = _build_tracker(monkeypatch)
 
     async def boom() -> None:
@@ -270,7 +270,7 @@ def test_render_synthesis_fallback_logs_warning_and_returns_cached(
 
     monkeypatch.setattr(tracker_module, "synthesize_window_render", boom_synthesize)
 
-    # render_state itself does NOT swallow synthesize errors directly — the
+    # render_state itself does NOT swallow synthesize errors directly -- the
     # synthesize helper is responsible for that. Replace the helper with one
     # that simulates an internal error path returning a fallback dict.
     def fallback_synthesize(window: Any, **kwargs: Any) -> dict[str, Any]:
@@ -302,7 +302,7 @@ def test_render_synthesis_fallback_logs_warning_and_returns_cached(
 def test_render_state_with_no_snapshot_returns_base_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Pre-first-poll: no snapshot yet — return the base state dict unchanged."""
+    """Pre-first-poll: no snapshot yet -- return the base state dict unchanged."""
     tracker = _build_tracker(monkeypatch)
     rendered = tracker.render_state()
     assert rendered["latest"] is None

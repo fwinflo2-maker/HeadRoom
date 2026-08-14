@@ -404,6 +404,15 @@ class TOINConfig:
     anonymize_queries: bool = True
     max_query_patterns: int = 10
 
+    # Maximum number of patterns (unique tool signatures) to keep in memory.
+    # When exceeded, oldest patterns (by last_updated) are evicted to
+    # prevent unbounded memory growth. 5000 covers all common tools across
+    # multiple tenant slices; set higher for SaaS deployments with many
+    # unique tool shapes. Override via HEADROOM_TOIN_MAX_PATTERNS env var.
+    max_patterns: int = field(
+        default_factory=lambda: int(os.environ.get("HEADROOM_TOIN_MAX_PATTERNS", "5000"))
+    )
+
     # LOW FIX #22: Metrics/monitoring hooks
     # Callback for emitting metrics events. Signature: (event_name, event_data) -> None
     # Event names: "toin.compression", "toin.retrieval", "toin.recommendation", "toin.save"
@@ -581,6 +590,7 @@ class ToolIntelligenceNetwork:
         with self._lock:
             # Get or create pattern
             if key not in self._patterns:
+                self._enforce_max_patterns()
                 self._patterns[key] = ToolPattern(
                     tool_signature_hash=sig_hash,
                     auth_mode=key[0],
@@ -826,6 +836,7 @@ class ToolIntelligenceNetwork:
         with self._lock:
             if key not in self._patterns:
                 # First time seeing this tool via retrieval
+                self._enforce_max_patterns()
                 self._patterns[key] = ToolPattern(
                     tool_signature_hash=tool_signature_hash,
                     auth_mode=key[0],
@@ -1037,6 +1048,31 @@ class ToolIntelligenceNetwork:
 
         return min(0.95, sample_confidence + user_boost)
 
+    def _enforce_max_patterns(self) -> None:
+        """Evict oldest patterns when max_patterns is exceeded.
+
+        Must be called under ``_lock``. Evicts from the pattern most
+        recently recorded (``last_updated``) so that rarely-seen tool
+        shapes are dropped first. Eviction stops once we are below the
+        limit or no evictable patterns remain.
+        """
+        max_p = self._config.max_patterns
+        if max_p <= 0 or len(self._patterns) < max_p:
+            return
+        evict_count = max(1, len(self._patterns) - max_p + 1)
+        sorted_keys = sorted(
+            self._patterns.keys(),
+            key=lambda k: self._patterns[k].last_updated,
+        )
+        for key in sorted_keys[:evict_count]:
+            del self._patterns[key]
+        logger.debug(
+            "TOIN: evicted %d patterns (total=%d, max=%d)",
+            evict_count,
+            len(self._patterns),
+            max_p,
+        )
+
     def _hash_field_name(self, field_name: str) -> str:
         """Hash a field name for anonymization."""
         return hashlib.sha256(field_name.encode()).hexdigest()[:8]
@@ -1228,6 +1264,7 @@ class ToolIntelligenceNetwork:
                     self._merge_patterns(self._patterns[key], imported)
                 else:
                     # Add new pattern - need to track source instance
+                    self._enforce_max_patterns()
                     self._patterns[key] = imported
 
                     # For NEW patterns from another instance, track the source in

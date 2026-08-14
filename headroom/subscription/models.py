@@ -99,8 +99,8 @@ class RateLimitWindow:
             "used": self.used,
             "limit": self.limit,
             "utilization_pct": round(self.utilization_pct, 2),
-            "resets_at": _to_utc_iso(self.resets_at) if self.resets_at else None,
-            "seconds_to_reset": self.seconds_to_reset(),
+            "resets_at": _to_utc_iso(self.resets_at) if self.resets_at else "",
+            "seconds_to_reset": self.seconds_to_reset() or 0.0,
         }
 
 
@@ -271,13 +271,13 @@ class ExtraUsage:
             "is_enabled": self.is_enabled,
             "monthly_limit_usd": round(self.monthly_limit_usd, 2)
             if self.monthly_limit_usd is not None
-            else None,
+            else 0.0,
             "used_credits_usd": round(self.used_credits_usd, 4)
             if self.used_credits_usd is not None
-            else None,
+            else 0.0,
             "utilization_pct": round(self.utilization_pct, 2)
             if self.utilization_pct is not None
-            else None,
+            else 0.0,
         }
 
 
@@ -521,14 +521,14 @@ class SubscriptionState:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "latest": self.latest.to_dict() if self.latest else None,
-            "window_tokens": self.window_tokens.to_dict() if self.window_tokens else None,
+            "latest": self.latest.to_dict() if self.latest else {},
+            "window_tokens": self.window_tokens.to_dict() if self.window_tokens else {},
             "contribution": self.contribution.to_dict(),
             "discrepancies": [d.to_dict() for d in self.discrepancies[-5:]],
             "poll_count": self.poll_count,
             "poll_errors": self.poll_errors,
-            "last_error": self.last_error,
-            "last_active_at": _to_utc_iso(self.last_active_at) if self.last_active_at else None,
+            "last_error": self.last_error or "",
+            "last_active_at": _to_utc_iso(self.last_active_at) if self.last_active_at else "",
         }
 
     def to_persist_dict(self) -> dict[str, Any]:

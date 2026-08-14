@@ -38,7 +38,7 @@ def resolve_dsh_command(
 ) -> list[str]:
     """Resolve the dsh launch argv.
 
-    Precedence for the launcher: explicit ``command``, then ``dsh`` on ``PATH``,
+    Precedence for the launcher: explicit ``--command``, then ``dsh`` on ``PATH``,
     then ``pnpm dsh``. ``profile`` is ``"web"`` (default) or ``"headless"``.
     """
     if command:

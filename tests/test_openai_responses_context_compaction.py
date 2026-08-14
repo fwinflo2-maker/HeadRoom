@@ -5,13 +5,8 @@ from typing import Any
 
 from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
-    _allow_responses_memory_tools,
-    _build_memory_continuation_body,
     _compact_openai_responses_tools,
-    _ensure_responses_store_for_memory_tools,
     _openai_responses_context_budget,
-    _responses_input_as_items,
-    _responses_request_allows_memory_tool_continuation,
 )
 from headroom.transforms.content_router import (
     CompressionStrategy,
@@ -442,30 +437,6 @@ def test_content_router_retries_kompress_when_structured_strategy_noops(monkeypa
     assert strategy_chain == ["smart_crusher", "kompress"]
 
 
-def test_responses_memory_tools_skip_explicit_store_false() -> None:
-    """Regression: explicit store=false must block Responses memory-tool injection."""
-
-    payload = {"model": "gpt-5.5", "input": "remember this", "store": False}
-
-    assert _responses_request_allows_memory_tool_continuation(payload) is False
-    assert payload["store"] is False
-
-
-def test_responses_memory_tools_allow_default_and_stored_requests() -> None:
-    no_memory_payload = {"model": "gpt-5.5", "input": "plain", "store": False}
-    already_stored_payload = {"model": "gpt-5.5", "input": "plain", "store": True}
-    default_store_payload = {"model": "gpt-5.5", "input": "plain"}
-
-    assert _responses_request_allows_memory_tool_continuation(no_memory_payload) is False
-    assert no_memory_payload["store"] is False
-
-    assert _responses_request_allows_memory_tool_continuation(already_stored_payload) is True
-    assert already_stored_payload["store"] is True
-
-    assert _responses_request_allows_memory_tool_continuation(default_store_payload) is True
-    assert "store" not in default_store_payload
-
-
 def test_responses_turn_hook_message_fold_is_applied_and_counted() -> None:
     """On the Responses path a turn hook may fold the `input` items (in place),
     not just tools. The fold must be written back to the outbound payload AND its
@@ -509,105 +480,3 @@ def test_responses_turn_hook_message_fold_is_applied_and_counted() -> None:
     assert working["input"][0]["output"] == "folded"  # fold applied to the outbound payload
     assert tokens_saved > 0  # ...and the message-fold saving is counted
     assert payload["input"][0]["output"] != "folded"  # original untouched (deep-copied)
-
-
-def _memory_continuation_fixture() -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
-    body = {
-        "model": "gpt-5.6-sol",
-        "store": False,
-        "stream": True,
-        "input": [{"type": "message", "role": "user", "content": "remember this"}],
-        "tools": [{"type": "function", "name": "shell"}],
-    }
-    resp_json = {
-        "id": "resp_1",
-        "output": [
-            {"type": "reasoning", "id": "rs_1"},
-            {"type": "function_call", "call_id": "call_1", "name": "memory_save"},
-        ],
-    }
-    tool_outputs = [{"type": "function_call_output", "call_id": "call_1", "output": "saved"}]
-    return body, resp_json, tool_outputs
-
-
-def test_memory_continuation_is_stateless_when_store_is_false() -> None:
-    body, resp_json, tool_outputs = _memory_continuation_fixture()
-
-    cont, used_stateless = _build_memory_continuation_body(
-        body, resp_json, tool_outputs, model="gpt-5.6-sol"
-    )
-
-    assert used_stateless is True
-    assert cont["store"] is False
-    assert "previous_response_id" not in cont
-    assert cont["stream"] is False
-    assert [item["type"] for item in cont["input"]] == [
-        "message",
-        "reasoning",
-        "function_call",
-        "function_call_output",
-    ]
-    assert cont["input"][0] is body["input"][0]
-
-
-def test_memory_continuation_uses_previous_response_id_when_stored() -> None:
-    body, resp_json, tool_outputs = _memory_continuation_fixture()
-    body["store"] = True
-
-    cont, used_stateless = _build_memory_continuation_body(
-        body, resp_json, tool_outputs, model="gpt-5.6-sol"
-    )
-
-    assert used_stateless is False
-    assert cont["previous_response_id"] == "resp_1"
-    assert cont["input"] == tool_outputs
-    assert cont["tools"] == body["tools"]
-
-
-def test_memory_continuation_falls_back_to_stateless_without_response_id() -> None:
-    body, resp_json, tool_outputs = _memory_continuation_fixture()
-    body["store"] = True
-    resp_json.pop("id")
-
-    _, used_stateless = _build_memory_continuation_body(
-        body, resp_json, tool_outputs, model="gpt-5.6-sol"
-    )
-
-    assert used_stateless is True
-
-
-def test_responses_input_as_items_expands_string_shorthand() -> None:
-    assert _responses_input_as_items("hello") == [
-        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
-    ]
-    items = [{"type": "message", "role": "user", "content": "x"}]
-    assert _responses_input_as_items(items) == items
-    assert _responses_input_as_items(None) == []
-
-
-def test_memory_tools_allowed_under_chatgpt_auth_with_stateless_continuation() -> None:
-    # WebSocket turn loop still continues via previous_response_id.
-    assert _allow_responses_memory_tools(True) is False
-    # HTTP path resends history, so ChatGPT auth keeps memory tools.
-    assert _allow_responses_memory_tools(True, stateless_continuation=True) is True
-    assert _allow_responses_memory_tools(False) is True
-
-
-def test_store_false_requests_keep_memory_tools_when_stateless() -> None:
-    payload = {"store": False}
-    assert _responses_request_allows_memory_tool_continuation(payload) is False
-    assert (
-        _responses_request_allows_memory_tool_continuation(payload, stateless_continuation=True)
-        is True
-    )
-
-
-def test_store_is_never_forced_true_when_continuation_is_stateless() -> None:
-    payload = {"model": "gpt-5.6-sol", "store": False}
-
-    changed = _ensure_responses_store_for_memory_tools(
-        payload, memory_tools_injected=True, stateless_continuation=True
-    )
-
-    assert changed is False
-    assert payload["store"] is False

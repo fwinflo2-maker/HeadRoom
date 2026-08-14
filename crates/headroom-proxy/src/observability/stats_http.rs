@@ -5,7 +5,7 @@
 //! All handlers are read-only snapshots over
 //! [`super::ledger::Ledger`] — no handler can mutate accounting
 //! state. Mounted by [`crate::proxy::build_app`] when
-//! `Config::stats` is on (default); when off, the paths fall through
+//! `Config::stats` is explicitly enabled; when off (the default), the paths fall through
 //! to the catch-all forwarder like any other route.
 //!
 //! # Exposure: aggregate tier is open, per-request tier is local-only

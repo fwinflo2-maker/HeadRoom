@@ -58,6 +58,7 @@ from headroom.proxy.output_effort_policy import (
     lower_text_verbosity_value,
 )
 from headroom.proxy.output_steering import (
+    apply_openai_chat_verbosity_steering,
     apply_openai_responses_verbosity_steering,
     apply_verbosity_steering,
     replace_or_append_steering_block,
@@ -76,6 +77,7 @@ __all__ = [
     "OutputShaperSettings",
     "ShapeResult",
     "TurnKind",
+    "apply_openai_chat_verbosity_steering",
     "apply_openai_responses_verbosity_steering",
     "apply_verbosity_steering",
     "classify_openai_responses_input",
@@ -84,6 +86,7 @@ __all__ = [
     "route_effort",
     "route_openai_reasoning_effort",
     "route_openai_text_verbosity",
+    "shape_openai_chat_request",
     "shape_openai_responses_request",
     "shape_request",
     "steering_text",
@@ -94,11 +97,7 @@ _replace_or_append_steering_block = replace_or_append_steering_block
 
 @dataclass(frozen=True)
 class OutputShaperSettings:
-    """Runtime settings, resolved once per request from the environment.
-
-    Env-driven (like HEADROOM_INTERCEPT_ENABLED) so the proxy picks it up
-    without config plumbing through the server. Off by default.
-    """
+    """Output-shaping settings with rollout enablement injected by the proxy."""
 
     enabled: bool = False
     verbosity_level: int = 2
@@ -106,12 +105,19 @@ class OutputShaperSettings:
     mechanical_effort: str = "low"
 
     @classmethod
-    def from_env(cls) -> OutputShaperSettings:
-        enabled = runtime_env.getenv("HEADROOM_OUTPUT_SHAPER", "").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
+    def from_env(cls, *, enabled: bool | None = None) -> OutputShaperSettings:
+        """Resolve tuning; running proxies always inject the resolved gate.
+
+        ``None`` preserves the helper's direct-call compatibility for SDK/tests,
+        but proxy request paths never use it and therefore never re-resolve the
+        rollout alias.
+        """
+        if enabled is None:
+            enabled = runtime_env.getenv("HEADROOM_OUTPUT_SHAPER", "").lower() in (
+                "1",
+                "true",
+                "yes",
+            )
         try:
             level = int(runtime_env.getenv("HEADROOM_VERBOSITY_LEVEL", "2"))
         except ValueError:
@@ -348,6 +354,36 @@ def shape_request(
             result.changed = True
             result.labels.extend(labels)
         logger.debug("OutputShaper: turn=%s mutations=%s", kind.value, labels)
+
+    return result
+
+
+def shape_openai_chat_request(
+    body: dict[str, Any],
+    settings: OutputShaperSettings | None = None,
+    level_override: int | None = None,
+) -> ShapeResult:
+    """Apply output-shaping levers to an OpenAI chat/completions body in place.
+
+    The chat counterpart of :func:`shape_request`. Chat carries the system
+    prompt as a ``role: "system"`` message, so verbosity steering uses the
+    chat-specific injector. Effort routing is intentionally not applied here:
+    the ``route_effort`` levers write Anthropic-shaped config and there is no
+    portable chat/completions equivalent, so only the verbosity steering lever
+    (the one that reduces output tokens) runs on this path.
+    """
+    if settings is None:
+        settings = OutputShaperSettings.from_env()
+    result = ShapeResult()
+    if not settings.enabled:
+        return result
+
+    assert result.labels is not None  # __post_init__ guarantees this
+
+    level = settings.verbosity_level if level_override is None else level_override
+    if level > 0 and apply_openai_chat_verbosity_steering(body, level):
+        result.changed = True
+        result.labels.append(f"output_shaper:verbosity:L{level}")
 
     return result
 

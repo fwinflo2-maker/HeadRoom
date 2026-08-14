@@ -406,6 +406,7 @@ def test_launcher_wire_api_uses_published_endpoints(monkeypatch: pytest.MonkeyPa
 
     from headroom.providers.copilot import wrap as copilot_wrap
 
+    monkeypatch.setenv("HEADROOM_MODEL_CATALOG", "true")
     payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
     monkeypatch.setattr(
         httpx, "get", lambda *a, **k: httpx.Response(200, json=payload), raising=True
@@ -426,6 +427,15 @@ def test_launcher_wire_api_uses_published_endpoints(monkeypatch: pytest.MonkeyPa
     ) == ("completions")
     # A model with no published endpoints keeps the heuristic.
     assert resolve("gpt-4o", api_url="https://api.githubcopilot.com", token="t") == "completions"
+
+
+def test_live_catalog_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    from headroom.models.copilot_catalog import catalog_enabled
+
+    monkeypatch.delenv("HEADROOM_MODEL_CATALOG", raising=False)
+    assert catalog_enabled() is False
+    monkeypatch.setenv("HEADROOM_MODEL_CATALOG", "true")
+    assert catalog_enabled() is True
 
 
 def test_launcher_wire_api_survives_an_unreachable_models_endpoint(

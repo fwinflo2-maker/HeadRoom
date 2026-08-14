@@ -32,18 +32,13 @@ OPENAI_RESPONSES_ROOT_PATHS: tuple[str, ...] = (
     "/v1/codex/responses",
     "/backend-api/responses",
     "/backend-api/codex/responses",
-    # Unprefixed form used by the GitHub Copilot CLI's *native* API surface
-    # (`wrap copilot --native`). Without it these requests fell through to the
-    # generic passthrough route, which forwards unchanged and does not compress
-    # by default -- so every OpenAI-family model in a native session was silently
-    # uncompressed while Claude models (on /v1/messages) were not.
+    # Copilot Chat derives this unprefixed path from overrideCapiUrl. Without an
+    # explicit root route it falls through to uncompressed generic passthrough.
     "/responses",
 )
 
-#: Deliberately NOT an alias of the HTTP paths above. The websocket relay here is
-#: the Codex ``/responses`` transport; Copilot's native WS frames are a different
-#: shape and unverified against it, so adding ``/responses`` to the HTTP list must
-#: not silently register a WS route for it too.
+# The Codex websocket relay speaks a different protocol; do not register the
+# Copilot HTTP alias as a websocket route without separate wire validation.
 OPENAI_RESPONSES_WEBSOCKET_PATHS: tuple[str, ...] = (
     "/v1/responses",
     "/v1/codex/responses",

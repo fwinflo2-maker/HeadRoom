@@ -273,6 +273,7 @@ def test_native_skips_the_model_list_injection(monkeypatch: pytest.MonkeyPatch) 
     """
     from headroom.cli import wrap as wrap_mod
 
+    monkeypatch.setenv("HEADROOM_MODEL_CATALOG", "true")
     calls: list[tuple] = []
     monkeypatch.setattr(
         wrap_mod,

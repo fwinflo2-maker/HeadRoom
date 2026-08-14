@@ -697,6 +697,21 @@ class LiteLLMBackend(Backend):
             if anthropic_model.startswith("arn:aws:"):
                 return f"bedrock/converse/{anthropic_model}"
 
+            # Cross-region prefixed IDs are already fully qualified system-defined
+            # profile IDs — pass through directly.  Normalizing and re-looking them
+            # up in the discovery map can route the request to a wrong or
+            # unauthorized profile (e.g. an APPLICATION profile in the same account
+            # that also wraps the same foundation model). This applies whether the
+            # prefix arrives bare ("us.anthropic...") or already LiteLLM-qualified
+            # ("bedrock/us.anthropic...").
+            _CROSS_REGION_PREFIXES = ("au.", "us.", "eu.", "apac.", "global.")
+            if anthropic_model.startswith(_CROSS_REGION_PREFIXES):
+                return f"bedrock/{anthropic_model}"
+            if anthropic_model.startswith("bedrock/") and anthropic_model[
+                len("bedrock/") :
+            ].startswith(_CROSS_REGION_PREFIXES):
+                return anthropic_model
+
             normalized = _normalize_bedrock_profile_id(anthropic_model)
             if normalized and normalized in self._model_map:
                 return self._model_map[normalized]
@@ -1389,10 +1404,16 @@ class LiteLLMBackend(Backend):
             # cache_creation_tokens for the OpenAI nested dialect. Surface both
             # so PrefixCacheTracker.update_from_response on the backend-routed
             # path observes a stable shape instead of branching on key presence.
+            # None-guard the core counts (same defensive style as the cache
+            # fields just below). A provider can leave any of these None on the
+            # Usage object; emitting None here flows into the OpenAI-shape body,
+            # and the backend-routed OpenAI handler reads them straight into
+            # arithmetic and RequestOutcome (output_tokens=..., and
+            # max(0, prompt_tokens - ...)), which raises TypeError on None.
             usage_block: dict[str, Any] = {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": response.usage.total_tokens,
+                "prompt_tokens": int(getattr(response.usage, "prompt_tokens", 0) or 0),
+                "completion_tokens": int(getattr(response.usage, "completion_tokens", 0) or 0),
+                "total_tokens": int(getattr(response.usage, "total_tokens", 0) or 0),
             }
 
             # Defensive getattr: LiteLLM only attaches these top-level attrs

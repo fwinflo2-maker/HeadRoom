@@ -93,14 +93,14 @@ _NEGATIVE_TTL_SECONDS = 60.0
 
 
 def catalog_enabled() -> bool:
-    """False when ``HEADROOM_MODEL_CATALOG`` is explicitly disabled."""
-    return os.environ.get("HEADROOM_MODEL_CATALOG", "").strip().lower() not in {
-        "0",
-        "off",
-        "false",
-        "no",
-        "disable",
-        "disabled",
+    """True only when live catalog-driven routing is explicitly enabled."""
+    return os.environ.get("HEADROOM_MODEL_CATALOG", "").strip().lower() in {
+        "1",
+        "on",
+        "true",
+        "yes",
+        "enable",
+        "enabled",
     }
 
 

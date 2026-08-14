@@ -137,4 +137,6 @@ class TestSQLiteMetadataFilteringIntegration:
             assert results[0].id == "test-1"
 
         finally:
+            if "store" in locals():
+                await store.close()
             db_path.unlink(missing_ok=True)

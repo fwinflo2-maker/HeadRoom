@@ -34,7 +34,7 @@ import pytest
 from headroom.transforms.tag_protector import protect_tags, restore_tags
 
 # ──────────────────────────────────────────────────────────────────────
-# Helpers — independent open/close counters that don't share code with
+# Helpers -- independent open/close counters that don't share code with
 # the implementation under test, so a parser bug can't mask itself.
 # ──────────────────────────────────────────────────────────────────────
 
@@ -44,8 +44,8 @@ def _is_name_start(ch: str) -> bool:
 
 
 def count_open_tags(s: str) -> int:
-    """Count `<name…>` style opening tags. Excludes `</…>` closes and
-    `<…/>` self-closers."""
+    """Count `<name...>` style opening tags. Excludes `</...>` closes and
+    `<.../>` self-closers."""
     count = 0
     i = 0
     n = len(s)
@@ -102,7 +102,7 @@ def count_close_tags(s: str) -> int:
 # ──────────────────────────────────────────────────────────────────────
 # Deterministic content generator. Yields a mix of:
 #   - random ASCII letters/punct
-#   - balanced custom-tag pairs (`<sys>x</sys>`, `<tool>y</tool>`, …)
+#   - balanced custom-tag pairs (`<sys>x</sys>`, `<tool>y</tool>`, ...)
 #   - bare orphan opens / closes / self-closers
 #   - HTML tags that should not be protected
 # Seed is fixed so failures reproduce.
@@ -133,7 +133,7 @@ def _gen_content(rng: random.Random, max_segments: int = 8) -> str:
             name = rng.choice(_TAG_NAMES)
             parts.append(f"<{name}/>")
         elif roll < 0.55:
-            # Orphan open (no close) — exercises the asymmetric-input case.
+            # Orphan open (no close) -- exercises the asymmetric-input case.
             name = rng.choice(_TAG_NAMES)
             parts.append(f"<{name}>")
         elif roll < 0.65:
@@ -141,7 +141,7 @@ def _gen_content(rng: random.Random, max_segments: int = 8) -> str:
             name = rng.choice(_TAG_NAMES)
             parts.append(f"</{name}>")
         elif roll < 0.75:
-            # HTML tag — should be passthrough.
+            # HTML tag -- should be passthrough.
             parts.append("<div>plain</div>")
         else:
             # Plain text segment.
@@ -186,14 +186,15 @@ def test_restore_idempotent_when_all_placeholders_lost(rng: random.Random) -> No
         compressed = _gen_content(rng)
         # If the random `compressed` happens to contain a placeholder
         # (vanishingly unlikely with our alphabet, but defensive),
-        # skip — the property under test is the *no-placeholder* case.
+        # skip -- the property under test is the *no-placeholder* case.
         if any(p in compressed for (p, _o) in blocks):
             continue
-        restored = restore_tags(compressed, blocks)
+        restored, had_loss = restore_tags(compressed, blocks)
         assert restored == compressed, (
             f"discard-wrap path corrupted output: blocks={blocks}, "
             f"compressed={compressed!r}, restored={restored!r}"
         )
+        assert had_loss
 
 
 def test_restore_never_introduces_asymmetry(rng: random.Random) -> None:
@@ -201,30 +202,34 @@ def test_restore_never_introduces_asymmetry(rng: random.Random) -> None:
     every placeholder lost (worst case for the discard-wrap path),
     skew equals the cleaned-minus-placeholders baseline. With every
     placeholder present, skew equals the original input's skew."""
-    for _ in range(_CASES):
+    for case_index in range(_CASES):
         content = _gen_content(rng)
         cleaned, blocks = protect_tags(content)
+        if not blocks:
+            continue
 
         # Worst case: every placeholder lost. Restored output must
         # equal `cleaned` with placeholders stripped, and so must
         # carry exactly that asymmetry.
         stripped = _strip_placeholders(cleaned, blocks)
         baseline_skew = count_open_tags(stripped) - count_close_tags(stripped)
-        restored_lost = restore_tags(stripped, blocks)
+        restored_lost, had_loss = restore_tags(stripped, blocks)
         lost_skew = count_open_tags(restored_lost) - count_close_tags(restored_lost)
         assert lost_skew == baseline_skew, (
             f"discard-wrap introduced asymmetry: baseline={baseline_skew}, "
             f"after_restore={lost_skew}, content={content!r}"
         )
+        assert had_loss, (case_index, content, cleaned, blocks, stripped, restored_lost)
 
         # Full restore: skew matches the original input.
-        restored_full = restore_tags(cleaned, blocks)
+        restored_full, had_loss_full = restore_tags(cleaned, blocks)
         full_skew = count_open_tags(restored_full) - count_close_tags(restored_full)
         content_skew = count_open_tags(content) - count_close_tags(content)
         assert full_skew == content_skew, (
             f"full-restore drifted from input skew: input={content_skew}, "
             f"restored={full_skew}, content={content!r}"
         )
+        assert not had_loss_full
 
 
 def test_restore_no_orphan_byte_injection(rng: random.Random) -> None:
@@ -236,7 +241,7 @@ def test_restore_no_orphan_byte_injection(rng: random.Random) -> None:
     for _ in range(_CASES):
         content = _gen_content(rng)
         cleaned, blocks = protect_tags(content)
-        restored = restore_tags(cleaned, blocks)
+        restored, _had_loss = restore_tags(cleaned, blocks)
         # Bytes added by substitution: for each placeholder that
         # appears in `cleaned`, replace it with `original` (delta =
         # len(original) - len(placeholder)).
@@ -264,9 +269,10 @@ def test_restore_lost_real_world_tag_does_not_inject_orphan() -> None:
         )
     ]
     compressed = "compressed body without any placeholder reference"
-    restored = restore_tags(compressed, blocks)
+    restored, had_loss = restore_tags(compressed, blocks)
     # The bug we are killing: opening tag at the END with no body / no close.
     assert not restored.endswith("<system-reminder>")
     assert "<system-reminder>" not in restored
     assert "</system-reminder>" not in restored
     assert restored == compressed
+    assert had_loss

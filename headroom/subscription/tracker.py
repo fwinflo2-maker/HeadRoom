@@ -263,6 +263,7 @@ class SubscriptionTracker(QuotaTracker):
             snapshot = self._state.latest
 
         if snapshot is None or base.get("latest") is None:
+            base["latest"] = None
             return base
 
         latest_dict = base["latest"]

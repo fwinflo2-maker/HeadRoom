@@ -10,19 +10,22 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import os
 import random
 import re
+import shutil
 import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from headroom import paths as _paths
+from headroom._subprocess import run as _utf8_subprocess_run
+from headroom.proxy import _json as json
 from headroom.proxy import (
     diagnostic_decode_policy,
     memory_injection_mode_policy,
@@ -50,6 +53,9 @@ from headroom.proxy.beta_header_policy import (
     BetaHeaderStickyMode,
     resolve_beta_header_sticky_mode,
     resolve_beta_tracker_max_sessions,
+)
+from headroom.proxy.body_forwarding import (
+    _PYTHON_FORWARDER_MODE_ENV,  # noqa: F401 - compatibility export
 )
 from headroom.proxy.body_forwarding import (
     BodyMutationTracker as BodyMutationTracker,  # noqa: F401 - compatibility export
@@ -90,6 +96,12 @@ from headroom.proxy.tool_definition_serialization import (
     serialize_tool_definition_canonical as _serialize_tool_definition_canonical,
 )
 from headroom.proxy.tool_injection_config import (
+    TOOL_INJECTION_STICKY_ENV as _TOOL_INJECTION_STICKY_ENV,  # noqa: F401 - compatibility export
+)
+from headroom.proxy.tool_injection_config import (
+    TOOL_TRACKER_MAX_SESSIONS_ENV as _TOOL_TRACKER_MAX_SESSIONS_ENV,  # noqa: F401 - compatibility export
+)
+from headroom.proxy.tool_injection_config import (
     ToolInjectionStickyMode,
 )
 from headroom.proxy.tool_injection_config import (
@@ -112,6 +124,265 @@ if TYPE_CHECKING:
     from fastapi import Request
 
 logger = logging.getLogger("headroom.proxy")
+
+_CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
+_CONTEXT_TOOL_RTK = "rtk"
+_CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
+_RTK_GAIN_SCOPE_ENV = "HEADROOM_RTK_GAIN_SCOPE"
+_RTK_GAIN_SCOPES = {"global", "project"}
+RTK_STATS_CACHE_TTL_SECONDS = 60.0
+CONTEXT_TOOL_STATS_CACHE_TTL_SECONDS = RTK_STATS_CACHE_TTL_SECONDS
+_rtk_stats_cache: dict[str, Any] = {
+    "expires_at": 0.0,
+    "has_value": False,
+    "tool": None,
+    "value": None,
+}
+# Compatibility aliases used by older integrations and tests.
+_context_tool_stats_cache = _rtk_stats_cache
+_rtk_session_baseline: dict[str, Any] = {
+    "initialized": False,
+    "tool": None,
+    "total_commands": 0,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "tokens_saved": 0,
+    "total_time_ms": 0,
+    "captured_at": 0.0,
+}
+_context_tool_session_baseline = _rtk_session_baseline
+_rtk_stats_cache_lock = threading.Lock()
+
+subprocess = SimpleNamespace(run=_utf8_subprocess_run)  # type: ignore[assignment]
+
+
+def _run_context_tool(*args: Any, **kwargs: Any) -> Any:
+    """Run a context-tool command through the UTF-8 subprocess wrapper."""
+    return subprocess.run(*args, **kwargs)
+
+
+def _selected_context_tool() -> str:
+    value = os.environ.get(_CONTEXT_TOOL_ENV, _CONTEXT_TOOL_RTK).strip().lower()
+    return (
+        _CONTEXT_TOOL_LEAN_CTX
+        if value in ("leanctx", _CONTEXT_TOOL_LEAN_CTX)
+        else _CONTEXT_TOOL_RTK
+    )
+
+
+def _context_tool_label(tool: str) -> str:
+    return "lean-ctx" if tool == _CONTEXT_TOOL_LEAN_CTX else "RTK"
+
+
+def _rtk_gain_scope() -> str:
+    value = os.environ.get(_RTK_GAIN_SCOPE_ENV, "").strip().lower()
+    if value in _RTK_GAIN_SCOPES:
+        return value
+    if value:
+        logger.warning(
+            "event=rtk_gain_scope_invalid env=%s value=%r default=global",
+            _RTK_GAIN_SCOPE_ENV,
+            value,
+        )
+    return "global"
+
+
+def _context_tool_summary_payload(
+    *, tool: str, installed: bool, scope: str | None = None, summary: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    summary = summary or {}
+    commands = int(summary.get("total_commands", 0) or 0)
+    input_tokens = int(summary.get("total_input", summary.get("total_input_tokens", 0)) or 0)
+    output_tokens = int(summary.get("total_output", summary.get("total_output_tokens", 0)) or 0)
+    tokens_saved = int(summary.get("total_saved", summary.get("tokens_saved", 0)) or 0)
+    return {
+        "tool": tool,
+        "label": _context_tool_label(tool),
+        "installed": installed,
+        "scope": scope or ("global" if tool == _CONTEXT_TOOL_RTK else "local"),
+        "total_commands": commands,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "tokens_saved": tokens_saved,
+        "total_time_ms": int(summary.get("total_time_ms", 0) or 0),
+        "avg_savings_pct": float(summary.get("avg_savings_pct", 0.0) or 0.0),
+        "lifetime_avg_savings_pct": float(summary.get("avg_savings_pct", 0.0) or 0.0),
+    }
+
+
+def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
+    try:
+        from headroom.rtk import get_rtk_path
+    except ImportError:
+
+        def get_rtk_path() -> Path | None:
+            return None
+
+    path = get_rtk_path() or shutil.which("rtk")  # type: ignore[arg-type]
+    if not path:
+        return _context_tool_summary_payload(tool=_CONTEXT_TOOL_RTK, installed=False)
+    command = [str(path), "gain"]
+    if _rtk_gain_scope() == "project":
+        command.append("--project")
+    command.extend(["--format", "json"])
+    try:
+        result = _run_context_tool(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout)
+        return _context_tool_summary_payload(
+            tool=_CONTEXT_TOOL_RTK,
+            installed=True,
+            scope=_rtk_gain_scope(),
+            summary=data.get("summary", {}),
+        )
+    except Exception:
+        return None
+
+
+def _read_context_tool_lifetime_stats(tool: str) -> dict[str, Any] | None:
+    if tool == _CONTEXT_TOOL_LEAN_CTX:
+        from headroom.lean_ctx import get_lean_ctx_path
+
+        path = get_lean_ctx_path()
+        command = [str(path), "gain", "--json"] if path else None
+    else:
+        return _read_rtk_lifetime_stats()
+    if command is None:
+        return _context_tool_summary_payload(tool=tool, installed=False)
+    try:
+        result = _run_context_tool(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout)
+        return _context_tool_summary_payload(
+            tool=tool, installed=True, summary=data.get("summary", data)
+        )
+    except Exception:
+        return None
+
+
+async def initialize_context_tool_session_baseline() -> None:
+    """Pin installed context-tool counters before a proxy session starts."""
+    tool = _selected_context_tool()
+    payload = await asyncio.to_thread(_read_context_tool_lifetime_stats, tool)
+    with _rtk_stats_cache_lock:
+        if payload is not None and payload.get("installed", False):
+            _rtk_session_baseline.update(
+                {
+                    "initialized": True,
+                    "tool": tool,
+                    "total_commands": payload["total_commands"],
+                    "input_tokens": payload["input_tokens"],
+                    "output_tokens": payload["output_tokens"],
+                    "tokens_saved": payload["tokens_saved"],
+                    "total_time_ms": payload["total_time_ms"],
+                    "captured_at": time.time(),
+                }
+            )
+        else:
+            _rtk_session_baseline.update({"initialized": False, "tool": tool})
+        _rtk_stats_cache.update(
+            {"expires_at": 0.0, "has_value": False, "tool": None, "value": None}
+        )
+
+
+def _get_context_tool_stats() -> dict[str, Any] | None:
+    tool = _selected_context_tool()
+    now = time.monotonic()
+    with _rtk_stats_cache_lock:
+        if (
+            _rtk_stats_cache["has_value"]
+            and now < _rtk_stats_cache["expires_at"]
+            and _rtk_stats_cache["tool"] == tool
+        ):
+            cached = _rtk_stats_cache["value"]
+            return cast(dict[str, Any] | None, cached)
+    payload = _read_context_tool_lifetime_stats(tool)
+    if payload is None:
+        return None
+    with _rtk_stats_cache_lock:
+        if payload.get("installed") and not _rtk_session_baseline["initialized"]:
+            _rtk_session_baseline.update(
+                {
+                    "initialized": True,
+                    "tool": tool,
+                    "total_commands": payload["total_commands"],
+                    "input_tokens": payload["input_tokens"],
+                    "output_tokens": payload["output_tokens"],
+                    "tokens_saved": payload["tokens_saved"],
+                    "total_time_ms": payload["total_time_ms"],
+                }
+            )
+        baseline = _rtk_session_baseline
+        for key in (
+            "total_commands",
+            "input_tokens",
+            "output_tokens",
+            "tokens_saved",
+            "total_time_ms",
+        ):
+            payload[f"lifetime_{key}"] = payload[key]
+            payload[f"session_baseline_{key}"] = baseline[key]
+            payload[key] = max(payload[key] - baseline[key], 0)
+        payload["session_savings_pct"] = (
+            round(payload["tokens_saved"] / payload["input_tokens"] * 100, 4)
+            if payload["input_tokens"]
+            else None
+        )
+        payload["session_avg_time_ms"] = (
+            payload["total_time_ms"] / payload["total_commands"]
+            if payload["total_commands"]
+            else None
+        )
+        payload["avg_savings_pct_scope"] = "lifetime"
+        payload["session"] = {
+            "commands": payload["total_commands"],
+            "input_tokens": payload["input_tokens"],
+            "output_tokens": payload["output_tokens"],
+            "tokens_saved": payload["tokens_saved"],
+            "savings_pct": payload["session_savings_pct"],
+            "total_time_ms": payload["total_time_ms"],
+            "avg_time_ms": payload["session_avg_time_ms"],
+        }
+        payload["lifetime"] = {
+            "commands": payload["lifetime_total_commands"],
+            "input_tokens": payload["lifetime_input_tokens"],
+            "output_tokens": payload["lifetime_output_tokens"],
+            "tokens_saved": payload["lifetime_tokens_saved"],
+            "savings_pct": payload["lifetime_avg_savings_pct"],
+            "total_time_ms": payload["lifetime_total_time_ms"],
+        }
+        payload["sample_ttl_seconds"] = CONTEXT_TOOL_STATS_CACHE_TTL_SECONDS
+        payload["refresh_interval_seconds"] = CONTEXT_TOOL_STATS_CACHE_TTL_SECONDS
+        _rtk_stats_cache.update(
+            {
+                "expires_at": now + CONTEXT_TOOL_STATS_CACHE_TTL_SECONDS,
+                "has_value": True,
+                "tool": tool,
+                "value": payload,
+            }
+        )
+        return payload
+
+
+def _get_rtk_stats() -> dict[str, Any] | None:
+    return _get_context_tool_stats()
+
 
 _CODEX_WIRE_DEBUG_ENV = "HEADROOM_CODEX_WIRE_DEBUG"
 _CODEX_WIRE_DEBUG_DIR_ENV = "HEADROOM_CODEX_WIRE_DEBUG_DIR"
@@ -241,7 +512,7 @@ def capture_codex_wire_debug(
         )
         return path
     except Exception as exc:  # pragma: no cover - debug path must never break traffic
-        logger.warning("event=codex_wire_debug_capture_failed error=%s", exc)
+        logger.warning("[%s] event=codex_wire_debug_capture_failed error=%s", request_id or "", exc)
         return None
 
 
@@ -316,6 +587,57 @@ def _headroom_bypass_enabled(headers: Any) -> bool:
     return bypass or passthrough
 
 
+_NO_INLINE_TOOLS_HEADER = "x-headroom-no-inline-tools"
+_NO_INLINE_TOOLS_QUERY_PARAM = "no_inline_tools"
+
+
+def _headroom_no_inline_tool_injection(
+    headers: Any, query_params: dict[str, str] | None = None
+) -> bool:
+    """Return True when the request asks to skip inline tool injection.
+
+    Inline tools (CCR retrieval tool, memory tools) are injected into the
+    client's request body before forwarding to the upstream LLM.  Clients
+    that do not want their tool list mutated can opt out via:
+
+    * HTTP header: ``x-headroom-no-inline-tools: true``
+    * URL query parameter: ``?no_inline_tools=true``
+
+    Checking both header and query param lets clients that cannot set custom
+    headers (browser-based copilots, restrictive SDKs) still opt out.
+    """
+    try:
+        header_val = str(headers.get(_NO_INLINE_TOOLS_HEADER, "")).strip().lower()
+        if header_val in ("true", "1", "yes"):
+            return True
+    except AttributeError:
+        pass
+
+    if query_params:
+        try:
+            qp_val = str(query_params.get(_NO_INLINE_TOOLS_QUERY_PARAM, "")).strip().lower()
+            if qp_val in ("true", "1", "yes"):
+                return True
+        except (AttributeError, TypeError):
+            pass
+
+    return False
+
+
+def _summarize_reasons(reasons: list[str]) -> str:
+    """Collapse repeated reasons into counted summary.
+
+    e.g. ['router:excluded:tool', 'router:excluded:tool', 'stream_options_injected']
+      -> 'router:excluded:tool*2,stream_options_injected'
+    """
+    if not reasons:
+        return ""
+    counts: dict[str, int] = {}
+    for r in reasons:
+        counts[r] = counts.get(r, 0) + 1
+    return ",".join(f"{k}*{v}" if v > 1 else k for k, v in counts.items())
+
+
 def log_outbound_request(
     *,
     forwarder: str,
@@ -341,7 +663,7 @@ def log_outbound_request(
         path,
         body_bytes_count,
         "true" if body_mutated else "false",
-        ",".join(mutation_reasons) if mutation_reasons else "",
+        _summarize_reasons(mutation_reasons) if mutation_reasons else "",
         source,
         request_id or "",
     )
@@ -685,6 +1007,25 @@ except ValueError:
 MAX_COMPRESSION_CACHE_SESSIONS = 500
 
 
+def _fast_copy_message(msg: dict[str, Any]) -> dict[str, Any]:
+    """Fast copy a single message dict without deepcopy overhead."""
+    new_msg: dict[str, Any] = dict(msg)
+    content = msg.get("content")
+    if isinstance(content, list):
+        new_msg["content"] = [dict(b) if isinstance(b, dict) else b for b in content]
+    return new_msg
+
+
+def _fast_copy_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fast copy messages without deepcopy overhead.
+
+    Messages are always ``list[dict]`` with ``str``/``list`` content.
+    Deepcopy is expensive (~10x slower) because it tracks the full object
+    graph, memo, and circular references we never have.
+    """
+    return [_fast_copy_message(msg) for msg in messages]
+
+
 # ---------------------------------------------------------------------------
 # Compression-failure escape hatch
 # ---------------------------------------------------------------------------
@@ -892,37 +1233,28 @@ async def request_with_transient_retry(
             )
 
 
-# Image compression availability (do not retain a global compressor instance)
+# Image compression availability. The compressor is intentionally created per
+# request; only the failed import is cached so optional dependency detection is
+# not repeated.
 _image_compressor_available: bool | None = None
-_image_compressor_instance: Any = None
 
 
 def _get_image_compressor():
     """Return the process-wide image compressor, or None if unavailable.
 
-    The compressor caches heavyweight models; creating a new one per request
-    (and a new ONNX router per image) accumulated native memory and grew RSS
-    unboundedly (#2513). Reuse a single shared instance. It is marked a
-    singleton so a caller's per-request ``close()`` is a no-op and the models
-    stay loaded. The main-process handlers only call ``has_images()`` on it (the
-    heavy compression runs in the isolation worker), but sharing still avoids a
-    fresh object per request.
+    The heavy image work runs in the isolation worker; callers only use this
+    lightweight availability probe in the main process.
     """
-    global _image_compressor_available, _image_compressor_instance
+    global _image_compressor_available
     if _image_compressor_available is False:
         return None
-    if _image_compressor_instance is not None:
-        return _image_compressor_instance
-
     try:
         from headroom.image import ImageCompressor
 
         instance = ImageCompressor()
-        instance._is_singleton = True
         if _image_compressor_available is None:
             logger.info("Image compression enabled (model: chopratejas/technique-router)")
         _image_compressor_available = True
-        _image_compressor_instance = instance
         return instance
     except ImportError as e:
         if _image_compressor_available is not False:
@@ -935,44 +1267,96 @@ def _get_image_compressor():
 # Resolved lazily so HEADROOM_WORKSPACE_DIR env-var changes are honored.
 
 
+class _RequestIdFilter(logging.Filter):
+    """Prepends ``[{request_id}]`` to every log record when a request is active."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            from headroom.proxy.server import _REQUEST_ID_VAR
+
+            rid = _REQUEST_ID_VAR.get(None)
+        except Exception:
+            rid = None
+        if rid:
+            record.msg = f"[{rid}] {record.msg}"
+        return True
+
+
 def _headroom_log_dir() -> Path:
     return _paths.log_dir()
 
 
 def _setup_file_logging() -> None:
-    """Add a RotatingFileHandler to the headroom root logger.
+    """Add a RotatingFileHandler and a StreamHandler to the headroom root logger.
 
-    Writes to ~/.headroom/logs/proxy.log with automatic rotation:
+    File writes to ~/.headroom/logs/proxy.log with automatic rotation:
     - Rotates at 10 MB
     - Keeps 5 backups (~50 MB max)
+
+    Stream output goes to stderr so Headroom messages appear in ``docker logs``
+    (and terminals) alongside third-party library logs.
+
+    If the configured log directory is not writable, falls back to a temporary
+    directory so logging is never silently lost.
+
+    When ``HEADROOM_NO_FILE_LOG`` is set to a truthy value
+    (true/1/yes/on), the RotatingFileHandler is skipped entirely —
+    only stderr logging remains.
     """
+    import tempfile
+    import warnings
     from logging.handlers import RotatingFileHandler
 
+    _no_file_log = os.environ.get("HEADROOM_NO_FILE_LOG", "").lower() in ("true", "1", "yes", "on")
+
+    initial_log_dir = _headroom_log_dir()
     try:
-        log_dir = _headroom_log_dir()
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "proxy.log"
-        handler = RotatingFileHandler(
-            log_path,
-            maxBytes=10 * 1024 * 1024,  # 10 MB
-            backupCount=5,
-            encoding="utf-8",
+        initial_log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        warnings.warn(
+            f"Logging to {initial_log_dir} failed ({exc}), falling back to temp directory",
+            stacklevel=2,
         )
-        handler.setLevel(logging.INFO)
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        )
-        # Attach to the headroom root logger so all sub-loggers are captured.
-        # Disable propagation to root to avoid duplicate writes when
-        # wrap.py redirects stderr to the same log file.
-        headroom_logger = logging.getLogger("headroom")
-        headroom_logger.setLevel(logging.INFO)
-        if not any(isinstance(h, RotatingFileHandler) for h in headroom_logger.handlers):
-            headroom_logger.addHandler(handler)
-        headroom_logger.propagate = False
-    except OSError:
-        # Non-fatal: can't write logs (read-only fs, permissions, etc.)
-        pass
+        try:
+            log_dir = Path(tempfile.mkdtemp(prefix="headroom-logs-"))
+        except OSError as exc2:
+            warnings.warn(f"Logging setup failed (non-fatal): {exc2}", stacklevel=2)
+            log_dir = None
+    else:
+        log_dir = initial_log_dir
+
+    fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+    headroom_logger = logging.getLogger("headroom")
+    headroom_logger.setLevel(logging.INFO)
+    if not any(
+        isinstance(handler, logging.StreamHandler) and not isinstance(handler, RotatingFileHandler)
+        for handler in headroom_logger.handlers
+    ):
+        stream_handler = logging.StreamHandler()
+        stream_handler.setLevel(logging.INFO)
+        stream_handler.setFormatter(fmt)
+        headroom_logger.addHandler(stream_handler)
+    headroom_logger.addFilter(_RequestIdFilter())
+
+    if not _no_file_log and log_dir is not None:
+        try:
+            log_path = log_dir / "proxy.log"
+            file_handler = RotatingFileHandler(
+                log_path,
+                maxBytes=10 * 1024 * 1024,  # 10 MB
+                backupCount=5,
+                encoding="utf-8",
+            )
+            file_handler.setLevel(logging.INFO)
+            file_handler.setFormatter(fmt)
+
+            if not any(isinstance(h, RotatingFileHandler) for h in headroom_logger.handlers):
+                headroom_logger.addHandler(file_handler)
+        except OSError as exc:
+            warnings.warn(f"Logging setup failed (non-fatal): {exc}", stacklevel=2)
+
+    headroom_logger.propagate = False
 
 
 def is_anthropic_auth(headers: dict[str, str]) -> bool:
@@ -1143,6 +1527,8 @@ _split_beta_tokens = split_beta_tokens
 
 _merge_beta_tokens = merge_beta_tokens
 
+_previous_session_beta_tracker = globals().get("SessionBetaTracker")
+
 
 class SessionBetaTracker:
     """Bounded LRU tracker of beta-header tokens observed per (provider, session).
@@ -1251,6 +1637,23 @@ class SessionBetaTracker:
         """Clear all session state (test helper)."""
         with self._lock:
             self._sessions.clear()
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        """Return a redacted snapshot for the dashboard sessions endpoint."""
+        with self._lock:
+            return [
+                {
+                    "provider": provider,
+                    "session_id": session_id,
+                    "beta_tokens": list(tokens),
+                    "token_count": len(tokens),
+                }
+                for (provider, session_id), tokens in self._sessions.items()
+            ]
+
+
+if _previous_session_beta_tracker is not None:
+    SessionBetaTracker = _previous_session_beta_tracker  # type: ignore[misc]
 
 
 # Process-wide singleton. Lazily replaced by tests via `reset` /
@@ -1380,6 +1783,9 @@ def serialize_tool_definition_canonical(tool_definition: dict[str, Any]) -> byte
     return _serialize_tool_definition_canonical(tool_definition)
 
 
+_previous_session_tool_tracker = globals().get("SessionToolTracker")
+
+
 class SessionToolTracker(_SessionToolTracker):
     """Env-aware compatibility wrapper for the pure session tool tracker."""
 
@@ -1387,6 +1793,10 @@ class SessionToolTracker(_SessionToolTracker):
         if max_sessions is None:
             max_sessions = get_tool_tracker_max_sessions()
         super().__init__(max_sessions=max_sessions)
+
+
+if _previous_session_tool_tracker is not None:
+    SessionToolTracker = _previous_session_tool_tracker  # type: ignore[misc]
 
 
 # Process-wide singleton. Lazily replaced by tests via
@@ -1461,6 +1871,7 @@ def apply_session_sticky_memory_tools(
     existing_tools: list[dict[str, Any]] | None,
     memory_tools_to_inject: list[dict[str, Any]],
     inject_this_turn: bool,
+    disable_inline_tool_injection: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Apply sticky-on memory tool injection per `SessionToolTracker`.
 
@@ -1468,6 +1879,9 @@ def apply_session_sticky_memory_tools(
     (Anthropic custom tools, Anthropic native tool, OpenAI function tools).
 
     Logic (guide §6.3 #2):
+
+      * If ``disable_inline_tool_injection`` is True: skip all tool
+        injection unconditionally (caller opt-out via header or query param).
 
       * If ``HEADROOM_TOOL_INJECTION_STICKY=disabled``: bypass tracker,
         inject only when ``inject_this_turn`` is True. Diagnostic mode.
@@ -1496,7 +1910,18 @@ def apply_session_sticky_memory_tools(
     if provider not in ("anthropic", "openai"):
         raise ValueError(f"unsupported provider: {provider!r}")
 
-    tools_out: list[dict[str, Any]] = list(existing_tools) if existing_tools else []
+    if disable_inline_tool_injection:
+        tools_out: list[dict[str, Any]] = list(existing_tools) if existing_tools else []
+        log_tool_injection_decision(
+            provider=provider,
+            session_id=session_id,
+            decision="skip",
+            tool_definition_bytes_count=0,
+            request_id=request_id,
+        )
+        return tools_out, False
+
+    tools_out = list(existing_tools) if existing_tools else []
     existing_names: set[str] = set()
     for t in tools_out:
         n = _extract_tool_name(t)
@@ -1584,7 +2009,7 @@ def apply_session_sticky_memory_tools(
                     tool_name=tool_name,
                     golden_tool_bytes=golden_bytes,
                 )
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
                 logger.error(
                     "corrupt golden tool bytes for session %s tool %s: %s — skipping tool injection",
                     session_id,
@@ -1655,6 +2080,9 @@ def apply_session_sticky_memory_tools(
 # tool list bytes stay byte-stable across turns once injected.
 
 
+_previous_session_ccr_tracker = globals().get("SessionCcrTracker")
+
+
 class SessionCcrTracker(_SessionCcrTracker):
     """Env-aware compatibility wrapper for the pure CCR session tracker."""
 
@@ -1662,6 +2090,10 @@ class SessionCcrTracker(_SessionCcrTracker):
         if max_sessions is None:
             max_sessions = get_tool_tracker_max_sessions()
         super().__init__(max_sessions=max_sessions)
+
+
+if _previous_session_ccr_tracker is not None:
+    SessionCcrTracker = _previous_session_ccr_tracker  # type: ignore[misc]
 
 
 # Process-wide singleton.
@@ -1719,6 +2151,7 @@ def apply_session_sticky_ccr_tool(
     request_id: str | None,
     existing_tools: list[dict[str, Any]] | None,
     has_compressed_content_this_turn: bool,
+    disable_inline_tool_injection: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Apply sticky-on CCR retrieval-tool injection per :class:`SessionCcrTracker`.
 
@@ -1727,6 +2160,9 @@ def apply_session_sticky_ccr_tool(
     off" behaviour.
 
     Logic:
+
+      * If ``disable_inline_tool_injection`` is True: skip all tool
+        injection unconditionally (caller opt-out via header or query param).
 
       * If ``session_id`` is None: tracker is bypassed and the per-turn
         ``has_compressed_content_this_turn`` flag drives the decision
@@ -1749,7 +2185,18 @@ def apply_session_sticky_ccr_tool(
     if provider not in ("anthropic", "openai", "google"):
         raise ValueError(f"unsupported provider: {provider!r}")
 
-    tools_out: list[dict[str, Any]] = list(existing_tools) if existing_tools else []
+    if disable_inline_tool_injection:
+        tools_out: list[dict[str, Any]] = list(existing_tools) if existing_tools else []
+        log_tool_injection_decision(
+            provider=provider,
+            session_id=session_id,
+            decision="skip",
+            tool_definition_bytes_count=0,
+            request_id=request_id,
+        )
+        return tools_out, False
+
+    tools_out = list(existing_tools) if existing_tools else []
     existing_names: set[str] = set()
     for t in tools_out:
         n = _extract_tool_name(t)
@@ -1811,7 +2258,7 @@ def apply_session_sticky_ccr_tool(
                     request_id=request_id,
                 )
                 return tools_out, True
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
                 logger.error(
                     "corrupt golden CCR tool bytes for session %s: %s — regenerating fresh definition",
                     session_id,
@@ -1860,55 +2307,59 @@ def apply_session_sticky_ccr_tool(
 async def _read_request_body_bytes(request: Request) -> bytes:
     """Read and (if needed) decompress the request body, returning raw UTF-8 bytes.
 
-    Mirrors ``_read_request_json`` but returns the bytes pre-parse so
-    forwarders can implement byte-faithful passthrough (PR-A3, fixes P0-2).
+    Decompression (zstd, gzip, deflate, brotli) is CPU-bound; it is offloaded
+    to a default thread-pool executor so it does not block the async event loop.
     Raises ``ValueError`` on any decompression failure.
     """
     encoding = (request.headers.get("content-encoding") or "").lower().strip()
     raw = await request.body()
 
-    if encoding in ("zstd", "zstandard"):
-        try:
+    if not encoding or encoding == "identity":
+        return cast(bytes, raw)
+
+    loop = asyncio.get_running_loop()
+
+    def _decompress(data: bytes) -> bytes:
+        if encoding in ("zstd", "zstandard"):
             import zstandard
 
             dctx = zstandard.ZstdDecompressor()
-            reader = dctx.stream_reader(raw)
-            raw = reader.read()
-            reader.close()
-        except ImportError:
-            raise ValueError(
-                "Request body is zstd-compressed but the 'zstandard' package is not installed. "
-                "Install it with: pip install zstandard"
-            ) from None
-        except Exception as exc:
-            raise ValueError(f"Failed to decompress zstd request body: {exc}") from exc
-    elif encoding == "gzip":
-        import gzip as _gzip
+            reader = dctx.stream_reader(data)
+            try:
+                result: bytes = reader.read()
+                return result
+            finally:
+                reader.close()
+        elif encoding == "gzip":
+            import gzip as _gzip
 
-        try:
-            raw = _gzip.decompress(raw)
-        except Exception as exc:
-            raise ValueError(f"Failed to decompress gzip request body: {exc}") from exc
-    elif encoding == "deflate":
-        import zlib
+            result = _gzip.decompress(data)
+            return result
+        elif encoding == "deflate":
+            import zlib
 
-        try:
-            raw = zlib.decompress(raw)
-        except Exception as exc:
-            raise ValueError(f"Failed to decompress deflate request body: {exc}") from exc
-    elif encoding == "br":
-        try:
+            result = zlib.decompress(data)
+            return result
+        elif encoding == "br":
             import brotli
 
-            raw = brotli.decompress(raw)
-        except ImportError:
-            raise ValueError(
-                "Request body is brotli-compressed but the 'brotli' package is not installed."
-            ) from None
-        except Exception as exc:
-            raise ValueError(f"Failed to decompress brotli request body: {exc}") from exc
-    elif encoding and encoding != "identity":
-        raise ValueError(f"Unsupported Content-Encoding: {encoding}")
+            result = brotli.decompress(data)
+            return result
+        else:
+            raise ValueError(f"Unsupported Content-Encoding: {encoding}")
+
+    try:
+        raw = await loop.run_in_executor(None, _decompress, raw)
+    except ImportError as exc:
+        pkg = {"zstd": "zstandard", "br": "brotli"}.get(encoding, encoding)
+        raise ValueError(
+            f"Request body is {encoding}-compressed but the '{pkg}' package is not installed. "
+            f"Install it with: pip install {pkg}"
+        ) from exc
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"Failed to decompress {encoding} request body: {exc}") from exc
 
     return cast(bytes, raw)
 
@@ -2365,6 +2816,117 @@ def inject_tool_search_deferral(
 
 
 # ---------------------------------------------------------------------------
+# Tool-search history repair (issue #2805).
+#
+# Once the deferral above is active, Anthropic answers with ``server_tool_use``
+# (the search) + ``tool_search_tool_result`` (a list of ``tool_reference``
+# entries) blocks, and the client writes them into its transcript permanently.
+# Anthropic validates every ``tool_reference`` in the history against the
+# request's ``tools`` array and 400s with
+# ``Tool reference 'X' not found in available tools`` when one is missing.
+#
+# That is fine for a client's main loop — the proxy re-injects the same tools
+# array every turn — but Claude Code also replays the SAME transcript on
+# side-requests that carry a different, smaller tools array (the prompt-type
+# Stop hook evaluator, /compact, …). The proxy cannot predict those tool sets,
+# so instead we repair the history: when the outbound request cannot support
+# the tool-search blocks, drop them. Deterministic (same request → same output,
+# so the prefix still caches), stateless (no session bookkeeping), and
+# self-healing for transcripts already poisoned before the fix.
+# ---------------------------------------------------------------------------
+
+_TOOL_SEARCH_RESULT_TYPE = "tool_search_tool_result"
+
+
+def _tool_search_reference_names(content: Any) -> list[str]:
+    """Return the ``tool_reference`` names carried by a tool-search result block.
+
+    Server-side results nest them (``content.tool_references``); a client-side
+    tool-search implementation returns the bare list. Accept both.
+    """
+    entries = content.get("tool_references") if isinstance(content, dict) else content
+    if not isinstance(entries, list):
+        return []
+    names = []
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("type") == "tool_reference":
+            # Server-side blocks use ``tool_name``; be liberal about ``name``.
+            name = entry.get("tool_name") or entry.get("name")
+            if name:
+                names.append(str(name))
+    return names
+
+
+def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any, int]:
+    """Drop tool-search blocks this request's ``tools`` array cannot support.
+
+    A block pair is unsupportable when the request carries no ``tool_search_tool_*``
+    tool, or when a ``tool_reference`` names a tool absent from ``tools`` — the two
+    shapes Anthropic rejects. Both the ``tool_search_tool_result`` and its paired
+    ``server_tool_use`` are removed (an orphan of either 400s on its own), and a
+    message left with no content blocks is dropped rather than sent empty.
+
+    Returns ``(messages, blocks_removed)``, and the ORIGINAL ``messages`` object
+    when nothing was removed — callers rely on identity to skip the write-back.
+    """
+    if not isinstance(messages, list):
+        return messages, 0
+
+    tool_list = tools if isinstance(tools, list) else []
+    available = {str(t["name"]) for t in tool_list if isinstance(t, dict) and t.get("name")}
+    has_search_tool = any(
+        isinstance(t, dict) and str(t.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+        for t in tool_list
+    )
+
+    out: list[Any] = []
+    removed = 0
+    changed = False
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            out.append(message)
+            continue
+
+        drop_indexes: set[int] = set()
+        orphaned_ids: set[str] = set()
+        for index, block in enumerate(content):
+            if not isinstance(block, dict) or block.get("type") != _TOOL_SEARCH_RESULT_TYPE:
+                continue
+            names = _tool_search_reference_names(block.get("content"))
+            if has_search_tool and all(name in available for name in names):
+                continue
+            drop_indexes.add(index)
+            use_id = block.get("tool_use_id")
+            if use_id:
+                orphaned_ids.add(str(use_id))
+        # The search call itself precedes its result, so pair it up in a second
+        # pass. Only tool-search server calls are eligible — web_search and code
+        # execution use the same block type and must survive untouched.
+        for index, block in enumerate(content):
+            if not isinstance(block, dict) or block.get("type") != "server_tool_use":
+                continue
+            is_search_call = str(block.get("name", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+            if str(block.get("id", "")) in orphaned_ids or (is_search_call and not has_search_tool):
+                drop_indexes.add(index)
+
+        if not drop_indexes:
+            out.append(message)
+            continue
+
+        changed = True
+        removed += len(drop_indexes)
+        kept = [block for index, block in enumerate(content) if index not in drop_indexes]
+        if not kept:
+            continue  # the whole turn was tool-search bookkeeping
+        repaired = dict(message)
+        repaired["content"] = kept
+        out.append(repaired)
+
+    return (out, removed) if changed else (messages, 0)
+
+
+# ---------------------------------------------------------------------------
 # Server-side Tool Search injection — OpenAI Responses API (gpt-5.4+).
 #
 # The OpenAI-side analogue of inject_tool_search_deferral above. OpenAI shipped
@@ -2374,7 +2936,11 @@ def inject_tool_search_deferral(
 # (only name+description remain) until the model searches for one — while every
 # tool stays callable and the prompt cache is preserved. Same win as Anthropic
 # (~15-25k tool-schema tokens -> ~200) for clients that ship a big tool surface
-# and never opt into tool search themselves (opencode, plain API clients).
+# and never opt into tool search themselves (plain API clients).
+#
+# Two harnesses are excluded. Codex drops deferred-call namespaces during its
+# round trip, while GH #2660 reports OpenCode rejecting the injected
+# `tool_search` tool as unavailable. Their tools therefore stay resident.
 #
 # Differences from the Anthropic path that require a separate function:
 #   * Responses function tools carry ``type: "function"`` (Anthropic real tools
@@ -2389,7 +2955,7 @@ def inject_tool_search_deferral(
 _OPENAI_TOOL_SEARCH_TYPE = "tool_search"
 _OPENAI_TOOL_SEARCH_MIN_TOOLS = 12
 _OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset({"terminal"})
-_OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex"})
+_OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex", "opencode"})
 # gpt-5.4 is the first model with Responses tool_search (OpenAI docs). Version-
 # gated by default; overridable per deployment via a regex in
 # HEADROOM_OPENAI_TOOL_SEARCH_MODELS (matched against the model name) so new
@@ -2437,8 +3003,9 @@ def inject_tool_search_deferral_openai(
     deferred + a ``{"type": "tool_search"}`` tool injected, or the original list
     unchanged when injection doesn't apply.
 
-    No-op for Codex, whose round-trip structs drop deferred-call namespaces. Also
-    no-op when: the model doesn't support tool search (gpt-5.4+ only), ``tools``
+    No-op for Codex and OpenCode, whose harnesses cannot safely execute the
+    injected search tool. Also no-op when: the model doesn't support tool search
+    (gpt-5.4+ only), ``tools``
     is not a list, there are fewer than ``_OPENAI_TOOL_SEARCH_MIN_TOOLS``, a
     tool_search tool is already present (client already defers), or nothing would
     be deferred. Core coding tools and hosted/typed tools (web_search,

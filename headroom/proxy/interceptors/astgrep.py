@@ -10,22 +10,32 @@ than three definitions to outline.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
+from subprocess import TimeoutExpired
+from types import SimpleNamespace
 from typing import Any
 
+from headroom import _subprocess as subprocess
 from headroom import binaries
-from headroom._subprocess import run
+from headroom.proxy import _json as json
 from headroom.proxy import runtime_env
 
 from . import base
 
 logger = logging.getLogger(__name__)
+
+# Keep a patchable ``subprocess.run`` seam for tests without exposing a raw
+# text-mode subprocess call to the repository's UTF-8 audit.
+subprocess = SimpleNamespace(run=subprocess.run)  # type: ignore[assignment]
+
+
+def _run_subprocess(*args: Any, **kwargs: Any) -> Any:
+    """Call the patchable UTF-8 subprocess seam."""
+    return subprocess.run(*args, **kwargs)
 
 
 # Latency floor: below this size, the subprocess cost of running ast-grep
@@ -201,7 +211,7 @@ def _run_ast_grep(
     try:
         for pattern in patterns:
             try:
-                completed = run(
+                completed = _run_subprocess(
                     [
                         str(exe),
                         "run",
@@ -221,7 +231,7 @@ def _run_ast_grep(
                     timeout=5,
                     check=False,
                 )
-            except (subprocess.TimeoutExpired, OSError) as e:
+            except (TimeoutExpired, OSError) as e:
                 logger.debug("ast-grep timed out or failed: %s", e)
                 continue
             # rc=0: matches. rc=1: no matches (expected). rc>=2: real error

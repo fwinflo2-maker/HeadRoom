@@ -345,11 +345,7 @@ def _try_detect_json(content: str) -> DetectionResult | None:
             1.0 if is_dict_array else 0.8,
             {"item_count": len(value), "is_dict_array": is_dict_array},
         )
-    return DetectionResult(
-        ContentType.JSON_ARRAY,
-        0.9,
-        {"is_dict_array": False, "is_object": True},
-    )
+    return None
 
 
 def _try_detect_diff(content: str) -> DetectionResult | None:

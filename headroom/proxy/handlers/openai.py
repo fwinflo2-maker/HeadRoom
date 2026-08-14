@@ -1712,15 +1712,17 @@ class OpenAIHandlerMixin:
     def _resolve_openai_upstream(self, request: Request, model: str | None = None) -> str:
         """Return the upstream base URL for ``request``.
 
-        Honors the ``x-headroom-base-url`` request header so OpenAI-compatible
-        gateways route through the dedicated handlers, and routes DeepSeek
-        Harness traffic (``x-deepseek-harness-user-id`` header, or a
-        ``deepseek-*`` model) to the configured DeepSeek upstream. Falls back to
-        the configured ``OPENAI_API_URL``.
+        Honors the explicit ``x-headroom-base-url`` request header first, then
+        routes DeepSeek Harness traffic (``x-deepseek-harness-user-id`` header,
+        or a ``deepseek-*`` model) to the configured DeepSeek upstream. Falls
+        back to the configured ``OPENAI_API_URL``.
         """
+        base = _resolve_openai_upstream_base(request.headers)
+        if base is not None:
+            return base
         if _is_deepseek_request(request.headers, model):
             return self.DEEPSEEK_API_URL
-        return _resolve_openai_upstream_base(request.headers) or self.OPENAI_API_URL
+        return self.OPENAI_API_URL
 
     @staticmethod
     def _strict_previous_turn_frozen_count(

@@ -14,6 +14,7 @@ Covers the two behavior-safe halves of the router/registry integration:
 from __future__ import annotations
 
 import dataclasses
+import logging
 
 import pytest
 
@@ -144,6 +145,44 @@ def test_unrecognized_names_are_ignored_but_recognized_still_apply() -> None:
     # No crash / no spurious flag creation for the unknown name.
 
 
+# ────────────────── unmatched-name warning (#2384, no behavior change) ────────
+
+
+def test_only_unmatched_selection_warns_that_builtins_are_disabled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A typo'd selection must be diagnosable from the startup log."""
+    config = ContentRouterConfig()
+    with caplog.at_level(logging.WARNING, logger="headroom.proxy"):
+        _apply_compressor_selection(config, {"smart_krusher"})
+    # Behavior is unchanged — the opt-in "exactly these" contract still holds.
+    assert not any(_enable_flags(config).values())
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "smart_krusher" in text
+    assert "disabled" in text.lower()
+    assert "smart_crusher" in text  # valid names listed for the typo case
+
+
+def test_mixed_selection_warns_only_about_unmatched_names(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = ContentRouterConfig()
+    with caplog.at_level(logging.WARNING, logger="headroom.proxy"):
+        _apply_compressor_selection(config, {"kompress", "does_not_exist"})
+    assert _enable_flags(config)["enable_kompress"] is True
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "does_not_exist" in text
+    assert "disabled" not in text.lower()  # built-ins were not all turned off
+
+
+def test_matched_selection_emits_no_warning(caplog: pytest.LogCaptureFixture) -> None:
+    for selection in ({"kompress"}, {"*"}):
+        config = ContentRouterConfig()
+        with caplog.at_level(logging.WARNING, logger="headroom.proxy"):
+            _apply_compressor_selection(config, selection)
+    assert not caplog.records
+
+
 # ─────────────────────────── ProxyConfig field ───────────────────────────────
 
 
@@ -190,12 +229,28 @@ def test_registry_inventory_does_not_enable_selection() -> None:
     assert registry.active(None) == []
 
 
-def test_builtin_entry_compress_is_a_guard() -> None:
+def test_builtin_entry_compress_delegates_via_router() -> None:
+    # The built-in entries now expose a WORKING (non-raising) compress that
+    # delegates to the router's own dispatch path. kompress with ML disabled is a
+    # passthrough (no model load), proving the entry runs without raising.
+    router = ContentRouter(ContentRouterConfig(enable_kompress=False))
+    entry = router.compressor_registry.get("kompress")
+    assert entry is not None
+    out = entry.compress(CompressInput(content="hello world", content_type="text/plain"))
+    assert isinstance(out, CompressOutput)
+    assert out.content == "hello world"  # ML disabled → passthrough, never raises
+
+
+def test_builtin_entry_without_router_is_inert_passthrough() -> None:
+    # A registry built with no bound router (module-level inventory use) has
+    # nothing to delegate to, so compress is an inert passthrough — still working
+    # (non-raising), never a fabricated result.
     registry = _build_compressor_registry()
     entry = registry.get("kompress")
     assert entry is not None
-    with pytest.raises(NotImplementedError):
-        entry.compress(CompressInput(content="x", content_type="text/plain"))
+    out = entry.compress(CompressInput(content="x", content_type="text/plain"))
+    assert isinstance(out, CompressOutput)
+    assert out.content == "x"
 
 
 def test_discovery_merges_external_compressor(monkeypatch: pytest.MonkeyPatch) -> None:

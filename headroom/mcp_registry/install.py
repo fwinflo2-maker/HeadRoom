@@ -59,8 +59,11 @@ def build_serena_spec(context: str) -> ServerSpec:
         name="serena",
         command="uvx",
         args=(
+            # The PyPI package (serena-agent) ships prebuilt wheels; the git
+            # source forced a from-source build that fails under proot-based
+            # filesystems where uv cannot hardlink into a build venv (#2871).
             "--from",
-            "git+https://github.com/oraios/serena",
+            "serena-agent",
             "serena",
             "start-mcp-server",
             "--project-from-cwd",
@@ -69,22 +72,6 @@ def build_serena_spec(context: str) -> ServerSpec:
             "--open-web-dashboard",
             "False",
         ),
-    )
-
-
-def build_tokensave_spec(binary: str = "tokensave") -> ServerSpec:
-    """Construct the canonical tokensave MCP server spec.
-
-    tokensave (https://github.com/aovestdipaperino/tokensave) is the primary
-    coding-task compressor — a local semantic code-graph server launched as
-    ``tokensave serve`` over stdio. ``binary`` is the command the agent runs;
-    pass an absolute path when tokensave was fetched to ``~/.local/bin`` and
-    is not on the agent's PATH, or leave the default when it is on PATH.
-    """
-    return ServerSpec(
-        name="tokensave",
-        command=binary,
-        args=("serve",),
     )
 
 

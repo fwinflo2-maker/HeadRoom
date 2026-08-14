@@ -60,7 +60,7 @@
     "extensions": [
       "./src/index.ts"
     ],
-    "image": "https://raw.githubusercontent.com/gurkanguray/headroom/feat/pi-extension-headroom/plugins/pi/banner.png"
+    "image": "https://raw.githubusercontent.com/headroomlabs-ai/headroom/main/plugins/pi/banner.png"
   },
   "publishConfig": {
     "access": "public"

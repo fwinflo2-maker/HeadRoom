@@ -5,13 +5,15 @@ dependencies), this provides a reasonable approximation based on
 character/word heuristics calibrated against real tokenizers.
 """
 
+#  Copyright (c) 2026 Noel Kuntze
+
 from __future__ import annotations
 
 import json
 import re
 from typing import Any
 
-from .base import BaseTokenizer
+from .base import BaseTokenizer, TokenCountCache
 
 
 class EstimatingTokenCounter(BaseTokenizer):
@@ -87,6 +89,7 @@ class EstimatingTokenCounter(BaseTokenizer):
                             If None, auto-detects based on content type.
         """
         self._fixed_ratio = chars_per_token
+        self._count_cache = TokenCountCache()
 
     def count_text(self, text: str) -> int:
         """Estimate token count for text.
@@ -100,6 +103,14 @@ class EstimatingTokenCounter(BaseTokenizer):
         if not text:
             return 0
 
+        cached = self._count_cache.get(text)
+        if cached is not None:
+            return cached
+        count = self._count_text_uncached(text)
+        self._count_cache.put(text, count)
+        return count
+
+    def _count_text_uncached(self, text: str) -> int:
         # Use fixed ratio if provided. Dense scripts (CJK/Kana/Hangul) still
         # tokenize at ~1 token per character, so pricing them at the (Latin)
         # fixed ratio under-counts by 2-4x — the same correction the auto path

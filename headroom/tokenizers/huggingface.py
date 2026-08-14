@@ -7,8 +7,6 @@ tokenizers. Requires the `transformers` library.
 from __future__ import annotations
 
 import logging
-import os
-import threading
 from functools import lru_cache
 from typing import Any
 
@@ -63,30 +61,16 @@ MODEL_TO_TOKENIZER: dict[str, str] = {
     "qwen2.5": "Qwen/Qwen2.5-7B",
     "qwen2.5-7b": "Qwen/Qwen2.5-7B",
     "qwen2.5-72b": "Qwen/Qwen2.5-72B",
-    # DeepSeek V1 / Coder (legacy, 2023-2024)
+    # DeepSeek
     "deepseek": "deepseek-ai/deepseek-llm-7b-base",
     "deepseek-7b": "deepseek-ai/deepseek-llm-7b-base",
     "deepseek-67b": "deepseek-ai/deepseek-llm-67b-base",
     "deepseek-coder": "deepseek-ai/deepseek-coder-6.7b-base",
-    "deepseek-coder-v2": "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
-    "deepseek-coder-v2-lite": "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
-    # DeepSeek V2/V3 family (2024)
     "deepseek-v2": "deepseek-ai/DeepSeek-V2",
-    "deepseek-v2-lite": "deepseek-ai/DeepSeek-V2-Lite",
     "deepseek-v3": "deepseek-ai/DeepSeek-V3",
-    "deepseek-v3-0324": "deepseek-ai/DeepSeek-V3-0324",
-    "deepseek-v3.2": "deepseek-ai/DeepSeek-V3.2",
-    # DeepSeek R1 reasoning family (2025)
-    "deepseek-r1": "deepseek-ai/DeepSeek-R1",
-    "deepseek-r1-0528": "deepseek-ai/DeepSeek-R1-0528",
-    "deepseek-reasoner": "deepseek-ai/DeepSeek-R1",
-    # DeepSeek V4 family (2025-2026)
-    "deepseek-v4-pro": "deepseek-ai/DeepSeek-V4-Pro",
+    "deepseek-v4": "deepseek-ai/DeepSeek-V4-Flash",
     "deepseek-v4-flash": "deepseek-ai/DeepSeek-V4-Flash",
-    # DeepSeek API aliases (routed through the proxy)
-    "deepseek-chat": "deepseek-ai/DeepSeek-V3",
-    "deepseek-r1-distill-qwen": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
-    "deepseek-r1-distill-llama": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+    "deepseek-v4-pro": "deepseek-ai/DeepSeek-V4-Pro",
     # Yi family
     "yi": "01-ai/Yi-6B",
     "yi-6b": "01-ai/Yi-6B",
@@ -122,31 +106,9 @@ MODEL_TO_TOKENIZER: dict[str, str] = {
 }
 
 
-# Bound the first (network) load of a HuggingFace tokenizer. Without a bound,
-# huggingface_hub download retries can block for many minutes (GH #1701: 610s
-# on a restricted Windows network). 0 disables network loads entirely.
-_LOAD_TIMEOUT_ENV = "HEADROOM_HF_TOKENIZER_LOAD_TIMEOUT_SECS"
-_LOAD_TIMEOUT_DEFAULT = 10.0
-
-
-def _load_timeout_secs() -> float:
-    try:
-        return float(os.environ.get(_LOAD_TIMEOUT_ENV, _LOAD_TIMEOUT_DEFAULT))
-    except (TypeError, ValueError):
-        return _LOAD_TIMEOUT_DEFAULT
-
-
 @lru_cache(maxsize=16)
 def _load_tokenizer(tokenizer_name: str):
     """Load and cache HuggingFace tokenizer.
-
-    The first attempt is cache-only (``local_files_only=True``) so a warm
-    HF cache never touches the network. A cache miss falls through to a
-    network download bounded by ``HEADROOM_HF_TOKENIZER_LOAD_TIMEOUT_SECS``
-    (default 10s) on a daemon thread — the download itself cannot be
-    cancelled, but the caller unblocks and falls back to estimation.
-    Failures are cached by ``lru_cache`` (returns ``None``), so a slow or
-    offline hub is probed at most once per process per tokenizer.
 
     Args:
         tokenizer_name: HuggingFace model/tokenizer name.
@@ -157,53 +119,20 @@ def _load_tokenizer(tokenizer_name: str):
     from transformers import AutoTokenizer
 
     try:
-        return AutoTokenizer.from_pretrained(
+        tok = AutoTokenizer.from_pretrained(
             tokenizer_name,
             trust_remote_code=True,
-            local_files_only=True,
         )
-    except Exception:
-        pass  # Not in the local cache — try the network below, bounded.
-
-    timeout = _load_timeout_secs()
-    if timeout <= 0:
-        logger.warning(
-            f"Tokenizer {tokenizer_name} not in local HF cache and network "
-            f"loading is disabled ({_LOAD_TIMEOUT_ENV}=0); using estimation"
-        )
+        # Suppress the "Token indices sequence length is longer than the
+        # specified maximum sequence length" warning — Headroom counts
+        # tokens for cost estimation and does NOT feed them into the
+        # model, so truncation is neither needed nor desired.
+        if hasattr(tok, "model_max_length"):
+            tok.model_max_length = 1 << 30  # 1B — effectively unlimited
+        return tok
+    except Exception as e:
+        logger.warning(f"Failed to load tokenizer {tokenizer_name}: {e}")
         return None
-
-    result: list[Any] = []
-    error: list[BaseException] = []
-
-    def _download() -> None:
-        try:
-            result.append(
-                AutoTokenizer.from_pretrained(
-                    tokenizer_name,
-                    trust_remote_code=True,
-                )
-            )
-        except BaseException as e:  # noqa: BLE001 — report any failure to the waiter
-            error.append(e)
-
-    thread = threading.Thread(
-        target=_download,
-        name=f"headroom-hf-tokenizer-load-{tokenizer_name}",
-        daemon=True,
-    )
-    thread.start()
-    thread.join(timeout)
-    if thread.is_alive():
-        logger.warning(
-            f"Timed out loading tokenizer {tokenizer_name} after {timeout}s "
-            f"(set {_LOAD_TIMEOUT_ENV} to adjust); using estimation"
-        )
-        return None
-    if error:
-        logger.warning(f"Failed to load tokenizer {tokenizer_name}: {error[0]}")
-        return None
-    return result[0] if result else None
 
 
 def get_tokenizer_name(model: str) -> str:
@@ -217,19 +146,22 @@ def get_tokenizer_name(model: str) -> str:
     """
     model_lower = model.lower()
 
-    # Direct lookup
-    if model_lower in MODEL_TO_TOKENIZER:
-        return MODEL_TO_TOKENIZER[model_lower]
+    # Gateways commonly prefix model ids with a provider path. Resolve the
+    # most-specific model key on each progressively unwrapped form so a
+    # generic ``deepseek`` entry cannot shadow ``deepseek-v4-flash``.
+    candidates = [model_lower]
+    while "/" in model_lower:
+        model_lower = model_lower.split("/", 1)[1]
+        candidates.append(model_lower)
 
-    # Try prefix matching, longest (most specific) key first. Scanning in
-    # dict-insertion order is wrong: a short family key like "qwen" precedes
-    # "qwen2"/"qwen2.5", so "qwen2-7b-instruct" would match "qwen" first and
-    # resolve to the Qwen1 tokenizer (a different vocabulary -> wrong counts).
-    # The sibling tiktoken resolver (get_encoding_for_model) documents and
-    # guards this exact order-dependent pitfall.
-    for key in sorted(MODEL_TO_TOKENIZER, key=len, reverse=True):
-        if model_lower.startswith(key):
-            return MODEL_TO_TOKENIZER[key]
+    for candidate in candidates:
+        if candidate in MODEL_TO_TOKENIZER:
+            return MODEL_TO_TOKENIZER[candidate]
+
+    for candidate in reversed(candidates):
+        for key in sorted(MODEL_TO_TOKENIZER, key=len, reverse=True):
+            if candidate.startswith(key):
+                return MODEL_TO_TOKENIZER[key]
 
     # Assume model name is the tokenizer name
     return model

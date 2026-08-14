@@ -135,6 +135,13 @@ def install_all(
         try:
             install(app, config)
         except Exception as exc:  # noqa: BLE001 — one bad extension must not brick the proxy
+            message = str(exc).lower()
+            optional_failure = any(
+                marker in message
+                for marker in ("license", "auth", "credential", "optional dependency")
+            )
+            if not optional_failure:
+                raise
             # A failing extension disables *itself* and the proxy keeps running
             # without it — covers environment/auth failures and compatibility
             # errors (e.g. a plugin built against a core API this version lacks).

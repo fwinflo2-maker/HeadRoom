@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import pytest
+
 from headroom.proxy import extensions
 
 
@@ -44,3 +46,13 @@ def test_install_all_warns_for_missing_requested_extension(caplog, monkeypatch) 
 
     assert installed == []
     assert "proxy extensions requested but not found: missing_ext" in caplog.text
+
+
+def test_install_all_surfaces_unexpected_enabled_extension_errors(monkeypatch) -> None:
+    def broken(app: Any, config: Any) -> None:
+        raise RuntimeError("extension bug")
+
+    monkeypatch.setattr(extensions, "discover", lambda: iter([("broken_ext", broken)]))
+
+    with pytest.raises(RuntimeError, match="extension bug"):
+        extensions.install_all(object(), object(), enabled=["broken_ext"])

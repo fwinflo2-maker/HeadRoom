@@ -57,6 +57,12 @@ def test_negative_min_input_tokens_clamps_to_disabled() -> None:
     assert TransformPipeline(config)._min_input_tokens == 0
 
 
+def test_min_input_guard_is_disabled_by_default() -> None:
+    config = HeadroomConfig()
+    assert config.min_input_tokens == 0
+    assert TransformPipeline(config)._min_input_tokens == 0
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [("-1", 0.0), ("0", 0.0), ("0.4", 0.4), ("2", 1.0), ("invalid", 0.7)],

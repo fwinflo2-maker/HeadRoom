@@ -21,6 +21,7 @@ from headroom.providers.registry import (
     ProviderApiTargets,
     ProxyProviderRuntime,
     UpstreamRoute,
+    UpstreamRoutesConfigError,
     parse_upstream_routes,
 )
 
@@ -54,14 +55,14 @@ def test_parse_empty_env_returns_empty() -> None:
     assert parse_upstream_routes({"HEADROOM_UPSTREAM_ROUTES": ""}) == ()
 
 
-def test_parse_invalid_json_returns_empty(caplog: pytest.LogCaptureFixture) -> None:
-    with caplog.at_level("ERROR", logger="headroom.proxy.routes"):
-        assert parse_upstream_routes({"HEADROOM_UPSTREAM_ROUTES": "{not json"}) == ()
-    assert any("invalid JSON" in r.message for r in caplog.records)
+def test_parse_invalid_json_fails_closed() -> None:
+    with pytest.raises(UpstreamRoutesConfigError, match="invalid JSON"):
+        parse_upstream_routes({"HEADROOM_UPSTREAM_ROUTES": "{not json"})
 
 
-def test_parse_non_array_returns_empty() -> None:
-    assert parse_upstream_routes({"HEADROOM_UPSTREAM_ROUTES": '{"a":1}'}) == ()
+def test_parse_non_array_fails_closed() -> None:
+    with pytest.raises(UpstreamRoutesConfigError, match="JSON array"):
+        parse_upstream_routes({"HEADROOM_UPSTREAM_ROUTES": '{"a":1}'})
 
 
 def test_parse_valid_routes() -> None:
@@ -86,26 +87,37 @@ def test_parse_strips_trailing_slash() -> None:
     assert routes[0].upstream == "https://ollama.com"
 
 
-def test_parse_skips_empty_prefix(caplog: pytest.LogCaptureFixture) -> None:
-    with caplog.at_level("WARNING", logger="headroom.proxy.routes"):
-        routes = _routes(
+def test_parse_empty_prefix_fails_closed() -> None:
+    with pytest.raises(UpstreamRoutesConfigError, match="model_prefix"):
+        _routes(
             {"model_prefix": "", "upstream": "https://x"},
             {"model_prefix": "glm-", "upstream": "https://ollama.com"},
         )
-    assert len(routes) == 1
-    assert routes[0].model_prefix == "glm-"
 
 
-def test_parse_bad_protocol_defaults_openai(caplog: pytest.LogCaptureFixture) -> None:
-    with caplog.at_level("WARNING", logger="headroom.proxy.routes"):
-        routes = _routes({"model_prefix": "x-", "protocol": "bogus"})
-    assert routes[0].protocol == "openai"
+def test_parse_bad_protocol_fails_closed() -> None:
+    with pytest.raises(UpstreamRoutesConfigError, match="protocol"):
+        _routes({"model_prefix": "x-", "protocol": "bogus"})
 
 
-def test_parse_bad_auth_falls_back_passthrough(caplog: pytest.LogCaptureFixture) -> None:
-    with caplog.at_level("WARNING", logger="headroom.proxy.routes"):
-        routes = _routes({"model_prefix": "x-", "auth": "weird"})
-    assert isinstance(routes[0].auth, PassthroughAuth)
+def test_parse_bad_auth_fails_closed() -> None:
+    with pytest.raises(UpstreamRoutesConfigError, match="auth"):
+        _routes({"model_prefix": "x-", "auth": "weird"})
+
+
+@pytest.mark.parametrize(
+    "upstream",
+    ["file:///tmp/socket", "https://user:secret@example.com", "example.com", 123],
+)
+def test_parse_unsafe_or_invalid_upstream_fails_closed(upstream: object) -> None:
+    with pytest.raises(UpstreamRoutesConfigError, match="upstream"):
+        _routes({"model_prefix": "x-", "upstream": upstream})
+
+
+@pytest.mark.parametrize("auth", ["env:", "env:BAD-NAME", 123])
+def test_parse_invalid_bearer_env_fails_closed(auth: object) -> None:
+    with pytest.raises(UpstreamRoutesConfigError, match="auth"):
+        _routes({"model_prefix": "x-", "auth": auth})
 
 
 # --- resolve_upstream ---

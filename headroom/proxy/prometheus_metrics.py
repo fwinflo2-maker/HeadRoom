@@ -14,7 +14,7 @@ import logging
 import threading
 from collections import defaultdict
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from headroom.observability import HeadroomOtelMetrics
@@ -22,12 +22,23 @@ if TYPE_CHECKING:
 
 from headroom import savings_ledger
 from headroom.observability import get_otel_metrics
-from headroom.proxy.savings_tracker import SavingsTracker
+from headroom.proxy.savings_tracker import SavingsTracker, estimate_request_savings_usd
 
 logger = logging.getLogger("headroom.proxy")
 
+# Sentinel label value that models past MAX_DISTINCT_MODELS collapse into, so
+# client-supplied model cardinality stays bounded (see record_request).
+_OTHER_MODEL = "other"
+
 
 def _escape_label_value(value: str) -> str:
+    # The /metrics body is emitted whole with .encode("utf-8") (server.py). A
+    # client-supplied value can be a valid str that is not UTF-8-encodable — a
+    # lone surrogate decoded from a JSON model id — which raises in the response
+    # encoder and 500s every scrape, not just its own line. Drop un-encodable
+    # code points before escaping so one malformed request can't down the
+    # endpoint. Byte-identical for encodable values, including non-ASCII.
+    value = value.encode("utf-8", "replace").decode("utf-8")
     return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
 
@@ -82,6 +93,9 @@ class PrometheusMetrics:
         self.requests_total = 0
         self.requests_by_provider: dict[str, int] = defaultdict(int)
         self.requests_by_model: dict[str, int] = defaultdict(int)
+        # Set once when requests_by_model first reaches MAX_DISTINCT_MODELS, so the
+        # cardinality-cap warning fires exactly once instead of per request.
+        self._model_cardinality_warned = False
         # Populated via X-Headroom-Stack header (TS SDK adapters, etc.)
         self.requests_by_stack: dict[str, int] = defaultdict(int)
         self.requests_cached = 0
@@ -97,6 +111,11 @@ class PrometheusMetrics:
         self.tokens_input_total = 0
         self.tokens_output_total = 0
         self.tokens_saved_total = 0
+        # Tool-schema savings (deferral + turn-hook tool shrink), aggregated from
+        # per-request tags. Tracked apart from tokens_saved_total (which is message
+        # compression only — tool bytes never move tok_before/after) so every sink
+        # can surface the tool-schema layer instead of silently dropping it.
+        self.tool_search_saved_total = 0
         # Sum of tokens we actually attempted to compress across the
         # session: extracted units that passed all gates + tool-schema
         # tokens we ran compaction against. Excludes prefix-frozen
@@ -117,6 +136,15 @@ class PrometheusMetrics:
         self.compressions_by_strategy: dict[str, int] = defaultdict(int)
         self.tokens_saved_by_strategy: dict[str, int] = defaultdict(int)
 
+        # Per-extension token savings, keyed by the extension-supplied
+        # ``key``. Populated lazily by ``record_extension_savings`` — no
+        # hardcoded list of extensions. Proxy extensions report the tokens
+        # they saved so per-extension contribution is observable via /stats,
+        # mirroring the per-strategy compression breakdown above.
+        self.extension_savings: dict[str, int] = defaultdict(int)
+        # Named savings attribution; realized and projected rows stay separate.
+        self.savings_by_source: dict[str, dict[str, str | int | float | bool]] = {}
+
         # Fail-open compression failures, keyed by reason ("timeout",
         # "error"). The proxy fails open on any optimization error so the
         # request still succeeds; without this counter the failure is only
@@ -130,14 +158,18 @@ class PrometheusMetrics:
         # counter proves whether the gate ever fires on live traffic.
         self.kompress_size_gate_by_outcome: dict[str, int] = defaultdict(int)
 
-        # These two counters are mutated from the compression thread-pool
-        # worker (record_kompress_size_gate runs inside ContentRouter, which
-        # the proxy runs in an executor), while export()/reset_runtime() read
-        # and clear them from the event-loop thread. asyncio.Lock can't be
-        # taken off-loop, so guard them with a plain threading.Lock, mirroring
-        # _stage_timing_lock below. Without it a first-time key insert can race
-        # an export iteration ("dictionary changed size during iteration") and
-        # concurrent increments can be lost.
+        # Timeout-debt quarantine events. ``activated`` means a request timed
+        # out while its worker kept running; ``skipped`` means later work was
+        # rejected before executor admission behind that worker.
+        self.compression_quarantine_by_event: dict[str, int] = defaultdict(int)
+
+        # These counters are mutated from compression worker threads and the
+        # event-loop thread, while export()/reset_runtime() read and clear them.
+        # asyncio.Lock can't be taken off-loop, so guard them with a plain
+        # threading.Lock, mirroring _stage_timing_lock below. Without it a
+        # first-time key insert can race an export iteration ("dictionary
+        # changed size during iteration") and concurrent increments can be
+        # lost.
         self._obs_counter_lock = threading.Lock()
 
         # Codex WebSocket compression observability. These are intentionally
@@ -299,6 +331,7 @@ class PrometheusMetrics:
             self.requests_total = 0
             self.requests_by_provider.clear()
             self.requests_by_model.clear()
+            self._model_cardinality_warned = False
             self.requests_by_stack.clear()
             self.requests_cached = 0
             self.requests_rate_limited = 0
@@ -313,13 +346,17 @@ class PrometheusMetrics:
             self.tokens_input_total = 0
             self.tokens_output_total = 0
             self.tokens_saved_total = 0
+            self.tool_search_saved_total = 0
             self.attempted_input_tokens_total = 0
 
             self.compressions_by_strategy.clear()
             self.tokens_saved_by_strategy.clear()
+            self.extension_savings.clear()
+            self.savings_by_source.clear()
             with self._obs_counter_lock:
                 self.compression_failed_by_reason.clear()
                 self.kompress_size_gate_by_outcome.clear()
+                self.compression_quarantine_by_event.clear()
 
             self.codex_ws_units_total = 0
             self.codex_ws_units_modified_total = 0
@@ -398,13 +435,13 @@ class PrometheusMetrics:
             return total_input_tokens, total_input_cost_usd
 
         try:
-            cost_stats = self.cost_tracker.stats()
+            # totals() rather than stats(): identical numbers, without the
+            # 31-day cost-record walk that stats()["budget_basis"] performs and
+            # this caller throws away. See CostTracker.totals.
+            tracked_input_tokens, tracked_input_cost_usd = self.cost_tracker.totals()
         except Exception:
             logger.debug("Failed to read cost tracker totals for savings history", exc_info=True)
             return total_input_tokens, total_input_cost_usd
-
-        tracked_input_tokens = cost_stats.get("total_input_tokens")
-        tracked_input_cost_usd = cost_stats.get("total_input_cost_usd")
 
         if tracked_input_tokens is not None:
             try:
@@ -448,6 +485,14 @@ class PrometheusMetrics:
         self.requests_by_stack[slug] += 1
         self.savings_tracker.record_lifetime_stack(slug)
 
+        # Same fan-out as record_compression. This header is the only signal
+        # that names the harness when an agent is pointed at a persistent proxy
+        # rather than launched by `headroom wrap`, and the beacon cannot import
+        # headroom.proxy to read requests_by_stack itself.
+        from headroom.telemetry.session import record_stack as _beacon_stack
+
+        _beacon_stack(slug)
+
     def record_compression(
         self,
         strategy: str,
@@ -478,6 +523,40 @@ class PrometheusMetrics:
         if saved > 0:
             self.tokens_saved_by_strategy[strategy] += saved
 
+        # Fan out to the beacon. This object is the configured
+        # CompressionObserver for the proxy's pipelines, so it is where those
+        # events already arrive with both token counts — a second observer here
+        # would mean a second measurement pass for numbers in hand. (The paths
+        # that have no observer at all pass telemetry's
+        # BeaconCompressionObserver directly instead.)
+        #
+        # The beacon is ON by default, so this does not short-circuit in
+        # practice and must stay off the aggregator's lock: it stages into a
+        # dedicated mutex that the request path never takes, which is what
+        # keeps this method's "synchronous + lock-free" contract honest with
+        # respect to everything else in the process.
+        from headroom.telemetry.session import record_compression as _beacon_compression
+
+        _beacon_compression(strategy, original_tokens, compressed_tokens)
+
+    def record_extension_savings(self, key: str, saved: int) -> None:
+        """Accumulate tokens saved by a proxy extension, keyed by ``key``.
+
+        Called by proxy extensions that perform their own token
+        reduction and want that contribution surfaced alongside the
+        built-in compression metrics. The per-extension totals are
+        exposed via /stats (``extension_savings``), mirroring how
+        ``record_compression`` accumulates ``tokens_saved_by_strategy``.
+
+        Synchronous + lock-free: ``defaultdict(int)`` writes are atomic
+        under the GIL for these key types, matching ``record_compression``.
+
+        Non-positive ``saved`` values are ignored — the metric never
+        records "negative savings".
+        """
+        if saved > 0:
+            self.extension_savings[key] += saved
+
     def record_compression_failed(self, reason: str) -> None:
         """Record one fail-open compression failure, bucketed by ``reason``.
 
@@ -501,6 +580,18 @@ class PrometheusMetrics:
         """
         with self._obs_counter_lock:
             self.kompress_size_gate_by_outcome[outcome or "within"] += 1
+
+    def record_compression_quarantine(self, event: str) -> None:
+        """Record one timeout-debt quarantine event.
+
+        ``event`` is ``"activated"`` when a timed-out worker is confirmed to
+        still be running, or ``"skipped"`` when new compression is rejected
+        before executor admission while that worker remains. Both worker and
+        event-loop threads call this method, so updates share the
+        observer-counter lock.
+        """
+        with self._obs_counter_lock:
+            self.compression_quarantine_by_event[event or "skipped"] += 1
 
     def record_router_route_counts(self, counts: dict[str, int]) -> None:
         """Accumulate ContentRouter routing-category counts for a single
@@ -640,8 +731,23 @@ class PrometheusMetrics:
         output_tokens_saved: int = 0,
         project: str | None = None,
         client: str | None = None,
+        tool_search_saved: int = 0,
+        local_input_tokens: int | None = None,
+        savings_attribution: list[dict[str, Any]] | None = None,
     ):
-        """Record metrics for a request."""
+        """Record metrics for a request.
+
+        ``input_tokens`` is the billed/volume figure and may be the provider's own
+        count. ``local_input_tokens`` is the same request measured with the SAME
+        tokenizer as ``tokens_saved``; it is used wherever a delta is derived, so
+        reduction/yield/ledger math never straddles two rulers. Defaults to
+        ``input_tokens`` when omitted, preserving pre-split behaviour.
+        """
+        # Local import mirrors record_stack: defers to call-time (the telemetry
+        # package is fully loaded by then), avoiding an import cycle at module load.
+        from headroom.telemetry.context import MAX_DISTINCT_MODELS
+
+        ledger_input_tokens = input_tokens if local_input_tokens is None else local_input_tokens
         # Post-guard invariant (all providers): Headroom never forwards a request
         # larger than the original — handlers revert any inflation before sending
         # (verified clean on the wire). So compression savings are >= 0; a negative
@@ -655,10 +761,35 @@ class PrometheusMetrics:
                 model,
             )
             tokens_saved = 0
+        savings_usd = estimate_request_savings_usd(
+            model,
+            compression_tokens_saved=tokens_saved,
+            tool_schema_tokens_saved=tool_search_saved,
+            output_tokens_saved=output_tokens_saved,
+            cache_read_tokens=cache_read_tokens,
+        )
         async with self._lock:
             self.requests_total += 1
             self.requests_by_provider[provider] += 1
-            self.requests_by_model[model] += 1
+            # Cap client-supplied model cardinality. `model` is client-controlled
+            # (body.get("model") in the openai/gemini/bedrock handlers), so an
+            # arbitrary-model client would otherwise grow requests_by_model and the
+            # exported series without bound. Bucket over-cap models into "other"
+            # (the sentinel docs/observability.md documents for `tier`), mirroring
+            # the requests_by_stack cap. Membership test, never a defaultdict index:
+            # indexing would materialize the key and defeat the cap.
+            if model in self.requests_by_model or len(self.requests_by_model) < MAX_DISTINCT_MODELS:
+                bounded_model = model
+            else:
+                bounded_model = _OTHER_MODEL
+                if not self._model_cardinality_warned:
+                    self._model_cardinality_warned = True
+                    logger.warning(
+                        "metrics.record: model cardinality cap (%d) reached; "
+                        'bucketing further models into "other"',
+                        MAX_DISTINCT_MODELS,
+                    )
+            self.requests_by_model[bounded_model] += 1
 
             if cached:
                 self.requests_cached += 1
@@ -666,6 +797,27 @@ class PrometheusMetrics:
             self.tokens_input_total += input_tokens
             self.tokens_output_total += output_tokens
             self.tokens_saved_total += tokens_saved
+            self.tool_search_saved_total += max(0, int(tool_search_saved))
+            for item in savings_attribution or ():
+                source = str(item.get("source") or "other")[:64]
+                realized = bool(item.get("realized", True))
+                key = f"{source}:{int(realized)}"
+                row = self.savings_by_source.setdefault(
+                    key,
+                    {
+                        "source": source,
+                        "realized": realized,
+                        "events": 0,
+                        "tokens": 0,
+                        "usd": 0.0,
+                    },
+                )
+                row["events"] = int(row["events"]) + 1
+                row["tokens"] = int(row["tokens"]) + max(0, int(item.get("tokens", 0) or 0))
+                row["usd"] = round(
+                    float(row["usd"]) + float(item.get("usd", 0.0) or 0.0),
+                    12,
+                )
             # See the attribute definition for why this is the right
             # denominator for the active-compression ratio.
             self.attempted_input_tokens_total += max(0, int(attempted_input_tokens))
@@ -689,8 +841,13 @@ class PrometheusMetrics:
                 # is always a cold start (100% write, 0% read) — not a bust.
                 # Only flag as bust when a previously-warm model suddenly has
                 # high write ratio, indicating prefix invalidation.
-                model_req_num = self._cache_requests_by_model[model]
-                self._cache_requests_by_model[model] += 1
+                # bounded_model can be "other" once the cardinality cap trips, which
+                # mixes distinct models in this bust heuristic. That is acceptable:
+                # it only happens past MAX_DISTINCT_MODELS distinct models on cached
+                # anthropic traffic, the worst case is a mis-attributed bust stat,
+                # and it keeps _cache_requests_by_model bounded.
+                model_req_num = self._cache_requests_by_model[bounded_model]
+                self._cache_requests_by_model[bounded_model] += 1
                 if provider == "anthropic" and model_req_num > 0:
                     total_cached = cache_read_tokens + cache_write_tokens
                     if total_cached > 0 and cache_write_tokens > total_cached * 0.5:
@@ -765,38 +922,69 @@ class PrometheusMetrics:
                 total_input_tokens=total_input_tokens,
                 total_input_cost_usd=total_input_cost_usd,
                 output_tokens_saved=output_tokens_saved,
+                estimated_savings_usd=savings_usd,
             )
 
-            # Also append to the durable, multi-process savings ledger so
-            # `headroom savings` reflects proxy traffic alongside MCP-tool usage.
-            # The real upstream model means litellm prices it accurately. The
-            # client is the harness classified from the User-Agent / X-Client
-            # (claude-code, codex, cursor, ...); it falls back to "proxy" only
-            # when the harness is unidentified.
-            if tokens_saved > 0 and not self._stateless:
-                # `input_tokens` here is the optimized (post-compression) count
-                # that was actually forwarded — see emit_request_outcome, which
-                # passes `input_tokens=outcome.optimized_tokens`. The ledger's
-                # `before` is the pre-compression original and `after` is what we
-                # forwarded, and `headroom savings` derives the reduction percent
-                # as saved / before. Passing the forwarded count as `before`
-                # understated the original by `tokens_saved`, inflating that
-                # percentage (e.g. a real 40% reduction was reported as ~67%).
-                # Reconstruct the original as forwarded + saved.
-                savings_ledger.record_savings_event(
-                    tokens_before=input_tokens + tokens_saved,
-                    tokens_after=input_tokens,
-                    model=model,
-                    client=client or "proxy",
-                    source="proxy",
-                )
+        # Also append to the durable, multi-process savings ledger so
+        # `headroom savings` reflects proxy traffic alongside MCP-tool usage.
+        # The real upstream model means litellm prices it accurately. The
+        # client is the harness classified from the User-Agent / X-Client
+        # (claude-code, codex, cursor, ...); it falls back to "proxy" only
+        # when the harness is unidentified.
+        #
+        # Deliberately outside `self._lock` and off the loop. The append does
+        # synchronous open + fcntl.flock + write, and rewrites the whole file
+        # once it passes 1 MB — and it fires on every compressed request. Under
+        # the lock that queued every other metrics caller behind the disk,
+        # including `export()`, which holds the same lock for the full
+        # Prometheus serialization. The ledger takes its own flock across
+        # processes, so the metrics lock was never what made it safe. Moving it
+        # out is not optional once it becomes an await: awaiting inside the lock
+        # would hold the lock for the whole write instead of just the syscall.
+        # ponytail: default thread pool, not a dedicated executor -- give it one
+        # if a profile ever shows writers parked on flock saturating the pool.
+        # tool_search_deferral saves tool-SCHEMA tokens that never move the
+        # message-level tok_before/after, so a tool-heavy turn can have
+        # tokens_saved=0 while genuinely deferring thousands of tokens. Fold that
+        # component into the ledger delta the same way the PERF headline and
+        # perf/analyzer do (`headline_before = before + tool_saved`); otherwise
+        # `headroom savings` understates real compression 7-10x on tool-search
+        # sessions and drops deferral-only turns from the ledger entirely (#2795).
+        deferral_saved = max(0, int(tool_search_saved))
+        ledger_saved = tokens_saved + deferral_saved
+        if ledger_saved > 0 and not self._stateless:
+            # `input_tokens` here is the optimized (post-compression) count
+            # that was actually forwarded — see emit_request_outcome, which
+            # passes `input_tokens=outcome.optimized_tokens`. The ledger's
+            # `before` is the pre-compression original and `after` is what we
+            # forwarded, and `headroom savings` derives the reduction percent
+            # as saved / before. Passing the forwarded count as `before`
+            # understated the original by `ledger_saved`, inflating that
+            # percentage (e.g. a real 40% reduction was reported as ~67%).
+            # Reconstruct the original as forwarded + saved.
+            await asyncio.to_thread(
+                savings_ledger.record_savings_event,
+                # The ledger stores a DELTA, so both ends must be on one ruler.
+                # `input_tokens` is the billed/volume figure and may be the
+                # provider's own count; pairing it with a locally-counted
+                # `tokens_saved` yields a mixed-ruler before/after (local 10->6
+                # with the provider reporting 8 would record 12->8). Use the
+                # caller's local count when supplied.
+                tokens_before=ledger_input_tokens + ledger_saved,
+                tokens_after=ledger_input_tokens,
+                model=model,
+                client=client or "proxy",
+                source="proxy",
+            )
 
-        self._get_otel_metrics().record_proxy_request(
+        otel_metrics = self._get_otel_metrics()
+        otel_metrics.record_proxy_request(
             provider=provider,
             model=model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             tokens_saved=tokens_saved,
+            tool_search_saved=tool_search_saved,
             latency_ms=latency_ms,
             cached=cached,
             overhead_ms=overhead_ms,
@@ -806,7 +994,15 @@ class PrometheusMetrics:
             cache_write_5m_tokens=cache_write_5m_tokens,
             cache_write_1h_tokens=cache_write_1h_tokens,
             uncached_input_tokens=uncached_input_tokens,
+            attempted_input_tokens=attempted_input_tokens,
+            output_tokens_saved=output_tokens_saved,
+            savings_usd=savings_usd,
+            project=project,
+            client=client,
         )
+        record_attribution = getattr(otel_metrics, "record_savings_attribution", None)
+        if record_attribution is not None and savings_attribution:
+            record_attribution(savings_attribution)
 
     async def record_stage_timings(
         self,
@@ -1002,6 +1198,47 @@ class PrometheusMetrics:
                 help_text="Tokens saved by optimization",
                 value=self.tokens_saved_total,
             )
+            if self.savings_by_source:
+                lines.extend(
+                    [
+                        "# HELP headroom_savings_attribution_events_total Per-request savings attribution events",
+                        "# TYPE headroom_savings_attribution_events_total counter",
+                    ]
+                )
+                for row in self.savings_by_source.values():
+                    labels = _format_labels(
+                        {"source": str(row["source"]), "realized": str(row["realized"]).lower()}
+                    )
+                    lines.append(
+                        f"headroom_savings_attribution_events_total{labels} {row['events']}"
+                    )
+                lines.extend(
+                    [
+                        "",
+                        "# HELP headroom_savings_attributed_tokens_total Tokens attributed to a savings source",
+                        "# TYPE headroom_savings_attributed_tokens_total counter",
+                    ]
+                )
+                for row in self.savings_by_source.values():
+                    labels = _format_labels(
+                        {"source": str(row["source"]), "realized": str(row["realized"]).lower()}
+                    )
+                    lines.append(
+                        f"headroom_savings_attributed_tokens_total{labels} {row['tokens']}"
+                    )
+                lines.extend(
+                    [
+                        "",
+                        "# HELP headroom_savings_attributed_usd_total Cost savings attributed to a source; may be negative",
+                        "# TYPE headroom_savings_attributed_usd_total gauge",
+                    ]
+                )
+                for row in self.savings_by_source.values():
+                    labels = _format_labels(
+                        {"source": str(row["source"]), "realized": str(row["realized"]).lower()}
+                    )
+                    lines.append(f"headroom_savings_attributed_usd_total{labels} {row['usd']}")
+                lines.append("")
             _append_metric(
                 lines,
                 name="headroom_persistent_savings_requests_total",
@@ -1155,10 +1392,11 @@ class PrometheusMetrics:
                     ]
                 )
                 for _provider, _reasons in self.cache_miss_attribution_by_provider.items():
+                    _safe_provider = _escape_label_value(str(_provider))
                     for _reason, _count in _reasons.items():
                         lines.append(
-                            f'headroom_cache_miss_attribution_total{{provider="{_provider}",'
-                            f'reason="{_reason}"}} {_count}'
+                            f'headroom_cache_miss_attribution_total{{provider="{_safe_provider}",'
+                            f'reason="{_escape_label_value(str(_reason))}"}} {_count}'
                         )
                 lines.append("")
 
@@ -1167,6 +1405,7 @@ class PrometheusMetrics:
             with self._obs_counter_lock:
                 compression_failed = dict(self.compression_failed_by_reason)
                 kompress_size_gate = dict(self.kompress_size_gate_by_outcome)
+                compression_quarantine = dict(self.compression_quarantine_by_event)
 
             if compression_failed:
                 lines.extend(
@@ -1194,6 +1433,19 @@ class PrometheusMetrics:
                     )
                 lines.append("")
 
+            if compression_quarantine:
+                lines.extend(
+                    [
+                        "# HELP headroom_compression_quarantine_total Timeout-debt quarantine events by type",
+                        "# TYPE headroom_compression_quarantine_total counter",
+                    ]
+                )
+                for event, count in compression_quarantine.items():
+                    lines.append(
+                        f'headroom_compression_quarantine_total{{event="{_escape_label_value(event)}"}} {count}'
+                    )
+                lines.append("")
+
             lines.extend(
                 [
                     "# HELP headroom_requests_by_provider Requests by provider",
@@ -1201,7 +1453,9 @@ class PrometheusMetrics:
                 ]
             )
             for provider, count in self.requests_by_provider.items():
-                lines.append(f'headroom_requests_by_provider{{provider="{provider}"}} {count}')
+                lines.append(
+                    f'headroom_requests_by_provider{{provider="{_escape_label_value(str(provider))}"}} {count}'
+                )
             lines.append("")
 
             lines.extend(
@@ -1211,7 +1465,9 @@ class PrometheusMetrics:
                 ]
             )
             for model, count in self.requests_by_model.items():
-                lines.append(f'headroom_requests_by_model{{model="{model}"}} {count}')
+                lines.append(
+                    f'headroom_requests_by_model{{model="{_escape_label_value(str(model))}"}} {count}'
+                )
             lines.append("")
 
             if self.transform_timing_sum:
@@ -1346,13 +1602,20 @@ class PrometheusMetrics:
                 lines.append("")
 
             if self.cache_by_provider:
+                # The exposition format wants each family's samples grouped, so the
+                # blocks below re-walk this dict once per family. Escape the provider
+                # keys once here instead of at all eleven emission sites.
+                cache_by_provider = {
+                    _escape_label_value(str(name)): stats
+                    for name, stats in self.cache_by_provider.items()
+                }
                 lines.extend(
                     [
                         "# HELP headroom_cache_read_tokens_total Provider cache read tokens",
                         "# TYPE headroom_cache_read_tokens_total counter",
                     ]
                 )
-                for provider, stats in self.cache_by_provider.items():
+                for provider, stats in cache_by_provider.items():
                     lines.append(
                         f'headroom_cache_read_tokens_total{{provider="{provider}"}} {stats["cache_read_tokens"]}'
                     )
@@ -1363,7 +1626,7 @@ class PrometheusMetrics:
                         "# TYPE headroom_cache_write_tokens_total counter",
                     ]
                 )
-                for provider, stats in self.cache_by_provider.items():
+                for provider, stats in cache_by_provider.items():
                     lines.append(
                         f'headroom_cache_write_tokens_total{{provider="{provider}"}} {stats["cache_write_tokens"]}'
                     )
@@ -1374,7 +1637,7 @@ class PrometheusMetrics:
                         "# TYPE headroom_cache_write_ttl_tokens_total counter",
                     ]
                 )
-                for provider, stats in self.cache_by_provider.items():
+                for provider, stats in cache_by_provider.items():
                     lines.append(
                         f'headroom_cache_write_ttl_tokens_total{{provider="{provider}",ttl="5m"}} {stats["cache_write_5m_tokens"]}'
                     )
@@ -1388,7 +1651,7 @@ class PrometheusMetrics:
                         "# TYPE headroom_cache_write_ttl_requests_total counter",
                     ]
                 )
-                for provider, stats in self.cache_by_provider.items():
+                for provider, stats in cache_by_provider.items():
                     lines.append(
                         f'headroom_cache_write_ttl_requests_total{{provider="{provider}",ttl="5m"}} {stats["cache_write_5m_requests"]}'
                     )
@@ -1402,7 +1665,7 @@ class PrometheusMetrics:
                         "# TYPE headroom_uncached_input_tokens_total counter",
                     ]
                 )
-                for provider, stats in self.cache_by_provider.items():
+                for provider, stats in cache_by_provider.items():
                     lines.append(
                         f'headroom_uncached_input_tokens_total{{provider="{provider}"}} {stats["uncached_input_tokens"]}'
                     )
@@ -1413,7 +1676,7 @@ class PrometheusMetrics:
                         "# TYPE headroom_provider_cache_requests_total counter",
                     ]
                 )
-                for provider, stats in self.cache_by_provider.items():
+                for provider, stats in cache_by_provider.items():
                     lines.append(
                         f'headroom_provider_cache_requests_total{{provider="{provider}"}} {stats["requests"]}'
                     )
@@ -1424,7 +1687,7 @@ class PrometheusMetrics:
                         "# TYPE headroom_provider_cache_hit_requests_total counter",
                     ]
                 )
-                for provider, stats in self.cache_by_provider.items():
+                for provider, stats in cache_by_provider.items():
                     lines.append(
                         f'headroom_provider_cache_hit_requests_total{{provider="{provider}"}} {stats["hit_requests"]}'
                     )
@@ -1435,7 +1698,7 @@ class PrometheusMetrics:
                         "# TYPE headroom_provider_cache_bust_total counter",
                     ]
                 )
-                for provider, stats in self.cache_by_provider.items():
+                for provider, stats in cache_by_provider.items():
                     lines.append(
                         f'headroom_provider_cache_bust_total{{provider="{provider}"}} {stats["bust_count"]}'
                     )
@@ -1446,7 +1709,7 @@ class PrometheusMetrics:
                         "# TYPE headroom_provider_cache_bust_write_tokens_total counter",
                     ]
                 )
-                for provider, stats in self.cache_by_provider.items():
+                for provider, stats in cache_by_provider.items():
                     lines.append(
                         f'headroom_provider_cache_bust_write_tokens_total{{provider="{provider}"}} {stats["bust_write_tokens"]}'
                     )
@@ -1475,33 +1738,5 @@ class PrometheusMetrics:
                 ),
                 value=redactions_total(),
             )
-
-            # Phase G PR-G3 remediation (C4): RTK invocations counter
-            # also lives Python-side. RTK is wrapped by the
-            # `headroom wrap` CLI (headroom.cli.wrap); the proxy
-            # observes invocation counts via a process-local tracker
-            # the wrap tail bumps. The Rust proxy previously held a
-            # dead counter for this; that's been removed.
-            from headroom.cli.wrap_rtk_metrics import rtk_invocation_counts
-
-            counts = rtk_invocation_counts()
-            lines.extend(
-                [
-                    "# HELP wrap_rtk_invocations_total RTK invocations observed via the wrap CLI tail",
-                    "# TYPE wrap_rtk_invocations_total counter",
-                ]
-            )
-            if not counts:
-                # Emit a zero-row under the sentinel tool name so
-                # the family advertises HELP/TYPE on a fresh boot
-                # and dashboards can probe it before any RTK
-                # invocation has happened. Matches the Rust side's
-                # H3 force-zero contract.
-                lines.append('wrap_rtk_invocations_total{tool="__init__"} 0')
-            else:
-                for tool, count in counts.items():
-                    safe_tool = _escape_label_value(str(tool))
-                    lines.append(f'wrap_rtk_invocations_total{{tool="{safe_tool}"}} {count}')
-            lines.append("")
 
             return "\n".join(lines)

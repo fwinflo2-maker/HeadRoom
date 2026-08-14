@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast
+from urllib.parse import urlparse
 
 from headroom.providers.claude import DEFAULT_API_URL as DEFAULT_ANTHROPIC_API_URL
 from headroom.providers.codex import DEFAULT_API_URL as DEFAULT_OPENAI_API_URL
@@ -62,6 +64,10 @@ class UpstreamAuthUnavailable(Exception):
         )
 
 
+class UpstreamRoutesConfigError(ValueError):
+    """A non-empty HEADROOM_UPSTREAM_ROUTES value is unsafe or malformed."""
+
+
 @dataclass(frozen=True)
 class UpstreamRoute:
     """One entry in the HEADROOM_UPSTREAM_ROUTES table.
@@ -90,19 +96,19 @@ def _parse_auth(spec: str) -> AuthMode:
     if spec == "passthrough":
         return PassthroughAuth()
     if spec.startswith("env:"):
-        return BearerAuth(env_var=spec[len("env:") :])
-    _route_logger.warning(
-        "HEADROOM_UPSTREAM_ROUTES: unknown auth spec %r, falling back to passthrough",
-        spec,
-    )
-    return PassthroughAuth()
+        env_var = spec[len("env:") :]
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_var):
+            return BearerAuth(env_var=env_var)
+        raise UpstreamRoutesConfigError("route auth env name is empty or invalid")
+    raise UpstreamRoutesConfigError("route auth must be 'passthrough' or 'env:VARNAME'")
 
 
 def parse_upstream_routes(env: Mapping[str, str]) -> tuple[UpstreamRoute, ...]:
     """Parse HEADROOM_UPSTREAM_ROUTES (JSON array) into an immutable tuple.
 
-    Empty / unset / malformed returns an empty tuple (legacy single-upstream
-    behavior).
+    Empty / unset returns an empty tuple (legacy single-upstream behavior).
+    Invalid non-empty configuration fails closed during proxy startup so an
+    operator typo cannot silently send credentials through the legacy route.
     """
     raw = env.get(_UPSTREAM_ROUTES_ENV, "").strip()
     if not raw:
@@ -110,39 +116,59 @@ def parse_upstream_routes(env: Mapping[str, str]) -> tuple[UpstreamRoute, ...]:
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
-        _route_logger.error("HEADROOM_UPSTREAM_ROUTES: invalid JSON (%s); ignoring routes", exc)
-        return ()
+        raise UpstreamRoutesConfigError(
+            f"HEADROOM_UPSTREAM_ROUTES contains invalid JSON at position {exc.pos}"
+        ) from exc
     if not isinstance(parsed, list):
-        _route_logger.error(
-            "HEADROOM_UPSTREAM_ROUTES: expected a JSON array, got %s; ignoring",
-            type(parsed).__name__,
-        )
-        return ()
+        raise UpstreamRoutesConfigError("HEADROOM_UPSTREAM_ROUTES must be a JSON array")
+    if not parsed:
+        raise UpstreamRoutesConfigError("HEADROOM_UPSTREAM_ROUTES must contain at least one route")
     routes: list[UpstreamRoute] = []
     for idx, entry in enumerate(parsed):
         if not isinstance(entry, dict):
-            _route_logger.warning("HEADROOM_UPSTREAM_ROUTES[%d]: not an object; skipping", idx)
-            continue
-        prefix = str(entry.get("model_prefix", "")).strip()
+            raise UpstreamRoutesConfigError(f"HEADROOM_UPSTREAM_ROUTES[{idx}] must be an object")
+        raw_prefix = entry.get("model_prefix")
+        prefix = raw_prefix.strip() if isinstance(raw_prefix, str) else ""
         if not prefix:
-            _route_logger.warning("HEADROOM_UPSTREAM_ROUTES[%d]: empty model_prefix; skipping", idx)
-            continue
+            raise UpstreamRoutesConfigError(
+                f"HEADROOM_UPSTREAM_ROUTES[{idx}].model_prefix must be a non-empty string"
+            )
         protocol = entry.get("protocol", "openai")
         if protocol not in ("openai", "anthropic"):
-            _route_logger.warning(
-                "HEADROOM_UPSTREAM_ROUTES[%d]: protocol %r not in (openai, anthropic); defaulting to openai",
-                idx,
-                protocol,
+            raise UpstreamRoutesConfigError(
+                f"HEADROOM_UPSTREAM_ROUTES[{idx}].protocol must be 'openai' or 'anthropic'"
             )
-            protocol = "openai"
         upstream = entry.get("upstream")
-        if isinstance(upstream, str):
+        if upstream is not None:
+            if not isinstance(upstream, str):
+                raise UpstreamRoutesConfigError(
+                    f"HEADROOM_UPSTREAM_ROUTES[{idx}].upstream must be an HTTP(S) URL"
+                )
             upstream = upstream.rstrip("/") or None
+            parsed_upstream = urlparse(upstream or "")
+            if (
+                parsed_upstream.scheme not in ("http", "https")
+                or not parsed_upstream.netloc
+                or parsed_upstream.username is not None
+                or parsed_upstream.password is not None
+            ):
+                raise UpstreamRoutesConfigError(
+                    f"HEADROOM_UPSTREAM_ROUTES[{idx}].upstream must be an HTTP(S) URL without embedded credentials"
+                )
+        auth_spec = entry.get("auth", "passthrough")
+        if not isinstance(auth_spec, str):
+            raise UpstreamRoutesConfigError(
+                f"HEADROOM_UPSTREAM_ROUTES[{idx}].auth must be a string"
+            )
+        try:
+            auth = _parse_auth(auth_spec)
+        except UpstreamRoutesConfigError as exc:
+            raise UpstreamRoutesConfigError(f"HEADROOM_UPSTREAM_ROUTES[{idx}]: {exc}") from exc
         routes.append(
             UpstreamRoute(
                 model_prefix=prefix.lower(),
                 upstream=upstream,
-                auth=_parse_auth(str(entry.get("auth", "passthrough"))),
+                auth=auth,
                 protocol=protocol,  # type: ignore[arg-type]
             )
         )

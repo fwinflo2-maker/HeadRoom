@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::{to_bytes, Body};
-use axum::extract::{ConnectInfo, DefaultBodyLimit, State, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, HeaderName, Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{any, get, post};
@@ -315,17 +315,22 @@ pub fn build_app(state: AppState) -> Router {
 async fn catch_all(
     State(state): State<AppState>,
     ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
-    ws: Option<WebSocketUpgrade>,
     req: Request<Body>,
 ) -> Response<Body> {
-    if is_websocket_upgrade(req.headers()) {
-        if let Some(ws) = ws {
+    let (mut parts, body) = req.into_parts();
+    if is_websocket_upgrade(&parts.headers) {
+        // axum 0.8 requires optional extractors to opt in explicitly, and
+        // WebSocketUpgrade intentionally does not. Extract it only after the
+        // upgrade headers have identified this as a WebSocket request.
+        if let Ok(ws) = WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
+            let req = Request::from_parts(parts, body);
             return ws_handler(ws, state, client_addr, req).await;
         }
         // Header says websocket but axum didn't extract it (likely missing
         // Sec-WebSocket-Key) — fall through to HTTP forwarding which will
         // surface the upstream error.
     }
+    let req = Request::from_parts(parts, body);
     forward_http(state, client_addr, req)
         .await
         .unwrap_or_else(|e| e.into_response())

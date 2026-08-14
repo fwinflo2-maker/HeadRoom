@@ -1,6 +1,7 @@
 """Claude-specific provider helpers."""
 
 from .runtime import (
+    CLAUDE_AUTH_KEYS,
     DEFAULT_API_URL,
     REMOTE_CONTROL_BASE_URL_ENV,
     REMOTE_CONTROL_GATED_MIN_VERSION,
@@ -8,7 +9,8 @@ from .runtime import (
     REMOTE_CONTROL_SIBLING_GATE_NOTE,
     TOOL_SEARCH_DEFAULT,
     TOOL_SEARCH_ENV,
-    TOOL_SEARCH_FOUNDRY_DEFAULT,
+    claude_auth_conflict_message,
+    claude_auth_conflict_sources,
     detect_claude_code_version,
     is_custom_anthropic_base_url,
     parse_claude_code_version,
@@ -26,6 +28,7 @@ from .vscode import (
 )
 
 __all__ = [
+    "CLAUDE_AUTH_KEYS",
     "claude_user_settings_path",
     "configure_vscode_claude_settings",
     "remove_vscode_claude_settings",
@@ -37,7 +40,8 @@ __all__ = [
     "REMOTE_CONTROL_SIBLING_GATE_NOTE",
     "TOOL_SEARCH_DEFAULT",
     "TOOL_SEARCH_ENV",
-    "TOOL_SEARCH_FOUNDRY_DEFAULT",
+    "claude_auth_conflict_message",
+    "claude_auth_conflict_sources",
     "detect_claude_code_version",
     "is_custom_anthropic_base_url",
     "parse_claude_code_version",

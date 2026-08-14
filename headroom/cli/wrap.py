@@ -32,8 +32,9 @@ import subprocess
 import sys
 import time
 import urllib.parse
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from typing import Any, cast
 
@@ -58,6 +59,7 @@ from headroom._version import normalize_release_version as _normalize_release_ve
 from headroom.agent_savings import (
     apply_agent_savings_env_defaults,
 )
+from headroom.cli.proxy import ensure_proxy_dependencies
 from headroom.copilot_auth import (
     _API_TOKEN_ENV_VARS,
     _API_TOKEN_EXPIRES_AT_ENV_VAR,
@@ -75,6 +77,8 @@ from headroom.providers.claude import (
     REMOTE_CONTROL_BASE_URL_ENV,
     TOOL_SEARCH_DEFAULT,
     TOOL_SEARCH_ENV,
+    claude_auth_conflict_message,
+    claude_auth_conflict_sources,
     claude_user_settings_path,
     configure_vscode_claude_settings,
     detect_claude_code_version,
@@ -217,51 +221,6 @@ def _write_text(path: Path, content: str) -> None:
     fsutil.write_text(path, content)
 
 
-@contextmanager
-def _claude_settings_lock(settings_path: Path) -> Iterator[None]:
-    """Hold an exclusive lock around one settings.local.json read/modify/write.
-
-    Overlapping ``headroom wrap`` processes share that file. ``fsutil.write_text``
-    already replaces atomically, but two unlocked read/modify/write cycles can
-    still interleave: each snapshots a stale previous value, and the first to
-    exit restores over the second wrap's live setting. Same sidecar-lock shape
-    as ``headroom.install.runtime.acquire_runtime_start_lock`` (msvcrt on
-    Windows, fcntl elsewhere). The lock is held only for the mutation, not the
-    wrapped session.
-    """
-    lock_path = settings_path.parent / f".{settings_path.name}.lock"
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_file = open(lock_path, "a+b")
-    try:
-        if lock_file.tell() == 0:
-            lock_file.write(b"\0")
-            lock_file.flush()
-        lock_file.seek(0)
-        if sys.platform == "win32":
-            import msvcrt
-
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        yield
-    finally:
-        try:
-            lock_file.seek(0)
-            if sys.platform == "win32":
-                import msvcrt
-
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        lock_file.close()
-
-
 def _read_settings_for_write(path: Path) -> dict[str, Any]:
     """Read a Claude settings file that is about to be mutated, or refuse to write.
 
@@ -301,6 +260,30 @@ def _read_settings_for_write(path: Path) -> dict[str, Any]:
             f"{path} does not contain a JSON object. Fix or move it, then re-run."
         )
     return cast("dict[str, Any]", payload)
+
+
+def _claude_settings_env(path: Path) -> dict[str, object]:
+    """Read a Claude settings env block for preflight validation."""
+    env = _read_settings_for_write(path).get("env")
+    return dict(env) if isinstance(env, dict) else {}
+
+
+def _raise_on_claude_auth_conflict(
+    *,
+    user_settings_path: Path,
+    project_settings_path: Path,
+    project_local_settings_path: Path,
+    environ: dict[str, str],
+) -> None:
+    """Refuse an auth state Claude Code rejects before mutating wrap state."""
+    conflict = claude_auth_conflict_sources(
+        (str(user_settings_path), _claude_settings_env(user_settings_path)),
+        (str(project_settings_path), _claude_settings_env(project_settings_path)),
+        (str(project_local_settings_path), _claude_settings_env(project_local_settings_path)),
+        ("shell environment", environ),
+    )
+    if conflict is not None:
+        raise click.ClickException(claude_auth_conflict_message(conflict))
 
 
 def _append_text(path: Path, content: str) -> None:
@@ -494,6 +477,8 @@ def _resolved_tool_search_mode(flag_value: str | None) -> str:
     existing = os.environ.get(_TOOL_SEARCH_ENV)
     if existing is not None:
         probe[_TOOL_SEARCH_ENV] = existing
+    if os.environ.get("CLAUDE_CODE_USE_FOUNDRY"):
+        probe["CLAUDE_CODE_USE_FOUNDRY"] = os.environ["CLAUDE_CODE_USE_FOUNDRY"]
     written = _configure_tool_search_env(probe, flag_value)
     return written if written is not None else probe.get(_TOOL_SEARCH_ENV, "")
 
@@ -501,121 +486,6 @@ def _resolved_tool_search_mode(flag_value: str | None) -> str:
 def _tool_search_mode_is_active(value: str) -> bool:
     """Whether an ``ENABLE_TOOL_SEARCH`` mode keeps tool deferral on (#746)."""
     return value.strip().lower() not in _TOOL_SEARCH_FALSY
-
-
-def _should_persist_tool_search_settings(
-    *,
-    flag_value: str | None,
-    resolved_value: str | None,
-) -> bool:
-    """Whether wrap should write ``ENABLE_TOOL_SEARCH`` into settings.local.json.
-
-    Daemon-spawned conversation workers read settings fresh (#951 / #2492), so a
-    process-env-only ``false`` never reaches them. Persist when the user asked
-    via ``--tool-search``, or when the resolved mode disables deferral (shell
-    ``ENABLE_TOOL_SEARCH=false`` / Foundry-compat defaults). Leaving the generic
-    ``true`` default unwritten avoids stomping a user settings value when wrap
-    did not change tool-search behavior.
-    """
-    if flag_value is not None:
-        return True
-    if resolved_value is None:
-        return False
-    stripped = resolved_value.strip()
-    if not stripped:
-        return False
-    return not _tool_search_mode_is_active(stripped)
-
-
-def _read_claude_settings_env_value(
-    key: str,
-    *,
-    settings_path: Path | None = None,
-) -> str | None:
-    """Return ``payload['env'][key]`` from a Claude settings file, or ``None``."""
-    path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
-    if not path.exists():
-        return None
-    try:
-        payload = json.loads(_read_text(path))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    env_map = payload.get("env")
-    if not isinstance(env_map, dict):
-        return None
-    value = env_map.get(key)
-    return value if isinstance(value, str) else None
-
-
-def _write_claude_wrap_tool_search(
-    value: str,
-    *,
-    settings_path: Path | None = None,
-) -> str | None:
-    """Persist ``ENABLE_TOOL_SEARCH`` into project-local settings for workers (#2492).
-
-    Same settings.local.json path as :func:`_write_claude_wrap_base_url` so
-    daemon-spawned conversation workers see the session's resolved tool-search
-    mode. Returns the previous value for restore on wrap exit.
-
-    The read/modify/write is serialized with :func:`_claude_settings_lock` and
-    refuses to clobber a malformed existing file (same as
-    :func:`_read_settings_for_write`).
-    """
-    path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
-    with _claude_settings_lock(path):
-        payload = _read_settings_for_write(path)
-        env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
-        previous = env_map.get(_TOOL_SEARCH_ENV)
-        env_map[_TOOL_SEARCH_ENV] = value
-        payload["env"] = env_map
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _write_text(path, json.dumps(payload, indent=2) + "\n")
-        return previous if isinstance(previous, str) else None
-
-
-def _restore_claude_wrap_tool_search(
-    previous: str | None,
-    *,
-    written: str,
-    settings_path: Path | None = None,
-) -> None:
-    """Restore (or remove) ``ENABLE_TOOL_SEARCH`` written by wrap (#2492).
-
-    Compare-before-restore: only mutate the file when it still contains
-    ``written``, the value this wrap put there. If another wrap or a user edit
-    changed the key, leave it. A malformed or unreadable file is left untouched
-    rather than rewritten as ``{}``.
-    """
-    path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
-    with _claude_settings_lock(path):
-        if not path.exists():
-            return
-        try:
-            payload = _read_settings_for_write(path)
-        except click.ClickException:
-            return
-        env_map = payload.get("env")
-        if not isinstance(env_map, dict):
-            return
-        current = env_map.get(_TOOL_SEARCH_ENV)
-        if not isinstance(current, str) or current != written:
-            return
-        if previous is None:
-            del env_map[_TOOL_SEARCH_ENV]
-            if env_map:
-                payload["env"] = env_map
-            else:
-                payload.pop("env", None)
-        else:
-            env_map[_TOOL_SEARCH_ENV] = previous
-            payload["env"] = env_map
-        if payload:
-            _write_text(path, json.dumps(payload, indent=2) + "\n")
-        else:
-            path.unlink(missing_ok=True)
 
 
 def _live_wrap_module() -> Any:
@@ -953,7 +823,7 @@ _RETIRED_CONTEXT_TOOL_MESSAGE = (
     "rewrote shell commands through a third-party binary Headroom no longer "
     "manages. Drop --context-tool / --no-context-tool and unset "
     f"{_RETIRED_CONTEXT_TOOL_ENV}; `headroom wrap` uninstalls what they left "
-    "behind on first run."
+    "behind automatically."
 )
 
 
@@ -1013,8 +883,10 @@ def _report_context_tool_purge() -> None:
     default: the Claude ``PreToolUse`` hook, the vendored binaries and the
     injected hint-file guidance are all durable on disk. Running this once per
     ``wrap`` / ``unwrap`` invocation is what actually makes the tools go away.
-    Silent when there is nothing to do, which is the steady state after the first
-    run, and never fatal — a cleanup failure must not block launching the tool.
+    Silent when there is nothing to do — the common case once the machine-global
+    half is stamped done, though the project- and config-directory-scoped half
+    still runs every launch — and never fatal: a cleanup failure must not block
+    launching the tool.
 
     Reports on **stderr**: some subcommands (``wrap/unwrap openclaw
     --prepare-only``) emit machine-readable JSON on stdout as their entire
@@ -1634,6 +1506,36 @@ def _write_claude_wrap_base_url(
     return previous
 
 
+def _write_claude_wrap_tool_search(value: str, *, settings_path: Path | None = None) -> str | None:
+    """Persist the resolved tool-search mode for daemon-spawned workers.
+
+    Claude Code workers read project settings afresh rather than inheriting
+    the parent process environment (#2492). Keep this separate from the proxy
+    URL crash marker: a stale tool-search mode cannot route traffic to a dead
+    process, and is restored transactionally when the wrap session exits.
+    """
+    path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
+    payload = _read_settings_for_write(path)
+    env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
+    previous = env_map.get(_TOOL_SEARCH_ENV)
+    env_map[_TOOL_SEARCH_ENV] = value
+    payload["env"] = env_map
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_text(path, json.dumps(payload, indent=2) + "\n")
+    return previous
+
+
+def _restore_claude_wrap_tool_search(
+    previous: str | None, *, settings_path: Path | None = None
+) -> None:
+    """Restore the project-local tool-search value written for this session."""
+    _restore_claude_wrap_base_url(
+        previous,
+        settings_path=settings_path,
+        _key_override=_TOOL_SEARCH_ENV,
+    )
+
+
 def _restore_claude_wrap_base_url(
     previous: str | None,
     *,
@@ -1874,6 +1776,18 @@ def _serena_project_skip_reason(root: Path) -> str | None:
     Serena's own ``~/.serena`` config directory. A linked git worktree (its
     top-level ``.git`` is a file, not a directory) is an ephemeral checkout that
     would pay for its own index at a path that soon disappears.
+
+    A project with no ``.serena/project.yml`` is skipped because the pre-index
+    cannot succeed there (#2938). ``serena project index`` auto-creates the file
+    when it is missing, and that auto-creation calls
+    ``ProjectConfig.autogenerate(interactive=True)``, which asks one ``[y/N]``
+    question per additionally-detected language server. The CLI has no
+    non-interactive switch; the only way to reach the silent branch is to pass
+    ``--ls/--language`` explicitly, which means Headroom guessing the project's
+    languages again — exactly the hand-maintained map removed below. Serena's
+    MCP server generates that file itself (non-interactively) on first start and
+    indexes lazily on demand, so the pre-index simply resumes from the next
+    wrap onwards.
     """
     try:
         resolved = root.resolve()
@@ -1884,24 +1798,108 @@ def _serena_project_skip_reason(root: Path) -> str | None:
         return "$HOME is not a project"
     if (resolved / ".git").is_file():
         return "linked git worktree"
+    if not (resolved / ".serena" / "project.yml").is_file():
+        return "no .serena/project.yml yet — Serena will create it and index on demand"
     return None
+
+
+#: Upper bound on the synchronous pre-index. The agent does not launch until
+#: this call returns, so the number is a stall budget, not just a safety net.
+_SERENA_INDEX_TIMEOUT = 300
+
+
+def _kill_serena_index_tree(proc: subprocess.Popen) -> None:
+    """Kill *proc* and everything it spawned (best-effort, never raises).
+
+    ``uvx`` is a launcher: it resolves the environment and then runs the real
+    ``serena`` executable as a grandchild. Killing only the direct child leaves
+    that grandchild alive and reparented to PID 1, so every timed-out pre-index
+    leaked one process that never exits (#2938 — the same failure mode as #615
+    and #880). The child is started in its own process group precisely so the
+    whole tree can be signalled here.
+    """
+    if sys.platform == "win32":
+        # Windows has no process groups to signal for an already-wedged child;
+        # ``taskkill /T`` walks the tree by parent PID instead. ``/F`` because a
+        # process blocked in a read will not act on a graceful close request.
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            pass
+    # Backstop: if the tree kill above did not land, at least the direct child
+    # goes. Then reap so the parent does not leave a zombie behind, and close
+    # the capture pipes we opened so the wrap does not carry stray fds into the
+    # agent it is about to exec.
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        pass
+    for stream in (proc.stdout, proc.stderr, proc.stdin):
+        try:
+            if stream is not None:
+                stream.close()
+        except Exception:
+            pass
 
 
 def _index_serena_project(*, verbose: bool = False) -> None:
     """Warm Serena's symbol cache for the current project (non-fatal).
 
-    Runs ``serena project index`` (the same ``uvx --from git+…`` launch used to
-    start the MCP server) in the project directory so the first symbol query is
-    not paying for a cold index. Timeout-guarded and best-effort: Serena also
-    indexes lazily on demand, so a failure or timeout here never blocks the
-    wrap.
+    Runs ``serena project index`` (the same ``uvx --from serena-agent`` launch
+    used to start the MCP server) in the project directory so the first symbol
+    query is not paying for a cold index. Serena also indexes lazily on demand,
+    so any failure here is survivable.
+
+    This runs on the launch path, synchronously: the agent starts only once it
+    returns, so the timeout below is time the user spends staring at nothing.
+    Two guards keep that bounded (#2938):
+
+    * ``stdin`` is ``DEVNULL``. Serena prompts when it has to auto-create
+      ``project.yml``, and because stdout is captured the question never
+      reaches the terminal — an inherited stdin turned that into a silent,
+      full-timeout hang. EOF makes it fail in about a second instead.
+      ``_serena_project_skip_reason`` already keeps us out of that state; this
+      is the belt-and-braces half, and it covers any future Serena prompt too.
+    * The child gets its own process group so ``_kill_serena_index_tree`` can
+      take out the ``uvx`` grandchild on timeout rather than orphaning it.
     """
     if shutil.which("uvx") is None:
         if verbose:
             click.echo("  Serena: uvx not found — skipping pre-index")
         return
+
+    popen_kwargs: dict[str, Any] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "stdin": subprocess.DEVNULL,
+        "text": True,
+        # ``subprocess.Popen`` directly, so the encoding defaults that
+        # ``headroom._subprocess.run`` applies have to be repeated here.
+        "encoding": "utf-8",
+        "errors": "replace",
+        "cwd": str(Path.cwd()),
+    }
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+
     try:
-        result = run(
+        proc = subprocess.Popen(
             [
                 "uvx",
                 # PyPI (prebuilt wheels), not the git source that fails to build
@@ -1912,20 +1910,32 @@ def _index_serena_project(*, verbose: bool = False) -> None:
                 "project",
                 "index",
             ],
-            capture_output=True,
-            text=True,
-            timeout=300,
-            cwd=str(Path.cwd()),
+            **popen_kwargs,
         )
-        if result.returncode == 0:
-            click.echo("  Serena: project pre-indexed (symbol cache warmed)")
-        elif verbose:
-            click.echo(f"  Serena: pre-index failed ({(result.stderr or '')[:100]})")
-    except subprocess.TimeoutExpired:
-        click.echo("  Serena: pre-index timed out (will index on demand)")
     except Exception as e:
         if verbose:
             click.echo(f"  Serena: pre-index skipped ({e})")
+        return
+
+    # Announce the wait. Indexing a large repo legitimately takes minutes and
+    # the output is captured, so without this line the wrap looks hung.
+    click.echo("  Serena: pre-indexing project (first run can take a while)…")
+    try:
+        _stdout, stderr = proc.communicate(timeout=_SERENA_INDEX_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        _kill_serena_index_tree(proc)
+        click.echo("  Serena: pre-index timed out (will index on demand)")
+        return
+    except Exception as e:
+        _kill_serena_index_tree(proc)
+        if verbose:
+            click.echo(f"  Serena: pre-index skipped ({e})")
+        return
+
+    if proc.returncode == 0:
+        click.echo("  Serena: project pre-indexed (symbol cache warmed)")
+    elif verbose:
+        click.echo(f"  Serena: pre-index failed ({(stderr or '')[:100]})")
 
 
 def _setup_serena_mcp(
@@ -1992,7 +2002,9 @@ def _setup_serena_mcp(
 
     # Serena is the active engine here (we passed the detect/uvx guards): steer
     # the agent toward symbol-level tools, then warm the symbol cache. Both are
-    # best-effort and non-fatal — neither blocks the wrap.
+    # best-effort and non-fatal, but the pre-index is *synchronous* — the agent
+    # does not launch until it returns or hits ``_SERENA_INDEX_TIMEOUT``. See
+    # ``_index_serena_project`` for how that wait is kept bounded and visible.
     #
     # Headroom no longer writes ``.serena/project.yml`` language scoping. Serena
     # determines the project's languages itself during
@@ -3621,7 +3633,7 @@ def _push_runtime_env(port: int, no_proxy: bool) -> None:
     click.echo(f"  Synced output settings to proxy: {', '.join(sorted(payload))}")
 
 
-def _ensure_proxy(
+def _ensure_proxy_unlocked(
     port: int,
     no_proxy: bool,
     *,
@@ -3640,7 +3652,13 @@ def _ensure_proxy(
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
 ) -> tuple[subprocess.Popen | None, int]:
-    """Start or verify proxy. Returns (process_handle, actual_port)."""
+    """Start or verify proxy. Returns (process_handle, actual_port).
+
+    The public ``_ensure_proxy`` wrapper serializes callers per port before
+    entering this function. Keeping the implementation separate makes the
+    lock boundary explicit and ensures every health/configuration check runs
+    under the same startup critical section.
+    """
     helpers = _live_wrap_module()
     copilot_subscription_seed_requested = (
         bool(copilot_api_token)
@@ -4005,6 +4023,81 @@ def _ensure_proxy(
                     "to the proxy's existing Vertex upstream."
                 )
         return None, port
+
+
+@contextmanager
+def _proxy_start_lock(port: int) -> Any:
+    """Serialize wrap proxy startup across processes sharing a port.
+
+    A proxy can spend tens of seconds loading optional ML components before it
+    binds its socket. Without this lock, two concurrent ``headroom wrap``
+    commands both see an unavailable health endpoint, choose the same port,
+    and race to spawn a listener. The lock is deliberately held through the
+    health/configuration checks and startup, then released once the proxy is
+    ready (or startup fails). Lock files are retained so an interrupted
+    process cannot create an inode-replacement race for another waiter.
+    """
+    from headroom import paths as _paths
+
+    lock_path = _paths.proxy_start_lock_path(port)
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = open(lock_path, "a+b")  # noqa: SIM115
+    except OSError:
+        # Locking is a race-prevention enhancement, not a reason to make wrap
+        # unusable when a read-only/custom workspace cannot hold state. The
+        # existing port bind remains the final safety check in that degraded
+        # environment.
+        yield
+        return
+    with lock_file:
+        if sys.platform == "win32":
+            import msvcrt
+
+            # msvcrt.locking operates on bytes from the current file position.
+            lock_file.seek(0)
+            if lock_file.read(1) == b"":
+                lock_file.seek(0)
+                lock_file.write(b"0")
+                lock_file.flush()
+            lock_file.seek(0)
+            # LK_LOCK has implementation-dependent retry limits. A proxy may
+            # legitimately take longer than that to load ML components, so
+            # use the non-blocking primitive in a loop instead.
+            while True:
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@wraps(_ensure_proxy_unlocked)
+def _ensure_proxy(
+    port: int,
+    no_proxy: bool,
+    **kwargs: Any,
+) -> tuple[subprocess.Popen | None, int]:
+    """Start or reuse a proxy without racing another wrap on the same port."""
+    if no_proxy:
+        return _ensure_proxy_unlocked(port, no_proxy, **kwargs)
+    with _proxy_start_lock(port):
+        # Re-checking is part of the lock boundary: a concurrent wrapper may
+        # have finished startup while this caller was waiting for the lock.
+        return _ensure_proxy_unlocked(port, no_proxy, **kwargs)
 
 
 def _client_marker_path(port: int) -> Path:
@@ -4590,10 +4683,7 @@ def wrap_selfheal(marker: str | None) -> None:
         "proxy. MODE is true (default), auto, auto:N, or false. Without it, a "
         "custom ANTHROPIC_BASE_URL makes Claude Code load every tool schema "
         "eagerly, inflating local context (issue #746). A pre-set "
-        "ENABLE_TOOL_SEARCH env var is respected for the launched process. "
-        "Daemon-spawned conversation workers read settings.local.json fresh "
-        "(issue #951), so disabling tool search also reconciles that file "
-        "(issue #2492)."
+        "ENABLE_TOOL_SEARCH env var is respected."
     ),
 )
 @click.option(
@@ -4671,9 +4761,8 @@ def claude(
 
     proxy_holder: list[subprocess.Popen | None] = [None]
     _saved_base_url: list[str | None] = [None]  # previous settings.json value for restore
-    _saved_tool_search: list[str | None] = [None]  # previous ENABLE_TOOL_SEARCH for restore
-    _written_tool_search: list[str | None] = [None]  # value this wrap persisted
-    _persisted_tool_search: list[bool] = [False]
+    _tool_search_not_written = object()
+    _saved_tool_search: list[object | str | None] = [_tool_search_not_written]
     _settings_foundry: list[bool] = [False]
     port_holder: list[int] = [port]
     _settings_vertex: list[bool] = [False]
@@ -4682,6 +4771,12 @@ def claude(
     # early proxy-start failure would make the finally raise UnboundLocalError,
     # masking the real error and skipping cleanup(). Mirrors the holders above.
     _wrap_settings_path = Path.cwd() / ".claude" / "settings.local.json"
+    _raise_on_claude_auth_conflict(
+        user_settings_path=claude_user_settings_path(),
+        project_settings_path=Path.cwd() / ".claude" / "settings.json",
+        project_local_settings_path=_wrap_settings_path,
+        environ=dict(os.environ),
+    )
     cleanup = _make_cleanup(proxy_holder, port_holder)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
     signal.signal(signal.SIGTERM, cleanup)
@@ -4905,7 +5000,11 @@ def claude(
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.
         _tool_search_value = _configure_tool_search_env(env, tool_search)
-        _resolved_tool_search = env.get(_TOOL_SEARCH_ENV)
+        _resolved_tool_search_value = env.get(_TOOL_SEARCH_ENV, "")
+        _saved_tool_search[0] = _write_claude_wrap_tool_search(
+            _resolved_tool_search_value,
+            settings_path=_wrap_settings_path,
+        )
         if _tool_search_value is not None:
             # Describe what the written value actually does: --tool-search
             # false/0/no/off turns deferral OFF, and the banner must say so
@@ -4922,56 +5021,6 @@ def claude(
             click.echo(
                 f"  {_TOOL_SEARCH_ENV}={env.get(_TOOL_SEARCH_ENV)} "
                 "(using your existing environment value)"
-            )
-
-        # Issue #2492: daemon workers read settings.local.json, not the parent
-        # process env. When the user disables tool search (flag or env), or
-        # passes an explicit --tool-search mode, reconcile the same file wrap
-        # already uses for the base URL (#951) so workers stop sending
-        # tool_search_server. Related: #2477 (Foundry default in process env).
-        _settings_tool_search = _read_claude_settings_env_value(
-            _TOOL_SEARCH_ENV, settings_path=_wrap_settings_path
-        )
-        if (
-            _settings_tool_search is not None
-            and _resolved_tool_search is not None
-            and _settings_tool_search.strip()
-            and _resolved_tool_search.strip()
-            and _settings_tool_search.strip().lower() != _resolved_tool_search.strip().lower()
-        ):
-            if _should_persist_tool_search_settings(
-                flag_value=tool_search, resolved_value=_resolved_tool_search
-            ):
-                click.echo(
-                    f"  Warning: {_wrap_settings_path} has "
-                    f"{_TOOL_SEARCH_ENV}={_settings_tool_search!r} but this "
-                    f"session uses {_resolved_tool_search!r}; reconciling "
-                    "settings for daemon workers (issue #2492)"
-                )
-            else:
-                click.echo(
-                    f"  Warning: {_wrap_settings_path} has "
-                    f"{_TOOL_SEARCH_ENV}={_settings_tool_search!r} while the "
-                    f"launched process uses {_resolved_tool_search!r}. Daemon "
-                    "workers read the settings file; pass --tool-search to "
-                    "reconcile (issue #2492)."
-                )
-        if _should_persist_tool_search_settings(
-            flag_value=tool_search, resolved_value=_resolved_tool_search
-        ):
-            if _resolved_tool_search is None or not _resolved_tool_search.strip():
-                raise click.ClickException(
-                    f"internal error: cannot persist empty {_TOOL_SEARCH_ENV} to settings"
-                )
-            _written_tool_search[0] = _resolved_tool_search.strip()
-            _saved_tool_search[0] = _write_claude_wrap_tool_search(
-                _written_tool_search[0],
-                settings_path=_wrap_settings_path,
-            )
-            _persisted_tool_search[0] = True
-            click.echo(
-                f"  Wrote {_TOOL_SEARCH_ENV}={_resolved_tool_search.strip()} "
-                f"to {_wrap_settings_path} for daemon workers (issue #2492)"
             )
 
         # Issue #1158: opt-in 1M context window. Claude Code only sends the
@@ -5001,10 +5050,9 @@ def claude(
         click.echo(f"  Error: {e}")
         raise SystemExit(1) from e
     finally:
-        if _persisted_tool_search[0] and _written_tool_search[0] is not None:
+        if _saved_tool_search[0] is not _tool_search_not_written:
             _restore_claude_wrap_tool_search(
-                _saved_tool_search[0],
-                written=_written_tool_search[0],
+                cast(str | None, _saved_tool_search[0]),
                 settings_path=_wrap_settings_path,
             )
         _restore_claude_wrap_base_url(
@@ -5463,8 +5511,8 @@ def vscode_copilot(
 ) -> None:
     """Run Headroom for GitHub Copilot inside Visual Studio Code.
 
-    Transparently overrides Copilot's proxy endpoint, preserving the model
-    selected in VS Code. It does not edit Codex settings.
+    Transparently overrides Copilot's proxy and CAPI endpoints, preserving the
+    model selected in VS Code. It does not edit Codex settings.
     """
     resolution = _require_copilot_subscription_resolution()
     target_settings = settings_file or vscode_settings_path()
@@ -5483,6 +5531,9 @@ def vscode_copilot(
         click.echo("  Add these user settings to VS Code:")
         click.echo(
             f'  "github.copilot.advanced.debug.overrideProxyUrl": "{vscode_proxy_url(actual_port, _project_name_from_cwd())}",'
+        )
+        click.echo(
+            f'  "github.copilot.advanced.debug.overrideCapiUrl": "{vscode_proxy_url(actual_port, _project_name_from_cwd())}",'
         )
         click.echo('  "github.copilot.advanced.debug.overrideAuthType": "token"')
 
@@ -5748,6 +5799,9 @@ def _run_codex_wrap(
     codex_args: tuple,
 ) -> None:
     """Execute the Codex wrap flow against the durable Codex home."""
+    if not no_proxy:
+        ensure_proxy_dependencies()
+
     if prepare_only:
         _prepare_codex_wrap_state(
             port=port,

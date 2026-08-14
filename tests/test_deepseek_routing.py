@@ -58,16 +58,21 @@ def test_resolve_openai_upstream_custom_base_url_wins_when_not_deepseek() -> Non
     req = SimpleNamespace(headers={"x-headroom-base-url": "https://gateway.example/v1"})
     assert mix._resolve_openai_upstream(req, model="gpt-4o") == "https://gateway.example/v1"
 
+
 def test_resolve_openai_upstream_base_url_wins_over_deepseek_model() -> None:
     mix = _mix()
     req = SimpleNamespace(headers={"x-headroom-base-url": "https://gateway.example/v1"})
-    assert mix._resolve_openai_upstream(req, model="deepseek-v4-flash") == "https://gateway.example/v1"
+    assert (
+        mix._resolve_openai_upstream(req, model="deepseek-v4-flash") == "https://gateway.example/v1"
+    )
 
 
 def test_resolve_openai_upstream_base_url_wins_over_deepseek_header() -> None:
     mix = _mix()
-    req = SimpleNamespace(headers={
-        "x-headroom-base-url": "https://gateway.example/v1",
-        "x-deepseek-harness-user-id": "anon",
-    })
+    req = SimpleNamespace(
+        headers={
+            "x-headroom-base-url": "https://gateway.example/v1",
+            "x-deepseek-harness-user-id": "anon",
+        }
+    )
     assert mix._resolve_openai_upstream(req, model=None) == "https://gateway.example/v1"

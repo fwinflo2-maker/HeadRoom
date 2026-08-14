@@ -7160,7 +7160,6 @@ class OpenAIHandlerMixin:
                     if isinstance(first_response_body, dict)
                     else None
                 )
-
             # Hot-fix follow-up to PR #406 — inline Rust compression on the
             # WS first frame before forwarding upstream. PR #406 enabled
             # the same call for HTTP /v1/responses; PR-C5's "WS-side
@@ -8000,6 +7999,7 @@ class OpenAIHandlerMixin:
                             response_output_items.clear()
 
                         response_started_ms: float | None = None
+                        completed_response_model = "unknown"
 
                         async def _record_ws_response_metrics() -> None:
                             """Record one completed Responses turn on long-lived WS sessions."""
@@ -8056,7 +8056,7 @@ class OpenAIHandlerMixin:
                             ):
                                 return
 
-                            model_for_metrics = str(body.get("model") or "unknown")
+                            model_for_metrics = completed_response_model
                             latency_ms = (
                                 (time.perf_counter() * 1000.0 - response_started_ms)
                                 if response_started_ms is not None
@@ -8209,6 +8209,13 @@ class OpenAIHandlerMixin:
                                     upstream_frame_index,
                                     ws_last_upstream_frame_type,
                                 )
+                                response = event.get("response")
+                                completed_response_model = (
+                                    str(response.get("model") or "unknown")
+                                    if isinstance(response, dict)
+                                    else "unknown"
+                                )
+
                                 if event_type == "response.created":
                                     response_started_ms = time.perf_counter() * 1000.0
                                 (
@@ -8581,11 +8588,7 @@ class OpenAIHandlerMixin:
             )
             if not isinstance(ws_inner_for_telemetry, dict):
                 ws_inner_for_telemetry = {}
-            model_name = (
-                ws_inner_for_telemetry.get("model")
-                or (body.get("model") if isinstance(body, dict) else None)
-                or "unknown"
-            )
+            model_name = str(current_response_template.get("model") or "unknown")
             _final_auth_mode = classify_auth_mode(ws_headers)
             residual_input_tokens = max(0, ws_input_tokens_total - ws_recorded_input_tokens_total)
             residual_output_tokens = max(

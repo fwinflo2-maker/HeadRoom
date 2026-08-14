@@ -371,7 +371,7 @@ class MemorySystem:
                 metadata=metadata,
             )
 
-        logger.info(f"Saved memory {memory.id}: {content[:50]}...")
+        logger.debug(f"Saved memory {memory.id}: {content[:50]}...")
 
         result: dict[str, Any] = {
             "success": True,
@@ -438,7 +438,7 @@ class MemorySystem:
         # Format results for LLM
         formatted_memories = [r.to_dict() for r in results]
 
-        logger.info(f"Search '{query[:30]}...' returned {len(results)} results")
+        logger.debug(f"Search '{query[:30]}...' returned {len(results)} results")
 
         return {
             "success": True,
@@ -496,7 +496,7 @@ class MemorySystem:
                 "message": f"Failed to update memory: {e}",
             }
 
-        logger.info(f"Updated memory {memory_id}: {reason}")
+        logger.debug(f"Updated memory {memory_id}: {reason}")
 
         return {
             "success": True,
@@ -553,7 +553,7 @@ class MemorySystem:
                 "message": f"Failed to delete memory {memory_id}",
             }
 
-        logger.info(f"Deleted memory {memory_id}: {reason}")
+        logger.debug(f"Deleted memory {memory_id}: {reason}")
 
         return {
             "success": True,

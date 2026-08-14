@@ -6,6 +6,7 @@ that Codex (or any MCP-compatible client) can call natively.
 Tools:
     memory_search  — semantic search across stored memories
     memory_save    — persist a new fact/decision/convention
+    memory_delete  — remove a memory by ID
 
 Design:
     - Embedder is pre-loaded at startup (no cold-start on first query)
@@ -23,6 +24,8 @@ Usage:
     args = ["-m", "headroom.memory.mcp_server", "--user", "alice"]
     # When --db is omitted, the server resolves .headroom/memory.db from cwd.
 """
+
+#  Copyright (c) 2026 Noel Kuntze
 
 from __future__ import annotations
 
@@ -51,9 +54,13 @@ _TOOLS = [
         name="memory_search",
         description=(
             "Search persistent memory for relevant knowledge from prior sessions. "
+            "Returns uncompressed content stored in .headroom/memory.db. "
             "Use this for questions about architecture, conventions, prior decisions, "
             "project context, user preferences, org info, codenames, debugging history, "
-            "or anything that might have been discussed before."
+            "or anything that might have been discussed before.\n\n"
+            "For previously compressed proxy context (e.g. compressed tool outputs, "
+            "diff summaries, or search results), use headroom_retrieve to get the "
+            "original uncompressed content by its hash."
         ),
         inputSchema={
             "type": "object",
@@ -75,6 +82,8 @@ _TOOLS = [
         name="memory_save",
         description=(
             "Save information to persistent memory for future sessions. "
+            "Content is stored uncompressed and fully readable in "
+            ".headroom/memory.db — no compression is applied.\n\n"
             "Use this for decisions, conventions, architecture context, "
             "user preferences, project facts, or anything worth remembering. "
             "Saving a similar fact does not replace an existing memory; corrections "
@@ -105,6 +114,81 @@ _TOOLS = [
                 },
             },
             "required": [],
+        },
+    ),
+    Tool(
+        name="memory_analyze",
+        description=(
+            "Analyze a conversation turn (user message + assistant response) "
+            "and extract facts worth remembering. Saves extracted memories "
+            "automatically — stored uncompressed and fully readable. "
+            "Use this when you've just had a conversation that "
+            "contained important information, decisions, or preferences.\n\n"
+            "For previously compressed proxy context, use headroom_retrieve "
+            "to get original content by hash."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "messages": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "role": {"type": "string", "description": "user or assistant"},
+                            "content": {"type": "string", "description": "Message content"},
+                        },
+                    },
+                    "description": "Conversation messages to analyze.",
+                },
+                "response_text": {
+                    "type": "string",
+                    "description": "The assistant's response text to analyze.",
+                },
+                "api_key": {
+                    "type": "string",
+                    "description": "Optional API key for extraction LLM. Defaults to OPENAI_API_KEY env.",
+                },
+                "base_url": {
+                    "type": "string",
+                    "description": "Optional base URL for extraction LLM. Defaults to OpenAI.",
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Extraction model. Default: gpt-4o-mini",
+                },
+            },
+            "required": ["messages", "response_text"],
+        },
+    ),
+    Tool(
+        name="memory_delete",
+        description=(
+            "Delete a memory by its ID permanently. Use this to remove "
+            "outdated, incorrect, or private information from persistent "
+            "storage. The memory must be retrieved via memory_search or "
+            "memory_list first to obtain its ID.\n\n"
+            "This only removes data from the uncompressed memory store "
+            "(.headroom/memory.db). Compressed proxy context stored by "
+            "headroom_compress is not affected."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "memory_id": {
+                    "type": "string",
+                    "description": "The ID of the memory to delete.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Optional reason for deletion (for audit trail).",
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Optional project root path. When provided, the memory is deleted from the project-specific database at <projectPath>/.headroom/memory.db.",
+                },
+            },
+            "required": ["memory_id"],
         },
     ),
 ]
@@ -240,6 +324,10 @@ def create_memory_server(db_path: str, user_id: str = "default") -> Server:
             return await _handle_search(backend, arguments, user_id)
         elif name == "memory_save":
             return await _handle_save(backend, arguments, user_id)
+        elif name == "memory_analyze":
+            return await _handle_analyze(backend, arguments, user_id)
+        elif name == "memory_delete":
+            return await _handle_delete(backend, arguments, user_id)
 
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -346,8 +434,114 @@ async def _handle_save(
         summary = f"Saved {saved} new, updated {superseded} existing ({saved + superseded} total)"
         return [TextContent(type="text", text=summary + "\n" + "\n".join(results_lines))]
     except Exception as e:
-        logger.error(f"memory_save failed: {e}")
+        logger.error(
+            "memory_save failed: %s | user_id=%s | facts=%s | project=%s | importance=%s | backend=%r",
+            e,
+            user_id,
+            [f[:80] for f in facts] if facts else None,
+            arguments.get("projectPath"),
+            arguments.get("importance"),
+            backend,
+            exc_info=True,
+        )
         return [TextContent(type="text", text=f"Save error: {e}")]
+
+
+async def _handle_analyze(
+    backend: LocalBackend, arguments: dict[str, Any], user_id: str
+) -> list[TextContent]:
+    """Analyze a conversation turn and extract memories."""
+    from headroom.memory.response_extractor import extract_memories_from_turn
+
+    messages = arguments.get("messages", [])
+    response_text = arguments.get("response_text", "")
+    model = arguments.get("model", "gpt-4o-mini")
+    api_key = arguments.get("api_key") or os.environ.get("OPENAI_API_KEY")
+    base_url = arguments.get("base_url") or os.environ.get("OPENAI_BASE_URL")
+
+    if not messages or not response_text:
+        return [TextContent(type="text", text="Error: messages and response_text are required")]
+
+    use_llm = bool(api_key)
+
+    try:
+        result = await extract_memories_from_turn(
+            messages,
+            response_text,
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            use_llm=use_llm,
+        )
+
+        if not result.memories:
+            if result.strategy == "none" and not use_llm:
+                msg = (
+                    "No memories extracted via inline <memory> block. "
+                    "To enable LLM-based extraction, set OPENAI_API_KEY or "
+                    "pass an api_key parameter."
+                )
+            else:
+                msg = "No memories worth extracting from this conversation."
+            return [TextContent(type="text", text=msg)]
+
+        saved_count = 0
+        for mem in result.memories:
+            await backend.save_memory(
+                content=mem.content,
+                user_id=user_id,
+                importance=mem.importance,
+            )
+            saved_count += 1
+
+        lines = [f"Extracted and saved {saved_count} memories (strategy: {result.strategy}):"]
+        for mem in result.memories:
+            lines.append(f"  [{mem.importance:.1f}] {mem.content}")
+
+        return [TextContent(type="text", text="\n".join(lines))]
+    except Exception as e:
+        logger.error(f"memory_analyze failed: {e}")
+        return [TextContent(type="text", text=f"Analysis error: {e}")]
+
+
+async def _handle_delete(
+    backend: LocalBackend, arguments: dict[str, Any], user_id: str
+) -> list[TextContent]:
+    """Delete a memory by ID."""
+    memory_id = arguments.get("memory_id", "")
+    if not memory_id:
+        return [TextContent(type="text", text="Error: memory_id is required")]
+
+    try:
+        existing = await backend.get_memory(memory_id)
+        if existing is None:
+            return [TextContent(type="text", text=f"Memory not found: {memory_id}")]
+
+        if existing.user_id != user_id:
+            return [
+                TextContent(
+                    type="text",
+                    text="Permission denied: cannot delete memories belonging to other users.",
+                )
+            ]
+
+        deleted = await backend.delete_memory(
+            memory_id=memory_id,
+            reason=arguments.get("reason", "Deleted via MCP"),
+            user_id=user_id,
+        )
+
+        if not deleted:
+            return [TextContent(type="text", text=f"Failed to delete memory {memory_id}")]
+
+        return [
+            TextContent(
+                type="text", text=f"Deleted memory [{memory_id[:8]}]: {existing.content[:80]}"
+            )
+        ]
+    except Exception as e:
+        logger.error(f"memory_delete failed: {e}")
+        return [TextContent(type="text", text=f"Delete error: {e}")]
 
 
 # ---------------------------------------------------------------------------

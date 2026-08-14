@@ -368,8 +368,6 @@ class BackendRouter:
                 self._backends.move_to_end(db_path)
                 return existing
 
-            db_path.parent.mkdir(parents=True, exist_ok=True)
-
             template = self._config.backend_config_template
             cfg = LocalBackendConfig(
                 db_path=str(db_path),
@@ -447,26 +445,5 @@ def extract_system_prompt(body: Mapping[str, Any]) -> str:
                             parts.append(text)
                 if parts:
                     return "\n".join(parts)
-
-        for msg in messages:
-            if not isinstance(msg, dict):
-                continue
-            if msg.get("role") != "user":
-                continue
-            content = msg.get("content")
-            user_text: str | None = None
-            if isinstance(content, str):
-                user_text = content
-            elif isinstance(content, list):
-                parts = []
-                for block in content:
-                    if isinstance(block, dict):
-                        text = block.get("text")
-                        if isinstance(text, str):
-                            parts.append(text)
-                if parts:
-                    user_text = "\n".join(parts)
-            if user_text and any(prefix in user_text for prefix in _CWD_PREFIXES):
-                return user_text
 
     return ""

@@ -925,3 +925,10 @@ class SQLiteVectorIndex:
         """Close the index (cleanup)."""
         with self._lock:
             self._close_cached_connections()
+
+    def __del__(self) -> None:
+        """Best-effort cleanup for callers that do not await ``close``."""
+        try:
+            self._close_cached_connections()
+        except Exception:
+            pass

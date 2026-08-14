@@ -181,6 +181,11 @@ When calling memory_save, include these pre-extracted fields to optimize storage
 # =============================================================================
 
 
+QUICK_EXTRACTION_PROMPT = """Extract facts worth remembering from this conversation turn.
+Output JSON: {"memories": [{"content": "...", "importance": 0.0-1.0}]}
+Max 5. Skip greetings/small talk. Be specific."""
+
+
 def get_conversation_extraction_prompt(
     speaker_names: list[str] | None = None,
     context_date: str | None = None,

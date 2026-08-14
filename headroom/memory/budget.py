@@ -13,13 +13,14 @@ LLM context also optimizes its own memory files for minimum token consumption.
 from __future__ import annotations
 
 import logging
+import os as _os
 import re
-import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from subprocess import TimeoutExpired
 
-from headroom._subprocess import run
+from headroom._subprocess import run as subprocess_run
 from headroom.memory.writers.base import MemoryEntry, _estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -216,7 +217,7 @@ class MemoryBudgetManager:
             return self._git_files_cache
 
         try:
-            result = run(
+            result = subprocess_run(
                 ["git", "ls-files"],
                 capture_output=True,
                 text=True,
@@ -227,7 +228,7 @@ class MemoryBudgetManager:
                 self._git_files_cache = set(result.stdout.strip().split("\n"))
             else:
                 self._git_files_cache = set()
-        except (subprocess.TimeoutExpired, FileNotFoundError):
+        except (TimeoutExpired, FileNotFoundError):
             self._git_files_cache = set()
 
         return self._git_files_cache
@@ -283,3 +284,64 @@ class MemoryBudgetManager:
         intersection = words_a & words_b
         union = words_a | words_b
         return len(intersection) / len(union)
+
+
+# =============================================================================
+# Global memory budget — env-var-driven scaling of all cache / store caps
+# =============================================================================
+
+_MEMORY_MODE = _os.environ.get("HEADROOM_MEMORY_MODE", "default")
+_MEMORY_DIVISOR = {"low": 10, "minimal": 100}.get(_MEMORY_MODE, 1)
+
+
+def _memory_scale(value: int) -> int:
+    return max(1, value // _MEMORY_DIVISOR)
+
+
+_MEMORY_DEFAULTS: dict[str, int] = {
+    "HEADROOM_CACHE_SESSION_MAX_ENTRIES": 10000,
+    "HEADROOM_COMPRESSION_CACHE_MAX_SESSIONS": 500,
+    "HEADROOM_CCR_MAX_ENTRIES": 1000,
+    "HEADROOM_CCR_TTL_SECONDS": 1800,
+    "HEADROOM_SESSION_TRACKER_MAX_SESSIONS": 1000,
+    "HEADROOM_TRAFFIC_LEARNER_MAX_PATTERNS": 5000,
+    "HEADROOM_TRAFFIC_LEARNER_MAX_PERSISTED_IDS": 5000,
+    "HEADROOM_BATCH_STORE_MAX_CONTEXTS": 10000,
+    "HEADROOM_BATCH_STORE_TTL": 86400,
+    "HEADROOM_REQUEST_LOGGER_MAX_ENTRIES": 10000,
+    "HEADROOM_REQUEST_LOGGER_MAX_BYTES": 100 * 1024 * 1024,
+    "HEADROOM_TOIN_MAX_PATTERNS": 5000,
+    "HEADROOM_SEMANTIC_CACHE_MAX_ENTRIES": 1000,
+    "HEADROOM_CONTEXT_TRACKER_MAX_CONTEXTS": 100,
+    "HEADROOM_BACKEND_ROUTER_MAX_OPEN": 16,
+    "HEADROOM_GRAPH_MAX_ENTITIES": 50000,
+    "HEADROOM_GRAPH_MAX_RELATIONSHIPS": 100000,
+    "HEADROOM_LRU_CACHE_MAX_SIZE": 1000,
+    # Kompress ONNX: intra-op / inter-op thread counts control CPU-side
+    # parallelism.  For GPU backends these threads handle I/O binding and
+    # memory management; reducing them lowers RSS without affecting
+    # inference throughput (actual computation runs on GPU).
+    "HEADROOM_KOMPRESS_ONNX_INTRA_THREADS": 2,
+    "HEADROOM_KOMPRESS_ONNX_INTER_THREADS": 1,
+    # Kompress batch size (number of 512-token chunks per ONNX call).
+    # Smaller batches use less scratch memory but increase call overhead.
+    "HEADROOM_KOMPRESS_BATCH_SIZE": 32,
+}
+
+
+def _apply_memory_budget() -> None:
+    """Inject scaled defaults into os.environ for any unset budget vars."""
+    if _MEMORY_DIVISOR <= 1:
+        return
+    for env_var, unscaled_default in _MEMORY_DEFAULTS.items():
+        if env_var not in _os.environ:
+            _os.environ[env_var] = str(_memory_scale(unscaled_default))
+    logger.info(
+        "Memory budget: mode=%s divisor=%d (%d vars set)",
+        _MEMORY_MODE,
+        _MEMORY_DIVISOR,
+        len(_MEMORY_DEFAULTS),
+    )
+
+
+_apply_memory_budget()

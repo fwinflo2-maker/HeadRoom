@@ -305,8 +305,8 @@ class TestGetConversationExtractionPrompt:
         result = get_conversation_extraction_prompt()
 
         assert "ATOMIC FACT" in result or "atomic fact" in result.lower()
-        assert "GOOD:" in result or "✓ GOOD" in result
-        assert "BAD:" in result or "✗ BAD" in result
+        assert "GOOD:" in result or "[OK] GOOD" in result
+        assert "BAD:" in result or "[X] BAD" in result
 
     def test_contains_few_shot_examples(self):
         """Prompt should contain few-shot examples."""

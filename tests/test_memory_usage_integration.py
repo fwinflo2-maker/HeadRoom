@@ -20,7 +20,7 @@ import os
 import pytest
 
 # Load .env values into a local dict and apply per-test (not at module
-# level) — see tests/_dotenv.py for why.
+# level) -- see tests/_dotenv.py for why.
 from tests._dotenv import autouse_apply_env, load_env_overrides
 
 _env_overrides = load_env_overrides()

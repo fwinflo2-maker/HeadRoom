@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -65,17 +66,28 @@ class FTS5TextIndex:
             db_path: Path to SQLite database file. Created if it doesn't exist.
         """
         self.db_path = Path(db_path)
+        self._local = threading.local()
         self._init_db()
 
     def _get_conn(self) -> sqlite3.Connection:
-        """Get a new database connection (thread-safe pattern).
+        """Get a thread-local connection (connection-pooling pattern).
 
         Returns:
-            A new SQLite connection with row factory configured.
+            A SQLite connection with row factory configured.
         """
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
+        conn: sqlite3.Connection | None = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(str(self.db_path))
+            conn.row_factory = sqlite3.Row
+            self._local.conn = conn
         return conn
+
+    async def close(self) -> None:
+        """Close the connection owned by the current thread."""
+        conn: sqlite3.Connection | None = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            del self._local.conn
 
     def _init_db(self) -> None:
         """Initialize the FTS5 virtual table schema."""

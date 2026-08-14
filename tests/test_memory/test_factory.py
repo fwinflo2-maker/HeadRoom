@@ -5,6 +5,8 @@ Tests component creation via the factory functions.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import tempfile
 from pathlib import Path
 
@@ -35,6 +37,17 @@ except ImportError:
     HNSW_AVAILABLE = False
 
 pytestmark = pytest.mark.skipif(not HNSW_AVAILABLE, reason="hnswlib not available")
+
+
+async def _close_components(*components) -> None:
+    """Close factory-created components that own external resources."""
+    for component in components:
+        close = getattr(component, "close", None)
+        if close is not None:
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+
 
 # =============================================================================
 # Test MemoryConfig
@@ -144,6 +157,7 @@ class TestCreateStore:
             from headroom.memory.adapters.sqlite import SQLiteMemoryStore
 
             assert isinstance(store, SQLiteMemoryStore)
+            asyncio.run(_close_components(store))
 
     def test_sqlite_store_with_custom_path(self):
         """SQLite store should use config db_path."""
@@ -155,6 +169,7 @@ class TestCreateStore:
             from headroom.memory.adapters.sqlite import SQLiteMemoryStore
 
             assert isinstance(store, SQLiteMemoryStore)
+            asyncio.run(_close_components(store))
 
     def test_unknown_store_backend_raises(self):
         """Unknown store backend should raise ValueError."""
@@ -310,6 +325,7 @@ class TestCreateTextIndex:
             from headroom.memory.adapters.fts5 import FTS5TextIndex
 
             assert isinstance(index, FTS5TextIndex)
+            asyncio.run(_close_components(index))
 
     def test_fts5_index_uses_db_path(self):
         """FTS5 index should use config db_path."""
@@ -321,6 +337,7 @@ class TestCreateTextIndex:
             from headroom.memory.adapters.fts5 import FTS5TextIndex
 
             assert isinstance(index, FTS5TextIndex)
+            asyncio.run(_close_components(index))
 
     def test_unknown_text_backend_raises(self):
         """Unknown text backend should raise ValueError."""
@@ -396,6 +413,7 @@ class TestCreateMemorySystem:
             assert isinstance(text, FTS5TextIndex)
             assert isinstance(embedder, LocalEmbedder)
             assert isinstance(cache, LRUMemoryCache)
+            await _close_components(store, vector, text)
 
     @pytest.mark.asyncio
     async def test_creates_components_without_cache(self):
@@ -405,6 +423,7 @@ class TestCreateMemorySystem:
             store, vector, text, embedder, cache = await create_memory_system(config)
 
             assert cache is None
+            await _close_components(store, vector, text)
 
     @pytest.mark.asyncio
     async def test_creates_components_with_none_config(self):
@@ -426,6 +445,7 @@ class TestCreateMemorySystem:
         assert isinstance(text, FTS5TextIndex)
         assert isinstance(embedder, LocalEmbedder)
         assert isinstance(cache, LRUMemoryCache)
+        await _close_components(store, vector, text)
 
     @pytest.mark.asyncio
     async def test_creates_ollama_embedder(self):
@@ -439,6 +459,7 @@ class TestCreateMemorySystem:
             from headroom.memory.adapters.embedders import OllamaEmbedder
 
             assert isinstance(embedder, OllamaEmbedder)
+            await _close_components(store, vector, text)
 
     @pytest.mark.asyncio
     async def test_creates_openai_embedder(self):
@@ -454,6 +475,7 @@ class TestCreateMemorySystem:
             from headroom.memory.adapters.embedders import OpenAIEmbedder
 
             assert isinstance(embedder, OpenAIEmbedder)
+            await _close_components(store, vector, text)
 
     @pytest.mark.asyncio
     async def test_custom_hnsw_params_propagate(self):
@@ -473,6 +495,7 @@ class TestCreateMemorySystem:
             assert vector._ef_construction == 300
             assert vector._m == 24
             assert vector._ef_search == 75
+            await _close_components(store, vector, text)
 
     @pytest.mark.asyncio
     async def test_returns_tuple_of_five(self):
@@ -483,6 +506,7 @@ class TestCreateMemorySystem:
 
             assert isinstance(result, tuple)
             assert len(result) == 5
+            await _close_components(*result[:3])
 
 
 # =============================================================================
@@ -554,6 +578,7 @@ class TestFactoryIntegration:
             assert hasattr(cache, "get")
             assert hasattr(cache, "put")
             assert hasattr(cache, "invalidate")
+            await _close_components(store, vector, text)
 
     @pytest.mark.asyncio
     async def test_embedder_dimension_property(self):

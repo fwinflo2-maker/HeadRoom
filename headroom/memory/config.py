@@ -48,6 +48,7 @@ class EmbedderBackend(Enum):
     ONNX = "onnx"  # ONNX Runtime (no torch, ~86MB, recommended)
     OPENAI = "openai"
     OLLAMA = "ollama"
+    NONE = "none"  # No-op embedder (no model loaded, returns zero vectors)
 
 
 @dataclass

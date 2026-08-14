@@ -46,7 +46,7 @@ async def test_mps_creates_single_worker_executor() -> None:
 
 @pytest.mark.skipif(not _HAS_MPS, reason="requires Apple-Silicon MPS")
 async def test_mps_concurrent_embeds_do_not_crash() -> None:
-    """Concurrent embeds on MPS must not SIGABRT — the serialization guarantees it."""
+    """Concurrent embeds on MPS must not SIGABRT -- the serialization guarantees it."""
     emb = LocalEmbedder(device="mps")
     await emb.embed("warmup")
     batches = [emb.embed_batch([f"text {i} " * 20] * 8) for i in range(16)]
@@ -59,7 +59,7 @@ async def test_mps_concurrent_embeds_do_not_crash() -> None:
 @pytest.mark.skipif(not _HAS_MPS, reason="requires Apple-Silicon MPS")
 async def test_mps_reembed_after_close_recreates_executor() -> None:
     """close() drops the cached model so a later embed() re-initializes and
-    re-creates the serialized executor — never encodes on the torn-down pool."""
+    re-creates the serialized executor -- never encodes on the torn-down pool."""
     emb = LocalEmbedder(device="mps")
     await emb.embed("warmup")
     await emb.close()

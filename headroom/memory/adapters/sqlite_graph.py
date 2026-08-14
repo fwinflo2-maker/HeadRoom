@@ -15,10 +15,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from threading import RLock
 from typing import TYPE_CHECKING, Any
 
 from .graph_models import Entity, Relationship, RelationshipDirection, Subgraph
@@ -68,25 +68,24 @@ class SQLiteGraphStore:
         """
         self.db_path = Path(db_path)
         self._page_cache_size_kb = page_cache_size_kb
-        self._lock = RLock()
+        self._lock = threading.RLock()
+        self._local = threading.local()
         self._init_db()
 
     def _get_conn(self) -> sqlite3.Connection:
-        """Get a new database connection (thread-safe pattern).
+        """Get a thread-local connection (connection-pooling pattern).
 
         Returns:
-            A new SQLite connection with row factory configured.
+            A SQLite connection with row factory configured.
         """
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
-
-        # Configure page cache size (negative = KB, positive = pages)
-        if self._page_cache_size_kb > 0:
-            conn.execute(f"PRAGMA cache_size = -{self._page_cache_size_kb}")
-
-        # Enable foreign keys
-        conn.execute("PRAGMA foreign_keys = ON")
-
+        conn: sqlite3.Connection | None = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(str(self.db_path))
+            conn.row_factory = sqlite3.Row
+            if self._page_cache_size_kb > 0:
+                conn.execute(f"PRAGMA cache_size = -{self._page_cache_size_kb}")
+            conn.execute("PRAGMA foreign_keys = ON")
+            self._local.conn = conn
         return conn
 
     def _init_db(self) -> None:
@@ -752,7 +751,13 @@ class SQLiteGraphStore:
     def close(self) -> None:
         """Close any open connections (cleanup).
 
-        Note: This store uses connection-per-request pattern,
-        so there's typically nothing to close.
+        The store keeps one connection per worker thread, so close the current
+        thread's connection and clear it from the thread-local cache.
         """
-        pass
+        with self._lock:
+            conn: sqlite3.Connection | None = getattr(self._local, "conn", None)
+            if conn is not None:
+                try:
+                    conn.close()
+                finally:
+                    self._local.conn = None

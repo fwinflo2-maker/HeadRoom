@@ -146,22 +146,16 @@ class LocalBackend:
         cleanly and ``CancelledError`` is re-raised rather than leaving the
         backend half-built.
         """
-        # Fast path: already initialized, no lock contention.
         if self._initialized:
             return
 
         lock = self._get_init_lock()
         async with lock:
-            # Double-check after acquiring the lock — another task may have
-            # finished the init while we were waiting.
             if self._initialized:
                 return
             try:
                 await self._init_locked()
             except asyncio.CancelledError:
-                # Cancellation (e.g. wait_for timeout) can leave a partial
-                # backend. Reset so the next call re-inits from scratch and
-                # never sees a half-built ``_hierarchical_memory``.
                 self._hierarchical_memory = None
                 self._graph = None
                 self._initialized = False
@@ -198,26 +192,22 @@ class LocalBackend:
 
         # Choose graph store based on config
         if self._config.graph_persist:
-            from headroom.memory.adapters.sqlite_graph import SQLiteGraphStore
+            from headroom.memory.adapters.graph import InMemoryGraphStore
 
             # Derive graph db path from main db path if not specified
             if self._config.graph_db_path:
-                graph_db_path = self._config.graph_db_path
+                _graph_db_path = self._config.graph_db_path
             else:
-                # "memory.db" -> "memory_graph.db"
-                db_path = Path(self._config.db_path)
-                graph_db_path = str(db_path.parent / f"{db_path.stem}_graph{db_path.suffix}")
+                import os as _os
 
-            self._graph = SQLiteGraphStore(
-                db_path=graph_db_path,
-                page_cache_size_kb=self._config.graph_cache_size_kb,
-            )
-            logger.info(
-                f"LocalBackend: Using SQLiteGraphStore at {graph_db_path} "
-                f"(cache: {self._config.graph_cache_size_kb}KB)"
-            )
-        else:
-            from headroom.memory.adapters.graph import InMemoryGraphStore
+                _max_e = int(_os.environ.get("HEADROOM_GRAPH_MAX_ENTITIES", "50000"))
+                _max_r = int(_os.environ.get("HEADROOM_GRAPH_MAX_RELATIONSHIPS", "100000"))
+                self._graph = InMemoryGraphStore(max_entities=_max_e, max_relationships=_max_r)
+                logger.info(
+                    "LocalBackend: Using InMemoryGraphStore (entities=%d, relationships=%d)",
+                    _max_e,
+                    _max_r,
+                )
 
             self._graph = InMemoryGraphStore()
             logger.info("LocalBackend: Using InMemoryGraphStore (unbounded)")
@@ -425,6 +415,9 @@ class LocalBackend:
         Returns:
             List of MemorySearchResult objects with scores and related entities.
         """
+        if not self._initialized and not Path(self._config.db_path).exists():
+            return []
+
         await self._ensure_initialized()
         assert self._hierarchical_memory is not None
         assert self._graph is not None
@@ -635,6 +628,9 @@ class LocalBackend:
         Returns:
             The Memory if found, None otherwise.
         """
+        if not self._initialized and not Path(self._config.db_path).exists():
+            return None
+
         await self._ensure_initialized()
         assert self._hierarchical_memory is not None
 
@@ -702,6 +698,9 @@ class LocalBackend:
         Returns:
             Subgraph containing reachable entities and relationships.
         """
+        if not self._initialized and not Path(self._config.db_path).exists():
+            return Subgraph(entities=[], relationships=[], root_entity_ids=[])
+
         await self._ensure_initialized()
         assert self._graph is not None
 
@@ -738,6 +737,9 @@ class LocalBackend:
         Returns:
             List of memories for the user.
         """
+        if not self._initialized and not Path(self._config.db_path).exists():
+            return []
+
         await self._ensure_initialized()
         assert self._hierarchical_memory is not None
 
@@ -798,6 +800,9 @@ class LocalBackend:
         Returns:
             List of MemorySearchResult objects.
         """
+        if not self._initialized and not Path(self._config.db_path).exists():
+            return []
+
         await self._ensure_initialized()
         assert self._hierarchical_memory is not None
 
@@ -851,6 +856,9 @@ class LocalBackend:
         Returns:
             List of MemorySearchResult objects sorted by combined score.
         """
+        if not self._initialized and not Path(self._config.db_path).exists():
+            return []
+
         await self._ensure_initialized()
 
         # Fetch more candidates than needed for better coverage

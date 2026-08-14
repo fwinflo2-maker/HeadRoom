@@ -7,6 +7,7 @@ and proper wiring between components.
 
 from __future__ import annotations
 
+import os
 import threading
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -194,9 +195,18 @@ def _create_embedder(config: MemoryConfig) -> Embedder:
             embedder: Embedder = LocalEmbedder(model_name=config.embedder_model)
 
         elif config.embedder_backend == EmbedderBackend.ONNX:
-            from headroom.memory.adapters.embedders import OnnxLocalEmbedder
+            # When the embedding server sidecar is active, every worker
+            # reuses a single ONNX model via Unix socket instead of loading
+            # its own copy (~600 MB RSS saving per extra worker).
+            _sidecar_socket = os.environ.get("HEADROOM_EMBEDDING_SERVER_SOCKET") or ""
+            if _sidecar_socket:
+                from headroom.memory.adapters.watchdog import EmbeddingServerClient
 
-            embedder = OnnxLocalEmbedder()
+                embedder = EmbeddingServerClient(_sidecar_socket)
+            else:
+                from headroom.memory.adapters.embedders import OnnxLocalEmbedder
+
+                embedder = OnnxLocalEmbedder()
 
         elif config.embedder_backend == EmbedderBackend.OPENAI:
             from headroom.memory.adapters.embedders import OpenAIEmbedder
@@ -213,6 +223,11 @@ def _create_embedder(config: MemoryConfig) -> Embedder:
                 base_url=config.ollama_base_url,
                 model_name=config.embedder_model,
             )
+
+        elif config.embedder_backend == EmbedderBackend.NONE:
+            from headroom.memory.adapters.embedders import NoopEmbedder
+
+            embedder = NoopEmbedder()
         else:
             raise ValueError(f"Unknown embedder backend: {config.embedder_backend}")
 

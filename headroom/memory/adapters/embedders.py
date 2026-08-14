@@ -172,6 +172,47 @@ def _normalize_embeddings_batch(embeddings: np.ndarray) -> np.ndarray:
 
 
 # =============================================================================
+# NoopEmbedder - passthrough (no model loaded, returns zero vectors)
+# =============================================================================
+
+
+class NoopEmbedder:
+    """No-op embedder that returns zero vectors without loading any model.
+
+    Analogue of the Kompress ``_passthrough()`` for the embedding path:
+    the system remains operational but returns no signal, so memory
+    searches gracefully return empty results. Useful when ONNX model
+    loading should be skipped (e.g. when ``--no-kompress`` is active).
+    """
+
+    DEFAULT_DIMENSION = 384
+    DEFAULT_MAX_TOKENS = 256
+
+    async def embed(self, text: str) -> np.ndarray:
+        return np.zeros(self.DEFAULT_DIMENSION, dtype=np.float32)
+
+    async def embed_batch(self, texts: list[str]) -> list[np.ndarray]:
+        if not texts:
+            return []
+        return [np.zeros(self.DEFAULT_DIMENSION, dtype=np.float32) for _ in texts]
+
+    @property
+    def dimension(self) -> int:
+        return self.DEFAULT_DIMENSION
+
+    @property
+    def model_name(self) -> str:
+        return "none"
+
+    @property
+    def max_tokens(self) -> int:
+        return self.DEFAULT_MAX_TOKENS
+
+    async def close(self) -> None:
+        pass
+
+
+# =============================================================================
 # LocalEmbedder - sentence-transformers
 # =============================================================================
 
@@ -291,8 +332,14 @@ class LocalEmbedder:
         # Use centralized registry for shared model instances
         self._model = MLModelRegistry.get_sentence_transformer(self._model_name, self._device)
 
-        # Get actual dimension from loaded model
-        self._dimension = self._model.get_sentence_embedding_dimension()
+        # Get actual dimension from loaded model. sentence-transformers renamed
+        # get_sentence_embedding_dimension() -> get_embedding_dimension(); prefer
+        # the new name and fall back for older versions to avoid a FutureWarning.
+        model = cast(Any, self._model)
+        if hasattr(model, "get_embedding_dimension"):
+            self._dimension = model.get_embedding_dimension()
+        else:
+            self._dimension = model.get_sentence_embedding_dimension()
         logger.info(
             f"Model loaded (shared): {self._model_name}, dimension={self._dimension}, device={self._device}"
         )
@@ -448,7 +495,6 @@ class OnnxLocalEmbedder:
         from tokenizers import Tokenizer
 
         logger.info("Loading ONNX embedding model (all-MiniLM-L6-v2, ~86MB)...")
-
         # Prefer local cache to avoid a redundant network HEAD on warm starts.
         model_path = hf_hub_download_local_first(self.ONNX_REPO, "model.onnx")
         tok_path = hf_hub_download_local_first(self.ONNX_REPO, "tokenizer.json")
@@ -461,10 +507,20 @@ class OnnxLocalEmbedder:
             intra_op_num_threads=1,
             inter_op_num_threads=1,
         )
-        self._session = ort.InferenceSession(
-            model_path, sess_options, providers=["CPUExecutionProvider"]
-        )
-        self._tokenizer = Tokenizer.from_file(tok_path)
+        try:
+            self._session = ort.InferenceSession(
+                model_path, sess_options, providers=["CPUExecutionProvider"]
+            )
+        except Exception as exc:
+            logger.error("Failed to create ONNX inference session: %s: %s", type(exc).__name__, exc)
+            raise
+
+        try:
+            self._tokenizer = Tokenizer.from_file(tok_path)
+        except Exception as exc:
+            logger.error("Failed to load ONNX tokenizer from file: %s: %s", type(exc).__name__, exc)
+            raise
+
         self._tokenizer.enable_truncation(max_length=self._max_length)
         self._tokenizer.enable_padding(length=self._max_length)
         self._input_names = [inp.name for inp in self._session.get_inputs()]

@@ -44,8 +44,19 @@ class InMemoryGraphStore:
         subgraph = await store.query_subgraph(["entity-id"], max_hops=2)
     """
 
-    def __init__(self) -> None:
-        """Initialize the in-memory graph store with empty indexes."""
+    def __init__(self, max_entities: int = 50000, max_relationships: int = 100000) -> None:
+        """Initialize the in-memory graph store with optional size caps.
+
+        Args:
+            max_entities: Maximum number of entities to store. When exceeded,
+                the oldest (by ``created_at``) entity is evicted along with
+                all its relationships.  Default 50000.
+            max_relationships: Maximum number of relationships to store.
+                When exceeded, the oldest relationship is evicted.  Default 100000.
+        """
+        self._max_entities = max_entities
+        self._max_relationships = max_relationships
+
         # Primary storage
         self._entities: dict[str, Entity] = {}
         self._relationships: dict[str, Relationship] = {}
@@ -91,6 +102,35 @@ class InMemoryGraphStore:
                 self._entities_by_name[entity.user_id] = {}
             name_lower = entity.name.lower()
             self._entities_by_name[entity.user_id][name_lower] = entity.id
+
+            # Evict oldest if over capacity
+            if len(self._entities) > self._max_entities:
+                self._evict_oldest_entity_locked()
+
+    def _evict_oldest_entity_locked(self) -> None:
+        """Evict the entity with the oldest ``created_at``. Must hold lock."""
+        if not self._entities:
+            return
+        oldest_id = min(
+            self._entities.keys(),
+            key=lambda eid: self._entities[eid].created_at,
+        )
+        self._remove_entity_and_relationships_locked(oldest_id)
+
+    def _remove_entity_and_relationships_locked(self, entity_id: str) -> None:
+        """Internal: remove an entity and all its relationships. Must hold lock."""
+        entity = self._entities.get(entity_id)
+        if entity is None:
+            return
+        relationships_to_delete: set[str] = set()
+        outgoing = self._relationships_by_source.get(entity_id, set())
+        relationships_to_delete.update(outgoing)
+        incoming = self._relationships_by_target.get(entity_id, set())
+        relationships_to_delete.update(incoming)
+        for rel_id in relationships_to_delete:
+            self._remove_relationship_internal(rel_id)
+        self._remove_entity_from_indexes(entity)
+        del self._entities[entity_id]
 
     async def get_entity(self, entity_id: str) -> Entity | None:
         """Retrieve an entity by ID.
@@ -138,31 +178,9 @@ class InMemoryGraphStore:
             True if the entity was deleted, False if not found.
         """
         with self._lock:
-            entity = self._entities.get(entity_id)
-            if entity is None:
+            if entity_id not in self._entities:
                 return False
-
-            # Collect all relationships to delete
-            relationships_to_delete: set[str] = set()
-
-            # Outgoing relationships
-            outgoing = self._relationships_by_source.get(entity_id, set())
-            relationships_to_delete.update(outgoing)
-
-            # Incoming relationships
-            incoming = self._relationships_by_target.get(entity_id, set())
-            relationships_to_delete.update(incoming)
-
-            # Delete relationships
-            for rel_id in relationships_to_delete:
-                self._remove_relationship_internal(rel_id)
-
-            # Remove entity from indexes
-            self._remove_entity_from_indexes(entity)
-
-            # Remove from primary storage
-            del self._entities[entity_id]
-
+            self._remove_entity_and_relationships_locked(entity_id)
             return True
 
     def _remove_entity_from_indexes(self, entity: Entity) -> None:
@@ -214,6 +232,20 @@ class InMemoryGraphStore:
             if relationship.target_id not in self._relationships_by_target:
                 self._relationships_by_target[relationship.target_id] = set()
             self._relationships_by_target[relationship.target_id].add(relationship.id)
+
+            # Evict oldest if over capacity
+            if len(self._relationships) > self._max_relationships:
+                self._evict_oldest_relationship_locked()
+
+    def _evict_oldest_relationship_locked(self) -> None:
+        """Evict the relationship with the oldest ``created_at``. Must hold lock."""
+        if not self._relationships:
+            return
+        oldest_id = min(
+            self._relationships.keys(),
+            key=lambda rid: self._relationships[rid].created_at,
+        )
+        self._remove_relationship_internal(oldest_id)
 
     async def get_relationships(
         self,

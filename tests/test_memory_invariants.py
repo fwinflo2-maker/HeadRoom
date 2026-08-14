@@ -16,7 +16,7 @@ introduce the bug classes this PR fixed:
     handler was the lone outlier writing to instructions; the AST
     check ensures it doesn't sneak back.
 
-The checks are static — no handler is invoked. They run in
+The checks are static -- no handler is invoked. They run in
 milliseconds and catch future regressions at PR-review time.
 """
 
@@ -36,7 +36,7 @@ HANDLER_FILES = [
 ]
 
 
-# ── Invariant A — no raw memory-gate conjunction ──────────────────────
+# ── Invariant A -- no raw memory-gate conjunction ──────────────────────
 
 
 def _file_contains_raw_memory_gate(file_path: Path) -> list[tuple[int, str]]:
@@ -48,12 +48,12 @@ def _file_contains_raw_memory_gate(file_path: Path) -> list[tuple[int, str]]:
 
     AST-walking the conditional itself is complex (BoolOp + Attribute),
     so we use a regex to scan source lines. False positives are caught
-    by the test author at write time — this is a one-line invariant.
+    by the test author at write time -- this is a one-line invariant.
     """
     text = file_path.read_text(encoding="utf-8")
     # Match "if self.memory_handler and memory_user_id" but NOT inside
     # the helper that defines the decision (which references both names
-    # for documentation purposes) — we only care about handler logic.
+    # for documentation purposes) -- we only care about handler logic.
     pattern = re.compile(r"^\s*if\s+self\.memory_handler\s+and\s+memory_user_id\b")
     hits = []
     for i, line in enumerate(text.splitlines(), start=1):
@@ -64,7 +64,7 @@ def _file_contains_raw_memory_gate(file_path: Path) -> list[tuple[int, str]]:
 
 def test_no_raw_memory_handler_gate_in_handlers() -> None:
     """Pre-PR-this, sites 1/2/3 used ``if self.memory_handler and
-    memory_user_id:`` as the memory-injection gate — silently
+    memory_user_id:`` as the memory-injection gate -- silently
     ignoring bypass. After PR-this, every site routes through
     ``MemoryDecision.decide(...)`` and gates on
     ``memory_decision.inject``. This test ensures the raw conjunction
@@ -83,12 +83,12 @@ def test_no_raw_memory_handler_gate_in_handlers() -> None:
         )
 
 
-# ── Invariant B — memory never writes to system/instructions ─────────
+# ── Invariant B -- memory never writes to system/instructions ─────────
 
 
 _FORBIDDEN_SYSTEM_WRITES = (
     # Direct mutation of cache-hot-zone system fields by the memory
-    # path. The patterns below are exact assignment forms — they match
+    # path. The patterns below are exact assignment forms -- they match
     # the pre-PR-this WS bug at openai.py:3517.
     re.compile(r'ws_response_body\["instructions"\]\s*='),
     re.compile(r'response_body\["instructions"\]\s*='),
@@ -108,7 +108,7 @@ def _find_system_writes_in_memory_context(file_path: Path) -> list[tuple[int, st
     - Look like a write to body["instructions"] / body["system"]
     - Live within ~10 lines of a ``memory_context`` reference
 
-    This is a windowed-context check — we don't want false positives
+    This is a windowed-context check -- we don't want false positives
     from unrelated instructions-writes (e.g. tool-result handling).
     """
     text = file_path.read_text(encoding="utf-8").splitlines()
@@ -126,7 +126,7 @@ def _find_system_writes_in_memory_context(file_path: Path) -> list[tuple[int, st
 
 def test_memory_never_writes_to_system_or_instructions() -> None:
     """Pre-PR-this, the WS handler wrote memory context to
-    ``ws_response_body["instructions"]`` — the system / cache-hot-zone
+    ``ws_response_body["instructions"]`` -- the system / cache-hot-zone
     field. That mutated the prefix cache bytes on every turn. All
     other sites route to user-message tail / body["input"]. This
     test asserts memory_context-related code paths never write to a
@@ -137,16 +137,16 @@ def test_memory_never_writes_to_system_or_instructions() -> None:
     if offenders:
         formatted = "\n".join(f"  {f.name}:{ln}  {src!r}" for f, ln, src in offenders)
         pytest.fail(
-            f"{len(offenders)} suspected memory→system write(s):\n"
+            f"{len(offenders)} suspected memory->system write(s):\n"
             f"{formatted}\n\n"
             "Memory must append to user-message tail (e.g. body['input'] "
             "for Responses, optimized_messages for chat). Never write to "
-            "body['instructions'] or body['system'] — they are the cache "
+            "body['instructions'] or body['system'] -- they are the cache "
             "hot zone (invariant I2)."
         )
 
 
-# ── Invariant C — every memory-search call passes a MemoryQuery ──────
+# ── Invariant C -- every memory-search call passes a MemoryQuery ──────
 
 
 def _find_search_and_format_context_calls_without_query(
@@ -155,7 +155,7 @@ def _find_search_and_format_context_calls_without_query(
     """Find ``search_and_format_context(...)`` invocations that DON'T
     pass a ``query=`` kwarg.
 
-    Pre-PR-this no site passed a query — they all relied on the
+    Pre-PR-this no site passed a query -- they all relied on the
     handler's internal ``_extract_user_query(messages)`` with its
     500-char truncation. The new contract: every handler builds a
     full-fidelity ``MemoryQuery`` and passes it explicitly.
@@ -193,6 +193,6 @@ def test_every_search_and_format_context_call_passes_query_kwarg() -> None:
         pytest.fail(
             f"{len(offenders)} search_and_format_context call(s) miss `query=`:\n"
             f"{formatted}\n\n"
-            "Pass `query=MemoryQuery.from_messages(...)` — the multi-source, "
+            "Pass `query=MemoryQuery.from_messages(...)` -- the multi-source, "
             "untruncated query value type. See headroom/proxy/memory_query.py."
         )

@@ -305,6 +305,25 @@ class HNSWVectorIndex:
         # Thread safety
         self._lock = Lock()
 
+        # Auto-load existing index from disk if auto_save is enabled and
+        # save files exist. Without this, every process restart starts with a
+        # cold index and vector search returns empty results even though the
+        # SQLite store has data (the root cause of "MCP clients couldn't
+        # retrieve memories after restart").
+        if self._auto_save and self._save_path:
+            try:
+                self.load_index(self._save_path)
+            except FileNotFoundError:
+                pass  # No saved index yet — fresh start is the default
+            except (ValueError, Exception) as exc:
+                import logging as _logging
+
+                _logging.getLogger(__name__).warning(
+                    "Could not restore HNSW index from %s: %s. Starting fresh.",
+                    self._save_path,
+                    exc,
+                )
+
     @property
     def dimension(self) -> int:
         """Return the embedding dimension this index expects."""
@@ -367,9 +386,9 @@ class HNSWVectorIndex:
                 self._hnsw_to_memory[hnsw_id] = memory.id
                 self._next_hnsw_id += 1
 
-                # Store metadata and embedding
+                # Store metadata and embedding (float16 halves memory vs float32)
                 self._metadata[memory.id] = IndexedMemoryMetadata.from_memory(memory)
-                self._embeddings[memory.id] = embedding.copy()
+                self._embeddings[memory.id] = embedding.astype("float16")
 
         if self._auto_save and self._save_path:
             self.save_index(self._save_path)
@@ -484,12 +503,12 @@ class HNSWVectorIndex:
                     self._memory_to_hnsw[memory.id] = hnsw_id
                     self._hnsw_to_memory[hnsw_id] = memory.id
                     self._metadata[memory.id] = IndexedMemoryMetadata.from_memory(memory)
-                    self._embeddings[memory.id] = embedding.copy()
+                    self._embeddings[memory.id] = embedding.astype("float16")
 
             # Handle updates (hnswlib doesn't support true updates, so we track separately)
             for memory, embedding in update_memories:
                 self._metadata[memory.id] = IndexedMemoryMetadata.from_memory(memory)
-                self._embeddings[memory.id] = embedding.copy()
+                self._embeddings[memory.id] = embedding.astype("float16")
                 # Note: HNSW embedding stays unchanged unless we remove and re-add
 
         if self._auto_save and self._save_path:
@@ -647,8 +666,9 @@ class HNSWVectorIndex:
                 if not self._passes_filter(metadata, filter):
                     continue
 
-                # Get stored embedding
-                embedding = self._embeddings.get(memory_id)
+                # Get stored embedding (stored as float16 to save memory)
+                stored = self._embeddings.get(memory_id)
+                embedding = stored.astype("float32") if stored is not None else None
 
                 # Create Memory from metadata
                 memory = metadata.to_memory(embedding=embedding)
@@ -778,7 +798,7 @@ class HNSWVectorIndex:
         if memory_id not in self._memory_to_hnsw:
             return False
 
-        self._embeddings[memory_id] = embedding.copy()
+        self._embeddings[memory_id] = embedding.astype("float16")
         return True
 
     def _resize_index(self, new_max_elements: int) -> None:

@@ -124,6 +124,28 @@ class TestHeadroomProxyTrafficLearner:
         assert proxy.traffic_learner is not None
         assert proxy.traffic_learner._min_evidence == 10
 
+    def test_max_memory_bytes_defaults_to_none(self):
+        """Default ProxyConfig has max_memory_bytes=None; learner inherits it."""
+        config = ProxyConfig(
+            memory_enabled=True,
+            traffic_learning_enabled=True,
+        )
+        assert config.traffic_learning_max_memory_bytes is None
+        proxy = HeadroomProxy(config)
+        assert proxy.traffic_learner is not None
+        assert proxy.traffic_learner._max_memory_bytes is None
+
+    def test_max_memory_bytes_propagates_to_learner(self):
+        """A custom max_memory_bytes flows from ProxyConfig into TrafficLearner."""
+        config = ProxyConfig(
+            memory_enabled=True,
+            traffic_learning_enabled=True,
+            traffic_learning_max_memory_bytes=4096,
+        )
+        proxy = HeadroomProxy(config)
+        assert proxy.traffic_learner is not None
+        assert proxy.traffic_learner._max_memory_bytes == 4096
+
 
 # =============================================================================
 # CLI Flag Resolution Tests (simulates CLI logic without running Click)
@@ -199,7 +221,7 @@ class TestCLIFlagResolution:
 class TestCompressAPIIsolation:
     """Verify that compress() is completely unaffected by memory/learn flags.
 
-    compress() is a pure function — it should never touch memory, traffic
+    compress() is a pure function -- it should never touch memory, traffic
     learning, or any stateful components.
     """
 

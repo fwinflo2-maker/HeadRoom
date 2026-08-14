@@ -188,7 +188,8 @@ class DirectMem0Adapter:
                 prefer_grpc=self._config.qdrant_prefer_grpc,
                 grpc_port=self._config.qdrant_grpc_port,
             )
-            self._qdrant_client = QdrantClient(**client_kwargs)
+            qdrant_client_type: Any = QdrantClient
+            self._qdrant_client = qdrant_client_type(**client_kwargs)
         except ImportError:
             raise ImportError(
                 "qdrant-client not installed. Install with: pip install qdrant-client"

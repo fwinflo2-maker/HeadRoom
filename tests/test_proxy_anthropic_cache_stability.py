@@ -13,8 +13,30 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 
+from headroom.cache.compression_store import get_compression_store, reset_compression_store
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.server import ProxyConfig, create_app
+
+_CCR_SYSTEM_MARKER_HASH = "abcdef0123456789abcdef01"
+
+
+@pytest.fixture
+def owned_ccr_system_marker() -> str:
+    """Seed the hand-written marker used by the system-instruction tests.
+
+    Current main verifies that a detected CCR hash belongs to this Headroom
+    store before advertising retrieval instructions. These tests exercise the
+    injection destination/stability contract, so their synthetic marker must
+    model a real owned entry rather than a foreign user-authored lookalike.
+    """
+    reset_compression_store()
+    get_compression_store().store(
+        original="original tool output",
+        compressed="[100 items compressed to 10]",
+        explicit_hash=_CCR_SYSTEM_MARKER_HASH,
+    )
+    yield _CCR_SYSTEM_MARKER_HASH
+    reset_compression_store()
 
 
 def _force_compression(monkeypatch) -> None:  # noqa: ANN001
@@ -628,7 +650,9 @@ def test_ccr_tool_injection_disabled_when_prefix_frozen(monkeypatch) -> None:
         assert captured["inject_tool"] is False
 
 
-def test_ccr_system_instructions_routed_to_body_system_not_messages() -> None:
+def test_ccr_system_instructions_routed_to_body_system_not_messages(
+    owned_ccr_system_marker: str,
+) -> None:
     """#A2: system-instruction injection must land in ``body["system"]``,
     never as a ``role:"system"`` message — the Messages API rejects that
     shape with a 400 on every marker-bearing turn."""
@@ -666,7 +690,7 @@ def test_ccr_system_instructions_routed_to_body_system_not_messages() -> None:
 
         proxy._retry_request = _fake_retry
 
-        marker = "[100 items compressed to 10. Retrieve more: hash=abcdef0123456789abcdef01]"
+        marker = f"[100 items compressed to 10. Retrieve more: hash={owned_ccr_system_marker}]"
         response = client.post(
             "/v1/messages",
             headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
@@ -689,7 +713,7 @@ def test_ccr_system_instructions_routed_to_body_system_not_messages() -> None:
         assert "Compressed Context Available" in str(body["system"])
 
 
-def test_ccr_system_instructions_stable_across_turns() -> None:
+def test_ccr_system_instructions_stable_across_turns(owned_ccr_system_marker: str) -> None:
     """Once injected, the ``body["system"]`` segment must stay byte-identical
     turn over turn or it busts the provider's prompt-cache prefix (#A2)."""
     captured: dict = {"bodies": []}
@@ -726,7 +750,7 @@ def test_ccr_system_instructions_stable_across_turns() -> None:
 
         proxy._retry_request = _fake_retry
 
-        marker = "[100 items compressed to 10. Retrieve more: hash=abcdef0123456789abcdef01]"
+        marker = f"[100 items compressed to 10. Retrieve more: hash={owned_ccr_system_marker}]"
         payload = {
             "model": "claude-sonnet-4-6",
             "max_tokens": 64,

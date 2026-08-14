@@ -79,6 +79,8 @@ def perf(hours: float, raw: bool, output_format: str) -> None:
                 "tokens_before",
                 "tokens_after",
                 "tokens_saved",
+                "message_tokens_saved",
+                "tool_tokens_saved",
                 "prompt_reduction_tokens",
                 "accounting_delta_tokens",
                 "savings_pct",

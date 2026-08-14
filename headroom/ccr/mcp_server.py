@@ -35,6 +35,7 @@ from typing import Any
 
 from headroom import paths as _paths
 from headroom import savings_ledger
+from headroom.accounting import get_model_accounting
 from headroom.cache.compression_store import format_retrieval_miss_detail
 from headroom.telemetry import session as telemetry_session
 
@@ -74,6 +75,11 @@ CCR_TOOL_NAME = "headroom_retrieve"
 COMPRESS_TOOL_NAME = "headroom_compress"
 STATS_TOOL_NAME = "headroom_stats"
 READ_TOOL_NAME = "headroom_read"
+
+MEMORY_SEARCH_TOOL_NAME = "memory_search"
+MEMORY_SAVE_TOOL_NAME = "memory_save"
+MEMORY_ANALYZE_TOOL_NAME = "memory_analyze"
+MEMORY_DELETE_TOOL_NAME = "memory_delete"
 
 logger = logging.getLogger("headroom.ccr.mcp")
 
@@ -138,7 +144,6 @@ def _format_session_summary(
             "too_small": "Too small (< 500 tokens)",
             "passthrough": "Passthrough (token counting)",
             "no_compressible_content": "No compressible content (user/assistant only)",
-            "unknown_token_accounting": "Unknown token accounting",
         }
         for key, count in uncomp.items():
             label = reason_labels.get(key, key)
@@ -290,17 +295,26 @@ class SessionStats:
     total_tokens_saved: int = 0
     started_at: float = field(default_factory=time.time)
     events: list[dict[str, Any]] = field(default_factory=list)
+    _model_accounting: Any = field(default_factory=get_model_accounting)
 
     def record_compression(
         self,
         input_tokens: int,
         output_tokens: int,
         strategy: str,
+        model_name: str | None = None,
+        runtime_ms: float | None = None,
     ) -> None:
         self.compressions += 1
         self.total_input_tokens += input_tokens
         self.total_output_tokens += output_tokens
         self.total_tokens_saved += max(0, input_tokens - output_tokens)
+        self._model_accounting.record(
+            model_name=model_name or strategy,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            runtime_ms=runtime_ms or 0.0,
+        )
         event = {
             "type": "compress",
             "input_tokens": input_tokens,
@@ -329,6 +343,21 @@ class SessionStats:
         if len(self.events) > 50:
             self.events = self.events[-50:]
 
+    def record_model_usage(
+        self,
+        model_name: str | None,
+        input_tokens: int,
+        output_tokens: int,
+        runtime_ms: float,
+    ) -> None:
+        """Record model accounting for callers that track usage separately."""
+        self._model_accounting.record(
+            model_name=model_name or "unknown",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            runtime_ms=runtime_ms,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         savings_pct = (
             round((self.total_tokens_saved / self.total_input_tokens) * 100, 1)
@@ -348,6 +377,7 @@ class SessionStats:
             "savings_percent": savings_pct,
             "estimated_cost_saved_usd": cost_saved,
             "recent_events": self.events[-10:],
+            "model_accounting": self._model_accounting.get_stats_dict(),
         }
 
 
@@ -371,18 +401,28 @@ class HeadroomMCPServer:
         self,
         proxy_url: str = DEFAULT_PROXY_URL,
         check_proxy: bool = True,
+        memory_db_path: str | None = None,
+        memory_user_id: str = "default",
     ):
         self.proxy_url = proxy_url
         self.check_proxy = check_proxy
+        self.memory_db_path = memory_db_path
+        self.memory_user_id = memory_user_id
         self._http_client: httpx.AsyncClient | None = None  # type: ignore[assignment]
         self._stats = SessionStats()
         self._local_store: Any = None  # Lazy-initialized CompressionStore
+        self._memory_backend: Any = None  # Lazy-initialized LocalBackend
         self._compressor_initialized = False
         # File read cache: path → (content_hash, ccr_hash, line_count, token_count)
         self._file_cache: dict[str, tuple[str, str, int, int]] = {}
 
         if not MCP_AVAILABLE or Server is None:
             raise ImportError("MCP SDK not installed. Install with: pip install mcp")
+        if not hasattr(Server, "list_tools"):
+            raise ImportError(
+                "MCP SDK >=2.0.0 is not supported. Install a compatible version: "
+                "pip install 'mcp>=1.0.0,<2.0.0'"
+            )
 
         self.server: Server = Server("headroom")
         self._setup_handlers()
@@ -435,6 +475,14 @@ class HeadroomMCPServer:
             ", ".join(result.transforms_applied) if result.transforms_applied else "passthrough"
         )
         self._stats.record_compression(input_tokens, output_tokens, strategy)
+        logger.info(
+            "ccr_store=%s strategy=%s original_tokens=%s compressed_tokens=%s ttl=%s",
+            hash_key,
+            strategy,
+            input_tokens,
+            output_tokens,
+            MCP_SESSION_TTL,
+        )
 
         # Percentage of tokens removed. Derive from the same token counts used
         # for ``tokens_saved`` so all three fields agree — this mirrors the
@@ -620,7 +668,10 @@ class HeadroomMCPServer:
                         "Use this on large tool outputs, file contents, search results, "
                         "or any content you want to shrink before reasoning over it. "
                         f"The original is stored and can be retrieved later via mcp__headroom__{CCR_TOOL_NAME}. "
-                        "Returns compressed text + a hash for retrieval."
+                        "Returns compressed text + a hash for retrieval.\n\n"
+                        "Note: The proxy also compresses content transparently (diffs, JSON arrays, "
+                        "search results). Those markers are retrievable via headroom_retrieve too — "
+                        "same system."
                     ),
                     inputSchema={
                         "type": "object",
@@ -641,8 +692,13 @@ class HeadroomMCPServer:
                     description=(
                         "Retrieve original uncompressed content by hash. "
                         "Use this when you need full details from previously compressed content. "
-                        "The hash comes from headroom_compress results or from compression "
-                        "markers like [N items compressed... hash=abc123]."
+                        "The proxy transparently compresses large tool outputs, diffs, search "
+                        "results, and JSON arrays to save context window space — the original "
+                        "is stored and retrievable here. "
+                        "Hashes appear in compression markers like "
+                        "``[N items compressed to M. Retrieve more: hash=abc123]`` "
+                        "embedded in the compressed output. "
+                        "Also works for content compressed explicitly via headroom_compress."
                     ),
                     inputSchema={
                         "type": "object",
@@ -703,6 +759,10 @@ class HeadroomMCPServer:
                     )
                 )
 
+            # Conditionally add memory tools when a memory DB path is configured
+            if self.memory_db_path:
+                tools.extend(self._get_memory_tool_definitions())
+
             return tools
 
         @self.server.call_tool()
@@ -722,6 +782,14 @@ class HeadroomMCPServer:
                     result = await self._handle_stats()
                 elif name == READ_TOOL_NAME and _READ_ENABLED:
                     result = await self._handle_read(arguments)
+                elif name == MEMORY_SEARCH_TOOL_NAME:
+                    result = await self._handle_memory_search(arguments)
+                elif name == MEMORY_SAVE_TOOL_NAME:
+                    result = await self._handle_memory_save(arguments)
+                elif name == MEMORY_ANALYZE_TOOL_NAME:
+                    result = await self._handle_memory_analyze(arguments)
+                elif name == MEMORY_DELETE_TOOL_NAME:
+                    result = await self._handle_memory_delete(arguments)
                 else:
                     result = [
                         TextContent(
@@ -748,6 +816,9 @@ class HeadroomMCPServer:
                         text=json.dumps({"error": str(e)}),
                     )
                 ]
+
+        self._call_tool_handler = call_tool
+        self._list_tools_handler = list_tools
 
     async def _handle_compress(self, arguments: dict[str, Any]) -> list[TextContent]:
         """Handle headroom_compress tool call."""
@@ -836,9 +907,9 @@ class HeadroomMCPServer:
         logger.info("event=mcp_retrieve_started hash=%s", hash_key)
         result = await self._retrieve_content(hash_key)
         logger.info(
-            "event=mcp_retrieve_completed hash=%s result=%s",
+            "event=mcp_retrieve_completed hash=%s found=%s",
             hash_key,
-            json.dumps(result, ensure_ascii=False, default=str),
+            "error" not in result,
         )
 
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
@@ -900,11 +971,6 @@ class HeadroomMCPServer:
                 proxy_stats = self._extract_proxy_stats(proxy_data)
                 if proxy_stats:
                     stats["proxy"] = proxy_stats
-            else:
-                proxy_status = await self._probe_proxy_unreachable()
-                if proxy_status:
-                    stats["proxy"] = proxy_status
-                    stats["warning"] = proxy_status["warning"]
 
         return [TextContent(type="text", text=json.dumps(stats, indent=2))]
 
@@ -1053,6 +1119,78 @@ class HeadroomMCPServer:
                 text=numbered_content,
             )
         ]
+
+    def _get_memory_tool_definitions(self) -> list[Tool]:
+        """Return memory tool definitions (lazy-imported schemas)."""
+        from headroom.memory.mcp_server import _TOOLS as _MEMORY_TOOLS
+
+        return _MEMORY_TOOLS
+
+    async def _get_memory_backend(self) -> Any:
+        """Lazy-initialize and return the memory LocalBackend."""
+        if self._memory_backend is not None:
+            return self._memory_backend
+        if self.memory_db_path is None:
+            return None
+        from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
+
+        config = LocalBackendConfig(db_path=self.memory_db_path, embedder_backend="onnx")
+        backend = LocalBackend(config)
+        await backend._ensure_initialized()
+        self._memory_backend = backend
+        return backend
+
+    async def _handle_memory_search(self, arguments: dict[str, Any]) -> list[TextContent]:
+        backend = await self._get_memory_backend()
+        if backend is None:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps({"error": "Memory backend not available"}),
+                )
+            ]
+        from headroom.memory.mcp_server import _handle_search
+
+        return await _handle_search(backend, arguments, self.memory_user_id)
+
+    async def _handle_memory_save(self, arguments: dict[str, Any]) -> list[TextContent]:
+        backend = await self._get_memory_backend()
+        if backend is None:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps({"error": "Memory backend not available"}),
+                )
+            ]
+        from headroom.memory.mcp_server import _handle_save
+
+        return await _handle_save(backend, arguments, self.memory_user_id)
+
+    async def _handle_memory_analyze(self, arguments: dict[str, Any]) -> list[TextContent]:
+        backend = await self._get_memory_backend()
+        if backend is None:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps({"error": "Memory backend not available"}),
+                )
+            ]
+        from headroom.memory.mcp_server import _handle_analyze
+
+        return await _handle_analyze(backend, arguments, self.memory_user_id)
+
+    async def _handle_memory_delete(self, arguments: dict[str, Any]) -> list[TextContent]:
+        backend = await self._get_memory_backend()
+        if backend is None:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps({"error": "Memory backend not available"}),
+                )
+            ]
+        from headroom.memory.mcp_server import _handle_delete
+
+        return await _handle_delete(backend, arguments, self.memory_user_id)
 
     async def _await_parent_death(self, interval: float) -> None:
         """Resolve once the launching parent process is gone.

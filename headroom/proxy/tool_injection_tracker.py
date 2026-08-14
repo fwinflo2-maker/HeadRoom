@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
+from typing import Any
 
 
 class SessionToolTracker:
@@ -91,3 +92,16 @@ class SessionToolTracker:
 
         with self._lock:
             self._sessions.clear()
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        """Return session metadata without exposing tool-definition bytes."""
+        with self._lock:
+            return [
+                {
+                    "provider": provider,
+                    "session_id": session_id,
+                    "tool_count": len(tools),
+                    "tool_names": list(tools),
+                }
+                for (provider, session_id), tools in self._sessions.items()
+            ]

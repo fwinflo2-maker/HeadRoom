@@ -9,7 +9,6 @@ import asyncio
 import contextlib
 import copy
 import hashlib
-import json
 import logging
 import os
 import threading
@@ -22,6 +21,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, unquote, urlparse
 
+from headroom.proxy import _json as json
 from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
     _headroom_bypass_enabled,
@@ -2642,6 +2642,7 @@ class OpenAIHandlerMixin:
             COMPRESSION_TIMEOUT_SECONDS,
             MAX_MESSAGE_ARRAY_LENGTH,
             MAX_REQUEST_BODY_SIZE,
+            _headroom_no_inline_tool_injection,
             _read_request_json,
         )
         from headroom.proxy.modes import is_cache_mode, is_token_mode
@@ -2742,6 +2743,10 @@ class OpenAIHandlerMixin:
         _bypass = self._headroom_bypass_enabled(request.headers)
         if _bypass:
             logger.info(f"[{request_id}] Bypass: skipping compression (header)")
+
+        _no_inline_tools = self.config.no_inline_tools or _headroom_no_inline_tool_injection(
+            request.headers, dict(request.query_params)
+        )
 
         # Image compression: tile alignment + ML-based technique routing.
         # Gated on ImageCompressionDecision — same value-type pattern
@@ -3210,11 +3215,17 @@ class OpenAIHandlerMixin:
         # only-guarded and idempotent (cache mode already replays).
         from headroom.cache.prefix_tracker import overlay_cached_prefix
 
+        get_last_original_messages = getattr(
+            openai_prefix_tracker, "get_last_original_messages", None
+        )
+        get_last_forwarded_messages = getattr(
+            openai_prefix_tracker, "get_last_forwarded_messages", None
+        )
         _ov = overlay_cached_prefix(
             optimized_messages,
             original_client_messages,
-            openai_prefix_tracker.get_last_original_messages(),
-            openai_prefix_tracker.get_last_forwarded_messages(),
+            get_last_original_messages() if callable(get_last_original_messages) else [],
+            get_last_forwarded_messages() if callable(get_last_forwarded_messages) else [],
         )
         if _ov != optimized_messages:
             optimized_messages = _ov
@@ -3337,6 +3348,7 @@ class OpenAIHandlerMixin:
                     request_id=request_id,
                     existing_tools=tools,
                     has_compressed_content_this_turn=has_new_compressed_content,
+                    disable_inline_tool_injection=_no_inline_tools,
                 )
                 if ccr_tool_injected:
                     logger.debug(
@@ -3352,7 +3364,7 @@ class OpenAIHandlerMixin:
                 frozen_message_count=openai_frozen_count,
             )
             if restored_count > 0:
-                logger.warning(
+                logger.info(
                     f"[{request_id}] Restored {restored_count} frozen prefix message(s) "
                     "to preserve cache stability (openai)"
                 )
@@ -3443,6 +3455,7 @@ class OpenAIHandlerMixin:
                     existing_tools=tools,
                     memory_tools_to_inject=memory_tool_defs,
                     inject_this_turn=bool(self.memory_handler.config.inject_tools),
+                    disable_inline_tool_injection=_no_inline_tools,
                 )
                 if mem_tools_injected:
                     memory_tools_injected = True
@@ -3614,8 +3627,11 @@ class OpenAIHandlerMixin:
         # (result.tokens_before), which mismatches optimized_tokens (provider tokenizer)
         # and yields impossible tok_after>tok_before. Recount original from the
         # pre-compression snapshot so the message delta is on one scale.
-        original_tokens = tokenizer.count_messages(original_client_messages)
-        optimized_tokens = tokenizer.count_messages(body["messages"])
+        # Off the event loop (#2810): see the matching note in the Anthropic handler.
+        original_tokens = await asyncio.to_thread(
+            tokenizer.count_messages, original_client_messages
+        )
+        optimized_tokens = await asyncio.to_thread(tokenizer.count_messages, body["messages"])
         if tool_tokens_before_compaction > 0:
             try:
                 tool_tokens_after_compaction = tokenizer.count_text(_json_debug_dumps(tools))
@@ -3702,8 +3718,15 @@ class OpenAIHandlerMixin:
         # translate it here — the proxy already owns the outbound body — and
         # those requests work unchanged. No-op when the caller already set
         # `max_completion_tokens`.
+        # Resolved without `body=` so nothing is rewritten yet -- we only need
+        # to know WHICH backend will serve this request, because a translating
+        # one owns the max_tokens spelling. Cached, so the dispatch-site call
+        # below is a dict lookup.
+        from headroom.proxy.route_advice import resolver_for
+
         _normalize_openai_max_tokens(
-            body, backend_owns_translation=self.anthropic_backend is not None
+            body,
+            backend_owns_translation=resolver_for(self).for_request(request) is not None,
         )
 
         # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER): verbosity steering
@@ -3763,8 +3786,12 @@ class OpenAIHandlerMixin:
                             f"{_shape_result.labels}"
                         )
 
-        # Route through LiteLLM/any-llm backend if configured
-        if self.anthropic_backend is not None:
+        # Route through LiteLLM/any-llm backend if configured -- or through a
+        # per-request one an extension asked for (see proxy/route_advice.py).
+        # No advice resolves to `self.anthropic_backend`, so this is the same
+        # condition it has always been.
+        request_backend = resolver_for(self).for_request(request, body=body)
+        if request_backend is not None:
             try:
                 if stream:
                     self.pipeline_extensions.emit(
@@ -3794,12 +3821,11 @@ class OpenAIHandlerMixin:
                         waste_signals=waste_signals_dict,
                         prefix_tracker=openai_prefix_tracker,
                         optimized_messages=optimized_messages,
+                        backend=request_backend,
                     )
                 else:
                     # Non-streaming: use send_openai_message() → JSON
-                    backend_response = await self.anthropic_backend.send_openai_message(
-                        body, headers
-                    )
+                    backend_response = await request_backend.send_openai_message(body, headers)
                     self.pipeline_extensions.emit(
                         PipelineStage.POST_SEND,
                         operation="proxy.request",
@@ -3858,7 +3884,7 @@ class OpenAIHandlerMixin:
                     ):
                         logger.info(
                             f"[{request_id}] CCR: Detected retrieval tool call "
-                            f"on backend path, handling via {self.anthropic_backend.name}"
+                            f"on backend path, handling via {request_backend.name}"
                         )
 
                         # Continuation closure — delegates transport to
@@ -3885,13 +3911,13 @@ class OpenAIHandlerMixin:
                                 )
                             }
 
-                            assert self.anthropic_backend is not None
+                            assert request_backend is not None
                             logger.info(
                                 f"[{request_id}] CCR: Issuing continuation via "
-                                f"{self.anthropic_backend.name} backend "
+                                f"{request_backend.name} backend "
                                 f"({len(msgs)} messages)"
                             )
-                            cont_resp = await self.anthropic_backend.send_openai_message(
+                            cont_resp = await request_backend.send_openai_message(
                                 continuation_body, continuation_headers
                             )
                             return cont_resp.body
@@ -4017,7 +4043,7 @@ class OpenAIHandlerMixin:
                     await self._record_request_outcome(
                         RequestOutcome(
                             request_id=request_id,
-                            provider=self.anthropic_backend.name,
+                            provider=request_backend.name,
                             model=model,
                             original_tokens=original_tokens,
                             # Local count, same tokenizer as original_tokens, so
@@ -4049,7 +4075,7 @@ class OpenAIHandlerMixin:
                     if tokens_saved > 0:
                         logger.info(
                             f"[{request_id}] {model}: {original_tokens:,} → {optimized_tokens:,} "
-                            f"(saved {tokens_saved:,} tokens) via {self.anthropic_backend.name}"
+                            f"(saved {tokens_saved:,} tokens) via {request_backend.name}"
                         )
 
                     return JSONResponse(
@@ -4068,6 +4094,44 @@ class OpenAIHandlerMixin:
                         }
                     },
                 )
+
+        # Strip reasoning_content from assistant messages before forwarding
+        # upstream.  DeepSeek rejects requests where these fields appear
+        # in the message history without corresponding reasoning_effort /
+        # thinking-mode parameters on the request itself.
+        #
+        # Cases that lead here:
+        #
+        # 1. Multi-turn chat with a thinking model
+        #    Client (e.g. opencode, Claude Code) posts a conversation that
+        #    includes the assistant's previous thinking response verbatim.
+        #    DeepSeek's assistant message schema includes reasoning_content
+        #    for thinking responses; the client includes it in the history.
+        #    Re-sending it without reasoning_effort → 400.
+        #
+        # 2. Non-thinking model following a thinking model
+        #    If the user switches from deepseek-v4-flash to deepseek-v4-pro
+        #    mid-conversation (or vice versa), the history still contains
+        #    reasoning_content from the earlier thinking turns.  The target
+        #    model may not accept this field → 400.
+        #
+        # 3. Other providers that pass through via OPENAI_TARGET_API_URL
+        #    (Anthropic, Google, Ollama) also reject unknown fields on
+        #    assistant messages.  Stripping prophylactically is safe.
+        #
+        # Why this is safe:
+        # - The response path (streaming _stream_response and non-streaming
+        #   _retry_request) passes the upstream response through unchanged,
+        #   so the client still receives reasoning_content on the current
+        #   turn.
+        # - The field is only meaningful in the *response* — the client does
+        #   not need to re-send it to maintain conversation state.
+        # - The Anthropic handler already strips its own thinking blocks in
+        #   the content_router for analogous reasons.
+        for msg in body.get("messages", []):
+            if isinstance(msg, dict) and msg.get("role") == "assistant":
+                msg.pop("reasoning_content", None)
+                msg.pop("redacted_reasoning_content", None)
 
         # Direct OpenAI API (no backend configured)
         url = build_copilot_upstream_url(
@@ -6410,11 +6474,9 @@ class OpenAIHandlerMixin:
                         t.get("name") or t.get("function", {}).get("name", "?")
                         for t in (ws_response_body.get("tools") or [])
                     ]
-                    instr_preview = (ws_response_body.get("instructions") or "")[:200]
                     logger.info(
                         f"[{request_id}] WS Memory: Codex tools={existing_tool_names}, "
-                        f"instructions_len={len(ws_response_body.get('instructions') or '')}, "
-                        f"instructions_preview={instr_preview!r}"
+                        f"instructions_len={len(ws_response_body.get('instructions') or '')}"
                     )
 
                     # Inject memory context into instructions
@@ -7076,6 +7138,11 @@ class OpenAIHandlerMixin:
                                 frame_type="response.create",
                                 model=str(inner_payload.get("model") or "unknown"),
                             )
+                            return (
+                                raw_after_store,
+                                store_forced,
+                                "chatgpt_store_false" if store_forced else "compression_exception",
+                            )
                         # Record transform labels even when the frame bytes are
                         # unchanged: control-arm output-shaper labels
                         # (output_shaper:control:*) must reach the outcome
@@ -7083,11 +7150,6 @@ class OpenAIHandlerMixin:
                         for t in frame_transforms:
                             if t not in transforms_applied:
                                 transforms_applied.append(t)
-                        return (
-                            raw_after_store,
-                            store_forced,
-                            "chatgpt_store_false" if store_forced else "compression_exception",
-                        )
                         if not modified:
                             reason = frame_reason or "no_compression"
                             _log_ws_passthrough(

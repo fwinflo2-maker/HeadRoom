@@ -1,5 +1,7 @@
 """Regression tests for OpenAI cache-mode stability in proxy mode."""
 
+#  Copyright (c) 2026 Noel Kuntze
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -20,16 +22,6 @@ class _FakePrefixTracker:
 
     def get_frozen_message_count(self) -> int:
         return self._frozen_count
-
-    # Empty history → overlay_cached_prefix() is a no-op here, so these tests
-    # keep asserting the cache-freeze behavior they always have. The cross-turn
-    # overlay itself is exercised in test_cross_turn_cache_safety.py against the
-    # real tracker; these stubs just satisfy the handler's overlay call.
-    def get_last_original_messages(self):  # noqa: ANN201
-        return []
-
-    def get_last_forwarded_messages(self):  # noqa: ANN201
-        return []
 
     def update_from_response(self, **kwargs):  # noqa: ANN003
         return None
@@ -62,7 +54,9 @@ def test_openai_cache_mode_freezes_previous_turns() -> None:
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider, project=None: (
+            fake_tracker
+        )
 
         def _fake_apply(**kwargs):
             captured["frozen_message_count"] = kwargs.get("frozen_message_count")
@@ -124,7 +118,9 @@ def test_openai_cache_mode_keeps_final_tool_observation_mutable(tail_role: str) 
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider, project=None: (
+            fake_tracker
+        )
 
         def _fake_apply(**kwargs):
             captured.setdefault("calls", []).append(
@@ -202,7 +198,9 @@ def test_openai_cache_mode_restores_mutated_frozen_prefix() -> None:
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider, project=None: (
+            fake_tracker
+        )
 
         original_messages = [
             {"role": "user", "content": "turn1"},
@@ -261,7 +259,7 @@ def test_openai_cache_mode_restores_mutated_frozen_prefix() -> None:
 # ─── Issue #327 cross-handler regression ────────────────────────────────
 #
 # The OpenAI handler was never affected by issue #327's content-keyed walker
-# bug — it has only ever used `compute_frozen_count` (positional). This test
+# bug -- it has only ever used `compute_frozen_count` (positional). This test
 # locks that property by spying on the OpenAI traffic path and asserting that
 # the buggy walker functions (`should_defer_compression`, `mark_stable`) are
 # never called from the production handler. If a future refactor accidentally
@@ -307,7 +305,7 @@ def test_issue_327_openai_handler_does_not_call_walker_functions() -> None:
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "openai-spy-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda s, p: fake_tracker
+        proxy.session_tracker_store.get_or_create = lambda s, p, _=None: fake_tracker
         proxy._get_compression_cache = lambda s: _SpyCompCache()
 
         def _fake_apply(**kwargs):  # noqa: ANN003

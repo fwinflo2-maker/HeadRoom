@@ -42,6 +42,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
+from headroom.relevance.bm25 import BM25Scorer
+
 if TYPE_CHECKING:
     from ..memory.tracker import ComponentStats
     from .backends import CompressionStoreBackend
@@ -50,14 +52,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CCR_TTL_SECONDS = 1800  # session-scale; override via HEADROOM_CCR_TTL_SECONDS
 CCR_TTL_SECONDS_ENV = "HEADROOM_CCR_TTL_SECONDS"
-
-_RETRIEVAL_LOG_PREVIEW_CHARS = 4096
-_SECRET_KEY_VALUE_RE = re.compile(
-    r"(?i)\b([A-Z0-9_-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)[A-Z0-9_-]*)"
-    r"(\s*[:=]\s*)([\"']?)([^\"'\s,}]+)"
-)
-_AUTH_VALUE_RE = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}")
-_API_KEY_VALUE_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
 
 
 def _get_env_default_ttl_seconds() -> int:
@@ -95,29 +89,15 @@ def format_retrieval_miss_detail(status: dict[str, Any]) -> str:
 
     if status.get("status") == "expired":
         age_seconds = status.get("age_seconds")
-        if isinstance(age_seconds, (int, float)):
+        if isinstance(age_seconds, int | float):
             return f"Entry expired (CCR TTL: {ttl_seconds} seconds; age: {age_seconds:.0f} seconds)"
         return f"Entry expired (CCR TTL: {ttl_seconds} seconds)"
 
     return f"Entry not found (CCR TTL: {default_ttl} seconds)"
 
 
-def _redact_retrieval_log_payload(payload: str) -> str:
-    redacted = _SECRET_KEY_VALUE_RE.sub(r"\1\2\3[REDACTED]", payload)
-    redacted = _AUTH_VALUE_RE.sub(r"\1 [REDACTED]", redacted)
-    return _API_KEY_VALUE_RE.sub("sk-[REDACTED]", redacted)
-
-
 def _payload_for_retrieval_log(payload: str) -> dict[str, Any]:
-    redacted = _redact_retrieval_log_payload(payload)
-    preview = redacted[:_RETRIEVAL_LOG_PREVIEW_CHARS]
-    truncated = len(redacted) > len(preview)
-    return {
-        "payload_chars": len(payload),
-        "payload_preview_chars": len(preview),
-        "payload_truncated": truncated,
-        "payload_preview": preview,
-    }
+    return {"payload_chars": len(payload)}
 
 
 # Single source of truth for the retrieval-miss message. Actionable by
@@ -244,6 +224,8 @@ class CompressionStore:
         self._stale_heap_entries = 0
         # Threshold for triggering heap rebuild (when 50% are stale)
         self._heap_rebuild_threshold = 0.5
+
+        self._scorer = BM25Scorer()
 
     @property
     def default_ttl_seconds(self) -> int:
@@ -412,6 +394,15 @@ class CompressionStore:
             # MEDIUM FIX #16: Add to eviction heap for O(log n) eviction
             heapq.heappush(self._eviction_heap, (entry.created_at, hash_key))
 
+        logger.info(
+            "ccr_store=%s tool=%s strategy=%s original_tokens=%s compressed_tokens=%s ttl=%s",
+            hash_key,
+            tool_name,
+            compression_strategy,
+            original_tokens,
+            compressed_tokens,
+            entry.ttl,
+        )
         return hash_key
 
     def retrieve(
@@ -982,9 +973,9 @@ def clear_request_compression_store() -> None:
 def _create_default_ccr_backend() -> CompressionStoreBackend | None:
     """Create a CCR backend from env (e.g. HEADROOM_CCR_BACKEND=redis).
 
-    Default (env unset or "sqlite"): SQLiteBackend at workspace_dir()/ccr_store.db
-    — restart-safe and shared across worker processes, which the
-    session-scale 30-minute TTL assumes.
+    Default (env unset or "sqlite"): SQLiteBackend at
+    ~/.headroom/ccr_store.db — restart-safe and shared across worker
+    processes, which the session-scale 30-minute TTL assumes.
     "memory" opts back into the in-process dict. Other values load
     adapters via setuptools entry point 'headroom.ccr_backend'.
     Returns None to use InMemoryBackend.

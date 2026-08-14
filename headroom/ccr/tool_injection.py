@@ -44,9 +44,11 @@ def create_ccr_tool_definition(
         "function": {
             "name": CCR_TOOL_NAME,
             "description": (
-                "Retrieve original uncompressed content that was compressed to save tokens. "
+                "Retrieve original uncompressed content that the proxy compressed to save tokens. "
+                "The proxy transparently compresses large tool outputs, diffs, JSON arrays, "
+                "and search results — the original is stored here. "
                 "Use this when you need more data than what's shown in compressed tool results. "
-                "The hash is provided in compression markers like [N items compressed... hash=abc123]."
+                "Hashes appear in markers like [N items compressed... hash=abc123]."
             ),
             "parameters": {
                 "type": "object",
@@ -69,9 +71,11 @@ def create_ccr_tool_definition(
         return {
             "name": CCR_TOOL_NAME,
             "description": (
-                "Retrieve original uncompressed content that was compressed to save tokens. "
+                "Retrieve original uncompressed content that the proxy compressed to save tokens. "
+                "The proxy transparently compresses large tool outputs, diffs, JSON arrays, "
+                "and search results — the original is stored here. "
                 "Use this when you need more data than what's shown in compressed tool results. "
-                "The hash is provided in compression markers like [N items compressed... hash=abc123]."
+                "Hashes appear in markers like [N items compressed... hash=abc123]."
             ),
             "input_schema": {
                 "type": "object",
@@ -90,8 +94,11 @@ def create_ccr_tool_definition(
         return {
             "name": CCR_TOOL_NAME,
             "description": (
-                "Retrieve original uncompressed content that was compressed to save tokens. "
-                "Use this when you need more data than what's shown in compressed tool results."
+                "Retrieve original uncompressed content that the proxy compressed to save tokens. "
+                "The proxy transparently compresses large tool outputs, diffs, JSON arrays, "
+                "and search results — the original is stored here. "
+                "Use this when you need more data than what's shown in compressed tool results. "
+                "Hashes appear in markers like [N items compressed... hash=abc123]."
             ),
             "parameters": {
                 "type": "object",

@@ -30,21 +30,6 @@ from .tool_injection import CCR_TOOL_NAME
 
 logger = logging.getLogger(__name__)
 
-# Residual-CCR status signals (provider-generic).
-#
-# ``handle_response`` may return a response that still contains
-# ``headroom_retrieve`` tool calls. Callers need to know *why* so they can
-# decide whether that is a safe passthrough or a genuine failure:
-#
-# - RESIDUAL_CCR_RESOLVED:       no CCR tool calls remain — fully handled.
-# - RESIDUAL_CCR_SKIPPED_MIXED:  CCR was intentionally skipped because the model
-#                                emitted headroom_retrieve alongside a non-CCR
-#                                client tool (#839). The client must resolve both
-#                                tool calls; the proxy must pass the turn through
-#                                unchanged (200), not fail closed.
-# - RESIDUAL_CCR_ERROR:          CCR tool calls remain with no accompanying client
-#                                tool — i.e. a real conversion/handling failure the
-#                                proxy could not resolve. Callers should fail closed.
 RESIDUAL_CCR_RESOLVED = "resolved"
 RESIDUAL_CCR_SKIPPED_MIXED = "skipped_mixed_tools"
 RESIDUAL_CCR_ERROR = "error"
@@ -134,21 +119,7 @@ class CCRResponseHandler:
         response: dict[str, Any],
         provider: str = "anthropic",
     ) -> str:
-        """Classify why (if at all) CCR tool calls remain in a handled response.
-
-        This is a stateless, provider-generic signal derived from the same
-        parsing ``handle_response`` uses, so it stays correct under concurrency
-        and works identically for every provider/harness.
-
-        Returns one of:
-        - ``RESIDUAL_CCR_RESOLVED``: no headroom_retrieve tool calls remain.
-        - ``RESIDUAL_CCR_SKIPPED_MIXED``: headroom_retrieve remains *alongside*
-          a non-CCR client tool call. This is an intentional skip (#839) — the
-          proxy cannot synthesize the client tool_result, so the turn must be
-          handed back to the client unchanged rather than failed closed.
-        - ``RESIDUAL_CCR_ERROR``: headroom_retrieve remains with no accompanying
-          client tool call — a genuine handling/conversion failure.
-        """
+        """Classify any CCR calls left after response handling."""
         ccr_calls, other_calls = self._parse_ccr_tool_calls(response, provider)
         if not ccr_calls:
             return RESIDUAL_CCR_RESOLVED
@@ -379,15 +350,9 @@ class CCRResponseHandler:
                 "content": response.get("content", []),
             }
         elif provider == "openai":
-            # Guard an empty/malformed ``choices`` the same way the Google branch
-            # below (and ccr/tool_calls.py) already do: ``response.get("choices",
-            # [{}])`` only falls back when the key is absent, so a present-but-
-            # empty ``choices: []`` (or ``[null]``) — which OpenAI-compatible
-            # gateways can send on a content-filtered/usage-only response — made
-            # ``[0]`` raise IndexError (or ``.get`` raise on a non-dict).
-            choices = response.get("choices")
-            first = choices[0] if isinstance(choices, list) and choices else {}
-            message = first.get("message", {}) if isinstance(first, dict) else {}
+            choices = response.get("choices") or []
+            first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+            message = first_choice.get("message", {})
             return {
                 "role": "assistant",
                 "content": message.get("content"),
@@ -769,109 +734,62 @@ class StreamingCCRHandler:
             "usage": {},
         }
 
-        blocks_by_index: dict[int, dict[str, Any]] = {}
-        current_block: dict[str, Any] | None = None
+        current_text = ""
+        current_tool: dict[str, Any] | None = None
 
         for event in events:
             event_type = event.get("type", "")
 
             if event_type == "content_block_start":
                 block = event.get("content_block", {})
-                block_index = event.get("index", len(blocks_by_index))
-                btype = block.get("type")
-                current_block = {"type": btype}
-                if btype == "text":
-                    current_block["text"] = block.get("text", "")
-                elif btype == "tool_use":
-                    current_block.update(
-                        {
-                            "id": block.get("id", ""),
-                            "name": block.get("name", ""),
-                            "input": {},
-                        }
-                    )
-                elif btype == "thinking":
-                    current_block["thinking_buffer"] = block.get("thinking", "")
-                    if "signature" in block:
-                        current_block["signature"] = block["signature"]
-                elif btype == "redacted_thinking":
-                    if "data" in block:
-                        current_block["data"] = block["data"]
-                elif btype:
-                    current_block = dict(block)
-                blocks_by_index[block_index] = current_block
+                if block.get("type") == "text":
+                    current_text = block.get("text", "")
+                elif block.get("type") == "tool_use":
+                    current_tool = {
+                        "type": "tool_use",
+                        "id": block.get("id", ""),
+                        "name": block.get("name", ""),
+                        "input": {},
+                    }
 
             elif event_type == "content_block_delta":
-                idx = event.get("index")
-                target = (blocks_by_index.get(idx) if idx is not None else None) or current_block
-                if target is None:
-                    continue
                 delta = event.get("delta", {})
-                dtype = delta.get("type")
-                if dtype == "text_delta":
-                    target["text"] = target.get("text", "") + delta.get("text", "")
-                elif dtype == "input_json_delta":
-                    # Accumulate for any block streaming input (tool_use AND
-                    # server_tool_use); the stop handler parses it into `input`
-                    # (#2438).
-                    partial = delta.get("partial_json", "")
-                    target["_partial_json"] = target.get("_partial_json", "") + partial
-                elif dtype == "thinking_delta":
-                    target["thinking_buffer"] = target.get("thinking_buffer", "") + delta.get(
-                        "thinking", ""
-                    )
-                elif dtype == "signature_delta":
-                    if "signature" in delta:
-                        target["signature"] = delta["signature"]
-                elif dtype == "citations_delta":
-                    citation = delta.get("citation")
-                    if citation is not None:
-                        target.setdefault("citations", []).append(citation)
+                if delta.get("type") == "text_delta":
+                    current_text += delta.get("text", "")
+                elif delta.get("type") == "input_json_delta":
+                    # Accumulate JSON for tool input
+                    if current_tool is not None:
+                        partial = delta.get("partial_json", "")
+                        # This is tricky - partial JSON needs accumulation
+                        # For simplicity, we'll try to parse when complete
+                        current_tool["_partial_json"] = (
+                            current_tool.get("_partial_json", "") + partial
+                        )
 
             elif event_type == "content_block_stop":
-                idx = event.get("index")
-                target = (blocks_by_index.get(idx) if idx is not None else None) or current_block
-                if target is not None:
-                    # Parse streamed `_partial_json` into `input` for any block
-                    # that carried input_json_delta — tool_use AND
-                    # server_tool_use — not just tool_use. The narrow type gate
-                    # left server_tool_use.input malformed and leaked the scratch
-                    # key into replayed history (#2438). Always strip the key.
-                    if "_partial_json" in target:
-                        partial = target.pop("_partial_json")
+                if current_text:
+                    response["content"].append(
+                        {
+                            "type": "text",
+                            "text": current_text,
+                        }
+                    )
+                    current_text = ""
+                if current_tool:
+                    # Parse accumulated JSON
+                    partial = current_tool.pop("_partial_json", "")
+                    if partial:
                         try:
-                            target["input"] = json.loads(partial) if partial else {}
+                            current_tool["input"] = json.loads(partial)
                         except json.JSONDecodeError:
-                            target["input"] = {}
-                    if target.get("type") == "thinking" and "thinking_buffer" in target:
-                        target["thinking"] = target.pop("thinking_buffer")
-                    if target not in response["content"]:
-                        response["content"].append(target)
-                    current_block = None
-
-            elif event_type == "message_start":
-                msg = event.get("message", {})
-                if "id" in msg:
-                    response["id"] = msg["id"]
-                if "model" in msg:
-                    response["model"] = msg["model"]
-                if "role" in msg:
-                    response["role"] = msg["role"]
-                if "stop_reason" in msg:
-                    response["stop_reason"] = msg["stop_reason"]
-                if "stop_details" in msg:
-                    response["stop_details"] = msg["stop_details"]
-                if msg.get("usage"):
-                    response["usage"].update(msg["usage"])
+                            current_tool["input"] = {}
+                    response["content"].append(current_tool)
+                    current_tool = None
 
             elif event_type == "message_delta":
                 delta = event.get("delta", {})
                 if "stop_reason" in delta:
                     response["stop_reason"] = delta["stop_reason"]
-                if "stop_details" in delta:
-                    response["stop_details"] = delta["stop_details"]
-                if event.get("usage"):
-                    response["usage"].update(event["usage"])
 
             elif event_type == "message_stop":
                 pass
@@ -941,10 +859,11 @@ class StreamingCCRHandler:
         to chunk the response more granularly.
         """
         if self.provider == "anthropic":
-            from headroom.proxy.handlers.streaming import StreamingMixin
-
-            for chunk in StreamingMixin()._response_to_sse(response, "anthropic"):
-                yield chunk
+            # Anthropic SSE format
+            yield b"event: message_start\n"
+            yield f"data: {json.dumps({'type': 'message_start', 'message': response})}\n\n".encode()
+            yield b"event: message_stop\n"
+            yield b'data: {"type": "message_stop"}\n\n'
         else:
             # OpenAI SSE format
             yield f"data: {json.dumps(response)}\n\n".encode()

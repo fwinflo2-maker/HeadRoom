@@ -1,5 +1,7 @@
 """Regression tests for Anthropic prefix-cache stability in proxy mode."""
 
+#  Copyright (c) 2026 Noel Kuntze
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -345,7 +347,9 @@ def test_token_mode_freeze_is_capped_by_prefix_tracker() -> None:
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider, project=None: (
+            fake_tracker
+        )
 
         class _FakeCompressionCache:
             def apply_cached(self, messages):  # noqa: ANN001
@@ -420,7 +424,9 @@ def test_memory_context_avoids_system_mutation_when_prefix_frozen() -> None:
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider, project=None: (
+            fake_tracker
+        )
 
         proxy.memory_handler = SimpleNamespace(
             config=SimpleNamespace(inject_context=True, inject_tools=False),
@@ -486,7 +492,9 @@ def test_ccr_system_instruction_injection_disabled_when_prefix_frozen(monkeypatc
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider, project=None: (
+            fake_tracker
+        )
 
         class _FakeInjector:
             def __init__(
@@ -553,7 +561,9 @@ def test_ccr_tool_injection_disabled_when_prefix_frozen(monkeypatch) -> None:
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider, project=None: (
+            fake_tracker
+        )
 
         class _FakeInjector:
             def __init__(
@@ -735,7 +745,9 @@ def test_previous_turns_always_frozen_only_final_turn_mutable() -> None:
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider, project=None: (
+            fake_tracker
+        )
 
         proxy.anthropic_pipeline.apply = lambda **kwargs: (_ for _ in ()).throw(
             AssertionError("cache mode should not invoke anthropic pipeline")
@@ -921,7 +933,9 @@ def test_token_mode_does_not_force_freeze_all_previous_turns() -> None:
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider, project=None: (
+            fake_tracker
+        )
 
         class _FakeCompressionCache:
             def apply_cached(self, messages):  # noqa: ANN001
@@ -1005,7 +1019,9 @@ def test_cache_mode_restores_frozen_prefix_if_transform_mutates_history() -> Non
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider, project=None: (
+            fake_tracker
+        )
 
         original_messages = [
             {"role": "user", "content": "turn1"},
@@ -1075,7 +1091,9 @@ def test_cache_mode_does_not_forward_latest_turn_rewrites() -> None:
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider, project=None: (
+            fake_tracker
+        )
 
         original_messages = [
             {"role": "user", "content": "turn1"},
@@ -1162,16 +1180,8 @@ def test_cache_mode_reuses_prior_forwarded_prefix_and_compresses_only_new_suffix
 
         def _fake_apply(**kwargs):
             captured["calls"].append(kwargs["messages"])
-            captured["frozen_message_count"] = kwargs.get("frozen_message_count")
-            # fix-6 contract: the compressor is handed the frozen forwarded prefix
-            # + the new delta and only compresses indices >= frozen_message_count
-            # (so a lone tool_result can resolve its tool_name from the prefix).
-            # Mirror the real router: pass the frozen prefix through verbatim and
-            # compress only the tail — the handler splices result.messages[prefix_n:].
-            fz = kwargs.get("frozen_message_count") or 0
-            msgs = kwargs["messages"]
             return SimpleNamespace(
-                messages=list(msgs[:fz]) + [{"role": "user", "content": "COMPRESSED_TURN3"}],
+                messages=[{"role": "user", "content": "COMPRESSED_TURN3"}],
                 transforms_applied=["fake:delta"],
                 timing={},
                 tokens_before=40,
@@ -1218,22 +1228,7 @@ def test_cache_mode_reuses_prior_forwarded_prefix_and_compresses_only_new_suffix
         )
 
         assert response.status_code == 200
-        # fix-6 contract: the compressor receives the frozen FORWARDED prefix
-        # (with COMPRESSED_TURN2, the byte-stable cached form) + the raw new
-        # delta (turn3), so tool_name resolution / dedup stay consistent with
-        # what is actually cached. frozen_message_count = prefix length pins
-        # compression to the delta ONLY — the prefix is never re-compressed.
-        assert captured["calls"] == [
-            [
-                {"role": "user", "content": "turn1"},
-                {"role": "assistant", "content": "turn1-assistant"},
-                {"role": "user", "content": "COMPRESSED_TURN2"},
-                {"role": "assistant", "content": "turn2-assistant"},
-                {"role": "user", "content": "turn3"},
-            ]
-        ]
-        assert captured["frozen_message_count"] == 4  # only the delta (turn3) is compressed
-        # Forwarded body = byte-identical cached prefix + the compressed delta.
+        assert captured["calls"] == [[{"role": "user", "content": "turn3"}]]
         assert captured["body"]["messages"] == [
             {"role": "user", "content": "turn1"},
             {"role": "assistant", "content": "turn1-assistant"},
@@ -1405,20 +1400,22 @@ def _drive_request(
     messages: list,
     captured: dict,
 ) -> httpx.Response:
-    """Common test driver — wire fakes and submit a /v1/messages request."""
+    """Common test driver -- wire fakes and submit a /v1/messages request."""
     proxy = client.app.state.proxy
 
     fake_tracker = _FakePrefixTracker(frozen_count=prefix_tracker_frozen)
     proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
         "issue-327-session"
     )
-    proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+    proxy.session_tracker_store.get_or_create = lambda session_id, provider, project=None: (
+        fake_tracker
+    )
     proxy._get_compression_cache = lambda session_id: fake_comp_cache
 
     def _fake_apply(**kwargs):  # noqa: ANN003
         captured["frozen_message_count"] = kwargs.get("frozen_message_count")
         captured["pipeline_messages"] = list(kwargs["messages"])
-        # Record the byte-shape of the frozen prefix (deep snapshot via repr —
+        # Record the byte-shape of the frozen prefix (deep snapshot via repr --
         # tests below assert byte-stability with input).
         captured["frozen_prefix_repr"] = repr(
             list(kwargs["messages"])[: kwargs.get("frozen_message_count", 0)]
@@ -1596,7 +1593,7 @@ def test_issue_327_repeated_content_new_position_is_not_frozen() -> None:
         )
 
     assert response.status_code == 200
-    # Pipeline got everything from index 8 onward — including the trailing
+    # Pipeline got everything from index 8 onward -- including the trailing
     # repeat-content tool_result at index 18. Post-fix, frozen_message_count
     # is exactly 8 regardless of any hash matches in _stable_hashes.
     assert captured["frozen_message_count"] == 8
@@ -1624,7 +1621,7 @@ def test_issue_327_pipeline_preserves_frozen_prefix_byte_for_byte() -> None:
     # byte-equal to the input.
     frozen_prefix = captured["pipeline_messages"][: captured["frozen_message_count"]]
     assert frozen_prefix == msgs[: captured["frozen_message_count"]], (
-        "Frozen prefix mutated between client request and pipeline call — "
+        "Frozen prefix mutated between client request and pipeline call -- "
         "this would bust Anthropic's prefix cache."
     )
 
@@ -1635,14 +1632,14 @@ def test_issue_327_multi_turn_session_compresses_each_turns_tail() -> None:
 
     Pre-fix, after a few turns of accumulation, the walker would advance
     `frozen_message_count` to `len(messages)` and the pipeline would get an
-    empty suffix → transforms_applied=[] on every turn (the SvenMeyer
+    empty suffix -> transforms_applied=[] on every turn (the SvenMeyer
     fingerprint).
     """
     frozen_per_turn: list = []
     suffix_size_per_turn: list = []
 
     with _make_optimize_proxy_client(mode="token") as client:
-        # Same comp_cache shared across all turns — `_stable_hashes` accumulates.
+        # Same comp_cache shared across all turns -- `_stable_hashes` accumulates.
         fake_cache = _IssueFakeCompCache()
 
         for turn in range(10):
@@ -1701,7 +1698,7 @@ def test_issue_327_streaming_and_non_streaming_compute_same_frozen_count() -> No
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stream-parity-A"
         )
-        proxy.session_tracker_store.get_or_create = lambda s, p: fake_tracker
+        proxy.session_tracker_store.get_or_create = lambda s, p, _=None: fake_tracker
         proxy._get_compression_cache = lambda s: fake_cache_a
 
         def _fake_apply_a(**kwargs):  # noqa: ANN003
@@ -1758,7 +1755,7 @@ def test_issue_327_streaming_and_non_streaming_compute_same_frozen_count() -> No
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stream-parity-B"
         )
-        proxy.session_tracker_store.get_or_create = lambda s, p: fake_tracker
+        proxy.session_tracker_store.get_or_create = lambda s, p, _=None: fake_tracker
         proxy._get_compression_cache = lambda s: fake_cache_b
 
         def _fake_apply_b(**kwargs):  # noqa: ANN003
@@ -1804,7 +1801,7 @@ def test_issue_327_streaming_and_non_streaming_compute_same_frozen_count() -> No
         # Streaming dispatch uses _stream_response (not _retry_request). Stub
         # it to a no-op streaming response so we can inspect what
         # pipeline.apply received without being responsible for the SSE
-        # plumbing — the optimization runs before _stream_response is called.
+        # plumbing -- the optimization runs before _stream_response is called.
         from fastapi.responses import StreamingResponse
 
         async def _fake_stream_response(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
@@ -1825,7 +1822,7 @@ def test_issue_327_streaming_and_non_streaming_compute_same_frozen_count() -> No
                 "messages": msgs,
             },
         )
-        # Status code is incidental — what matters is that pipeline.apply ran
+        # Status code is incidental -- what matters is that pipeline.apply ran
         # and captured_b was populated.
 
     assert "frozen_message_count" in captured_a, "Non-streaming path didn't reach pipeline.apply()"

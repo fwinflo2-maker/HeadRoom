@@ -169,8 +169,11 @@ class CompressionCache:
             self._total_tokens_saved += tokens_saved
 
             while len(self._cache) > self.max_entries:
-                _, evicted = self._cache.popitem(last=False)
+                evicted_key, evicted = self._cache.popitem(last=False)
                 self._total_tokens_saved -= evicted.tokens_saved
+                # Keep auxiliary structures bounded too
+                self._stable_hashes.discard(evicted_key)
+                self._first_seen.pop(evicted_key, None)
 
     def mark_stable(self, content_hash: str) -> None:
         """Mark a content hash as stable (unchanged, not compressed).
@@ -181,6 +184,13 @@ class CompressionCache:
         """
         with self._lock:
             self._stable_hashes.add(content_hash)
+            # Keep _stable_hashes bounded
+            if len(self._stable_hashes) > self.max_entries * 2:
+                # When over limit, retain only entries that are also in _cache
+                self._stable_hashes.intersection_update(self._cache.keys())
+                # If still over limit (unlikely), keep newest entries
+                if len(self._stable_hashes) > self.max_entries:
+                    self._stable_hashes.clear()
 
     def mark_stable_from_messages(self, messages: list[dict], up_to: int) -> None:
         """Mark all tool_result hashes in messages[:up_to] as stable."""
@@ -219,6 +229,21 @@ class CompressionCache:
             first_seen = self._first_seen.get(content_hash)
             if first_seen is None:
                 self._first_seen[content_hash] = now
+                # Keep _first_seen bounded to prevent memory growth
+                if len(self._first_seen) > self.max_entries * 2:
+                    # Trim oldest entries
+                    cutoff = now - 3600  # Keep only entries from last hour
+                    stale = [k for k, v in self._first_seen.items() if v < cutoff]
+                    for k in stale:
+                        del self._first_seen[k]
+                    # If still over limit, keep newest max_entries
+                    if len(self._first_seen) > self.max_entries * 2:
+                        sorted_keys = sorted(
+                            self._first_seen.keys(),
+                            key=lambda k: self._first_seen[k],
+                        )[: len(self._first_seen) - self.max_entries]
+                        for k in sorted_keys:
+                            del self._first_seen[k]
                 return False  # First time — compress now (no cache entry to preserve)
             age = now - first_seen
             if age >= ttl_seconds - batch_window:

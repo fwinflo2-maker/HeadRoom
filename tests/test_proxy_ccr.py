@@ -296,7 +296,7 @@ class TestCCREdgeCases:
 
 
 class TestEndToEndTOINIntegration:
-    """End-to-end tests verifying the production path from proxy → TOIN.
+    """End-to-end tests verifying the production path from proxy -> TOIN.
 
     These tests verify that:
     1. SmartCrusher compresses tool outputs when called through the proxy pipeline
@@ -407,7 +407,7 @@ class TestEndToEndTOINIntegration:
         # Use with_compaction=False so we exercise the lossy + CCR
         # caching path that this test asserts. The PR4 lossless
         # default substitutes a CSV+schema string and skips CCR
-        # caching (nothing dropped → no cache entry).
+        # caching (nothing dropped -> no cache entry).
         pipeline = TransformPipeline(
             transforms=[
                 SmartCrusher(

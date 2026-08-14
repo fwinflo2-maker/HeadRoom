@@ -7,11 +7,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import time
 from typing import TYPE_CHECKING, Any
 
+from headroom.proxy import _json as json
 from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.helpers import (
     RETRYABLE_OVERLOAD_STATUSES,
@@ -218,6 +218,18 @@ class StreamingMixin:
                         # OpenAI has cached tokens in prompt_tokens_details
                         details = chunk_usage.get("prompt_tokens_details") or {}
                         usage["cache_read_input_tokens"] = details.get("cached_tokens", 0)
+                        # OpenAI/DeepSeek: infer writes as uncached portion
+                        _input_val = int(usage.get("input_tokens", 0))
+                        _cached_val = int(usage.get("cache_read_input_tokens", 0))
+                        if _input_val > 0:
+                            usage["cache_creation_input_tokens"] = max(_input_val - _cached_val, 0)
+                        # OpenRouter sends per-request cost in the usage block
+                        _cost = chunk_usage.get("cost")
+                        if _cost is not None:
+                            try:
+                                usage["cost"] = float(_cost)
+                            except (TypeError, ValueError):
+                                pass
 
                 elif provider == "gemini":
                     # Gemini sends usageMetadata in each streaming chunk
@@ -338,6 +350,12 @@ class StreamingMixin:
                         usage_found["cache_read_input_tokens"] = _usage_int(
                             details.get("cached_tokens")
                         )
+                        _cost = chunk_usage.get("cost")
+                        if _cost is not None:
+                            try:
+                                usage_found["cost"] = float(_cost)
+                            except (TypeError, ValueError):
+                                pass
 
             elif provider == "gemini":
                 usage_meta = data.get("usageMetadata")
@@ -623,11 +641,7 @@ class StreamingMixin:
                     "content_block": block,
                 }
             else:
-                block_start = {
-                    "type": "content_block_start",
-                    "index": idx,
-                    "content_block": block,
-                }
+                raise ValueError(f"Unsupported Anthropic content block type: {block.get('type')!r}")
 
             events.append(
                 f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n".encode()
@@ -932,33 +946,44 @@ class StreamingMixin:
                         next_forwarded.append(_copy.deepcopy(asst_msg))
                         next_original.append(_copy.deepcopy(asst_msg))
 
-            # Cache-miss attribution (#1313), streaming Anthropic path. Mirror
-            # the non-streaming handler: classify BEFORE update_from_response
-            # overwrites the last-turn state the classifier reads. Compare the
-            # prefix we forwarded this turn (`forwarded_messages`, pre-assistant
-            # append) against last turn's.
-            # `hasattr` guard: stub trackers in tests may implement only the
-            # freeze API, not the full PrefixCacheTracker surface.
-            if provider == "anthropic" and hasattr(prefix_tracker, "classify_cache_miss"):
-                miss = prefix_tracker.classify_cache_miss(
-                    cache_read_tokens=cache_read_tokens,
-                    current_forwarded_messages=forwarded_messages,
-                )
-                if miss.is_miss:
-                    logger.info(
-                        f"[{request_id}] CACHE-MISS-ATTRIBUTION: reason={miss.reason} "
-                        f"idle={miss.idle_seconds:.0f}s ttl={miss.cache_ttl_seconds}s "
-                        f"expected_cached={miss.expected_cached_tokens:,} "
-                        f"prefix_changed={miss.prefix_changed} ttl_exceeded={miss.ttl_exceeded}"
-                    )
-                    await self.metrics.record_cache_miss_attribution(provider, miss.reason)
-
+            _frozen_before_update = prefix_tracker._cached_message_count
             prefix_tracker.update_from_response(
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
                 messages=next_forwarded,
                 original_messages=next_original,
             )
+
+            if _frozen_before_update > 0 and cache_read_tokens > 0:
+                _est_compression_ratio = 0.5
+                await self.metrics.record_prefix_freeze(
+                    tokens_preserved=cache_read_tokens,
+                    compression_foregone=int(cache_read_tokens * _est_compression_ratio),
+                )
+
+        # Auto-detect pricing from upstream streaming response (OpenRouter etc.)
+        # Injects into litellm.model_cost before cost_tracker.record_tokens()
+        # runs, so future requests for the same model get accurate pricing.
+        _cost = stream_state.get("cost")
+        if _cost is not None and _cost > 0:
+            try:
+                from headroom.proxy.pricing_detect import feed_response
+
+                _prompt = stream_state.get("input_tokens", 0) or 0
+                _completion = stream_state.get("output_tokens", 0) or 0
+                feed_response(
+                    model,
+                    response_body={
+                        "usage": {
+                            "prompt_tokens": _prompt,
+                            "completion_tokens": _completion,
+                            "cost": _cost,
+                        }
+                    },
+                    provider=outcome_provider or provider,
+                )
+            except Exception:
+                pass
 
         # Active-compression denominator (``attempted_input_tokens``) is
         # derived inside ``RequestOutcome.from_stream`` as
@@ -1166,6 +1191,7 @@ class StreamingMixin:
             "cache_creation_ephemeral_5m_input_tokens": 0,
             "cache_creation_ephemeral_1h_input_tokens": 0,
             "total_bytes": 0,
+            "cost": None,  # OpenRouter per-request cost from usage block
             # Buffer for incomplete SSE events (bytes, per PR-A8 / P1-8).
             # We split events on the ``\n\n`` byte sequence and decode
             # each complete event as UTF-8 only after the boundary is
@@ -1240,6 +1266,9 @@ class StreamingMixin:
                 except httpx.TransportError as e:
                     last_connect_error = e
                     if attempt >= retry_attempts - 1:
+                        from headroom.proxy.upstream_diagnostics import diagnose_upstream
+
+                        asyncio.ensure_future(diagnose_upstream(url, correlation_id=request_id))
                         raise
 
                     delay_with_jitter = jitter_delay_ms(
@@ -1398,8 +1427,6 @@ class StreamingMixin:
         async def generate():
             nonlocal body, memory_enabled  # May need to modify for continuation requests
 
-            # For memory mode, we buffer the response to check for tool calls
-            buffered_chunks: list[bytes] = []
             # Bytes-level mirror of the SSE stream for memory/prefix
             # tracking. PR-A8 / P1-8: keep this as bytes too — we
             # decode only after a complete `\n\n`-terminated event has
@@ -1430,8 +1457,9 @@ class StreamingMixin:
                         # Safety: prevent unbounded buffer growth.
                         if len(stream_state["sse_buffer"]) > MAX_SSE_BUFFER_SIZE:
                             logger.error(
-                                "SSE buffer exceeded maximum size (%d bytes), "
+                                "[%s] SSE buffer exceeded maximum size (%d bytes), "
                                 "truncating to prevent memory exhaustion",
+                                request_id,
                                 MAX_SSE_BUFFER_SIZE,
                             )
                             # Keep the most recent half so an in-flight
@@ -1465,13 +1493,12 @@ class StreamingMixin:
                             or (prefix_tracker is not None and provider == "anthropic")
                         )
                         if _track_sse:
-                            if memory_enabled:
-                                buffered_chunks.append(chunk)
                             full_sse_bytes.extend(chunk)
                             if len(full_sse_bytes) > MAX_SSE_BUFFER_SIZE:
                                 logger.warning(
-                                    "Memory-mode SSE buffer exceeded maximum size, "
-                                    "disabling memory detection for this request"
+                                    "[%s] Memory-mode SSE buffer exceeded maximum size, "
+                                    "disabling memory detection for this request",
+                                    request_id,
                                 )
                                 memory_enabled = False
 
@@ -1498,6 +1525,14 @@ class StreamingMixin:
                                 stream_state["cache_creation_ephemeral_1h_input_tokens"] = usage[
                                     "cache_creation_ephemeral_1h_input_tokens"
                                 ]
+                            if "cost" in usage and usage["cost"] is not None:
+                                stream_state["cost"] = usage["cost"]
+
+                        # Per-chunk fallback for upstreams that emit only
+                        # ``completion_tokens`` and not a full usage frame.
+                        parsed = _parse_completion_tokens_from_sse_chunk(chunk)
+                        if parsed is not None and stream_state["output_tokens"] is None:
+                            stream_state["output_tokens"] = parsed
 
                 # Memory tool handling after stream completes
                 # Chunks were already yielded in real-time above, so we only
@@ -1546,6 +1581,65 @@ class StreamingMixin:
                                 f"({len(tool_results)} results saved, SSE streaming — "
                                 "continuation handled by client)"
                             )
+                            # Push memory operation notifications back to the caller
+                            # as custom SSE events.  Clients can listen for
+                            # ``event: memory_op`` to learn what was saved/found
+                            # without needing a continuation API call.
+                            memory_events = self.memory_handler.format_memory_events(tool_results)
+                            for mem_event in memory_events:
+                                sse_payload = f"event: memory_op\ndata: {json.dumps(mem_event)}\n\n"
+                                yield sse_payload.encode()
+                                logger.debug(
+                                    f"[{request_id}] Memory: Pushed event op={mem_event['op']} "
+                                    f"status={mem_event['status']}"
+                                )
+
+                # Traffic Learner: Extract patterns from inbound tool results
+                if self.traffic_learner:
+                    try:
+                        # Wire backend on first use (lazy init after memory handler is ready)
+                        if (
+                            self.traffic_learner._backend is None
+                            and self.memory_handler
+                            and self.memory_handler.initialized
+                            and self.memory_handler.backend
+                        ):
+                            self.traffic_learner.set_backend(self.memory_handler.backend)
+
+                        # Extract tool results from messages and learn from them
+                        tool_results = self.traffic_learner.extract_tool_results_from_messages(
+                            original_messages or []
+                        )
+                        for tr in tool_results[-5:]:  # Only recent results
+                            await self.traffic_learner.on_tool_result(
+                                tool_name=tr["tool_name"],
+                                tool_input=tr["input"],
+                                tool_output=tr["output"],
+                                is_error=tr["is_error"],
+                            )
+
+                        # Also extract preference signals from user messages
+                        await self.traffic_learner.on_messages(original_messages or [])
+                    except Exception as e:
+                        logger.debug(f"[{request_id}] Traffic learner: {e}")
+
+                # Auto-extract memories from response (if enabled)
+                if (
+                    self.config.auto_extract_memories
+                    and memory_enabled
+                    and parsed_response
+                    and original_messages
+                ):
+                    try:
+                        await self.memory_handler.extract_from_response(
+                            parsed_response,
+                            original_messages,
+                            memory_user_id,
+                            provider=provider,
+                            request_context=memory_request_ctx,
+                        )
+                    except Exception as exc:
+                        logger.warning(f"[{request_id}] Auto-extraction failed: {exc}")
 
                 # CCR Feedback: Record headroom_retrieve tool calls for TOIN learning.
                 # In streaming mode, the client handles actual retrieval, but we
@@ -1679,6 +1773,7 @@ class StreamingMixin:
         original_messages: list[dict] | None = None,
         prefix_tracker: Any | None = None,
         optimized_messages: list[dict] | None = None,
+        backend: Any | None = None,
     ) -> StreamingResponse:
         """Stream response from Bedrock backend with metrics tracking.
 
@@ -1696,6 +1791,11 @@ class StreamingMixin:
         from fastapi.responses import StreamingResponse
 
         from headroom.proxy.outcome import RequestOutcome
+
+        # ``backend`` lets the caller serve this one request from somewhere
+        # other than the configured backend (see proxy/route_advice.py). None
+        # means "the configured one", i.e. what this method always did.
+        backend = backend if backend is not None else self.anthropic_backend
 
         client = classify_client(headers)
 
@@ -1721,7 +1821,7 @@ class StreamingMixin:
 
         async def generate():
             try:
-                assert self.anthropic_backend is not None
+                assert backend is not None
 
                 # Emit a synthetic ping before the first message_start so that
                 # downstream clients (e.g. Claude Code) arm their mid-turn
@@ -1731,7 +1831,7 @@ class StreamingMixin:
                 # (issue #902).
                 yield b"event: ping\ndata: {}\n\n"
 
-                async for event in self.anthropic_backend.stream_message(body, headers):
+                async for event in backend.stream_message(body, headers):
                     # Record TTFB on first event
                     if stream_state["ttfb_ms"] is None:
                         stream_state["ttfb_ms"] = (time.time() - start_time) * 1000
@@ -1807,9 +1907,7 @@ class StreamingMixin:
 
             finally:
                 total_latency = (time.time() - start_time) * 1000
-                _backend_name = (
-                    self.anthropic_backend.name if self.anthropic_backend else "anthropic"
-                )
+                _backend_name = backend.name if backend else "anthropic"
 
                 # Update prefix cache tracker for the next turn — mirrors
                 # _finalize_stream_response (direct-API streaming path)
@@ -1908,6 +2006,7 @@ class StreamingMixin:
         waste_signals: dict[str, int] | None = None,
         prefix_tracker: Any | None = None,
         optimized_messages: list[dict] | None = None,
+        backend: Any | None = None,
     ) -> StreamingResponse:
         """Stream OpenAI chat completion response from backend.
 
@@ -1940,9 +2039,14 @@ class StreamingMixin:
         from fastapi.responses import StreamingResponse
 
         from headroom.proxy.handlers.openai import _infer_openai_cache_write_tokens
+        from headroom.proxy.helpers import MAX_SSE_BUFFER_SIZE
         from headroom.proxy.outcome import RequestOutcome
 
-        assert self.anthropic_backend is not None
+        # ``backend`` lets the caller serve this one request from somewhere
+        # other than the configured backend (see proxy/route_advice.py). None
+        # means "the configured one", i.e. what this method always did.
+        backend = backend if backend is not None else self.anthropic_backend
+        assert backend is not None
         client = classify_client(headers)
 
         async def generate():
@@ -1972,10 +2076,12 @@ class StreamingMixin:
                         stream_state[key] = usage[key]
 
             try:
-                async for sse_chunk in self.anthropic_backend.stream_openai_message(body, headers):
+                async for sse_chunk in backend.stream_openai_message(body, headers):
                     chunk_bytes = sse_chunk.encode() if isinstance(sse_chunk, str) else sse_chunk
                     stream_state["sse_buffer"].extend(chunk_bytes)
                     full_sse_bytes.extend(chunk_bytes)
+                    if len(full_sse_bytes) > MAX_SSE_BUFFER_SIZE:
+                        full_sse_bytes.clear()
                     _absorb(self._parse_sse_usage_from_buffer(stream_state, "openai"))
                     # Per-chunk fallback for upstreams that emit only
                     # ``completion_tokens`` and not a full usage frame.
@@ -2040,6 +2146,7 @@ class StreamingMixin:
                 # so prefix state is consistent regardless of metric
                 # path.
                 if prefix_tracker is not None:
+                    _frozen_before_update = prefix_tracker._cached_message_count
                     tracker_messages = (
                         optimized_messages
                         if optimized_messages is not None
@@ -2050,6 +2157,13 @@ class StreamingMixin:
                         cache_write_tokens=cache_write_tokens,
                         messages=tracker_messages,
                     )
+
+                    if _frozen_before_update > 0 and cache_read_tokens > 0:
+                        _est_compression_ratio = 0.5
+                        await self.metrics.record_prefix_freeze(
+                            tokens_preserved=cache_read_tokens,
+                            compression_foregone=int(cache_read_tokens * _est_compression_ratio),
+                        )
 
                 # CCR Feedback: record headroom_retrieve tool calls so
                 # TOIN learns which fields matter. Streaming path can't
@@ -2074,7 +2188,7 @@ class StreamingMixin:
                 # instead of collapsing the dashboard headline to 0%.
                 outcome = RequestOutcome.from_stream(
                     body=body,
-                    provider=self.anthropic_backend.name,
+                    provider=backend.name,
                     model=model,
                     request_id=request_id,
                     original_tokens=original_tokens,
@@ -2099,7 +2213,7 @@ class StreamingMixin:
                 if tokens_saved > 0:
                     logger.info(
                         f"[{request_id}] {model}: {original_tokens:,} → {optimized_tokens:,} "
-                        f"(saved {tokens_saved:,} tokens) via {self.anthropic_backend.name} [stream]"
+                        f"(saved {tokens_saved:,} tokens) via {backend.name} [stream]"
                     )
 
         return StreamingResponse(

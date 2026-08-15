@@ -1,0 +1,51 @@
+---
+title: OpenClaw
+description: Context compression plugin for OpenClaw with 70-90% token savings and optional local proxy auto-start.
+---
+
+The bundled [`plugins/openclaw`](https://github.com/chopratejas/headroom/tree/main/plugins/openclaw) plugin (`@headroom-ai/openclaw`) brings Headroom compression to [OpenClaw](https://github.com/openclaw/openclaw): tool outputs, code, logs, and structured data — 70-90% token savings with zero LLM calls.
+
+## Install
+
+Recommended one-command setup:
+
+```bash
+headroom wrap openclaw
+```
+
+Manual install:
+
+```bash
+pip install "headroom-ai[proxy]"
+openclaw plugins install --dangerously-force-unsafe-install headroom-ai/openclaw
+```
+
+> The plugin can auto-start a local `headroom proxy` when needed. OpenClaw treats process-launching plugins as unsafe by default, so `--dangerously-force-unsafe-install` is required even if you plan to use a remote proxy — the capability is declared at install time.
+
+## Configure
+
+Install automatically selects the `contextEngine` slot for `headroom` on current OpenClaw releases. To switch back manually, set `plugins.slots.contextEngine` to `"legacy"` or another engine id.
+
+Key options (exposed as plugin UI hints):
+
+| Option | Meaning |
+|--------|---------|
+| `proxyUrl` | Optional proxy URL (e.g. `http://127.0.0.1:8787` or remote). Probe-gated before provider routing; auto-start opt-in only works for local addresses. |
+| `proxyPort` | Default port for auto-detect/auto-start when `proxyUrl` is unset (default 8787). |
+| `pythonPath` | Optional explicit python executable for the python fallback launcher. |
+| `retryMaxAttempts` | Max upstream retry attempts (connection/read/5xx) with auto-started local proxy. |
+| `connectTimeoutSeconds` | Upstream connection timeout for the auto-started proxy. |
+| `requestTimeoutMs` | Max wait for one compression request before returning original messages. |
+
+## Local development install
+
+When testing from the repo, build from the plugin directory so launcher detection aligns with runtime paths:
+
+```bash
+cd plugins/openclaw
+npm install
+npm run build
+openclaw plugins install --dangerously-force-unsafe-install --link .
+```
+
+The plugin checks launchers in this order: **PATH → local npm bin → global npm → python**, where "local npm bin" means `plugins/openclaw/node_modules/.bin/headroom` relative to the source checkout. `plugins/openclaw` also carries a no-op hook shim so OpenClaw's hook-pack fallback treats the path as valid instead of emitting a misleading `package.json missing openclaw.hooks` warning.

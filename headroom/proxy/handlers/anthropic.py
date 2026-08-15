@@ -1892,22 +1892,30 @@ class AnthropicHandlerMixin:
                 overlay_cached_prefix,
             )
 
+            _overlay_replayed = False
             # On a confirmed-cold turn we deliberately do NOT replay the previously
             # forwarded prefix: the cache is dead (nothing to keep byte-identical for)
             # and the replay would clobber the whole-prefix recompaction we just did.
-            if _cold_recompact_active:
-                _overlay_replayed = False
+            if _decision.should_compress and not _skip_compression_for_backpressure:
+                if _cold_recompact_active:
+                    _overlay_replayed = False
+                else:
+                    _ov = overlay_cached_prefix(
+                        optimized_messages,
+                        original_client_messages,
+                        previous_original_messages,
+                        previous_forwarded_messages,
+                    )
+                    _overlay_replayed = _ov != optimized_messages
+                    if _overlay_replayed:
+                        optimized_messages = _ov
+                        optimized_tokens = tokenizer.count_messages(optimized_messages)
             else:
-                _ov = overlay_cached_prefix(
-                    optimized_messages,
-                    original_client_messages,
-                    previous_original_messages,
-                    previous_forwarded_messages,
+                logger.debug(
+                    "[%s] Cached-prefix replay skipped: reason=%s",
+                    request_id,
+                    _decision.passthrough_reason,
                 )
-                _overlay_replayed = _ov != optimized_messages
-                if _overlay_replayed:
-                    optimized_messages = _ov
-                    optimized_tokens = tokenizer.count_messages(optimized_messages)
 
             # Own cache_control placement: the client moves the breakpoint each
             # turn and the overlay replays past markers, so they accumulate ~1/turn

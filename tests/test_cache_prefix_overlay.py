@@ -72,6 +72,20 @@ def test_shorter_current_or_optimized_returns_unchanged():
     ]
 
 
+def test_overlay_requires_positional_alignment_with_originals():
+    optimized = [M("user", "x")]
+    current = [M("user", "x"), M("assistant", "ok")]
+    assert overlay_cached_prefix(optimized, current, PREV_ORIG, PREV_FWD) == optimized
+
+
+def test_overlay_never_inflates_forwarded_payload():
+    optimized = [M("user", "small"), M("assistant", "ok"), M("user", "tail")]
+    inflated_forwarded = [M("user", "x" * 1000), M("assistant", "ok")]
+    previous = [M("user", "small"), M("assistant", "ok")]
+    current = previous + [M("user", "tail")]
+    assert overlay_cached_prefix(optimized, current, previous, inflated_forwarded) == optimized
+
+
 def test_cache_hit_property_prefix_matches_last_forward():
     # The invariant that guarantees a cache hit: forwarded[:n] this turn ==
     # forwarded[:n] last turn (== what the provider cached).

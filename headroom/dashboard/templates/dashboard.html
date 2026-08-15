@@ -1841,7 +1841,12 @@
 
                 formatCurrency(n) {
                     if (n < 0) return '-' + this.formatCurrency(-n);
-                    if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+                    // Below $10k show whole dollars. One decimal in the k-band
+                    // meant $1,050-$1,149 all rendered "$1.1k", so a lifetime
+                    // figure growing a few dollars a day looked frozen for
+                    // weeks and read as "compression stopped saving anything".
+                    if (n >= 10000) return (n / 1000).toFixed(1) + 'k';
+                    if (n >= 1000) return Math.round(n).toLocaleString('en-US');
                     if (n >= 1) return n.toFixed(2);
                     if (n >= 0.01) return n.toFixed(3);
                     if (n > 0) return n.toFixed(4);

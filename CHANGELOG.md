@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+- **Savings: a long-lived proxy priced newly-released models at $0.00.**
+  `litellm.model_cost` is populated once, at import, so a proxy left up for
+  weeks prices every request against the map it fetched at startup and a model
+  released after that date is simply absent. The lookup treated absent as free
+  and returned `0.0` with no signal anywhere. A miss now schedules a bounded,
+  TTL'd refresh of the map on a background thread (the request-recording path
+  never blocks on network I/O) and records the tokens it could not price;
+  `/stats` gains `unpriced_savings` so a $0 is visible rather than silent.
+  Dashboard `formatCurrency` also widened its k-band — everything over $1000
+  rendered with one decimal, so $1,050-$1,149 all displayed "$1.1k" and a
+  lifetime figure growing a few dollars a day could not visibly move.
+
 ### Features
 
 * **proxy:** per-project savings breakdown on the dashboard for all wrapped agents — Claude Code, Codex, aider, Copilot, and Cursor ([#802](https://github.com/chopratejas/headroom/issues/802)). `headroom wrap claude`/`codex` tag requests with an `X-Headroom-Project` header (launch-directory name); `wrap aider`/`copilot`/`cursor` — whose clients cannot send custom headers — use a `/p/<name>` base-URL prefix the proxy strips. Savings are aggregated per project (persisted, schema v3 with transparent v2 migration), exposed as `savings.per_project` in `/stats` and `projects` in `/stats-history`, and shown in a Per-Project Savings dashboard table.

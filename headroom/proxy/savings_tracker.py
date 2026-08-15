@@ -13,6 +13,7 @@ import logging
 import os
 import tempfile
 import threading
+import time
 from csv import DictWriter
 from datetime import datetime, timedelta, timezone
 from io import StringIO
@@ -37,6 +38,28 @@ DEFAULT_DISPLAY_SESSION_INACTIVITY_MINUTES = 60
 LITELLM_AVAILABLE = importlib.util.find_spec("litellm") is not None
 litellm: Any | None = None
 
+# LiteLLM populates ``litellm.model_cost`` once, at import. A proxy that stays
+# up for weeks therefore prices every request against a snapshot taken when it
+# started, and a model released after that start date is simply absent from the
+# map. The lookup below used to treat "absent" as "free" and return 0.0, so the
+# savings counter silently stopped moving for the newest — usually the most
+# expensive — model in use.
+#
+# Observed: a proxy started 2026-07-01 priced 25,400,013 claude-opus-5 tokens at
+# $0.00 across 3,962 checkpoints while pricing claude-sonnet-5 normally, because
+# opus-5 did not exist in the July map. Restarting the process fixed it, which
+# is the whole problem — nothing about a long-lived proxy should require a
+# restart to learn a price.
+#
+# Fix: a miss schedules a *background*, TTL'd refresh of the map and records the
+# miss in a counter. The record path never blocks on network I/O, and a $0 is
+# now visible in ``/stats`` instead of silent.
+PRICE_MAP_REFRESH_INTERVAL_SECONDS = 3600.0
+_price_map_lock = threading.Lock()
+_price_map_last_refresh: float = 0.0
+_price_map_refresh_in_flight: bool = False
+_unpriced_tokens: dict[str, int] = {}
+
 
 def _get_litellm_module() -> Any | None:
     """Import LiteLLM only when cost metadata is requested."""
@@ -54,6 +77,76 @@ def _get_litellm_module() -> Any | None:
 
     litellm = imported_litellm
     return litellm
+
+
+def _refresh_price_map_blocking() -> None:
+    """Re-fetch LiteLLM's model cost map in place. Never raises."""
+    global _price_map_refresh_in_flight
+
+    module = _get_litellm_module()
+    try:
+        if module is None:
+            return
+        getter = getattr(module, "get_model_cost_map", None)
+        url = getattr(module, "model_cost_map_url", "") or ""
+        if getter is None or not url:
+            return
+        refreshed = getter(url)
+        if isinstance(refreshed, dict) and refreshed:
+            module.model_cost = refreshed
+            logger.info(
+                "refreshed litellm price map: %d models",
+                len(refreshed),
+            )
+    except Exception as exc:  # pragma: no cover - network/shape dependent
+        logger.debug("litellm price map refresh failed: %s", exc)
+    finally:
+        with _price_map_lock:
+            _price_map_refresh_in_flight = False
+
+
+def _schedule_price_map_refresh() -> None:
+    """Kick off at most one background price-map refresh per TTL window.
+
+    Deliberately off the calling thread: this runs from the request-recording
+    path, which must not block on a network fetch.
+    """
+    global _price_map_last_refresh, _price_map_refresh_in_flight
+
+    now = time.monotonic()
+    with _price_map_lock:
+        if _price_map_refresh_in_flight:
+            return
+        if _price_map_last_refresh and (
+            now - _price_map_last_refresh < PRICE_MAP_REFRESH_INTERVAL_SECONDS
+        ):
+            return
+        _price_map_last_refresh = now
+        _price_map_refresh_in_flight = True
+
+    threading.Thread(
+        target=_refresh_price_map_blocking,
+        name="headroom-price-map-refresh",
+        daemon=True,
+    ).start()
+
+
+def _record_unpriced(model: str, tokens: int) -> None:
+    """Count tokens we could not price, so a $0 is visible rather than silent."""
+    if tokens <= 0:
+        return
+    with _price_map_lock:
+        _unpriced_tokens[model] = _unpriced_tokens.get(model, 0) + tokens
+
+
+def unpriced_tokens_snapshot() -> dict[str, Any]:
+    """Tokens saved for models with no known price, for ``/stats``."""
+    with _price_map_lock:
+        by_model = dict(_unpriced_tokens)
+    return {
+        "total": sum(by_model.values()),
+        "by_model": by_model,
+    }
 
 
 def get_default_savings_storage_path() -> str:
@@ -196,6 +289,12 @@ def _estimate_compression_savings_usd(model: str, tokens_saved: int) -> float:
         info = litellm.model_cost.get(resolved, {})
         input_cost_per_token = info.get("input_cost_per_token")
         if not input_cost_per_token:
+            # Unknown model. Usually means this process's price map predates the
+            # model's release, so ask for a refresh (bounded, off-thread) and
+            # count the tokens we could not price. Returning 0.0 silently here
+            # is what froze the savings counter for weeks — see the note above.
+            _schedule_price_map_refresh()
+            _record_unpriced(resolved, tokens_saved)
             return 0.0
         return float(tokens_saved) * float(input_cost_per_token)
     except Exception:

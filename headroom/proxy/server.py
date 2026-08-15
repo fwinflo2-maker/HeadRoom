@@ -103,6 +103,7 @@ from headroom.providers.registry import (
     format_backend_status,
     resolve_api_targets,
 )
+from headroom.proxy import savings_tracker as _savings_tracker_module
 
 # =============================================================================
 # Extracted modules (re-exported for backward compatibility)
@@ -2672,6 +2673,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "savings_history": m.savings_history[-100:],  # Last 100 data points
             "display_session": display_session,
             "persistent_savings": persistent_savings,
+            # Tokens saved for models with no known price. Surfaced so a $0 is
+            # visible instead of silently flattening the savings figure.
+            "unpriced_savings": _savings_tracker_module.unpriced_tokens_snapshot(),
             "prefix_cache": prefix_cache_stats,
             "cost": _merge_cost_stats(
                 proxy.cost_tracker.stats() if proxy.cost_tracker else None,

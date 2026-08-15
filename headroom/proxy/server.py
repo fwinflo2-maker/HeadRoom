@@ -449,6 +449,27 @@ _RUST_CORE_REQUIRED_ENV = "HEADROOM_REQUIRE_RUST_CORE"
 _EXIT_CONFIG = 78
 
 
+def _env_int_or_none(name: str) -> int | None:
+    """Read a positive int from the environment, ignoring junk.
+
+    A malformed or non-positive value falls back to the caller's default rather
+    than crashing proxy startup — an unparseable tuning knob should not take
+    the proxy down.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("ignoring non-integer %s=%r", name, raw)
+        return None
+    if value < 1:
+        logger.warning("ignoring non-positive %s=%d", name, value)
+        return None
+    return value
+
+
 def _check_rust_core() -> tuple[str, str | None]:
     """Verify the Rust extension `headroom._core` is loadable at startup.
 
@@ -759,6 +780,8 @@ class HeadroomProxy(
         #      the worker, so this is the only signal that some pool slots
         #      are sitting on stuck work.
         _compression_max_cfg = config.compression_max_workers
+        if _compression_max_cfg is None:
+            _compression_max_cfg = _env_int_or_none("HEADROOM_COMPRESSION_MAX_WORKERS")
         if _compression_max_cfg is None:
             _compression_max = min(32, (os.cpu_count() or 1) * 4)
         else:
@@ -1917,7 +1940,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "run_seconds_total": _comp_run_total,
                 "run_seconds_max": _comp_run_max,
                 "leaked_threads_total": _comp_leaked,
-                "source": ("auto" if config.compression_max_workers is None else "explicit"),
+                "source": (
+                    "explicit"
+                    if config.compression_max_workers is not None
+                    else "env"
+                    if _env_int_or_none("HEADROOM_COMPRESSION_MAX_WORKERS") is not None
+                    else "auto"
+                ),
             },
             "websocket_sessions": {
                 "active_sessions": ws_active_sessions,

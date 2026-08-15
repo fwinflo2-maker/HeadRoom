@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+- **`HEADROOM_COMPRESSION_MAX_WORKERS` was documented but never read.**
+  `ProxyConfig.compression_max_workers` has documented that environment variable
+  and a `--compression-max-workers` CLI flag since the field was introduced, but
+  the string appeared exactly once in the tree — inside the comment promising it.
+  The compression pool was therefore pinned to `min(32, cpu_count * 4)` with no
+  way to change it short of editing source. That matters because the pool sits in
+  front of Kompress's execution semaphore, which defaults to 1 concurrent
+  inference: the remaining workers block on an untimed `acquire()` while still
+  holding a pool slot, so the pool reports 32/32 in-flight while at most one
+  inference runs. The env var is now read; malformed or non-positive values are
+  ignored with a warning rather than taking startup down, and `/stats` reports
+  `source` as `explicit` / `env` / `auto`.
+
 ### Features
 
 * **proxy:** per-project savings breakdown on the dashboard for all wrapped agents — Claude Code, Codex, aider, Copilot, and Cursor ([#802](https://github.com/chopratejas/headroom/issues/802)). `headroom wrap claude`/`codex` tag requests with an `X-Headroom-Project` header (launch-directory name); `wrap aider`/`copilot`/`cursor` — whose clients cannot send custom headers — use a `/p/<name>` base-URL prefix the proxy strips. Savings are aggregated per project (persisted, schema v3 with transparent v2 migration), exposed as `savings.per_project` in `/stats` and `projects` in `/stats-history`, and shown in a Per-Project Savings dashboard table.

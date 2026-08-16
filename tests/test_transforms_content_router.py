@@ -15,7 +15,9 @@ from headroom.transforms.content_router import (
     ContentRouter,
     ContentRouterConfig,
     RouterCompressionResult,
+    RouterRequestOptions,
     RoutingDecision,
+    _compression_cache_key,
     _create_content_signature,
     _detect_content,
     _estimate_tokens,
@@ -24,6 +26,30 @@ from headroom.transforms.content_router import (
     is_mixed_content,
     split_into_sections,
 )
+
+
+def test_compression_cache_key_is_stable_and_request_aware() -> None:
+    config = ContentRouterConfig()
+    options = RouterRequestOptions(target_ratio=0.25, kompress_model="model-a")
+    kwargs = {
+        "content": "same content",
+        "strategy_hint": "tool_result",
+        "context": "ctx",
+        "question": None,
+        "bias": 1.0,
+        "router_config": config,
+    }
+
+    first = _compression_cache_key(request_options=options, **kwargs)
+    assert first == _compression_cache_key(request_options=options, **kwargs)
+    assert first != _compression_cache_key(
+        request_options=RouterRequestOptions(target_ratio=0.5, kompress_model="model-a"),
+        **kwargs,
+    )
+    assert first != _compression_cache_key(
+        request_options=RouterRequestOptions(target_ratio=0.25, kompress_model="model-b"),
+        **kwargs,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -367,7 +393,6 @@ def test_content_router_strategy_and_compress_paths(monkeypatch: pytest.MonkeyPa
 
 def test_force_kompress_bypasses_content_detection(monkeypatch: pytest.MonkeyPatch) -> None:
     router = ContentRouter()
-    router._runtime_force_kompress = True
     pure_result = RouterCompressionResult(
         compressed="pure",
         original="pure",
@@ -387,7 +412,12 @@ def test_force_kompress_bypasses_content_detection(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(router, "_determine_strategy", lambda content: CompressionStrategy.MIXED)
     monkeypatch.setattr(router, "_compress_pure", lambda *args, **kwargs: pure_result)
 
-    assert router.compress("large tool output") is pure_result
+    assert (
+        router.compress(
+            "large tool output", request_options=RouterRequestOptions(force_kompress=True)
+        )
+        is pure_result
+    )
 
 
 def test_normal_compress_path_still_uses_content_detection(
@@ -441,7 +471,7 @@ def test_force_kompress_apply_uses_lightweight_detection(
     monkeypatch.setattr(
         router,
         "compress",
-        lambda content, context="", bias=1.0: RouterCompressionResult(
+        lambda content, context="", bias=1.0, **_kwargs: RouterCompressionResult(
             # CCR marker -> the original was stored and is retrievable, so the
             # #1307 reversibility gate accepts this lossy KOMPRESS tool result.
             compressed="compressed <<ccr:tool>>",
@@ -689,7 +719,7 @@ def test_smart_crusher_log_fallback_skipped_for_invalid_json(
     monkeypatch.setattr(
         router,
         "_try_ml_compressor",
-        lambda content, context, question=None: (content, len(content.split())),
+        lambda content, context, question=None, **_kwargs: (content, len(content.split())),
     )
 
     compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
@@ -734,7 +764,7 @@ def test_smart_crusher_log_fallback_runs_for_valid_json(
     monkeypatch.setattr(
         router,
         "_try_ml_compressor",
-        lambda content, context, question=None: (content, _estimate_tokens(content)),
+        lambda content, context, question=None, **_kwargs: (content, _estimate_tokens(content)),
     )
 
     compressed, _compressed_tokens, strategy_chain = router._apply_strategy_to_content(

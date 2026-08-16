@@ -1911,10 +1911,15 @@ class AnthropicHandlerMixin:
                         optimized_messages = _ov
                         optimized_tokens = tokenizer.count_messages(optimized_messages)
             else:
+                replay_skip_reason = (
+                    "pre_upstream_backpressure"
+                    if _skip_compression_for_backpressure
+                    else _decision.passthrough_reason
+                )
                 logger.debug(
                     "[%s] Cached-prefix replay skipped: reason=%s",
                     request_id,
-                    _decision.passthrough_reason,
+                    replay_skip_reason,
                 )
 
             # Own cache_control placement: the client moves the breakpoint each

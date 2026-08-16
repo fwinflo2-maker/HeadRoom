@@ -548,15 +548,12 @@ def overlay_cached_prefix(
                     + [merged]
                     + list(optimized_messages[message_index + 1 :])
                 )
-                cache_control_only_change = current_original_messages[
-                    : message_index + 1
-                ] != prev_orig[: message_index + 1] and _strip_cache_control(
-                    current_original_messages[: message_index + 1]
-                ) == _strip_cache_control(prev_orig[: message_index + 1])
+                replayed_bytes = _compact_json_bytes(replayed)
+                optimized_bytes = _compact_json_bytes(optimized_messages)
                 if (
-                    len(_compact_json_bytes(replayed))
-                    > len(_compact_json_bytes(optimized_messages))
-                    and not cache_control_only_change
+                    replayed_bytes is None
+                    or optimized_bytes is None
+                    or len(replayed_bytes) > len(optimized_bytes)
                 ):
                     logger.debug("overlay: block replay inflated compact JSON — skipping")
                     return optimized_messages
@@ -607,20 +604,29 @@ def overlay_cached_prefix(
     # Replay the cached (compressed) prefix byte-identical up to the first
     # divergence; keep this turn's freshly-produced output for the rest.
     replayed = list(prev_fwd[:k]) + list(optimized_messages[k:])
-    cache_control_only_change = current_original_messages[:k] != prev_orig[
-        :k
-    ] and _strip_cache_control(current_original_messages[:k]) == _strip_cache_control(prev_orig[:k])
+    replayed_bytes = _compact_json_bytes(replayed)
+    optimized_bytes = _compact_json_bytes(optimized_messages)
     if (
-        len(_compact_json_bytes(replayed)) > len(_compact_json_bytes(optimized_messages))
-        and not cache_control_only_change
+        replayed_bytes is None
+        or optimized_bytes is None
+        or len(replayed_bytes) > len(optimized_bytes)
     ):
         logger.debug("overlay: replay inflated compact JSON — skipping cached-prefix replay")
         return optimized_messages
     return replayed
 
 
-def _compact_json_bytes(value: Any) -> bytes:
-    return json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+def _compact_json_bytes(value: Any) -> bytes | None:
+    """Return compact JSON bytes, or ``None`` when sizing cannot be proved."""
+    try:
+        return json.dumps(
+            value,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError, UnicodeError):
+        return None
 
 
 _STABLE_BOUNDARY_ENV = "HEADROOM_STABLE_BOUNDARY_BREAKPOINT"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -26,6 +27,7 @@ def _manifest_commands() -> list[str]:
 
 
 LAUNCHER = REPO_ROOT / "plugins/headroom-agent-hooks/bin/headroom-hook.sh"
+SHELL = shutil.which("sh") or "/bin/sh"
 
 
 def _posix(path: Path) -> str:
@@ -51,7 +53,7 @@ def _run_launcher(tmp_path: Path, **extra: str) -> subprocess.CompletedProcess[s
         **extra,
     }
     return subprocess.run(
-        ["sh", _posix(LAUNCHER)],
+        [SHELL, _posix(LAUNCHER)],
         cwd=REPO_ROOT,
         env=environment,
         capture_output=True,
@@ -91,7 +93,7 @@ def test_manifest_command_recovers_reported_non_login_environment(tmp_path: Path
     }
     for command in _manifest_commands():
         result = subprocess.run(
-            ["sh", "-c", command],
+            [SHELL, "-c", command],
             cwd=REPO_ROOT,
             env=environment,
             capture_output=True,
@@ -225,7 +227,7 @@ def test_manifest_rootless_tail_reaches_path(tmp_path: Path) -> None:
         }
         for command in _manifest_commands():
             result = subprocess.run(
-                ["sh", "-c", command],
+                [SHELL, "-c", command],
                 cwd=REPO_ROOT,
                 env={key: value for key, value in environment.items() if value is not None},
                 capture_output=True,
@@ -259,7 +261,7 @@ def test_manifest_nonempty_missing_or_unreadable_root_reaches_path(tmp_path: Pat
         }
         for command in _manifest_commands():
             result = subprocess.run(
-                ["sh", "-c", command],
+                [SHELL, "-c", command],
                 cwd=REPO_ROOT,
                 env=environment,
                 capture_output=True,

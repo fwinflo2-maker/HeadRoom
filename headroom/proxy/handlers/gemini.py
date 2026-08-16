@@ -11,6 +11,7 @@ import logging
 import os
 import time
 from typing import TYPE_CHECKING, Any
+from urllib.parse import unquote_plus
 
 if TYPE_CHECKING:
     from fastapi import Request
@@ -280,6 +281,15 @@ class GeminiHandlerMixin:
         from headroom.proxy.helpers import MAX_REQUEST_BODY_SIZE, _read_request_json
         from headroom.utils import extract_user_query
 
+        def _stream_url(base_url: str) -> str:
+            query_parts = []
+            for part in request.url.query.split("&") if request.url.query else []:
+                key = unquote_plus(part.split("=", 1)[0])
+                if key != "alt":
+                    query_parts.append(part)
+            query_parts.append("alt=sse")
+            return f"{base_url}?{'&'.join(query_parts)}"
+
         start_time = time.time()
         request_id = await self._next_request_id()
 
@@ -430,16 +440,11 @@ class GeminiHandlerMixin:
 
             if is_streaming:
                 if upstream_base_url:
-                    stream_url = url
-                    separator = "&" if "?" in stream_url else "?"
-                    if "alt=" not in request.url.query:
-                        stream_url = f"{stream_url}{separator}alt=sse"
+                    stream_url = _stream_url(url.split("?", 1)[0])
                 else:
-                    stream_url = (
-                        f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent?alt=sse"
+                    stream_url = _stream_url(
+                        f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent"
                     )
-                if "key" in query_params and not upstream_base_url:
-                    stream_url = f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent?key={query_params['key']}&alt=sse"
                 return await self._stream_response(
                     stream_url,
                     headers,
@@ -734,16 +739,11 @@ class GeminiHandlerMixin:
             if is_streaming:
                 # For streaming, use streamGenerateContent endpoint
                 if upstream_base_url:
-                    stream_url = url
-                    separator = "&" if "?" in stream_url else "?"
-                    if "alt=" not in request.url.query:
-                        stream_url = f"{stream_url}{separator}alt=sse"
+                    stream_url = _stream_url(url.split("?", 1)[0])
                 else:
-                    stream_url = (
-                        f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent?alt=sse"
+                    stream_url = _stream_url(
+                        f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent"
                     )
-                if "key" in query_params and not upstream_base_url:
-                    stream_url = f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent?key={query_params['key']}&alt=sse"
 
                 return await self._stream_response(
                     stream_url,
@@ -1151,81 +1151,13 @@ class GeminiHandlerMixin:
         self,
         request: Request,
         model: str,
-    ) -> StreamingResponse | JSONResponse:
+        upstream_base_url: str | None = None,
+    ) -> Response | StreamingResponse | JSONResponse:
         """Handle Gemini streaming endpoint /v1beta/models/{model}:streamGenerateContent."""
-        from fastapi.responses import JSONResponse
-
-        from headroom.proxy.helpers import _read_request_json
-
-        start_time = time.time()
-        request_id = await self._next_request_id()
-
-        # Parse request
-        try:
-            body = await _read_request_json(request)
-        except (json.JSONDecodeError, ValueError) as e:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": {
-                        "message": f"Invalid request body: {e!s}",
-                        "code": 400,
-                    }
-                },
-            )
-
-        contents = body.get("contents", [])
-
-        headers = dict(request.headers.items())
-        headers.pop("host", None)
-        headers.pop("content-length", None)
-        tags = extract_tags(headers)
-        # Streaming variant — delegates to _stream_response which
-        # classifies the client itself from headers.
-        # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
-        from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
-
-        _pre_strip_count_gem_stream = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
-        headers = _strip_internal_headers(headers)
-        log_outbound_headers(
-            forwarder="gemini_stream_generate_content",
-            stripped_count=_pre_strip_count_gem_stream,
-            request_id=request_id,
-        )
-
-        # Token counting (offloaded off the event loop — GH #1701). Reuse the
-        # shared _dict_parts coercion and keep only str text values: count_text
-        # raises on a non-str part value and the fail-open path re-runs the same
-        # input, so a malformed part would otherwise 500 the streaming request.
-        text_parts = [
-            part["text"]
-            for content in (contents if isinstance(contents, list) else [])
-            for part in self._dict_parts(content)
-            if isinstance(part.get("text"), str)
-        ]
-        _, original_tokens = await self._count_texts_offloaded(model, text_parts)
-
-        optimization_latency = (time.time() - start_time) * 1000
-
-        # Build URL with SSE param
-        query_params = dict(request.query_params)
-        url = f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent?alt=sse"
-        if "key" in query_params:
-            url = f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent?key={query_params['key']}&alt=sse"
-
-        return await self._stream_response(
-            url,
-            headers,
-            body,
-            "gemini",
+        return await self.handle_gemini_generate_content(
+            request,
             model,
-            request_id,
-            original_tokens,
-            original_tokens,
-            0,  # tokens_saved
-            [],  # transforms_applied
-            tags,
-            optimization_latency,
+            upstream_base_url=upstream_base_url,
         )
 
     async def handle_gemini_count_tokens(

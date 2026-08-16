@@ -317,6 +317,40 @@ def _headroom_bypass_enabled(headers: Any) -> bool:
     return bypass or passthrough
 
 
+# Response headers that describe how the *upstream* framed its body on the
+# wire, not what the payload means. Every one of them is invalid to replay:
+# Starlette recomputes content-length, and uvicorn owns the connection
+# framing. Forwarding a stale ``transfer-encoding: chunked`` onto a
+# fixed-length body is the worst of them — RFC 9112 §6.1 makes
+# Transfer-Encoding override Content-Length, so the client tries to parse a
+# plain JSON body as chunked frames, finds no valid chunk-size line, and
+# reads an empty body out of an HTTP 200 (#3019).
+FRAMING_RESPONSE_HEADERS: tuple[str, ...] = (
+    "content-encoding",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "server",
+)
+
+
+def sanitize_forwarded_response_headers(
+    headers: Any,
+    *extra_names: str,
+) -> dict[str, str]:
+    """Drop wire-framing headers before replaying an upstream response.
+
+    Pass any additional header names to strip as ``extra_names`` (for
+    example ``"content-type"`` when the caller sets its own media type).
+
+    Matching is case-insensitive, but the casing of the headers that
+    survive is left untouched.
+    """
+    drop = {name.lower() for name in (*FRAMING_RESPONSE_HEADERS, *extra_names)}
+    return {key: value for key, value in dict(headers).items() if key.lower() not in drop}
+
+
 def log_outbound_request(
     *,
     forwarder: str,
@@ -2811,6 +2845,13 @@ _TOOL_SEARCH_DEFAULT_NAME = "tool_search_tool_regex"
 _TOOL_SEARCH_MIN_TOOLS = 12
 
 
+def _tool_search_resident_key(name: Any) -> str:
+    """Normalize a client tool name for resident-tool membership checks."""
+    # Oh My Pi prefixes every built-in with ``_``. Strip only leading namespace
+    # markers so internal separators such as ``mcp__server__read`` stay intact.
+    return str(name or "").lower().lstrip("_")
+
+
 def anthropic_first_party_tool_search_supported(api_base_url: str | None) -> bool:
     """Return whether Anthropic server-side tool search is valid for this upstream."""
     from headroom.providers.claude.runtime import is_custom_anthropic_base_url
@@ -2872,17 +2913,17 @@ def inject_tool_search_deferral(
     last_resident_real: dict[str, Any] | None = None
     resident_has_cache_control = False
 
-    # Clients disagree on casing for the same tool: Claude Code sends ``Bash`` /
-    # ``ToolSearch`` where opencode sends ``bash``. Compare case-insensitively so
-    # the exemption applies to both — an exact match silently deferred *every*
-    # tool for PascalCase clients, including their own tool-search tool.
-    core_lower = {name.lower() for name in core_tools}
+    # Clients disagree on casing and leading namespace markers for the same tool:
+    # Claude Code sends ``Bash``, opencode sends ``bash``, and Oh My Pi sends
+    # ``_bash``. Normalize both the configured names and each candidate so the
+    # exemption applies consistently across clients.
+    core_keys = {_tool_search_resident_key(name) for name in core_tools}
 
     for tool in tools:
         if (
             not isinstance(tool, dict)
             or tool.get("type")
-            or str(tool.get("name") or "").lower() in core_lower
+            or _tool_search_resident_key(tool.get("name")) in core_keys
         ):
             # Non-dict, server/typed tools (web_search, computer, …), and core
             # tools stay resident and unchanged.
@@ -3259,10 +3300,10 @@ def inject_tool_search_deferral_openai(
 
     out: list[Any] = [{"type": _OPENAI_TOOL_SEARCH_TYPE}]
     deferred = 0
-    # Case-insensitive for the same reason as the Anthropic path above: the
-    # resident-name sets are lowercase, clients are not required to be.
-    resident_lower = {name.lower() for name in core_tools} | {
-        name.lower() for name in _OPENAI_TOOL_SEARCH_RESIDENT_NAMES
+    # Normalize for the same reason as the Anthropic path above: clients may use
+    # different casing or a leading namespace marker for the same resident tool.
+    resident_keys = {_tool_search_resident_key(name) for name in core_tools} | {
+        _tool_search_resident_key(name) for name in _OPENAI_TOOL_SEARCH_RESIDENT_NAMES
     }
     for tool in tools:
         if not isinstance(tool, dict):
@@ -3273,7 +3314,7 @@ def inject_tool_search_deferral_openai(
         # trained to search namespaces / MCP servers). Everything else — core
         # coding tools and other hosted tools — stays resident.
         deferrable = (
-            ttype == "function" and str(tool.get("name") or "").lower() not in resident_lower
+            ttype == "function" and _tool_search_resident_key(tool.get("name")) not in resident_keys
         ) or ttype == "mcp"
         if deferrable and not tool.get("defer_loading"):
             new_tool = dict(tool)

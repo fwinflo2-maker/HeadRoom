@@ -319,6 +319,44 @@ class AnthropicHandlerMixin:
         return False
 
     @staticmethod
+    def _outgoing_body_has_redeemable_marker(body: Any) -> bool:
+        """Does the body about to be sent carry a marker retrieval could expand?
+
+        ``headroom_retrieve`` exists only to expand a ``<<ccr:...>>`` marker, so
+        a request carrying none cannot benefit from the buffered path (#3071).
+
+        Ownership is verified rather than shape-matched: the marker shape is not
+        unique to Headroom, and adopting another context tool's hash would send
+        the model to an endpoint that is guaranteed to miss (#2836). A hash that
+        survives ``verify_ownership`` is redeemable right now.
+
+        Errors are swallowed deliberately and answered ``True``. This gates a
+        wire-format decision, and the safe direction on an unexpected message
+        shape is the long-standing buffered behavior, not a silent change.
+        """
+        if not isinstance(body, dict):
+            return True
+        messages = body.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return False
+        try:
+            from headroom.ccr.tool_injection import CCRToolInjector
+
+            probe = CCRToolInjector(
+                provider="anthropic",
+                inject_tool=False,
+                inject_system_instructions=False,
+            )
+            probe.scan_for_markers(messages)
+            if not probe.detected_hashes:
+                return False
+            probe.verify_ownership()
+            return bool(probe.detected_hashes)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("CCR: marker probe failed; keeping the buffered path", exc_info=True)
+            return True
+
+    @staticmethod
     def _extract_anthropic_cache_ttl_metrics(usage: dict[str, Any] | None) -> tuple[int, int]:
         """Extract observed Anthropic cache-write TTL bucket usage.
 
@@ -3368,13 +3406,40 @@ class AnthropicHandlerMixin:
                     body=body,
                     original_body_bytes=original_body_bytes,
                 )
-                wants_buffered_stream_ccr = bool(
+                # ``headroom_retrieve`` stays resident for the session lifetime so
+                # the tools array is byte-stable and the prompt cache survives, so
+                # its mere presence is a poor reason to buffer. Once a session went
+                # sticky, *every* later streaming turn took the buffered path, and
+                # buffering replaces incremental delivery with one write at the
+                # end: time-to-last-byte is roughly unchanged, but time-to-first-
+                # byte becomes the entire generation. In the traffic reported in
+                # #3071 that was 8s on average and up to 100s, on 234 requests in
+                # a single day.
+                #
+                # The tool can only expand a marker that is in the outgoing body
+                # and redeemable now, so a turn carrying none cannot benefit from
+                # server-side retrieval and should keep streaming. This reads
+                # ``body`` rather than the earlier scan of ``optimized_messages``
+                # because memory hooks, pre-send extensions and the CCR/tool-search
+                # repairs can all replace the message list after that scan; the
+                # only list that matters is the one about to go on the wire.
+                retrieve_tool_is_offered = (
                     stream
                     and ccr_response_handler_enabled
                     and self._has_headroom_retrieve_tool(
                         tools if tools is not None else body.get("tools")
                     )
                 )
+                buffered_retrieval_can_help = (
+                    retrieve_tool_is_offered and self._outgoing_body_has_redeemable_marker(body)
+                )
+                wants_buffered_stream_ccr = bool(buffered_retrieval_can_help)
+                if retrieve_tool_is_offered and not buffered_retrieval_can_help:
+                    logger.info(
+                        f"[{request_id}] CCR: headroom_retrieve is resident but this "
+                        "request carries no redeemable marker, so server-side "
+                        "retrieval cannot fire; keeping the streaming path (#3071)"
+                    )
                 buffered_stream_ccr = (
                     wants_buffered_stream_ccr and not outbound_locked_to_client_bytes
                 )

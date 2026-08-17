@@ -15,6 +15,7 @@ import os
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from headroom import paths as _paths
 from headroom.pricing.litellm_pricing import resolve_litellm_model
@@ -218,6 +219,10 @@ class PerfReport:
     transform_records: list[TransformRecord] = field(default_factory=list)
     toin_records: list[ToinRecord] = field(default_factory=list)
     log_files_read: int = 0
+    # Rotated files skipped unopened because they were last written before the
+    # requested window. Reported so coverage stays honest: `log_files_read` on
+    # its own would silently understate how much log exists on disk.
+    log_files_skipped: int = 0
     total_lines_parsed: int = 0
     # Window covered by the report. `requested_hours` is what the caller
     # asked for; `oldest_kept_ts` / `newest_kept_ts` are the actual
@@ -302,7 +307,31 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
             report.newest_kept_ts = ts_str
 
     # Collect log files: proxy.log, proxy.log.1, proxy.log.2, ...
-    log_files = sorted(log_dir.glob("proxy.log*"), key=lambda p: p.stat().st_mtime)
+    #
+    # A rotated file last written before the cutoff cannot contain a record
+    # inside the window, so skip it without opening it. Without this the cost
+    # of a windowed query is O(total log history) rather than O(window):
+    # `/stats` recomputes throughput over the last hour on a 10s cache TTL, so
+    # a dashboard polling it re-read and re-regexed every byte of every
+    # rotated log, forever, for an answer that lives in the tail of the newest
+    # file. Measured on a developer machine with six rotations (54 MB).
+    #
+    # mtime is the safe discriminator: the logs are append-only, so a file
+    # untouched since before the cutoff has no line written after it. Files
+    # are stat'd once and the value reused for the sort.
+    cutoff_epoch = cutoff.timestamp() if cutoff is not None else None
+    dated_files: list[tuple[float, Path]] = []
+    for path in log_dir.glob("proxy.log*"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            # Rotated away between glob and stat — nothing to read.
+            continue
+        if cutoff_epoch is not None and mtime < cutoff_epoch:
+            report.log_files_skipped += 1
+            continue
+        dated_files.append((mtime, path))
+    log_files = [path for _, path in sorted(dated_files, key=lambda pair: pair[0])]
 
     for log_file in log_files:
         report.log_files_read += 1

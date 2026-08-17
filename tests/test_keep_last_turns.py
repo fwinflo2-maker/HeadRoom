@@ -6,10 +6,7 @@ openai.py call before the optimized_messages assignment.
 
 from __future__ import annotations
 
-import pytest
-
 from headroom.proxy.helpers import apply_keep_last_turns
-
 
 # ---------------------------------------------------------------------------
 # Helpers

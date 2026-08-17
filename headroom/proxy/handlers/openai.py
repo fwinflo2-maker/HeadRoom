@@ -28,6 +28,7 @@ from headroom.proxy.helpers import (
     _headroom_bypass_enabled,
     extract_tags,
     jitter_delay_ms,
+    sanitize_forwarded_response_headers,
 )
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
@@ -69,6 +70,11 @@ from headroom.proxy.auth_mode import (
     classify_auth_mode,
     classify_client,
     should_stamp_codex_client,
+)
+from headroom.proxy.buffered_ccr_response import (
+    DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
+    OPENAI_ERROR_FORMAT,
+    buffered_ccr_asgi_call,
 )
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.cost import header_safe_transforms
@@ -327,10 +333,10 @@ def _sanitize_forwarded_response_headers(
     headers: httpx.Headers | dict[str, str],
     *extra_names: str,
 ) -> dict[str, str]:
-    cleaned = dict(headers)
-    for name in ("content-encoding", "content-length", "server", *extra_names):
-        cleaned.pop(name, None)
-    return cleaned
+    # Thin alias kept for the many call sites in this module; the policy
+    # (and the list of framing headers) lives in one place so the Anthropic
+    # handler strips exactly the same set — see #3019.
+    return sanitize_forwarded_response_headers(headers, *extra_names)
 
 
 def _resolve_openai_handler_path(
@@ -3273,10 +3279,34 @@ class OpenAIHandlerMixin:
                     )
                 )
 
-                # Remove compression headers from cached response
-                response_headers = _sanitize_forwarded_response_headers(cached.response_headers)
+                # Strip the stored response's wire-framing headers, and its
+                # content-type: the entry carries whatever the *producing*
+                # upstream sent, and replaying that framing over a different
+                # connection breaks the body — a stale
+                # ``transfer-encoding: chunked`` makes the client parse plain
+                # JSON as chunked frames and read nothing out of an HTTP 200
+                # (#3019, same reasoning as #2952 on the Anthropic twin).
+                response_headers = _sanitize_forwarded_response_headers(
+                    cached.response_headers,
+                    "content-type",
+                )
 
-                return Response(content=cached.response_body, headers=response_headers)
+                # A cache hit answers without touching the upstream, so it
+                # emits no outbound_request line and no upstream stage
+                # timings. Log it, or a served-from-cache turn looks exactly
+                # like a turn that died silently (#3019).
+                logger.info(
+                    f"[{request_id}] RESPONSE-CACHE-HIT: model={model} "
+                    f"bytes={len(cached.response_body)} "
+                    f"age_s={(datetime.now() - cached.created_at).total_seconds():.0f} "
+                    f"hits={cached.hit_count}"
+                )
+
+                return Response(
+                    content=cached.response_body,
+                    headers=response_headers,
+                    media_type="application/json",
+                )
 
         # Token counting (offloaded off the event loop — GH #1701)
         tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
@@ -4810,7 +4840,16 @@ class OpenAIHandlerMixin:
                 # Cache response under the SAME key it was looked up by:
                 # cache_lookup_messages is the raw pre-mutation snapshot, not
                 # the live (hooked) `messages` (#327).
-                if self.cache and response.status_code == 200:
+                #
+                # ``not stream`` mirrors the read gate at the cache lookup
+                # above. It is currently redundant here — a streaming chat
+                # request returns via ``_stream_response`` well before this
+                # point — but the Anthropic handler had the same shape until a
+                # buffered-CCR branch started falling through to its store
+                # site, which let a response built for a stream:true request
+                # answer a later non-streaming caller (#3019). Stating the
+                # invariant keeps that from being reintroduced silently.
+                if self.cache and not stream and response.status_code == 200:
                     await self.cache.set(
                         cache_lookup_messages,
                         model,
@@ -6173,48 +6212,24 @@ class OpenAIHandlerMixin:
 
             if buffered_stream_ccr:
                 operation = asyncio.create_task(_buffered_ccr_operation())
-                record_failed = self.metrics.record_failed
+
+                # Same wrapper as the Anthropic twin; only the error wire format
+                # differs. See headroom/proxy/buffered_ccr_response.py (#3079).
+                _buffered_call = buffered_ccr_asgi_call(
+                    operation=operation,
+                    fmt=OPENAI_ERROR_FORMAT,
+                    grace_seconds=getattr(
+                        self.config,
+                        "buffered_ccr_grace_seconds",
+                        DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
+                    ),
+                    record_failed=self.metrics.record_failed,
+                    request_id=request_id,
+                )
 
                 class _BufferedCCRResponse(Response):
                     async def __call__(self, scope, receive, send):  # noqa: ANN001
-                        # Send nothing until the buffered operation resolves —
-                        # see the AnthropicHandler twin for the full rationale.
-                        # Committing `200 text/event-stream` on a keepalive timer,
-                        # before the outcome is known, turns every non-200 or
-                        # unparseable upstream reply into a 200 with no usable
-                        # body and discards the status the client needs to back
-                        # off on.
-                        try:
-                            result = await operation
-                        except Exception as e:
-                            await record_failed(provider="openai")
-                            logger.error(
-                                f"[{request_id}] OpenAI responses request failed: {type(e).__name__}: {e}"
-                            )
-                            await send(
-                                {
-                                    "type": "http.response.start",
-                                    "status": 502,
-                                    "headers": [(b"content-type", b"application/json")],
-                                }
-                            )
-                            await send(
-                                {
-                                    "type": "http.response.body",
-                                    "body": json.dumps(
-                                        {
-                                            "error": {
-                                                "message": "An error occurred while processing your request. Please try again.",
-                                                "type": "server_error",
-                                                "code": "proxy_error",
-                                            }
-                                        }
-                                    ).encode(),
-                                    "more_body": False,
-                                }
-                            )
-                            return
-                        await result(scope, receive, send)
+                        await _buffered_call(scope, receive, send)
 
                 return _BufferedCCRResponse(media_type="text/event-stream")
             return await _buffered_ccr_operation()
@@ -7160,7 +7175,6 @@ class OpenAIHandlerMixin:
                     if isinstance(first_response_body, dict)
                     else None
                 )
-
             # Hot-fix follow-up to PR #406 — inline Rust compression on the
             # WS first frame before forwarding upstream. PR #406 enabled
             # the same call for HTTP /v1/responses; PR-C5's "WS-side
@@ -8000,6 +8014,7 @@ class OpenAIHandlerMixin:
                             response_output_items.clear()
 
                         response_started_ms: float | None = None
+                        completed_response_model = "unknown"
 
                         async def _record_ws_response_metrics() -> None:
                             """Record one completed Responses turn on long-lived WS sessions."""
@@ -8056,7 +8071,7 @@ class OpenAIHandlerMixin:
                             ):
                                 return
 
-                            model_for_metrics = str(body.get("model") or "unknown")
+                            model_for_metrics = completed_response_model
                             latency_ms = (
                                 (time.perf_counter() * 1000.0 - response_started_ms)
                                 if response_started_ms is not None
@@ -8209,6 +8224,13 @@ class OpenAIHandlerMixin:
                                     upstream_frame_index,
                                     ws_last_upstream_frame_type,
                                 )
+                                response = event.get("response")
+                                completed_response_model = (
+                                    str(response.get("model") or "unknown")
+                                    if isinstance(response, dict)
+                                    else "unknown"
+                                )
+
                                 if event_type == "response.created":
                                     response_started_ms = time.perf_counter() * 1000.0
                                 (
@@ -8561,9 +8583,23 @@ class OpenAIHandlerMixin:
                     f"[{request_id}] WS upstream failed ({_ws_detail}), "
                     f"falling back to HTTP POST streaming"
                 )
-                await self._ws_http_fallback(
+                (
+                    fb_input_tokens,
+                    fb_output_tokens,
+                    fb_cache_read_tokens,
+                    fb_cache_write_tokens,
+                    fb_uncached_tokens,
+                ) = await self._ws_http_fallback(
                     websocket, body, first_msg_raw, upstream_headers, request_id
                 )
+                # Fold the fallback's provider usage into the session totals so
+                # the WS session-end outcome records the authoritative wire-token
+                # count instead of 0 (#2957).
+                ws_input_tokens_total += fb_input_tokens
+                ws_output_tokens_total += fb_output_tokens
+                ws_cache_read_tokens_total += fb_cache_read_tokens
+                ws_cache_write_tokens_total += fb_cache_write_tokens
+                ws_uncached_input_tokens_total += fb_uncached_tokens
 
             # ── WS session-end metric + RequestLog ──────────────────
             #
@@ -8581,11 +8617,7 @@ class OpenAIHandlerMixin:
             )
             if not isinstance(ws_inner_for_telemetry, dict):
                 ws_inner_for_telemetry = {}
-            model_name = (
-                ws_inner_for_telemetry.get("model")
-                or (body.get("model") if isinstance(body, dict) else None)
-                or "unknown"
-            )
+            model_name = str(current_response_template.get("model") or "unknown")
             _final_auth_mode = classify_auth_mode(ws_headers)
             residual_input_tokens = max(0, ws_input_tokens_total - ws_recorded_input_tokens_total)
             residual_output_tokens = max(
@@ -8813,14 +8845,31 @@ class OpenAIHandlerMixin:
         first_msg_raw: str,
         upstream_headers: dict[str, str],
         request_id: str,
-    ) -> None:
+    ) -> tuple[int, int, int, int, int]:
         """Fall back to HTTP POST streaming when upstream WS fails.
 
         Converts the WS ``response.create`` message to an HTTP POST to
         ``/v1/responses?stream=true``, reads SSE events, and relays each
         ``data:`` line as a WS text message to the client.  This makes
         Codex work immediately instead of exhausting its WS retry budget.
+
+        Returns ``(input, output, cache_read, cache_write, uncached)`` provider
+        usage parsed from the ``response.completed`` SSE event. The caller folds
+        it into the session totals so the WS session-end outcome uses the
+        authoritative wire-token count; otherwise a fallback recorded
+        ``input_tokens=0`` and savings percentages blew past 100 (#2957).
         """
+        fallback_usage = [0, 0, 0, 0, 0]
+
+        def _accumulate_usage(data_str: str) -> None:
+            try:
+                event = json.loads(data_str)
+            except (json.JSONDecodeError, TypeError):
+                return
+            if isinstance(event, dict) and event.get("type") == "response.completed":
+                for i, value in enumerate(_extract_responses_usage(event)):
+                    fallback_usage[i] += value
+
         # Route to correct endpoint based on auth mode
         is_chatgpt_fallback = has_chatgpt_account_header(upstream_headers)
         if is_chatgpt_fallback:
@@ -8926,7 +8975,7 @@ class OpenAIHandlerMixin:
                                 },
                             }
                             await websocket.send_text(json.dumps(error_event))
-                            return
+                            return tuple(fallback_usage)  # type: ignore[return-value]
 
                         # Refresh Codex /stats from the fallback response
                         # headers. We can't forward them onto the client 101
@@ -8952,10 +9001,11 @@ class OpenAIHandlerMixin:
                                     data = line[6:]
                                     if data == "[DONE]":
                                         continue
+                                    _accumulate_usage(data)
                                     try:
                                         await websocket.send_text(data)
                                     except Exception:
-                                        return
+                                        return tuple(fallback_usage)  # type: ignore[return-value]
                                 elif line.startswith("event: "):
                                     # SSE event type — skip, the data line contains the type
                                     continue
@@ -8964,9 +9014,10 @@ class OpenAIHandlerMixin:
                         for line in buffer.strip().splitlines():
                             line = line.strip()
                             if line.startswith("data: ") and line[6:] != "[DONE]":
+                                _accumulate_usage(line[6:])
                                 with contextlib.suppress(Exception):
                                     await websocket.send_text(line[6:])
-                        return
+                        return tuple(fallback_usage)  # type: ignore[return-value]
                 except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as http_err:
                     if http_attempt >= retry_attempts - 1:
                         raise
@@ -8997,6 +9048,7 @@ class OpenAIHandlerMixin:
         finally:
             with contextlib.suppress(Exception):
                 await websocket.close()
+        return tuple(fallback_usage)  # type: ignore[return-value]
 
     def _derived_compress_pipeline(self, key: str, **overrides: Any) -> Any:
         """Cached ``/v1/compress`` pipeline derived from the live OpenAI router.

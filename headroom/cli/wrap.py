@@ -77,6 +77,8 @@ from headroom.providers.claude import (
     REMOTE_CONTROL_BASE_URL_ENV,
     TOOL_SEARCH_DEFAULT,
     TOOL_SEARCH_ENV,
+    claude_auth_conflict_message,
+    claude_auth_conflict_sources,
     claude_user_settings_path,
     configure_vscode_claude_settings,
     detect_claude_code_version,
@@ -134,7 +136,12 @@ from headroom.providers.copilot import (
     validate_configuration as _validate_copilot_configuration,
 )
 from headroom.providers.cursor import render_setup_lines as _render_cursor_setup_lines
-from headroom.providers.grok import build_launch_env as _build_grok_launch_env
+from headroom.providers.grok import (
+    DEFAULT_API_URL as _GROK_DEFAULT_API_URL,
+)
+from headroom.providers.grok import (
+    build_launch_env as _build_grok_launch_env,
+)
 from headroom.providers.grok_build import render_setup_lines as _render_grok_build_setup_lines
 from headroom.providers.grok_build.config import (
     inject_grok_provider_config,
@@ -260,6 +267,30 @@ def _read_settings_for_write(path: Path) -> dict[str, Any]:
     return cast("dict[str, Any]", payload)
 
 
+def _claude_settings_env(path: Path) -> dict[str, object]:
+    """Read a Claude settings env block for preflight validation."""
+    env = _read_settings_for_write(path).get("env")
+    return dict(env) if isinstance(env, dict) else {}
+
+
+def _raise_on_claude_auth_conflict(
+    *,
+    user_settings_path: Path,
+    project_settings_path: Path,
+    project_local_settings_path: Path,
+    environ: dict[str, str],
+) -> None:
+    """Refuse an auth state Claude Code rejects before mutating wrap state."""
+    conflict = claude_auth_conflict_sources(
+        (str(user_settings_path), _claude_settings_env(user_settings_path)),
+        (str(project_settings_path), _claude_settings_env(project_settings_path)),
+        (str(project_local_settings_path), _claude_settings_env(project_local_settings_path)),
+        ("shell environment", environ),
+    )
+    if conflict is not None:
+        raise click.ClickException(claude_auth_conflict_message(conflict))
+
+
 def _append_text(path: Path, content: str) -> None:
     """Append to a text file as UTF-8 without translating line endings."""
     fsutil.append_text(path, content)
@@ -290,9 +321,13 @@ _AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor", "grok", "grok_build"}
 # so `--1m` forces the suffix via ANTHROPIC_MODEL on the launched process.
 _ANTHROPIC_MODEL_ENV = "ANTHROPIC_MODEL"
 _CONTEXT_1M_SUFFIX = "[1m]"
-# Only used when no model is otherwise selected (no ANTHROPIC_MODEL set). The
-# current default Opus; the suffix logic preserves any model the user did set.
-_DEFAULT_1M_MODEL = "claude-opus-4-8"
+_1M_MODEL_ENV = "HEADROOM_1M_MODEL"
+# Fallback model for `--1m` when nothing else selects one (no ANTHROPIC_MODEL,
+# no explicit --model). Overridable via HEADROOM_1M_MODEL so it can track new
+# Opus releases without a code change and without pinning ANTHROPIC_MODEL
+# globally (which would also change non-`--1m` sessions and override Claude
+# Code's /model picker). #2937.
+_DEFAULT_1M_MODEL = "claude-opus-5"
 _OPENCLAUDE_INSTRUCTIONS_FILE = "CONVENTIONS.md"
 
 
@@ -300,11 +335,12 @@ def _resolve_1m_model(current: str | None) -> str:
     """Return the model id that makes Claude Code request the 1M window (#1158).
 
     Preserves a model the user already selected via ``ANTHROPIC_MODEL`` (only
-    appending the ``[1m]`` suffix when missing); falls back to the default Opus
-    when none is set. Idempotent — a value already ending in ``[1m]`` is
-    returned unchanged.
+    appending the ``[1m]`` suffix when missing). When none is set it falls back
+    to ``HEADROOM_1M_MODEL`` if defined, else the built-in default Opus (#2937).
+    Idempotent — a value already ending in ``[1m]`` is returned unchanged.
     """
-    base = (current or "").strip() or _DEFAULT_1M_MODEL
+    fallback = (os.environ.get(_1M_MODEL_ENV) or "").strip() or _DEFAULT_1M_MODEL
+    base = (current or "").strip() or fallback
     return base if base.endswith(_CONTEXT_1M_SUFFIX) else f"{base}{_CONTEXT_1M_SUFFIX}"
 
 
@@ -4746,6 +4782,12 @@ def claude(
     # early proxy-start failure would make the finally raise UnboundLocalError,
     # masking the real error and skipping cleanup(). Mirrors the holders above.
     _wrap_settings_path = Path.cwd() / ".claude" / "settings.local.json"
+    _raise_on_claude_auth_conflict(
+        user_settings_path=claude_user_settings_path(),
+        project_settings_path=Path.cwd() / ".claude" / "settings.json",
+        project_local_settings_path=_wrap_settings_path,
+        environ=dict(os.environ),
+    )
     cleanup = _make_cleanup(proxy_holder, port_holder)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
     signal.signal(signal.SIGTERM, cleanup)
@@ -6386,7 +6428,7 @@ def grok(
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
-        openai_api_url="https://api.x.ai",
+        openai_api_url=_GROK_DEFAULT_API_URL,
     )
 
 
@@ -6476,9 +6518,9 @@ def grok_build(
 
     \b
     Grok Build reads model endpoints from ``~/.grok/config.toml``. This
-    command starts the proxy, optionally sets up the selected CLI context
-    tool, injects a Headroom-managed ``[model.grok-build]`` override, and
-    prints next steps.
+    command starts the proxy (upstream ``https://api.x.ai``, same as
+    ``wrap grok``), injects a Headroom-managed ``[model.grok-build]``
+    override, and prints next steps.
 
     \b
     Example:
@@ -6505,6 +6547,8 @@ def grok_build(
         for line in _render_grok_build_setup_lines(actual_port, project=project):
             click.echo(line)
 
+    # Client hop is local proxy via config.toml; upstream must be xAI (not
+    # the OpenAI default). Omitting this caused 401s with Grok auth headers.
     _run_proxy_only_watcher(
         agent_label="grok-build",
         port=port,
@@ -6513,6 +6557,7 @@ def grok_build(
         memory=memory,
         agent_type="grok_build",
         print_setup_lines=_print_grok_build_setup,
+        openai_api_url=_GROK_DEFAULT_API_URL,
     )
 
 

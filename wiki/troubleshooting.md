@@ -225,6 +225,7 @@ client = HeadroomClient(
 # 2. For temp directory storage
 import tempfile
 import os
+
 db_path = os.path.join(tempfile.gettempdir(), "headroom.db")
 client = HeadroomClient(
     original_client=OpenAI(),
@@ -288,6 +289,7 @@ pip install --upgrade headroom-ai
 ```python
 # Check available imports
 import headroom
+
 print(dir(headroom))
 
 # Common imports:
@@ -398,6 +400,7 @@ print(f"Waste signals: {plan.waste_signals}")
 
 # See the actual optimized messages
 import json
+
 print(json.dumps(plan.messages_optimized, indent=2))
 ```
 

@@ -151,6 +151,69 @@ describe("candidateFromToolResult", () => {
 		).toBeUndefined();
 	});
 
+	it.each([
+		["direct", { rtkCompaction: { truncated: true } }],
+		["nested", { metadata: { rtkCompaction: { truncated: true } } }],
+		[
+			"emitted direct and nested",
+			{
+				rtkCompaction: { truncated: true },
+				metadata: { rtkCompaction: { truncated: true } },
+			},
+		],
+		[
+			"nested after direct non-truncated",
+			{
+				rtkCompaction: { truncated: false },
+				metadata: { rtkCompaction: { truncated: true } },
+			},
+		],
+		[
+			"direct before nested non-truncated",
+			{
+				rtkCompaction: { truncated: true },
+				metadata: { rtkCompaction: { truncated: false } },
+			},
+		],
+	] as const)("rejects RTK-truncated output from %s metadata", (_shape, details) => {
+		expect(
+			candidateFromToolResult(
+				toolResult("rtk", "bash", "x".repeat(20), { details }),
+				config(),
+			),
+		).toBeUndefined();
+	});
+
+	it.each([
+		["direct non-truncated", { rtkCompaction: { truncated: false } }],
+		[
+			"nested non-truncated",
+			{ metadata: { rtkCompaction: { truncated: false } } },
+		],
+		[
+			"direct and nested non-truncated",
+			{
+				rtkCompaction: { truncated: false },
+				metadata: { rtkCompaction: { truncated: false } },
+			},
+		],
+		["malformed direct", { rtkCompaction: "invalid" }],
+		["malformed metadata", { metadata: "invalid" }],
+		[
+			"malformed nested compaction",
+			{ metadata: { rtkCompaction: "invalid" } },
+		],
+		["non-boolean truncated flag", { rtkCompaction: { truncated: "true" } }],
+		["null shapes", { rtkCompaction: null, metadata: null }],
+	] as const)("keeps %s RTK metadata eligible", (_shape, details) => {
+		expect(
+			candidateFromToolResult(
+				toolResult("rtk", "bash", "x".repeat(20), { details }),
+				config(),
+			),
+		).toBeDefined();
+	});
+
 	it("rejects repeated incomplete CCR prefixes without pathological backtracking", () => {
 		const started = performance.now();
 

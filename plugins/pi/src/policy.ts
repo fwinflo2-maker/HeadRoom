@@ -23,6 +23,22 @@ export type PreparedLookup = (key: string) => PreparedEntry | undefined;
 export type CandidateEnqueue = (candidate: Candidate) => void;
 export type PreparedSubstitution = (entry: PreparedEntry) => void;
 
+function hasTruncatedFlag(value: unknown): boolean {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"truncated" in value &&
+		value.truncated === true
+	);
+}
+
+function nestedRtkCompaction(details: object): unknown {
+	if (!("metadata" in details)) return undefined;
+	const { metadata } = details;
+	if (typeof metadata !== "object" || metadata === null) return undefined;
+	return "rtkCompaction" in metadata ? metadata.rtkCompaction : undefined;
+}
+
 function hasPruningMetadata(details: unknown): boolean {
 	if (typeof details !== "object" || details === null) return false;
 	if (
@@ -32,12 +48,12 @@ function hasPruningMetadata(details: unknown): boolean {
 		return true;
 	}
 
-	const truncation = "truncation" in details ? details.truncation : undefined;
 	return (
-		typeof truncation === "object" &&
-		truncation !== null &&
-		"truncated" in truncation &&
-		truncation.truncated === true
+		hasTruncatedFlag("truncation" in details ? details.truncation : undefined) ||
+		hasTruncatedFlag(
+			"rtkCompaction" in details ? details.rtkCompaction : undefined,
+		) ||
+		hasTruncatedFlag(nestedRtkCompaction(details))
 	);
 }
 function isToolResultMessage(

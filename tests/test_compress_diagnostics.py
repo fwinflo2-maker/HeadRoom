@@ -16,11 +16,8 @@ import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import pytest
-
-from headroom.compress import CompressConfig, CompressResult, compress
+from headroom.compress import CompressConfig, compress
 from headroom.config import MessageDecision, TransformResult
-
 
 # ---------------------------------------------------------------------------
 # Mock pipeline factory
@@ -38,7 +35,9 @@ def _noop_result(messages: list[dict]) -> TransformResult:
     )
 
 
-def _result_with_decisions(messages: list[dict], decisions: list[MessageDecision]) -> TransformResult:
+def _result_with_decisions(
+    messages: list[dict], decisions: list[MessageDecision]
+) -> TransformResult:
     """TransformResult that includes per-message decisions."""
     tokens = sum(len(str(m.get("content", ""))) for m in messages)
     return TransformResult(
@@ -93,7 +92,13 @@ def test_message_decision_importable_from_headroom():
 
     assert hasattr(headroom, "MessageDecision")
     cls = headroom.MessageDecision
-    dec = cls(message_index=1, role="assistant", tokens_before=50, tokens_after=50, action="passthrough:small")
+    dec = cls(
+        message_index=1,
+        role="assistant",
+        tokens_before=50,
+        tokens_after=50,
+        action="passthrough:small",
+    )
     assert dec.message_index == 1
 
 
@@ -116,7 +121,9 @@ def test_transform_result_has_message_decisions_field():
 
 def test_transform_result_message_decisions_populated():
     """TransformResult stores MessageDecision objects when provided."""
-    dec = MessageDecision(message_index=0, role="user", tokens_before=10, tokens_after=10, action="passthrough:small")
+    dec = MessageDecision(
+        message_index=0, role="user", tokens_before=10, tokens_after=10, action="passthrough:small"
+    )
     tr = TransformResult(
         messages=[],
         tokens_before=0,
@@ -202,8 +209,20 @@ def test_compress_result_diagnostics_contains_decisions(monkeypatch):
     """CompressResult.diagnostics contains the MessageDecision objects from the pipeline."""
     compress_module = importlib.import_module("headroom.compress")
     expected = [
-        MessageDecision(message_index=0, role="user", tokens_before=10, tokens_after=10, action="protected:user_message"),
-        MessageDecision(message_index=1, role="tool", tokens_before=200, tokens_after=80, action="compressed:kompress:0.40"),
+        MessageDecision(
+            message_index=0,
+            role="user",
+            tokens_before=10,
+            tokens_after=10,
+            action="protected:user_message",
+        ),
+        MessageDecision(
+            message_index=1,
+            role="tool",
+            tokens_before=200,
+            tokens_after=80,
+            action="compressed:kompress:0.40",
+        ),
     ]
     mock_pipeline = _MockPipeline(decisions=expected)
     monkeypatch.setattr(compress_module, "_get_pipeline", lambda: mock_pipeline)

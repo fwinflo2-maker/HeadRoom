@@ -245,6 +245,65 @@ def _configured_api_url() -> str:
     return DEFAULT_API_URL
 
 
+def copilot_api_url() -> str:
+    """Return the configured Copilot API base URL without any network calls.
+
+    Resolves ``GITHUB_COPILOT_API_URL``, then the configured enterprise domain,
+    then ``api.githubcopilot.com``. Unlike :func:`resolve_copilot_api_url` this
+    performs no token exchange, so it is safe to call while routing a request.
+    """
+
+    return _configured_api_url()
+
+
+# GitHub's token exchange advertises the host that serves inline completions
+# under ``endpoints.proxy``, alongside the ``endpoints.api`` chat host. It is
+# recorded here when observed so completions routing uses GitHub's own answer
+# instead of an assumption about which host serves that endpoint (#3076).
+_observed_completions_base_url: str | None = None
+
+
+def _remember_completions_endpoint(payload: Any) -> None:
+    """Record the completions host advertised by a token-exchange payload."""
+
+    global _observed_completions_base_url
+    endpoints = payload.get("endpoints") if isinstance(payload, dict) else None
+    proxy_url = endpoints.get("proxy") if isinstance(endpoints, dict) else None
+    if isinstance(proxy_url, str) and proxy_url.strip():
+        _observed_completions_base_url = proxy_url.strip().rstrip("/")
+
+
+def reset_observed_completions_endpoint() -> None:
+    """Forget the advertised completions host (test isolation)."""
+
+    global _observed_completions_base_url
+    _observed_completions_base_url = None
+
+
+def copilot_completions_base_url() -> str:
+    """Return the base URL serving Copilot's inline-completions endpoint.
+
+    Resolution order, most authoritative first:
+
+    1. ``GITHUB_COPILOT_PROXY_URL`` — an explicit operator override, so a
+       network that fronts Copilot behind its own gateway (or a GitHub change
+       to this endpoint) is a config edit rather than a code change.
+    2. ``endpoints.proxy`` from the last Copilot token exchange — GitHub
+       telling us directly where completions go.
+    3. The Copilot API URL, which is where GitHub's consolidated surface
+       serves them.
+
+    Never performs I/O; step 2 only reads what a previous exchange recorded.
+    """
+
+    override = os.environ.get("GITHUB_COPILOT_PROXY_URL", "").strip()
+    if override:
+        return override.rstrip("/")
+    if _observed_completions_base_url:
+        return _observed_completions_base_url
+    return copilot_api_url()
+
+
 def _github_oauth_domain(domain: str | None = None) -> str:
     raw = (domain or DEFAULT_GITHUB_HOST).strip()
     if not raw:
@@ -1056,6 +1115,29 @@ def reset_request_routed_to_copilot() -> None:
     _request_routed_to_copilot.set(False)
 
 
+def is_copilot_completions_path(path: str) -> bool:
+    """Return True for Copilot's inline-completions ("ghost text") endpoint.
+
+    The Copilot editor extensions send code completions to
+    ``/v1/engines/<engine>/completions`` on whatever host
+    ``github.copilot.advanced.debug.overrideProxyUrl`` names — so when that
+    setting points at Headroom, this is the path that arrives.
+
+    The shape identifies GitHub Copilot on its own. OpenAI's Engines API was
+    removed years ago and no other provider Headroom fronts serves it, so a
+    request on this path is Copilot's and can never be answered by the default
+    OpenAI target (#3076).
+    """
+
+    normalized = (path if path.startswith("/") else f"/{path}").rstrip("/")
+    prefix = "/v1/engines/"
+    suffix = "/completions"
+    if not normalized.startswith(prefix) or not normalized.endswith(suffix):
+        return False
+    engine = normalized[len(prefix) : -len(suffix)]
+    return bool(engine) and "/" not in engine
+
+
 def build_copilot_upstream_url(base_url: str, path: str) -> str:
     """Build an upstream URL, normalizing GitHub Copilot's non-/v1 path layout."""
 
@@ -1071,7 +1153,17 @@ def build_copilot_upstream_url(base_url: str, path: str) -> str:
         # Anthropic surface for Claude models IS ``/v1/messages`` (with the
         # ``/v1``); stripping it forwarded ``/messages`` and Copilot returned 404
         # for claude-* models (#2409). Keep ``/v1`` for the messages endpoint.
-        if normalized_path.startswith("/v1/") and not normalized_path.startswith("/v1/messages"):
+        #
+        # Inline completions are the same story: the Copilot extension itself
+        # builds ``/v1/engines/<engine>/completions``, so the path that reaches
+        # us is already the exact path Copilot serves. Stripping ``/v1`` there
+        # rewrites a Copilot-native path into one that 404s (#3076). The rule
+        # this encodes: strip only for clients speaking generic-OpenAI at
+        # Copilot, never for Copilot's own paths.
+        keep_v1 = normalized_path.startswith("/v1/messages") or is_copilot_completions_path(
+            normalized_path
+        )
+        if normalized_path.startswith("/v1/") and not keep_v1:
             normalized_path = normalized_path[3:]
     else:
         reset_request_routed_to_copilot()
@@ -1207,7 +1299,12 @@ class CopilotTokenProvider:
         try:
             with urllib_request.urlopen(request, timeout=10.0) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-                return payload if isinstance(payload, dict) else {}
+                if not isinstance(payload, dict):
+                    return {}
+                # Every exchange funnels through here, so this is the one place
+                # that sees GitHub's advertised completions host (#3076).
+                _remember_completions_endpoint(payload)
+                return payload
         except urllib_error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(

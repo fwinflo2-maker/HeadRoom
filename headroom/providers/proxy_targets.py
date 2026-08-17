@@ -5,6 +5,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, cast
 
+from headroom.copilot_auth import (
+    copilot_completions_base_url,
+    is_copilot_api_url,
+    is_copilot_completions_path,
+)
 from headroom.providers.codex import resolve_codex_routing
 from headroom.providers.codex.endpoints import CHATGPT_BACKEND_API_URL
 from headroom.providers.codex.runtime import DEFAULT_API_URL as DEFAULT_OPENAI_API_URL
@@ -69,7 +74,9 @@ def openai_compatible_base_url(proxy: Any, headers: Mapping[str, str]) -> str:
     return target
 
 
-def select_passthrough_base_url(proxy: Any, headers: Mapping[str, str]) -> str:
+def select_passthrough_base_url(
+    proxy: Any, headers: Mapping[str, str], path: str | None = None
+) -> str:
     """Resolve the upstream base URL for catch-all proxy passthrough requests."""
     routing = resolve_codex_routing(headers)
     if routing.is_chatgpt_auth:
@@ -81,6 +88,42 @@ def select_passthrough_base_url(proxy: Any, headers: Mapping[str, str]) -> str:
         if azure_base:
             return azure_base.rstrip("/")
     provider_name = proxy.provider_runtime.model_metadata_provider(headers)
+    target = api_target(proxy, provider_name)
+    if (
+        path is not None
+        and provider_name == "openai"
+        and is_copilot_completions_path(path)
+        and not is_copilot_api_url(target)
+    ):
+        # Copilot's inline completions arrive here because
+        # `/v1/engines/<engine>/completions` matches no built-in route. Nothing
+        # above this line looks at the path, so the request fell through to the
+        # OpenAI target and Headroom forwarded editor keystrokes to
+        # api.openai.com — a host that has not served the Engines API for years,
+        # and one many corporate networks block outright (#3076).
+        #
+        # Only Copilot emits this path, so sending it to Copilot is unambiguous.
+        # `copilot_completions_base_url()` does no I/O: it prefers an operator
+        # override, then the completions host GitHub advertised in the last
+        # token exchange, then the Copilot API URL — so the destination is
+        # GitHub's own answer where we have it rather than a hardcoded guess,
+        # and GHE deployments keep their host.
+        #
+        # When the target is already a Copilot host — `headroom wrap vscode`
+        # points the OpenAI target at the resolved subscription URL — it is left
+        # alone, so an account-specific host is never overwritten with the
+        # generic one.
+        #
+        # Scoped to the OpenAI fall-through, which is the branch that is wrong
+        # for this path. Every other branch above reflects a deliberate choice
+        # of upstream by the caller's own auth headers, and the Copilot editor
+        # extension sends none of them — so a request that took one of those
+        # branches is not Copilot's and keeps the upstream it asked for.
+        return copilot_completions_base_url()
     if provider_name == "openai":
+        # Grok CLI reaches passthrough the same way, recognized by wire signals
+        # rather than path, and only while the OpenAI target is still the
+        # default. Checked after Copilot because that branch keys on a path only
+        # Copilot emits, so it is the narrower claim on this fall-through.
         return openai_compatible_base_url(proxy, headers)
-    return api_target(proxy, provider_name)
+    return target

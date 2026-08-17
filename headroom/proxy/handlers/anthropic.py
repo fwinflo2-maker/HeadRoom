@@ -318,6 +318,34 @@ class AnthropicHandlerMixin:
                 return True
         return False
 
+    def _can_salvage_buffered_upstream(self, resp_json: Any) -> bool:
+        """May this upstream response be relayed when post-processing failed?
+
+        Only when the client can actually consume it. The buffered path exists
+        because a ``headroom_retrieve`` call has to be resolved server-side, so
+        a response still carrying one is exactly the case the handler already
+        fails closed on: relaying it would hand the client a tool call naming an
+        endpoint it is not expected to reach, and a marker nobody expanded.
+
+        Anything else — an ordinary answer, a client tool call, a turn whose
+        retrieval already resolved — is a complete provider turn and is safer in
+        the client's hands than a synthesized error (#3088).
+        """
+        if not isinstance(resp_json, dict):
+            return False
+        handler = getattr(self, "ccr_response_handler", None)
+        if handler is None:
+            return True
+        try:
+            from headroom.ccr.response_handler import RESIDUAL_CCR_ERROR
+
+            if handler.residual_ccr_status(resp_json, "anthropic") == RESIDUAL_CCR_ERROR:
+                return False
+            return not handler.has_ccr_tool_calls(resp_json, "anthropic")
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("CCR: salvage check failed; not salvaging", exc_info=True)
+            return False
+
     @staticmethod
     def _outgoing_body_has_redeemable_marker(body: Any) -> bool:
         """Does the body about to be sent carry a marker retrieval could expand?
@@ -3597,6 +3625,9 @@ class AnthropicHandlerMixin:
                         session_key=session_key,
                     )
                 else:
+                    # Populated once the upstream answers 200 with parseable
+                    # JSON, so the guard below can fall back to it (#3088).
+                    _salvageable_upstream: dict[str, Any] = {}
 
                     async def _buffered_ccr_operation():
                         async with stage_timer.measure("upstream_connect"):
@@ -3768,6 +3799,16 @@ class AnthropicHandlerMixin:
                         resp_json = None
                         try:
                             resp_json = response.json()
+                            if buffered_stream_ccr and response.status_code == 200 and resp_json:
+                                # Remember the upstream's own answer before any
+                                # post-processing touches it. Everything from here
+                                # to the SSE resynthesis — retrieval, memory tool
+                                # calls, turn hooks, usage accounting, caching — is
+                                # work layered on top of a turn the provider has
+                                # already produced and billed. If any of it raises
+                                # unexpectedly, this is what the client should get
+                                # instead of a synthesized error (#3088).
+                                _salvageable_upstream["resp_json"] = resp_json
                         except (json.JSONDecodeError, ValueError) as e:
                             # DEBUG is right for the buffered non-stream path, where
                             # an unparseable body is just "no CCR handling". On the
@@ -4483,8 +4524,58 @@ class AnthropicHandlerMixin:
                             headers=response_headers,
                         )
 
+                async def _buffered_ccr_operation_salvaging():
+                    """Never trade a successful upstream turn for a synthesized error.
+
+                    Everything the buffered path does after the provider answers
+                    — server-side retrieval, memory tool calls, turn hooks, usage
+                    accounting, caching, SSE resynthesis — is post-processing on
+                    a turn that already succeeded and was already billed. When a
+                    step raised unexpectedly the whole turn surfaced as a generic
+                    ``api_error``, so the client lost a complete 69KB answer the
+                    provider had produced (#3088), and the cause was unlogged.
+
+                    Relay the upstream's own answer instead. Two things are
+                    deliberately preserved: the exception is logged with a
+                    traceback so the real defect stays diagnosable rather than
+                    being papered over, and a response the client cannot safely
+                    consume is never salvaged — see ``_can_salvage``.
+                    """
+                    try:
+                        return await _buffered_ccr_operation()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        salvaged = _salvageable_upstream.get("resp_json")
+                        if salvaged is None or not self._can_salvage_buffered_upstream(salvaged):
+                            raise
+                        logger.error(
+                            f"[{request_id}] CCR: buffered post-processing failed after a "
+                            "successful upstream turn; relaying the upstream response "
+                            "instead of failing the request (#3088)",
+                            exc_info=True,
+                        )
+                        try:
+                            events = self._response_to_sse(salvaged, "anthropic")
+                        except Exception:
+                            logger.error(
+                                f"[{request_id}] CCR: could not resynthesize the salvaged "
+                                "upstream response; failing the request",
+                                exc_info=True,
+                            )
+                            raise
+
+                        async def _salvaged_sse():
+                            for event in events:
+                                yield event
+
+                        return StreamingResponse(
+                            _salvaged_sse(),
+                            media_type="text/event-stream",
+                        )
+
                 if buffered_stream_ccr:
-                    operation = asyncio.create_task(_buffered_ccr_operation())
+                    operation = asyncio.create_task(_buffered_ccr_operation_salvaging())
 
                     # Holds out for the real status, then keeps the stream alive
                     # once waiting silently would risk the client's idle
@@ -4507,7 +4598,7 @@ class AnthropicHandlerMixin:
                             await _buffered_call(scope, receive, send)
 
                     return _BufferedCCRResponse(media_type="text/event-stream")
-                return await _buffered_ccr_operation()
+                return await _buffered_ccr_operation_salvaging()
             except HTTPException:
                 # FastAPI HTTPException carries its own status code, headers,
                 # and client-facing message (e.g. 429 with Retry-After, 413 for

@@ -15,6 +15,7 @@ import logging
 import os
 import random
 import re
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -1512,6 +1513,10 @@ def _setup_file_logging() -> None:
     """
     from logging.handlers import RotatingFileHandler
 
+    # Attach to the headroom root logger so all sub-loggers are captured.
+    headroom_logger = logging.getLogger("headroom")
+    headroom_logger.setLevel(logging.INFO)
+
     try:
         log_dir = _headroom_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -1526,17 +1531,39 @@ def _setup_file_logging() -> None:
         handler.setFormatter(
             logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
-        # Attach to the headroom root logger so all sub-loggers are captured.
         # Disable propagation to root to avoid duplicate writes when
         # wrap.py redirects stderr to the same log file.
-        headroom_logger = logging.getLogger("headroom")
-        headroom_logger.setLevel(logging.INFO)
         if not any(isinstance(h, RotatingFileHandler) for h in headroom_logger.handlers):
             headroom_logger.addHandler(handler)
         headroom_logger.propagate = False
     except OSError:
         # Non-fatal: can't write logs (read-only fs, permissions, etc.)
         pass
+
+    # Container platforms (Docker, Kubernetes, ...) collect stdout, not the
+    # workspace log file inside the container. With propagation disabled above,
+    # headroom.* records otherwise never reach stdout, so every application log
+    # is silently lost in those deployments. HEADROOM_LOG_TO_STDOUT adds a
+    # dedicated stdout handler on the headroom logger — no propagation, so this
+    # never double-writes the rotating file (#3087). Opt-in keeps the default
+    # file-only behavior unchanged.
+    if os.environ.get("HEADROOM_LOG_TO_STDOUT", "").strip().lower() in ("true", "1", "yes", "on"):
+        _ensure_stdout_log_handler(headroom_logger)
+
+
+def _ensure_stdout_log_handler(headroom_logger: logging.Logger) -> None:
+    """Attach a stdout ``StreamHandler`` to ``headroom_logger`` once (idempotent)."""
+    for existing in headroom_logger.handlers:
+        # RotatingFileHandler is a StreamHandler subclass, so match on the
+        # bound stream rather than the type to avoid re-adding on every call.
+        if getattr(existing, "stream", None) is sys.stdout:
+            return
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setLevel(logging.INFO)
+    stream_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    )
+    headroom_logger.addHandler(stream_handler)
 
 
 def is_anthropic_auth(headers: dict[str, str]) -> bool:

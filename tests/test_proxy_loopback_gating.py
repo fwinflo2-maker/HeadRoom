@@ -112,7 +112,9 @@ def test_toin_pattern_detail_whitelists_learned_payload(monkeypatch: pytest.Monk
             }
 
     monkeypatch.setattr("headroom.proxy.server.get_toin", lambda: FakeTOIN())
-    response = _loopback_client().get("/v1/toin/pattern/unknown")
+    # Address the pattern by its tool-signature-hash prefix (the identifier the
+    # listing reports), not the "auth|model" prefix of the composite key.
+    response = _loopback_client().get("/v1/toin/pattern/abc")
 
     assert response.status_code == 200
     assert response.json() == {
@@ -123,6 +125,46 @@ def test_toin_pattern_detail_whitelists_learned_payload(monkeypatch: pytest.Monk
         "skip_recommended": False,
         "optimal_max_items": 20,
     }
+
+
+def test_toin_patterns_hash_is_signature_not_composite_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression for #2928: the listing must report the tool signature hash,
+    # not the first 12 chars of the "auth|model|hash" composite key. Two
+    # patterns that share auth mode and model family (both "unknown" here)
+    # otherwise collapse to the identical id "unknown|unkn", and the detail
+    # endpoint can no longer address either one.
+    class FakeTOIN:
+        def export_patterns(self):
+            def _pat(n: int) -> dict:
+                return {
+                    "sample_size": n,
+                    "total_compressions": n,
+                    "total_retrievals": 0,
+                    "confidence": 0.0,
+                    "skip_compression_recommended": False,
+                    "optimal_max_items": 20,
+                    "retrieval_rate": 0.0,
+                }
+
+            return {
+                "patterns": {
+                    "unknown|unknown|aaaaaaaaaaaa1111": _pat(10),
+                    "unknown|unknown|bbbbbbbbbbbb2222": _pat(5),
+                }
+            }
+
+    monkeypatch.setattr("headroom.proxy.server.get_toin", lambda: FakeTOIN())
+    client = _loopback_client()
+
+    listed = client.get("/v1/toin/patterns").json()
+    hashes = {entry["hash"] for entry in listed}
+    assert hashes == {"aaaaaaaaaaaa", "bbbbbbbbbbbb"}
+
+    # The reported hash addresses exactly its own pattern.
+    detail = client.get("/v1/toin/pattern/bbbbbbbbbbbb").json()
+    assert detail["compressions"] == 5
 
 
 # Mutating routes reachable from loopback. `require_loopback` cannot stop a

@@ -156,6 +156,18 @@ def _deserialize_pattern_key(serialized: str) -> PatternKey:
     return (DEFAULT_AUTH_MODE, DEFAULT_MODEL_FAMILY, serialized)
 
 
+def signature_hash_from_serialized_key(serialized: str) -> str:
+    """Return the tool-signature-hash component of a serialized pattern key.
+
+    Serialized keys are ``"auth|model|hash"`` (see `_serialize_pattern_key`);
+    the tool signature hash is the third field. Slicing the whole serialized
+    string instead — e.g. ``serialized[:12]`` — returns the auth mode and part
+    of the model family, which collapses to an identical value for every
+    pattern whenever those dimensions are unset (#2928).
+    """
+    return _deserialize_pattern_key(serialized)[2]
+
+
 def get_default_toin_storage_path() -> str:
     """Get the default TOIN storage path.
 

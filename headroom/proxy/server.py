@@ -181,7 +181,7 @@ from headroom.subscription.tracker import (
 )
 from headroom.telemetry import get_telemetry_collector
 from headroom.telemetry.beacon import is_telemetry_enabled
-from headroom.telemetry.toin import get_toin
+from headroom.telemetry.toin import get_toin, signature_hash_from_serialized_key
 from headroom.transforms import (
     CacheAligner,
     CodeAwareCompressor,
@@ -4932,7 +4932,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
             patterns_list.append(
                 {
-                    "hash": sig_hash[:12],
+                    "hash": signature_hash_from_serialized_key(sig_hash)[:12],
                     "compressions": total_compressions,
                     "retrievals": total_retrievals,
                     "retrieval_rate": f"{retrieval_rate:.1%}",
@@ -4968,9 +4968,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         exported = toin.export_patterns()
         patterns_data = exported.get("patterns", {})
 
-        # Search for pattern with matching hash prefix
+        # Search for pattern with matching hash prefix. Match against the tool
+        # signature hash (the identifier /v1/toin/patterns reports), not the
+        # whole "auth|model|hash" composite key — otherwise a prefix taken from
+        # the reported hash never matches the composite string (#2928).
         for sig_hash, pattern_dict in patterns_data.items():
-            if sig_hash.startswith(hash_prefix):
+            if signature_hash_from_serialized_key(sig_hash).startswith(hash_prefix):
                 # Keep this response aligned with /v1/toin/patterns while
                 # excluding query text, field semantics, and other internal
                 # learning state from the detail endpoint.

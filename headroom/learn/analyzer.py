@@ -56,7 +56,10 @@ _MAX_DIGEST_TOKENS = 80_000  # Budget for the digest (leave room for prompt + ou
 _CLI_BACKENDS: list[tuple[str, str, list[str]]] = [
     ("claude", "claude-cli", ["claude", "-p", "--output-format", "stream-json", "--verbose"]),
     ("gemini", "gemini-cli", ["gemini", "-p"]),
-    ("codex", "codex-cli", ["codex", "exec"]),
+    # ``--skip-git-repo-check`` so the analysis runs from any cwd. The prompt is
+    # delivered entirely on stdin and needs no repository context; current Codex
+    # CLIs otherwise refuse to run outside a trusted git repo (#3008).
+    ("codex", "codex-cli", ["codex", "exec", "--skip-git-repo-check"]),
 ]
 
 # Set of valid CLI model identifiers, derived from _CLI_BACKENDS.

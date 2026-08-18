@@ -865,7 +865,23 @@ class TestCallCliLlm:
         result = _call_cli_llm("test digest", "codex-cli")
         assert result == {"context_file_rules": [], "memory_file_rules": []}
         cmd = mock_run.call_args[0][0]
-        assert cmd == ["codex", "exec"]
+        # --skip-git-repo-check so the analysis runs from any cwd; the prompt is
+        # delivered on stdin and needs no repository context (#3008).
+        assert cmd == ["codex", "exec", "--skip-git-repo-check"]
+
+    @patch("headroom.learn.analyzer.subprocess.run")
+    def test_codex_cli_skips_git_repo_check(self, mock_run: MagicMock):
+        # Regression for #3008: current Codex CLIs refuse to run outside a
+        # trusted git repo without this flag, so `learn --agent codex` failed
+        # from any non-repo cwd. The prompt is on stdin; no repo context needed.
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='{"context_file_rules": [], "memory_file_rules": []}',
+            stderr="",
+        )
+        _call_cli_llm("test digest", "codex-cli")
+        cmd = mock_run.call_args[0][0]
+        assert "--skip-git-repo-check" in cmd
 
     @patch("headroom.learn.analyzer.subprocess.run")
     def test_gemini_cli_uses_p_flag(self, mock_run: MagicMock):

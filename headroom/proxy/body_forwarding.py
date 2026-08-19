@@ -81,14 +81,41 @@ def has_signed_thinking_blocks(body: dict[str, Any]) -> bool:
     return False
 
 
-def _original_body_has_signed_thinking_blocks(original_body_bytes: bytes | None) -> bool:
+#: Any body carrying a ``thinking`` or ``redacted_thinking`` block must contain
+#: this substring, because it appears in the block's own ``type`` value. Scanning
+#: for it is orders of magnitude cheaper than parsing, and request bodies here
+#: reach 9.3 MB in real agent traffic -- so this prescreen keeps the common case
+#: (no thinking anywhere, ~2 of every 3 requests) from paying a full JSON parse
+#: it cannot learn anything from. Conservative direction: a false positive costs
+#: one parse we would have done anyway, and a false negative is impossible.
+_THINKING_SUBSTRING = b"thinking"
+
+
+def _parse_original_body(original_body_bytes: bytes | None) -> dict[str, Any] | None:
+    """Parse the client's body once, or ``None`` when it cannot be used.
+
+    Every caller here needs the same parsed document, and a 9.3 MB body parsed
+    twice per decision (and twice again in the handler's earlier probe) is real
+    latency on a stage that already has a 30s timeout whose expiry quarantines
+    compression process-wide. Parse in one place and pass the result down.
+
+    ``None`` means "cannot prove anything from the original", which every caller
+    must treat as the conservative answer.
+    """
     if original_body_bytes is None:
-        return False
+        return None
+    if _THINKING_SUBSTRING not in original_body_bytes:
+        return None
     try:
         original = json.loads(original_body_bytes)
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError, MemoryError, RecursionError):
-        return False
-    return isinstance(original, dict) and has_signed_thinking_blocks(original)
+        return None
+    return original if isinstance(original, dict) else None
+
+
+def _original_body_has_signed_thinking_blocks(original_body_bytes: bytes | None) -> bool:
+    original = _parse_original_body(original_body_bytes)
+    return original is not None and has_signed_thinking_blocks(original)
 
 
 #: Allow canonical re-serialization on a thinking-bearing request when every
@@ -163,6 +190,7 @@ def thinking_block_fingerprint(body: Any) -> list[tuple[int, int, str]]:
 def thinking_blocks_survived_mutation(
     body: dict[str, Any],
     original_body_bytes: bytes | None,
+    original: dict[str, Any] | None = None,
 ) -> bool:
     """True when every thinking block is byte-equal to the one the client sent.
 
@@ -177,14 +205,13 @@ def thinking_blocks_survived_mutation(
 
     Conservative by construction: any parse failure, or any detectable
     difference at all, returns False and the caller keeps today's passthrough.
+
+    Pass ``original`` when the caller has already parsed the client body, so a
+    multi-megabyte document is not re-parsed once per predicate.
     """
-    if original_body_bytes is None:
-        return False
-    try:
-        original = json.loads(original_body_bytes)
-    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, MemoryError, RecursionError):
-        return False
-    if not isinstance(original, dict):
+    if original is None:
+        original = _parse_original_body(original_body_bytes)
+    if original is None:
         return False
     try:
         return thinking_block_fingerprint(body) == thinking_block_fingerprint(original)
@@ -236,9 +263,12 @@ def select_outbound_body(
     upstream instead of silently claiming the edit landed.
     """
     mode = forwarder_mode if forwarder_mode is not None else get_python_forwarder_mode()
+    # Parse the client body at most once for the whole decision (bodies here
+    # reach 9.3 MB in real traffic; this used to cost two full parses).
+    original_parsed = _parse_original_body(original_body_bytes)
     if original_body_bytes is not None and (
         has_signed_thinking_blocks(body)
-        or _original_body_has_signed_thinking_blocks(original_body_bytes)
+        or (original_parsed is not None and has_signed_thinking_blocks(original_parsed))
     ):
         # The lock is about the SEAL, not the box. When every thinking block is
         # provably identical to the one the client sent, no signature can have
@@ -248,7 +278,7 @@ def select_outbound_body(
         # request for the rest of the session -- on real Claude Code traffic that
         # discarded every computed compression on 34% of requests.
         if thinking_preserving_mutations_enabled() and thinking_blocks_survived_mutation(
-            body, original_body_bytes
+            body, original_body_bytes, original=original_parsed
         ):
             if mode == "legacy_json_kwarg":
                 content = json.dumps(body, separators=(", ", ": "), ensure_ascii=True).encode(
@@ -325,13 +355,14 @@ def outbound_body_is_client_bytes(
     """
     if original_body_bytes is None:
         return False
+    original_parsed = _parse_original_body(original_body_bytes)
     if not (
         has_signed_thinking_blocks(body)
-        or _original_body_has_signed_thinking_blocks(original_body_bytes)
+        or (original_parsed is not None and has_signed_thinking_blocks(original_parsed))
     ):
         return False
     if thinking_preserving_mutations_enabled() and thinking_blocks_survived_mutation(
-        body, original_body_bytes
+        body, original_body_bytes, original=original_parsed
     ):
         return False
     return True

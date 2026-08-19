@@ -56,8 +56,30 @@ def get_python_forwarder_mode() -> PythonForwarderMode:
 
 
 def serialize_body_canonical(body: dict[str, Any]) -> bytes:
-    """Re-serialize a request body deterministically with cache-stable formatting."""
-    return json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    """Re-serialize a request body deterministically with cache-stable formatting.
+
+    ``ensure_ascii=False`` keeps the bytes compact and cache-stable, but it also
+    means a lone surrogate anywhere in the body raises here. That is reachable
+    input, not a hypothetical: ``"\\ud800"`` is valid JSON, ``json.loads``
+    accepts it happily, and a tool result carrying truncated UTF-16 or sliced
+    binary produces one. Both forwarders resolve outbound bytes *outside* their
+    connection-retry loop, so the exception escapes as a 500 with no retry.
+
+    #3124 made that newly load-bearing: mutated thinking-bearing bodies used to
+    return the client's bytes verbatim and never reached this function at all,
+    so the largest, most tool-result-heavy population in Claude Code traffic now
+    depends on it not raising.
+
+    The escaped form is the right degradation -- it encodes the identical parsed
+    values, so upstream reconstructs exactly the same request, and every mutation
+    still reaches the wire (important: the caller's ``stream`` flip rides on
+    these bytes). Only the byte-level encoding differs, costing one cache miss on
+    a request that would otherwise have failed outright.
+    """
+    try:
+        return json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        return json.dumps(body, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
 
 
 def has_signed_thinking_blocks(body: dict[str, Any]) -> bool:

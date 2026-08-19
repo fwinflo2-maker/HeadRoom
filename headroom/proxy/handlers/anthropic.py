@@ -3559,7 +3559,23 @@ class AnthropicHandlerMixin:
                 # edits that will not be sent (#2990). This covers PERF, /stats,
                 # durable savings, response headers, pipeline events, and the
                 # prefix tracker rather than fixing only one reporting surface.
-                if outbound_locked_to_client_bytes and body_mutation_tracker.mutated:
+                #
+                # RECOMPUTE rather than reusing the probe from before the CCR
+                # branch. That probe answers "will my stream flip survive?" and
+                # has to be asked early; this asks "what are we actually about to
+                # bill for?" and must be asked last. The two diverge now that the
+                # predicate tests thinking-block CONTENT and not merely presence:
+                # `enforce_cache_control_ttl_order` immediately above rewrites
+                # `body["messages"]`, so a marker moved onto or off a message
+                # holding a thinking block changes the answer after the early
+                # probe was taken. Evaluating the same predicate on the same
+                # final `body` that `select_outbound_body` will see is what keeps
+                # the accounting and the wire in agreement.
+                final_locked_to_client_bytes = outbound_body_is_client_bytes(
+                    body=body,
+                    original_body_bytes=original_body_bytes,
+                )
+                if final_locked_to_client_bytes and body_mutation_tracker.mutated:
                     discarded_reasons = body_mutation_tracker.reasons
                     try:
                         wire_body = json.loads(original_body_bytes or b"")

@@ -1857,7 +1857,11 @@ class ContentRouter(Transform):
         ).strip().lower() in ("1", "true", "yes", "on")
         self._text_crusher: Any = None
         # Cross-turn dedup: config field OR env HEADROOM_DEDUPE (robust to how the
-        # config was built). Effective only in lossless mode (guarded in apply()).
+        # config was built). Runs in BOTH modes — the call site in ``apply()`` has
+        # no lossless guard, and ``_cross_turn_dedup_messages`` documents working
+        # against lossless folds and CCR-recoverable forms alike. (This comment
+        # previously claimed "lossless mode only", which reads as "inert in your
+        # config" to anyone auditing why dedup never fired.)
         self._cross_turn_dedup_enabled: bool = (
             self.config.enable_cross_turn_dedup
             or os.environ.get("HEADROOM_DEDUPE", "").strip().lower() in ("1", "true", "yes", "on")

@@ -91,6 +91,109 @@ def _original_body_has_signed_thinking_blocks(original_body_bytes: bytes | None)
     return isinstance(original, dict) and has_signed_thinking_blocks(original)
 
 
+#: Allow canonical re-serialization on a thinking-bearing request when every
+#: thinking block is provably unchanged. **Default ON**; set this to ``0`` (or
+#: ``false``/``no``/``off``) to restore the previous blanket lock.
+#:
+#: Risk note, recorded deliberately. The lock this relaxes was added by #2254
+#: after real upstream 400s ("`thinking` blocks ... cannot be modified"). That
+#: report attributed the failure to a plain canonical re-encode, which cannot
+#: alter parsed values and therefore cannot by itself invalidate a signature --
+#: and the report's own log shows a transform (`tool_search_deferral`) firing on
+#: the failing turn. So the stated cause does not hold up, but the failure was
+#: real and its true trigger was never isolated. This relaxation is narrower
+#: than what broke: it forwards edits ONLY when every thinking block is
+#: byte-identical to the client's, which is exactly the property #2254's blanket
+#: rule was a crude proxy for.
+#:
+#: It is on by default at the maintainer's direction, to recover the savings the
+#: lock was discarding. If Anthropic starts rejecting thinking-bearing turns,
+#: set the env var to ``0`` -- that is a single-variable, no-deploy rollback to
+#: the previous behaviour, and the 400s stop immediately.
+THINKING_PRESERVING_MUTATIONS_ENV = "HEADROOM_THINKING_PRESERVING_MUTATIONS"
+
+
+def thinking_preserving_mutations_enabled() -> bool:
+    """Whether to forward edits that provably left every thinking block intact.
+
+    Defaults to enabled. Only an explicit falsey value restores the blanket lock,
+    so an unset or unparseable variable keeps the documented default rather than
+    silently reverting behaviour.
+    """
+    raw = os.environ.get(THINKING_PRESERVING_MUTATIONS_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def thinking_block_fingerprint(body: Any) -> list[tuple[int, int, str]]:
+    """Positional, order-sensitive fingerprint of every thinking block.
+
+    Each entry is ``(message_index, block_index, canonical_json_of_block)``, so
+    the comparison catches a block whose text or ``signature`` changed, one that
+    was added, removed, reordered, or moved between messages. Keys are sorted so
+    a dict rebuilt in a different order is not mistaken for an edit -- the wire
+    contract is over parsed values, not key order.
+    """
+    out: list[tuple[int, int, str]] = []
+    messages = body.get("messages") if isinstance(body, dict) else None
+    if not isinstance(messages, list):
+        return out
+    for message_index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block_index, block in enumerate(content):
+            if isinstance(block, dict) and block.get("type") in {
+                "thinking",
+                "redacted_thinking",
+            }:
+                out.append(
+                    (
+                        message_index,
+                        block_index,
+                        json.dumps(block, sort_keys=True, ensure_ascii=False),
+                    )
+                )
+    return out
+
+
+def thinking_blocks_survived_mutation(
+    body: dict[str, Any],
+    original_body_bytes: bytes | None,
+) -> bool:
+    """True when every thinking block is byte-equal to the one the client sent.
+
+    This is the whole point of the relaxation. Anthropic signs the thinking
+    block, not the request: the signature covers that block's own content, so
+    edits to a ``tool_result`` twenty turns back, or to the top-level ``tools``
+    and ``system`` fields (which are not even inside ``messages`` and therefore
+    cannot be covered by any per-block signature), leave every seal intact.
+    Treating the presence of a sealed block as a reason to freeze the entire
+    body is a category error -- it protects bytes the signature says nothing
+    about, and on Claude Code traffic that is nearly the whole request.
+
+    Conservative by construction: any parse failure, or any detectable
+    difference at all, returns False and the caller keeps today's passthrough.
+    """
+    if original_body_bytes is None:
+        return False
+    try:
+        original = json.loads(original_body_bytes)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, MemoryError, RecursionError):
+        return False
+    if not isinstance(original, dict):
+        return False
+    try:
+        return thinking_block_fingerprint(body) == thinking_block_fingerprint(original)
+    except (TypeError, ValueError, RecursionError):
+        # An unserializable block (or pathological nesting) means we cannot prove
+        # the blocks are untouched, so we must not claim they are.
+        return False
+
+
 class BodyMutationTracker:
     """Records whether a request body was mutated and why."""
 
@@ -137,6 +240,24 @@ def select_outbound_body(
         has_signed_thinking_blocks(body)
         or _original_body_has_signed_thinking_blocks(original_body_bytes)
     ):
+        # The lock is about the SEAL, not the box. When every thinking block is
+        # provably identical to the one the client sent, no signature can have
+        # been invalidated, so the remaining edits (compressed tool_result text,
+        # compacted tool schemas, tool-search deferral) are safe to forward.
+        # Without this, one thinking block anywhere in history froze the entire
+        # request for the rest of the session -- on real Claude Code traffic that
+        # discarded every computed compression on 34% of requests.
+        if thinking_preserving_mutations_enabled() and thinking_blocks_survived_mutation(
+            body, original_body_bytes
+        ):
+            if mode == "legacy_json_kwarg":
+                content = json.dumps(body, separators=(", ", ": "), ensure_ascii=True).encode(
+                    "utf-8"
+                )
+                return OutboundBody(content=content, source="legacy")
+            if body_mutated:
+                return OutboundBody(content=serialize_body_canonical(body), source="canonical")
+            return OutboundBody(content=original_body_bytes, source="passthrough")
         return OutboundBody(
             content=original_body_bytes,
             source="passthrough",
@@ -190,10 +311,27 @@ def outbound_body_is_client_bytes(
     send the client's bytes verbatim. Asking before acting is cheaper than
     discovering it from a reply in the wrong wire format.
 
-    Mirrors the first branch of :func:`select_outbound_body`; the forwarder mode
-    is deliberately not consulted because that branch overrides it too.
+    Mirrors the first branch of :func:`select_outbound_body`, INCLUDING the
+    thinking-preserving relaxation. These two must agree exactly: the caller
+    flips ``stream`` to False to buy a buffered reply, and that flip only lands
+    if the mutated body actually reaches the wire. If this said "locked" while
+    ``select_outbound_body`` shipped canonical bytes, we would ask upstream for a
+    stream and then parse the reply as buffered JSON -- the 200-with-empty-body
+    failure from #2952, in reverse.
+
+    The forwarder mode is deliberately not consulted: the lock branch overrides
+    it, and the relaxation only ever returns bytes derived from ``body``, so
+    either way the caller's edits are on the wire.
     """
-    return original_body_bytes is not None and (
+    if original_body_bytes is None:
+        return False
+    if not (
         has_signed_thinking_blocks(body)
         or _original_body_has_signed_thinking_blocks(original_body_bytes)
-    )
+    ):
+        return False
+    if thinking_preserving_mutations_enabled() and thinking_blocks_survived_mutation(
+        body, original_body_bytes
+    ):
+        return False
+    return True

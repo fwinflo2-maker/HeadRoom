@@ -277,8 +277,11 @@ class TestCogneeProjectScoping:
 
         assert backend is handler._backend
         assert scope is not None
-        assert scope.project_key == "projA"
-        assert effective_user_id == "alice::projA"
+        # Current project scoping appends a collision-resistant digest to the
+        # human-readable project ID; Cognee must consume that canonical key
+        # instead of rebuilding the older unhashed form.
+        assert scope.project_key.startswith("projA-")
+        assert effective_user_id == f"alice::{scope.project_key}"
 
     async def test_unresolved_project_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """No project signal in PROJECT mode -> sentinel scope, bare user id.

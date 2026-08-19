@@ -321,6 +321,42 @@ class TestEstimateFromHoldout:
             ledger.record("treatment", "opus|a|s|tools", 900)
         assert ledger.best_estimate().kind == "estimated"
 
+    def test_a_thin_control_arm_does_not_take_over(self):
+        """The -1439.9% case: a few scattered control samples decide nothing."""
+        ledger = SavingsLedger()
+        for i in range(200):
+            ledger.baseline.observe("opus|a|s|tools", 1000 + i)
+            ledger.record("treatment", "opus|a|s|tools", 800 + i)
+        # Three control samples, spread wide enough to be worthless.
+        for value in (200, 1000, 5000):
+            ledger.record("control", "opus|a|s|tools", value)
+
+        measured = ledger.estimate_from_holdout()
+        assert measured is not None, "the arm exists"
+        assert (measured.ci_high_pct - measured.ci_low_pct) / 2 > 100, "and is meaningless"
+        assert ledger.best_estimate().kind == "estimated"
+
+    def test_a_holdout_covering_a_corner_of_traffic_does_not_take_over(self):
+        ledger = SavingsLedger()
+        # One stratum measured cleanly, but it is a twentieth of the traffic.
+        for _ in range(10):
+            ledger.baseline.observe("opus|a|s|tools", 1000)
+            ledger.record("control", "opus|a|s|tools", 1000)
+            ledger.record("treatment", "opus|a|s|tools", 900)
+        for _ in range(200):
+            ledger.baseline.observe("opus|b|xl|tools", 4000)
+            ledger.record("treatment", "opus|b|xl|tools", 3000)
+        assert ledger.best_estimate().kind == "estimated"
+
+    def test_measured_wins_without_a_baseline_to_fall_back_on(self):
+        """A holdout-only deployment (no ``learn --verbosity`` run) still reports."""
+        ledger = SavingsLedger()
+        for _ in range(50):
+            ledger.record("control", "opus|a|s|tools", 1000)
+            ledger.record("treatment", "opus|a|s|tools", 800)
+        assert ledger.estimate_from_baseline().n_requests == 0
+        assert ledger.best_estimate().kind == "measured"
+
 
 # ---------------------------------------------------------------------------
 # persistence

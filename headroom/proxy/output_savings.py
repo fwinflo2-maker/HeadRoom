@@ -198,6 +198,32 @@ class SavingsEstimate:
         return asdict(self)
 
 
+# A measured (A/B holdout) estimate replaces the synthetic-control one only
+# once strata with data in both arms account for this share of the requests the
+# baseline can also score. Below it the holdout describes a corner of the
+# traffic, not the traffic.
+MEASURED_MIN_COVERAGE = 0.5
+
+# ...and only once its 95% band is at least this tight, in percentage points of
+# reduction. A wide band is the signature of a control arm too thin to divide
+# by: three stale control samples once produced 20% +/- 277pp.
+MEASURED_MAX_CI_HALF_WIDTH_PCT = 10.0
+
+
+def _measured_supersedes(measured: SavingsEstimate, estimated: SavingsEstimate) -> bool:
+    """Whether the A/B measurement has outgrown the synthetic-control estimate."""
+    if measured.n_requests == 0:
+        return False
+    half_width = (measured.ci_high_pct - measured.ci_low_pct) / 2.0
+    if half_width > MEASURED_MAX_CI_HALF_WIDTH_PCT:
+        return False
+    if estimated.n_requests == 0:
+        # No baseline to fall back on: a well-bounded measurement is all there
+        # is, and it is still better than reporting nothing.
+        return True
+    return measured.n_requests >= MEASURED_MIN_COVERAGE * estimated.n_requests
+
+
 @dataclass
 class SavingsLedger:
     """Accumulates shaped (treatment) and unshaped (control) observations and
@@ -303,9 +329,27 @@ class SavingsLedger:
         )
 
     def best_estimate(self) -> SavingsEstimate:
-        """Prefer the measured A/B number; fall back to the baseline estimate."""
+        """Prefer the measured A/B number, but only once it is worth believing.
+
+        A holdout arm starts empty and fills slowly -- at a 1-3% holdout, over
+        weeks. Preferring it the moment a single stratum has one sample in both
+        arms means the headline number is decided by a handful of requests: a
+        three-sample control arm reported a -1439.9% reduction, which a UI then
+        has to either render or suppress. Neither is the estimator's job to
+        force.
+
+        So the measured number displaces the synthetic control only when it
+        actually measures the traffic: it must cover a real share of the
+        requests the baseline can also speak to, and carry a band tight enough
+        to mean something. Until then the synthetic control stands -- it is an
+        estimate, and honestly labelled as one, which beats a measurement of
+        three requests.
+        """
+        estimated = self.estimate_from_baseline()
         measured = self.estimate_from_holdout()
-        return measured if measured is not None else self.estimate_from_baseline()
+        if measured is not None and _measured_supersedes(measured, estimated):
+            return measured
+        return estimated
 
     # ---- persistence -----------------------------------------------------
 

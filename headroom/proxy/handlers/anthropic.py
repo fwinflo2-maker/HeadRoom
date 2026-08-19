@@ -51,6 +51,10 @@ from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
 from headroom.proxy.model_router import estimate_input_tokens
+from headroom.proxy.nonstream_sse_policy import (
+    json_reply_headers,
+    should_recover_sse_reply,
+)
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
@@ -383,6 +387,37 @@ class AnthropicHandlerMixin:
         except Exception:  # pragma: no cover - defensive
             logger.debug("CCR: marker probe failed; keeping the buffered path", exc_info=True)
             return True
+
+    def _recover_sse_reply(
+        self, response: httpx.Response, request_id: str
+    ) -> dict[str, Any] | None:
+        """Rebuild a Messages JSON object from an SSE body sent to a JSON caller.
+
+        Reuses ``StreamingMixin._parse_sse_to_response`` — the reconstruction
+        the streaming path already runs for usage accounting — so no new
+        parsing surface is introduced. Returns ``None`` when the frames do not
+        yield a usable message, which the caller must treat as a refusal
+        rather than a reason to pass the SSE body through.
+
+        HeadroomProxy inherits StreamingMixin, but this handler is also tested
+        and embedded without it, so the helper is resolved defensively.
+        """
+        parse_sse = getattr(self, "_parse_sse_to_response", None)
+        if parse_sse is None:  # pragma: no cover - defensive
+            logger.debug(f"[{request_id}] SSE recovery: StreamingMixin unavailable")
+            return None
+        try:
+            recovered = parse_sse(response.text, "anthropic")
+        except Exception:  # pragma: no cover - defensive
+            logger.debug(f"[{request_id}] SSE recovery: parse raised", exc_info=True)
+            return None
+        # ``_parse_sse_to_response`` always returns a skeleton dict, so a
+        # truthy result proves nothing. ``id`` is only ever set from
+        # ``message_start``, which makes it the cheapest evidence that real
+        # frames were seen rather than a truncated or empty body.
+        if not recovered or not recovered.get("id"):
+            return None
+        return recovered
 
     @staticmethod
     def _extract_anthropic_cache_ttl_metrics(usage: dict[str, Any] | None) -> tuple[int, int]:
@@ -3877,6 +3912,57 @@ class AnthropicHandlerMixin:
                                     f"[{request_id}] CCR: buffered stream:false request got a "
                                     f"non-JSON {response.status_code} reply "
                                     f"(content-type={response.headers.get('content-type')!r}): {e}"
+                                )
+                            elif should_recover_sse_reply(
+                                client_requested_stream=stream,
+                                status_code=response.status_code,
+                                content_type=response.headers.get("content-type"),
+                            ):
+                                # Same wire-format mismatch as the buffered-stream
+                                # case above; only the direction differs. This
+                                # caller never asked for SSE, and the headers
+                                # further down are copied from upstream verbatim —
+                                # so passing this through hands it a 200 in a
+                                # format it cannot parse, and the turn is lost even
+                                # though the reply arrived complete. Rebuild the
+                                # message in place so CCR, turn hooks, the security
+                                # scan and usage accounting all see a normal reply.
+                                recovered = self._recover_sse_reply(response, request_id)
+                                if recovered is None:
+                                    logger.error(
+                                        f"[{request_id}] Upstream answered a non-streaming "
+                                        f"{response.status_code} request with an unrecoverable "
+                                        f"event stream "
+                                        f"(content-type={response.headers.get('content-type')!r}, "
+                                        f"body_bytes={len(response.content)}): {e}"
+                                    )
+                                    return Response(
+                                        content=json.dumps(
+                                            {
+                                                "type": "error",
+                                                "error": {
+                                                    "type": "upstream_protocol_error",
+                                                    "message": (
+                                                        "Upstream answered a non-streaming "
+                                                        "request with an event stream that "
+                                                        "could not be recovered."
+                                                    ),
+                                                },
+                                            }
+                                        ).encode(),
+                                        status_code=502,
+                                        media_type="application/json",
+                                    )
+                                logger.warning(
+                                    f"[{request_id}] Upstream answered a non-streaming request "
+                                    f"with an event stream; recovered the message from "
+                                    f"{len(response.content)} SSE bytes"
+                                )
+                                resp_json = recovered
+                                response = httpx.Response(
+                                    status_code=200,
+                                    content=json.dumps(recovered).encode(),
+                                    headers=json_reply_headers(dict(response.headers)),
                                 )
                             else:
                                 logger.debug(

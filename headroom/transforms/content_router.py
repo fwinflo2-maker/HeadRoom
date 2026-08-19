@@ -5552,7 +5552,16 @@ class ContentRouter(Transform):
         if route_counts["user_msg"]:
             parts.append(f"{route_counts['user_msg']} skipped (user)")
         if route_counts["small"]:
-            parts.append(f"{route_counts['small']} skipped (<50 words)")
+            # Report the thresholds actually in force, not a literal. This line
+            # used to read "skipped (<50 words)" unconditionally: wrong number
+            # (the message gate is `min_tokens`, which profiles set anywhere from
+            # 10 to 250), wrong unit (tokens and characters, never words), and it
+            # merged two different gates under one label. Operators read it as
+            # evidence of a mis-set threshold and tuned the wrong knob.
+            parts.append(
+                f"{route_counts['small']} skipped "
+                f"(<{min_tokens} tok msg / <{min_chars_for_block_compression} chars block)"
+            )
         if route_counts["recent_code"]:
             parts.append(f"{route_counts['recent_code']} protected (recent code)")
         if route_counts["analysis_ctx"]:

@@ -157,6 +157,12 @@ class PerfRecord:
     tokens_before: int = 0
     tokens_after: int = 0
     tokens_saved: int = 0
+    # Tokens the forwarded request GREW by (PERF ``tok_inflated``). Both
+    # endpoints are clamped — ``tok_saved`` at zero and ``tok_inflated`` at zero
+    # — so a turn that left the proxy bigger reports ``tok_saved=0`` and hides
+    # its growth in a field nothing downstream read. Carrying it here is what
+    # lets the report state net alongside gross instead of implying they agree.
+    tokens_inflated: int = 0
     tool_saved: int = 0
     cache_read: int = 0
     cache_write: int = 0
@@ -397,6 +403,7 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                                 tokens_before=int(kv.get("tok_before", 0)),
                                 tokens_after=int(kv.get("tok_after", 0)),
                                 tokens_saved=int(kv.get("tok_saved", 0)),
+                                tokens_inflated=int(kv.get("tok_inflated", 0)),
                                 tool_saved=int(kv.get("tool_saved", 0)),
                                 savings_breakdown=_decode_perf_savings(kv.get("savings", "none")),
                                 cache_read=int(kv.get("cache_read", 0)),
@@ -546,6 +553,19 @@ def format_report(report: PerfReport) -> str:
         # include tool bytes), so it used to render as a rival "Tool saved" line — which
         # read as a side metric and hid the win on tool-heavy turns where tok_saved=0.
         lines.append(f"Tokens saved: {total_headline_saved:,} ({headline_pct:.1f}% reduction)")
+        # Gross vs net. ``tok_saved`` is clamped at zero per request, so turns
+        # where Headroom made the body BIGGER (CCR proactive expansion, memory
+        # injection) contribute nothing negative to the headline — their growth
+        # lands in ``tok_inflated`` instead, which nothing here used to read.
+        # Printing "321,239,562 -> 313,274,727" directly above "8,455,763 saved"
+        # implies the two reconcile; they differ by exactly the inflation. Show
+        # it whenever it is non-zero so the arithmetic closes on the page.
+        total_inflated = sum(r.tokens_inflated for r in records)
+        if total_inflated > 0:
+            lines.append(
+                f"  · inflated      {total_inflated:,} "
+                f"(net message reduction {total_before - total_after:,})"
+            )
         if total_tool_saved > 0:
             lines.append(f"  · messages       {max(0, total_saved):,}")
             lines.append(f"  · tool schemas   {total_tool_saved:,}")
@@ -698,6 +718,31 @@ def format_report(report: PerfReport) -> str:
             lines.append(
                 f"  {name}: {avg_pct:.1f}% avg reduction, {len(recs)} uses, {total_s:,} saved"
             )
+        # This table is built ONLY from "Transform NAME: B -> A tokens (saved N)"
+        # lines, which just one engine emits (transforms/pipeline.py). The
+        # OpenAI-Responses engine (transforms/compression_units.py +
+        # compression_batches.py) applies the same strategies and contains no
+        # logging calls at all, so none of its work appears above. On real
+        # traffic that hid ~7M of ~8.5M message-token savings — the table read
+        # "content_router: 189,783 saved" against a PERF total 44x larger, which
+        # invites exactly the wrong conclusion about which compressors work.
+        #
+        # State the divergence, NOT a coverage ratio. The two totals are
+        # different populations and neither strictly contains the other: the
+        # Transform lines carry no request_id, fire once per pipeline STAGE (so
+        # several can describe one request), and are emitted before the forwarder
+        # decides anything — a mutation later discarded by the signed-thinking
+        # byte-lock still logs its "saved" here while the request's PERF line
+        # correctly reports 0. So "table covers X of Y" would be a false subset
+        # claim in both directions; report the two sums and let the reader judge.
+        table_total = sum(r.tokens_saved for r in report.transform_records)
+        perf_total = sum(r.tokens_saved for r in report.perf_records)
+        if table_total != perf_total:
+            lines.append(
+                f"  ! stage-level total {table_total:,} != PERF message total {perf_total:,} "
+                "— this table sees only engines that emit a Transform line, counts "
+                "per stage, and does not check whether the mutation shipped"
+            )
         lines.append("")
 
     # Router routing breakdown
@@ -717,10 +762,23 @@ def format_report(report: PerfReport) -> str:
                 f"  Excluded:    {total_excluded} ({total_excluded / total_all * 100:.0f}%) — Read/Glob outputs"
             )
             lines.append(
-                f"  Skipped:     {total_skipped} ({total_skipped / total_all * 100:.0f}%) — <50 words"
+                f"  Skipped:     {total_skipped} ({total_skipped / total_all * 100:.0f}%) — below size floor"
             )
             lines.append(
                 f"  Unchanged:   {total_unchanged} ({total_unchanged / total_all * 100:.0f}%) — ratio too high"
+            )
+            # These four buckets are NOT the router's full outcome space — the
+            # `[router] route_counts=` line carries 17 keys, and the ones omitted
+            # here (cache_hit, system_msg, error_protected, already_compressed,
+            # …) are individually larger than "Excluded". Percentages taken over
+            # this subset therefore overstate every share: on real traffic the
+            # "skipped" bucket read 77% here against 49.5% of actual terminal
+            # fates, which reads as a mis-set threshold rather than a narrow
+            # denominator. Say what the denominator is instead of implying it is
+            # everything.
+            lines.append(
+                f"  (shares are of these 4 buckets only, n={total_all}; "
+                "see `[router] route_counts=` for the full outcome space)"
             )
         if total_excluded > total_compressed * 3:
             lines.append("  ! Excluded tools dominate — consider compressing stale Read outputs")
@@ -803,6 +861,7 @@ PERF_RECORD_FIELDS = [
     # Appended last so every existing CSV column keeps its position; a reader
     # that indexes by name is unaffected either way.
     "from_response_cache",
+    "tokens_inflated",
 ]
 
 

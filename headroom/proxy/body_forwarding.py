@@ -81,13 +81,26 @@ def has_signed_thinking_blocks(body: dict[str, Any]) -> bool:
     return False
 
 
-#: Any body carrying a ``thinking`` or ``redacted_thinking`` block must contain
-#: this substring, because it appears in the block's own ``type`` value. Scanning
-#: for it is orders of magnitude cheaper than parsing, and request bodies here
-#: reach 9.3 MB in real agent traffic -- so this prescreen keeps the common case
-#: (no thinking anywhere, ~2 of every 3 requests) from paying a full JSON parse
-#: it cannot learn anything from. Conservative direction: a false positive costs
-#: one parse we would have done anyway, and a false negative is impossible.
+#: A body carrying a ``thinking`` or ``redacted_thinking`` block contains this
+#: substring, because it appears in the block's own ``type`` value. Scanning for
+#: it is orders of magnitude cheaper than parsing, and request bodies here reach
+#: 9.3 MB in real agent traffic -- so this prescreen keeps the common case (no
+#: thinking anywhere, ~2 of every 3 requests) from paying a full JSON parse it
+#: cannot learn anything from.
+#:
+#: A false positive costs one parse we would have done anyway. A false negative
+#: is not strictly impossible -- a ``type`` value whose ASCII letters are written
+#: as JSON unicode escapes still parses to ``thinking`` while containing no
+#: literal match, and that is legal JSON no standard encoder emits
+#: (``json.dumps`` does not escape ASCII even under
+#: ``ensure_ascii=True``, and neither does any client we forward for) -- and its
+#: consequences are asymmetric in our favour: when the mutated body still holds
+#: the block, ``has_signed_thinking_blocks(body)`` sees it on the parsed dict and
+#: we lock anyway. The single reachable gap needs an escaped ``type`` in the
+#: original AND a transform that removed the block from the body, which is the
+#: rare #3015 shape crossed with an encoder nobody uses. Documented rather than
+#: defended, because closing it means re-parsing every large body to catch a case
+#: no observed client can produce.
 _THINKING_SUBSTRING = b"thinking"
 
 

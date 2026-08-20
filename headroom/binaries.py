@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -36,6 +37,8 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from headroom._subprocess import run
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +114,7 @@ def _is_musl() -> bool:
     which is present on Alpine even when `ldd` is absent.
     """
     try:
-        out = subprocess.run(
+        out = run(
             ["ldd", "--version"],
             capture_output=True,
             text=True,
@@ -141,6 +144,24 @@ def detect_platform() -> PlatformKey:
 
 
 # ---------- Cache dir ----------------------------------------------------- #
+
+
+def _is_writable_dir(path: Path) -> bool:
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        return False
+    return path.is_dir() and bool(mode & 0o222)
+
+
+def _has_writable_existing_parent(path: Path) -> bool:
+    current = path
+    while not current.exists():
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+    return _is_writable_dir(current)
 
 
 def cache_dir() -> Path:
@@ -218,15 +239,31 @@ def _mirror_url(url: str) -> str:
 def _download(url: str, dest: Path, *, progress: bool = True) -> None:
     if os.environ.get("HEADROOM_BINARIES_OFFLINE"):
         raise OfflineError(f"offline mode (HEADROOM_BINARIES_OFFLINE=1) but fetch required: {url}")
+    if not _has_writable_existing_parent(dest.parent):
+        raise OSError(f"binary cache directory parent is not writable: {dest.parent}")
     dest.parent.mkdir(parents=True, exist_ok=True)
+    if not _is_writable_dir(dest.parent):
+        raise OSError(f"binary cache directory is not writable: {dest.parent}")
     final_url = _mirror_url(url)
     req = urllib.request.Request(final_url, headers={"User-Agent": "headroom-binaries/1"})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310 (https)
-            total = int(resp.headers.get("Content-Length") or 0)
-            _stream_to(resp, dest, total, label=dest.name, show_progress=progress)
-    except urllib.error.URLError as e:
-        raise BinaryFetchError(f"failed to download {final_url}: {e}") from e
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310 (https)
+                total = int(resp.headers.get("Content-Length") or 0)
+                _stream_to(resp, dest, total, label=dest.name, show_progress=progress)
+            return
+        except urllib.error.URLError as e:
+            dest.unlink(missing_ok=True)
+            if attempt == attempts:
+                raise BinaryFetchError(
+                    f"failed to download {final_url} after {attempts} attempts: {e}"
+                ) from e
+            # GitHub release assets occasionally return a transient 5xx or
+            # reset while redirecting to the object store. A short bounded
+            # retry keeps proxy startup reliable without hiding persistent
+            # credential, mirror, or connectivity failures.
+            time.sleep(0.25 * attempt)
 
 
 def _stream_to(src: Any, dest: Path, total: int, *, label: str, show_progress: bool) -> None:
@@ -287,7 +324,11 @@ def _verify_sha256(path: Path, expected: str | None) -> None:
 
 def _extract(archive: Path, member: str, dest: Path) -> None:
     """Extract `member` from archive into `dest` (single-file binary)."""
+    if not _has_writable_existing_parent(dest.parent):
+        raise OSError(f"binary cache directory parent is not writable: {dest.parent}")
     dest.parent.mkdir(parents=True, exist_ok=True)
+    if not _is_writable_dir(dest.parent):
+        raise OSError(f"binary cache directory is not writable: {dest.parent}")
     name = archive.name.lower()
     try:
         if name.endswith(".tar.gz") or name.endswith(".tgz"):
@@ -452,6 +493,8 @@ def resolve(tool: str) -> Path:
 
 
 def ensure_tools(quiet: bool = False) -> dict[str, Path | None]:
+    if not _has_writable_existing_parent(cache_dir()):
+        return {name: which(name) for name in _registry().get("tools", {})}
     """Install every tool in the registry if missing. Safe to call repeatedly.
 
     Called at proxy startup and on first `headroom` CLI invocation so that no

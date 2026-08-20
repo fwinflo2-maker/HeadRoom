@@ -83,11 +83,11 @@ class TestIdempotency:
         writer = ClaudeCodeWriter()
         # First write
         writer.write(recs, proj, dry_run=False)
-        first_content = (tmp_path / "CLAUDE.md").read_text()
+        first_content = (tmp_path / "CLAUDE.local.md").read_text()
 
         # Second write (same recs)
         writer.write(recs, proj, dry_run=False)
-        second_content = (tmp_path / "CLAUDE.md").read_text()
+        second_content = (tmp_path / "CLAUDE.local.md").read_text()
 
         # Content should be identical (replaced, not appended)
         assert first_content == second_content
@@ -113,6 +113,20 @@ class TestFalsePositiveFiltering:
             "FileNotFoundError: [Errno 2] No such file or directory: '/bad/path'"
         )
         assert is_error_content("bash: unknown_cmd: command not found")
+
+    def test_exit_code_zero_is_not_an_error(self):
+        """Agent harnesses append 'exit code 0' to every successful command;
+        that must not be classified as an error."""
+        from headroom.learn.scanner import is_error_content
+
+        assert not is_error_content("Ran the tests.\nProcess finished with exit code 0")
+
+    def test_nonzero_exit_code_is_an_error(self):
+        """A nonzero exit code (any casing / with a colon) is still an error."""
+        from headroom.learn.scanner import is_error_content
+
+        assert is_error_content("build failed\ncommand exited with exit code 1")
+        assert is_error_content("npm run build\nExit code: 127")
 
 
 # =============================================================================
@@ -216,7 +230,7 @@ class TestClaudeCodeIntegration:
 
             assert write_result.dry_run is True
             for fp in write_result.files_written:
-                assert "CLAUDE.md" in fp.name or "MEMORY.md" in fp.name
+                assert "CLAUDE" in fp.name or "MEMORY" in fp.name
 
 
 class TestDecodeProjectPath:

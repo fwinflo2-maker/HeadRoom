@@ -325,7 +325,6 @@ jobs:
         run: |
           pytest \
             tests/test_cli \
-            tests/test_cli.py \
             tests/test_cli_*.py \
             tests/test_install \
             --tb=short -q

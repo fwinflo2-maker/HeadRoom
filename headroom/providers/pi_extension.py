@@ -85,7 +85,8 @@ def _extension_config_lock(path: Path) -> Iterator[None]:
         else:
             import fcntl
 
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            fcntl_any = cast(Any, fcntl)
+            fcntl_any.flock(lock_file.fileno(), fcntl_any.LOCK_EX)
         try:
             yield
         finally:
@@ -98,7 +99,8 @@ def _extension_config_lock(path: Path) -> Iterator[None]:
             else:
                 import fcntl
 
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                fcntl_any = cast(Any, fcntl)
+                fcntl_any.flock(lock_file.fileno(), fcntl_any.LOCK_UN)
 
 
 def _capture_candidate(path: Path) -> _ConfigCandidate | None:

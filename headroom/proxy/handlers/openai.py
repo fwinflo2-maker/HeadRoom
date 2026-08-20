@@ -30,8 +30,10 @@ from headroom.proxy.helpers import (
     jitter_delay_ms,
     sanitize_forwarded_response_headers,
 )
+from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
+from headroom.proxy.upstream_guard import is_safe_upstream_url
 from headroom.proxy.ws_headers import WS_HOP_BY_HOP_HEADERS
 from headroom.proxy.ws_session_registry import (
     TerminationCause,
@@ -70,6 +72,11 @@ from headroom.proxy.auth_mode import (
     classify_auth_mode,
     classify_client,
     should_stamp_codex_client,
+)
+from headroom.proxy.buffered_ccr_response import (
+    DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
+    OPENAI_ERROR_FORMAT,
+    buffered_ccr_asgi_call,
 )
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.cost import header_safe_transforms
@@ -376,6 +383,13 @@ def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None
         normalized = f"{normalized}{path}"
 
     if urlparse(normalized).scheme not in {"http", "https"}:
+        return None
+    if not is_safe_upstream_url(normalized):
+        # Client-supplied upstream resolves to a private/loopback/link-local or
+        # cloud-metadata address (SSRF). Ignore the override and fall back to the
+        # configured upstream; set HEADROOM_ALLOWED_BASE_URLS to permit specific
+        # internal endpoints.
+        logger.warning("ignoring unsafe x-headroom-base-url override: %r", raw_base_url)
         return None
     return normalized
 
@@ -3120,7 +3134,14 @@ class OpenAIHandlerMixin:
 
         _pre_strip_count_chat = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
         headers = _strip_internal_headers(headers)
-        headers = merge_extra_headers(headers, self.config.openai_extra_headers)
+        # `custom_upstream_base_url` is the per-request `x-headroom-base-url`
+        # override resolved above. Secrets only go to designated hosts.
+        headers = merge_extra_headers(
+            headers,
+            self.config.openai_extra_headers,
+            upstream_url=custom_upstream_base_url,
+            config=self.config,
+        )
         log_outbound_headers(
             forwarder="openai_chat_completions",
             stripped_count=_pre_strip_count_chat,
@@ -3148,10 +3169,7 @@ class OpenAIHandlerMixin:
         memory_user_id: str | None = None
         memory_request_ctx = None
         if self.memory_handler:
-            memory_user_id = request.headers.get(
-                "x-headroom-user-id",
-                os.environ.get("USER", os.environ.get("USERNAME", "default")),
-            )
+            memory_user_id = resolve_memory_identity(request)
             # Per-project memory routing (GH #462). Built once per request
             # so every save/search/inject resolves to the same workspace.
             from headroom.memory.storage_router import (
@@ -5112,7 +5130,15 @@ class OpenAIHandlerMixin:
 
         _pre_strip_count_resp = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
         headers = _strip_internal_headers(headers)
-        headers = merge_extra_headers(headers, self.config.openai_extra_headers)
+        # This handler also honors `x-headroom-base-url` (resolved further
+        # below); resolve it here too so the secret headers are gated on the
+        # real destination rather than merged before it is known.
+        headers = merge_extra_headers(
+            headers,
+            self.config.openai_extra_headers,
+            upstream_url=_resolve_openai_upstream_base(request.headers),
+            config=self.config,
+        )
         # Mirror the WS handler: never forward Codex's client-only lite header
         # upstream. OpenAI rejects newer Codex models when it leaks, and the HTTP
         # POST path (unlike the WS path) otherwise forwards request headers verbatim.
@@ -5177,10 +5203,7 @@ class OpenAIHandlerMixin:
         memory_user_id: str | None = None
         memory_request_ctx = None
         if self.memory_handler:
-            memory_user_id = request.headers.get(
-                "x-headroom-user-id",
-                os.environ.get("USER", os.environ.get("USERNAME", "default")),
-            )
+            memory_user_id = resolve_memory_identity(request)
             from headroom.memory.storage_router import (
                 RequestContext as _MemRequestContext,
             )
@@ -5611,6 +5634,12 @@ class OpenAIHandlerMixin:
             if body.get("stream") is not False:
                 body["stream"] = False
                 body_mutation_tracker.mark_mutated("ccr_streaming_retrieve_buffered_non_stream")
+            # Same contradiction as the Anthropic path: the body now asks for a
+            # non-streaming reply while the client's Accept still says SSE. This
+            # handler serves GitHub Copilot (see apply_copilot_api_auth below),
+            # whose gateway is one of the strict ones (#3078).
+            _accept_key = next((k for k in headers if k.lower() == "accept"), "accept")
+            headers[_accept_key] = "application/json"
             logger.info(
                 f"[{request_id}] CCR: stream:true /v1/responses request has "
                 "headroom_retrieve available; using buffered stream:false "
@@ -6207,48 +6236,24 @@ class OpenAIHandlerMixin:
 
             if buffered_stream_ccr:
                 operation = asyncio.create_task(_buffered_ccr_operation())
-                record_failed = self.metrics.record_failed
+
+                # Same wrapper as the Anthropic twin; only the error wire format
+                # differs. See headroom/proxy/buffered_ccr_response.py (#3079).
+                _buffered_call = buffered_ccr_asgi_call(
+                    operation=operation,
+                    fmt=OPENAI_ERROR_FORMAT,
+                    grace_seconds=getattr(
+                        self.config,
+                        "buffered_ccr_grace_seconds",
+                        DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
+                    ),
+                    record_failed=self.metrics.record_failed,
+                    request_id=request_id,
+                )
 
                 class _BufferedCCRResponse(Response):
                     async def __call__(self, scope, receive, send):  # noqa: ANN001
-                        # Send nothing until the buffered operation resolves —
-                        # see the AnthropicHandler twin for the full rationale.
-                        # Committing `200 text/event-stream` on a keepalive timer,
-                        # before the outcome is known, turns every non-200 or
-                        # unparseable upstream reply into a 200 with no usable
-                        # body and discards the status the client needs to back
-                        # off on.
-                        try:
-                            result = await operation
-                        except Exception as e:
-                            await record_failed(provider="openai")
-                            logger.error(
-                                f"[{request_id}] OpenAI responses request failed: {type(e).__name__}: {e}"
-                            )
-                            await send(
-                                {
-                                    "type": "http.response.start",
-                                    "status": 502,
-                                    "headers": [(b"content-type", b"application/json")],
-                                }
-                            )
-                            await send(
-                                {
-                                    "type": "http.response.body",
-                                    "body": json.dumps(
-                                        {
-                                            "error": {
-                                                "message": "An error occurred while processing your request. Please try again.",
-                                                "type": "server_error",
-                                                "code": "proxy_error",
-                                            }
-                                        }
-                                    ).encode(),
-                                    "more_body": False,
-                                }
-                            )
-                            return
-                        await result(scope, receive, send)
+                        await _buffered_call(scope, receive, send)
 
                 return _BufferedCCRResponse(media_type="text/event-stream")
             return await _buffered_ccr_operation()
@@ -6616,8 +6621,13 @@ class OpenAIHandlerMixin:
             upstream: Any = None
             from headroom.proxy.helpers import merge_extra_headers
 
+            # The WS upstream is derived from config (chatgpt.com backend or
+            # OPENAI_API_URL), never from a request header.
             upstream_headers = merge_extra_headers(
-                upstream_headers, self.config.openai_extra_headers
+                upstream_headers,
+                self.config.openai_extra_headers,
+                upstream_url=None,
+                config=self.config,
             )
 
             for ws_attempt in range(ws_connect_attempts):
@@ -6972,12 +6982,7 @@ class OpenAIHandlerMixin:
                 nonlocal memory_user_id, memory_request_ctx
 
                 memory_user_id_candidate = (
-                    ws_headers.get(
-                        "x-headroom-user-id",
-                        os.environ.get("USER", os.environ.get("USERNAME", "default")),
-                    )
-                    if self.memory_handler
-                    else None
+                    resolve_memory_identity(websocket) if self.memory_handler else None
                 )
                 memory_decision = MemoryDecision.decide(
                     headers=ws_headers,

@@ -34,7 +34,9 @@ result = truncate_text(tool_output, window_radius=50)
 ```python
 lc = LeanContext(window_radius=50)  # Lines to keep around each signal
 result = lc.truncate(text)
-print(f"Dropped {result.dropped_lines} of {result.original_lines} lines ({result.savings_pct:.1f}%)")
+print(
+    f"Dropped {result.dropped_lines} of {result.original_lines} lines ({result.savings_pct:.1f}%)"
+)
 print(f"Found {result.signal_lines} signal lines")
 ```
 

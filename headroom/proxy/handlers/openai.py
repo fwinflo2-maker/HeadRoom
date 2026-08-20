@@ -3175,12 +3175,16 @@ class OpenAIHandlerMixin:
         headers = _strip_internal_headers(headers)
         # Configured backends own their destination and authentication, so they
         # retain the existing extra-header policy. The direct path selects
-        # extras from the resolved OpenAI-compatible upstream.
+        # extras from the resolved OpenAI-compatible upstream. Direct custom
+        # upstreams must also pass the operator-designated-host check before
+        # receiving those extras.
         headers = merge_extra_headers(
             headers,
             self.config.openai_extra_headers
             if self.anthropic_backend is not None
             else self._openai_extra_headers_for_upstream(upstream_base_url),
+            upstream_url=(None if self.anthropic_backend is not None else custom_upstream_base_url),
+            config=self.config,
         )
         log_outbound_headers(
             forwarder="openai_chat_completions",
@@ -5181,9 +5185,13 @@ class OpenAIHandlerMixin:
         # extras. Mixed ChatGPT-auth + Grok-signal requests conservatively
         # withhold extras based on the xAI candidate even though the higher-
         # priority routing branch below still sends them to chatgpt.com.
+        custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
         openai_upstream_base_url = self._resolve_openai_upstream(request)
         headers = merge_extra_headers(
-            headers, self._openai_extra_headers_for_upstream(openai_upstream_base_url)
+            headers,
+            self._openai_extra_headers_for_upstream(openai_upstream_base_url),
+            upstream_url=custom_upstream_base_url,
+            config=self.config,
         )
         # Mirror the WS handler: never forward Codex's client-only lite header
         # upstream. OpenAI rejects newer Codex models when it leaks, and the HTTP
@@ -5686,6 +5694,12 @@ class OpenAIHandlerMixin:
             if body.get("stream") is not False:
                 body["stream"] = False
                 body_mutation_tracker.mark_mutated("ccr_streaming_retrieve_buffered_non_stream")
+            # Same contradiction as the Anthropic path: the body now asks for a
+            # non-streaming reply while the client's Accept still says SSE. This
+            # handler serves GitHub Copilot (see apply_copilot_api_auth below),
+            # whose gateway is one of the strict ones (#3078).
+            _accept_key = next((k for k in headers if k.lower() == "accept"), "accept")
+            headers[_accept_key] = "application/json"
             logger.info(
                 f"[{request_id}] CCR: stream:true /v1/responses request has "
                 "headroom_retrieve available; using buffered stream:false "
@@ -6667,8 +6681,13 @@ class OpenAIHandlerMixin:
             upstream: Any = None
             from headroom.proxy.helpers import merge_extra_headers
 
+            # The WS upstream is derived from config (chatgpt.com backend or
+            # OPENAI_API_URL), never from a request header.
             upstream_headers = merge_extra_headers(
-                upstream_headers, self.config.openai_extra_headers
+                upstream_headers,
+                self.config.openai_extra_headers,
+                upstream_url=None,
+                config=self.config,
             )
 
             for ws_attempt in range(ws_connect_attempts):

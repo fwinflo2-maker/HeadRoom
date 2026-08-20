@@ -183,7 +183,7 @@ def test_configured_gateway_outranks_grok_and_keeps_operator_extras(
             _run_chat,
             "https://litellm.internal",
             "https://litellm.internal/v1/chat/completions",
-            False,
+            True,
         ),
         (
             _run_chat,
@@ -204,7 +204,7 @@ def test_configured_gateway_outranks_grok_and_keeps_operator_extras(
             True,
         ),
     ],
-    ids=("non-xai", "xai-subpath", "xai-port", "xai-trailing-dot"),
+    ids=("untrusted-non-xai", "xai-subpath", "xai-port", "xai-trailing-dot"),
 )
 def test_custom_base_url_applies_hostname_scoped_header_policy(
     run: _Runner,

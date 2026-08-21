@@ -3112,6 +3112,8 @@ class OpenAIHandlerMixin:
         # Cloudflare Workers forward "br, zstd" which OpenAI may honor;
         # if httpx lacks brotli support the response body is undecipherable → 502.
         headers.pop("accept-encoding", None)
+        from headroom.proxy.helpers import strip_openai_internal_headers
+        headers = strip_openai_internal_headers(headers)
         tags = extract_tags(headers)
         from headroom.proxy.savings_attribution import bind_scope
 
@@ -5109,6 +5111,8 @@ class OpenAIHandlerMixin:
         # plain. Leaving a stale content-encoding header makes the upstream try
         # to decompress already-decoded JSON and reject it with HTTP 400 (#1542).
         headers.pop("content-encoding", None)
+        from headroom.proxy.helpers import strip_openai_internal_headers
+        headers = strip_openai_internal_headers(headers)
         tags = extract_tags(headers)
         from headroom.proxy.savings_attribution import bind_scope
 
@@ -9619,6 +9623,8 @@ class OpenAIHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("accept-encoding", None)
+        from headroom.proxy.helpers import strip_openai_internal_headers
+        headers = strip_openai_internal_headers(headers)
         client = classify_client(headers)
         tags = extract_tags(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.

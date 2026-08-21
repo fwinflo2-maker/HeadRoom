@@ -217,8 +217,7 @@ def test_astgrep_outlines_large_python_read(tokenizer):
 
 def test_astgrep_flags_truncated_read(tokenizer):
     truncated_source = (
-        _PY_FIXTURE
-        + "\n\n[Truncated: PARTIAL view — /repo/payments.py: "
+        _PY_FIXTURE + "\n\n[Truncated: PARTIAL view — /repo/payments.py: "
         "showing lines 1-42 of 90 total (26031 tokens, cap 25000). "
         "Call Read with offset=43 to see more.]\n"
     )

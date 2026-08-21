@@ -198,6 +198,17 @@ class SavingsEstimate:
         return asdict(self)
 
 
+# A stratum contributes to the measured (A/B) estimate only once BOTH of its
+# arms hold at least this many observations. Below it an arm mean is a draw
+# rather than a mean, and its sample variance has too few degrees of freedom
+# for the normal approximation in ``_finalize``: a single observation reports
+# variance 0, so one stale control request enters the sum with an arbitrary
+# per-request delta and contributes nothing to the width of the band that is
+# supposed to catch it. 30 is the conventional floor at which a z-interval on
+# an estimated variance is defensible; below it the interval would need a
+# t-quantile, which this module does not compute.
+MEASURED_MIN_ARM_SAMPLES = 30
+
 # A measured (A/B holdout) estimate replaces the synthetic-control one only
 # once strata with data in both arms account for this share of the requests the
 # baseline can also score. Below it the holdout describes a corner of the
@@ -205,8 +216,10 @@ class SavingsEstimate:
 MEASURED_MIN_COVERAGE = 0.5
 
 # ...and only once its 95% band is at least this tight, in percentage points of
-# reduction. A wide band is the signature of a control arm too thin to divide
-# by: three stale control samples once produced 20% +/- 277pp.
+# reduction. An arm can clear the sample floor and still be too noisy to say
+# anything: the observation that produced 20% +/- 277pp was three control
+# samples spread over an order of magnitude, and that spread does not go away
+# just because the arm eventually fills.
 MEASURED_MAX_CI_HALF_WIDTH_PCT = 10.0
 
 
@@ -278,8 +291,11 @@ class SavingsLedger:
     def estimate_from_holdout(self) -> SavingsEstimate | None:
         """A/B measurement: per-stratum control mean minus treatment mean.
 
-        Only strata with data in BOTH arms contribute. Returns ``None`` if no
-        such stratum exists (no holdout traffic yet). Weighted by treatment
+        Only strata whose BOTH arms clear ``MEASURED_MIN_ARM_SAMPLES``
+        contribute: a one-request arm has no variance to propagate, so it would
+        enter the sum with an arbitrary delta and widen the band by nothing.
+        Returns ``None`` when no stratum qualifies -- there is no holdout
+        traffic yet, or not enough of it to divide by. Weighted by treatment
         volume; this is the unbiased causal number.
         """
         total_saved = 0.0
@@ -289,7 +305,7 @@ class SavingsLedger:
         contributing = 0
         for key, t in self.treatment.items():
             c = self.control.get(key)
-            if c is None or c.n == 0 or t.n == 0:
+            if c is None or min(c.n, t.n) < MEASURED_MIN_ARM_SAMPLES:
                 continue
             contributing += 1
             n = t.n
@@ -339,9 +355,11 @@ class SavingsLedger:
         force.
 
         So the measured number displaces the synthetic control only when it
-        actually measures the traffic: it must cover a real share of the
-        requests the baseline can also speak to, and carry a band tight enough
-        to mean something. Until then the synthetic control stands -- it is an
+        actually measures the traffic: every stratum it is built from must hold
+        enough of both arms to support a variance estimate (see
+        ``estimate_from_holdout``), it must cover a real share of the requests
+        the baseline can also speak to, and it must carry a band tight enough to
+        mean something. Until then the synthetic control stands -- it is an
         estimate, and honestly labelled as one, which beats a measurement of
         three requests.
         """

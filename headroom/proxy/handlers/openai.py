@@ -17,7 +17,6 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -97,12 +96,7 @@ logger = logging.getLogger("headroom.proxy")
 
 _OPENAI_RESPONSES_UNIT_CACHE_MAX_ENTRIES = 10_000
 _OPENAI_RESPONSES_UNIT_CACHE_VERSION = "openai_responses_unit_v1"
-_OPENAI_RESPONSES_UNIT_PARALLELISM_ENV = "HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM"
-_OPENAI_RESPONSES_UNIT_PARALLELISM_DEFAULT = 4
-_OPENAI_RESPONSES_UNIT_PARALLELISM_MAX = 16
 _OPENAI_RESPONSES_UNIT_CACHE_INIT_LOCK = threading.RLock()
-_OPENAI_RESPONSES_UNIT_EXECUTOR_LOCK = threading.RLock()
-_OPENAI_RESPONSES_UNIT_EXECUTOR: ThreadPoolExecutor | None = None
 _CODEX_WS_COMPRESSION_TIMEOUT_SECONDS = 5.0
 _CCR_HASH_RE = re.compile(
     r"(?:Retrieve (?:more|original): hash=|<<ccr:)([a-fA-F0-9]{12,24})(?=[^a-fA-F0-9]|$)"
@@ -471,6 +465,15 @@ def _is_allowed_websocket_origin(headers: dict[str, str]) -> bool:
         if normalized is not None
     }
     return normalized_origin in normalized_allowed
+_OPENAI_RESPONSES_UNIT_CACHE_METADATA_EXCLUDED_KEYS = frozenset({"tool_call_id"})
+_OPENAI_RESPONSES_CCR_MARKERS = (
+    "Retrieve more: hash=",
+    "Retrieve original: hash=",
+    "<<ccr:",
+)
+_OPENAI_RESPONSES_LARGE_TEXT_CCR_STRATEGY = "large_text_ccr"
+_OPENAI_RESPONSES_LARGE_TEXT_CCR_TRANSFORM = "openai:responses:large_text_ccr"
+_OPENAI_RESPONSES_LARGE_TEXT_PREVIEW_CHARS = 2_048
 
 
 def _usage_int(value: Any) -> int:
@@ -523,32 +526,19 @@ def _passthrough_model_from_path(path: str, endpoint_name: str) -> str:
     return f"passthrough:{endpoint_name}"
 
 
-def _openai_responses_unit_parallelism() -> int:
-    raw = os.getenv(_OPENAI_RESPONSES_UNIT_PARALLELISM_ENV)
-    if raw is None or raw.strip() == "":
-        return _OPENAI_RESPONSES_UNIT_PARALLELISM_DEFAULT
-    try:
-        requested = int(raw)
-    except ValueError:
-        logger.warning(
-            "Invalid %s=%r; using default %d",
-            _OPENAI_RESPONSES_UNIT_PARALLELISM_ENV,
-            raw,
-            _OPENAI_RESPONSES_UNIT_PARALLELISM_DEFAULT,
-        )
-        return _OPENAI_RESPONSES_UNIT_PARALLELISM_DEFAULT
-    return max(1, min(_OPENAI_RESPONSES_UNIT_PARALLELISM_MAX, requested))
+def _openai_responses_cache_metadata(unit: Any) -> dict[str, Any]:
+    metadata = getattr(unit, "metadata", None)
+    if not isinstance(metadata, dict):
+        return {}
+    return {
+        key: value
+        for key, value in metadata.items()
+        if key not in _OPENAI_RESPONSES_UNIT_CACHE_METADATA_EXCLUDED_KEYS
+    }
 
 
-def _openai_responses_unit_executor() -> ThreadPoolExecutor:
-    global _OPENAI_RESPONSES_UNIT_EXECUTOR
-    with _OPENAI_RESPONSES_UNIT_EXECUTOR_LOCK:
-        if _OPENAI_RESPONSES_UNIT_EXECUTOR is None:
-            _OPENAI_RESPONSES_UNIT_EXECUTOR = ThreadPoolExecutor(
-                max_workers=_OPENAI_RESPONSES_UNIT_PARALLELISM_MAX,
-                thread_name_prefix="headroom-openai-unit",
-            )
-        return _OPENAI_RESPONSES_UNIT_EXECUTOR
+def _openai_responses_contains_ccr_marker(text: str) -> bool:
+    return any(marker in text for marker in _OPENAI_RESPONSES_CCR_MARKERS)
 
 
 def _openai_responses_unit_cache_key(
@@ -571,7 +561,7 @@ def _openai_responses_unit_cache_key(
         "context": unit.context,
         "question": unit.question,
         "bias": unit.bias,
-        "metadata": unit.metadata,
+        "metadata": _openai_responses_cache_metadata(unit),
         "target_ratio": target_ratio,
         "text_sha256": text_hash,
     }
@@ -827,6 +817,34 @@ def _responses_input_item_text_bytes(item: Any) -> int:
         return total
 
     return _json_byte_len(item)
+
+
+def _openai_responses_live_text_byte_lengths(payload: dict[str, Any]) -> list[int]:
+    lengths: list[int] = []
+    items = payload.get("input")
+    if not isinstance(items, list):
+        items = payload.get("messages")
+    if not isinstance(items, list):
+        return lengths
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") not in _RESPONSES_OUTPUT_ITEM_TYPES:
+            continue
+        output = item.get("output")
+        if not isinstance(output, str):
+            continue
+        lengths.append(len(output.encode("utf-8", errors="replace")))
+    return lengths
+
+
+def _openai_responses_has_compressible_live_text(
+    payload: dict[str, Any],
+    *,
+    min_bytes: int,
+) -> bool:
+    return any(length >= min_bytes for length in _openai_responses_live_text_byte_lengths(payload))
 
 
 _RESPONSES_OUTPUT_ITEM_TYPES = frozenset(
@@ -1533,6 +1551,7 @@ class OpenAIHandlerMixin:
         return await count_tokens_offloaded(self, model, messages)
 
     OPENAI_RESPONSES_ROUTER_MIN_BYTES = 512
+    OPENAI_RESPONSES_ROUTER_MAX_BYTES = 64 * 1024
     OPENAI_RESPONSES_OUTPUT_TYPES = _RESPONSES_OUTPUT_ITEM_TYPES
 
     def _openai_responses_unit_cache(self) -> tuple[Any, OrderedDict[str, Any]]:
@@ -1708,6 +1727,144 @@ class OpenAIHandlerMixin:
             logger.debug("[%s] Traffic learner (ws): %s", request_id, exc)
 
     @staticmethod
+    def _estimate_openai_responses_text_tokens(text: str) -> int:
+        """Cheap token estimate for the deterministic oversized-unit fast path."""
+        return max(1, len(text) // 4)
+
+    @staticmethod
+    def _openai_responses_text_prefix(text: str, max_bytes: int) -> str:
+        if max_bytes <= 0:
+            return ""
+        encoded = text.encode("utf-8", errors="replace")
+        if len(encoded) <= max_bytes:
+            return text
+        return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+    @staticmethod
+    def _openai_responses_text_suffix(text: str, max_bytes: int) -> str:
+        if max_bytes <= 0:
+            return ""
+        encoded = text.encode("utf-8", errors="replace")
+        if len(encoded) <= max_bytes:
+            return text
+        return encoded[-max_bytes:].decode("utf-8", errors="ignore")
+
+    @classmethod
+    def _openai_responses_large_text_preview(cls, text: str, *, max_bytes: int) -> str:
+        encoded = text.encode("utf-8", errors="replace")
+        text_bytes = len(encoded)
+        if max_bytes <= 0:
+            return ""
+        if text_bytes <= min(max_bytes, _OPENAI_RESPONSES_LARGE_TEXT_PREVIEW_CHARS):
+            return text
+        max_bytes = min(max_bytes, _OPENAI_RESPONSES_LARGE_TEXT_PREVIEW_CHARS)
+        if text_bytes <= max_bytes:
+            return text
+        omission = "\n\n[... middle omitted; retrieve full content with the hash below ...]\n\n"
+        omission_bytes = len(omission.encode("utf-8"))
+        if max_bytes <= omission_bytes + 16:
+            return cls._openai_responses_text_prefix(text, max_bytes)
+        head_bytes = (max_bytes - omission_bytes) // 2
+        tail_bytes = max_bytes - omission_bytes - head_bytes
+        return (
+            cls._openai_responses_text_prefix(text, head_bytes)
+            + omission
+            + cls._openai_responses_text_suffix(text, tail_bytes)
+        )
+
+    def _compress_openai_responses_oversized_unit(
+        self,
+        unit: Any,
+        *,
+        tool_call_id: str | None,
+        tokenizer: Any,
+    ) -> Any:
+        from headroom.cache.compression_store import get_compression_store
+        from headroom.transforms.compression_units import UnitCompressionResult
+
+        original = unit.text
+        original_tokens = tokenizer.count_text(original)
+        original_encoded = original.encode("utf-8", errors="replace")
+        storage_original = original_encoded.decode("utf-8")
+        original_bytes = len(original_encoded)
+        if _openai_responses_contains_ccr_marker(original):
+            return UnitCompressionResult(
+                original=original,
+                compressed=original,
+                modified=False,
+                tokens_before=original_tokens,
+                tokens_after=original_tokens,
+                tokens_saved=0,
+                transforms_applied=[],
+                strategy="none",
+                reason="already_compressed",
+                router_result=None,
+                text_bytes=original_bytes,
+                min_bytes=unit.min_bytes,
+                reason_category="already_compressed",
+            )
+
+        hash_key = hashlib.sha256(original_encoded).hexdigest()[:24]
+        header = (
+            "[Large OpenAI Responses tool output compressed by Headroom "
+            f"from {original_bytes} bytes. Retrieve more: hash={hash_key}]\n"
+        )
+        header_bytes = len(header.encode("utf-8", errors="replace"))
+        preview_budget = min(
+            _OPENAI_RESPONSES_LARGE_TEXT_PREVIEW_CHARS,
+            original_bytes - header_bytes - 1,
+            (original_bytes // 2) - header_bytes,
+        )
+        preview = self._openai_responses_large_text_preview(
+            storage_original,
+            max_bytes=preview_budget,
+        )
+        compressed = f"{header}{preview}"
+        compressed_bytes = len(compressed.encode("utf-8", errors="replace"))
+        if compressed_bytes >= original_bytes:
+            return UnitCompressionResult(
+                original=original,
+                compressed=original,
+                modified=False,
+                tokens_before=original_tokens,
+                tokens_after=original_tokens,
+                tokens_saved=0,
+                transforms_applied=[],
+                strategy="none",
+                reason="rejected_not_smaller",
+                router_result=None,
+                text_bytes=original_bytes,
+                min_bytes=unit.min_bytes,
+                reason_category="rejected_not_smaller",
+            )
+
+        compressed_tokens = tokenizer.count_text(compressed)
+        get_compression_store().store(
+            storage_original,
+            compressed,
+            original_tokens=original_tokens,
+            compressed_tokens=compressed_tokens,
+            tool_call_id=tool_call_id,
+            compression_strategy=_OPENAI_RESPONSES_LARGE_TEXT_CCR_TRANSFORM,
+            explicit_hash=hash_key,
+        )
+        return UnitCompressionResult(
+            original=original,
+            compressed=compressed,
+            modified=True,
+            tokens_before=original_tokens,
+            tokens_after=compressed_tokens,
+            tokens_saved=max(0, original_tokens - compressed_tokens),
+            transforms_applied=[_OPENAI_RESPONSES_LARGE_TEXT_CCR_TRANSFORM],
+            strategy=_OPENAI_RESPONSES_LARGE_TEXT_CCR_STRATEGY,
+            reason=None,
+            router_result=None,
+            text_bytes=original_bytes,
+            min_bytes=unit.min_bytes,
+            reason_category="applied",
+        )
+
+    @staticmethod
     def _headroom_bypass_enabled(headers: Any) -> bool:
         """Return True when inbound headers request full passthrough."""
         return _headroom_bypass_enabled(headers)
@@ -1781,6 +1938,7 @@ class OpenAIHandlerMixin:
         request_id: str,
         pass_id: str | None = None,
         timing: dict[str, float] | None = None,
+        router_max_bytes: int | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], dict[str, int], list[str], int]:
         """Run ContentRouter on OpenAI Responses text units.
 
@@ -1818,6 +1976,7 @@ class OpenAIHandlerMixin:
             from headroom.transforms.compression_units import (
                 CompressionUnit,
                 RoutedCompressionUnit,
+                UnitCompressionResult,
                 compress_unit_with_router,
                 find_content_router,
             )
@@ -1941,6 +2100,11 @@ class OpenAIHandlerMixin:
         }
 
         timing_sink: dict[str, float] = timing if timing is not None else {}
+        effective_router_max_bytes = (
+            self.OPENAI_RESPONSES_ROUTER_MAX_BYTES
+            if router_max_bytes is None
+            else int(router_max_bytes)
+        )
 
         def _add_timing(name: str, started_at: float) -> None:
             timing_sink[name] = (
@@ -2127,6 +2291,7 @@ class OpenAIHandlerMixin:
         attempted_input_tokens = 0
         transforms: list[str] = []
         routed_units: list[RoutedCompressionUnit] = []
+        deterministic_results: dict[int, UnitCompressionResult] = {}
 
         unit_build_started = time.perf_counter()
         unit_debug: list[dict[str, Any]] = []
@@ -2134,6 +2299,8 @@ class OpenAIHandlerMixin:
             item = items[item_idx] if item_idx < len(items) else {}
             item_type = item.get("type", "unknown") if isinstance(item, dict) else "unknown"
             role = str(item.get("role") or "tool") if isinstance(item, dict) else "tool"
+            call_id = item.get("call_id") if isinstance(item, dict) else None
+            tool_call_id = call_id if isinstance(call_id, str) and call_id else None
             unit = CompressionUnit(
                 text=original_text,
                 provider="openai",
@@ -2143,8 +2310,17 @@ class OpenAIHandlerMixin:
                 cache_zone="live",
                 mutable=True,
                 min_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
+                metadata={"tool_call_id": tool_call_id} if tool_call_id else {},
             )
+            text_bytes = len(original_text.encode("utf-8", errors="replace"))
+            unit_idx = len(routed_units)
             routed_units.append(RoutedCompressionUnit(unit=unit, slot=(item_idx, slot_ref)))
+            if text_bytes >= effective_router_max_bytes:
+                deterministic_results[unit_idx] = self._compress_openai_responses_oversized_unit(
+                    unit,
+                    tool_call_id=tool_call_id,
+                    tokenizer=tokenizer,
+                )
             if debug_enabled:
                 unit_debug.append(
                     {
@@ -2158,7 +2334,7 @@ class OpenAIHandlerMixin:
                         "mutable": unit.mutable,
                         "min_bytes": unit.min_bytes,
                         "text_chars": len(unit.text),
-                        "text_bytes": len(unit.text.encode("utf-8", errors="replace")),
+                        "text_bytes": text_bytes,
                         "text_json_shape": _json_shape(unit.text),
                         "text": unit.text,
                     }
@@ -2196,6 +2372,8 @@ class OpenAIHandlerMixin:
 
         router_total_started = time.perf_counter()
         routed_results: list[tuple[object, Any, float] | None] = [None] * len(routed_units)
+        for unit_idx, result in deterministic_results.items():
+            routed_results[unit_idx] = (routed_units[unit_idx].slot, result, 0.0)
         unit_index_by_slot = {routed.slot: unit_idx for unit_idx, routed in enumerate(routed_units)}
         small_batch_entries: list[CompressionBatchEntry] = []
         large_unit_indexes: list[int] = []
@@ -2215,6 +2393,8 @@ class OpenAIHandlerMixin:
         cache_miss_followers: dict[str, list[int]] = {}
         for unit_idx in large_unit_indexes:
             routed = routed_units[unit_idx]
+            if routed_results[unit_idx] is not None:
+                continue
             cache_key = _openai_responses_unit_cache_key(
                 routed.unit,
                 model=model,
@@ -2253,22 +2433,12 @@ class OpenAIHandlerMixin:
                     0.0,
                 )
 
-        parallelism = _openai_responses_unit_parallelism()
-        if len(cache_misses) > 1 and parallelism > 1:
-            executor = _openai_responses_unit_executor()
-            for start in range(0, len(cache_misses), parallelism):
-                batch = cache_misses[start : start + parallelism]
-                futures = [executor.submit(_compress_and_store, *item) for item in batch]
-                for future in as_completed(futures):
-                    unit_idx, cache_key, routed_result = future.result()
-                    _record_routed_result(unit_idx, cache_key, routed_result)
-        else:
-            for unit_idx, cache_key, routed in cache_misses:
-                _record_routed_result(
-                    unit_idx,
-                    cache_key,
-                    _compress_and_store(unit_idx, cache_key, routed)[2],
-                )
+        for unit_idx, cache_key, routed in cache_misses:
+            _record_routed_result(
+                unit_idx,
+                cache_key,
+                _compress_and_store(unit_idx, cache_key, routed)[2],
+            )
 
         # Tail batches below the shared 512B floor keep the existing size-floor
         # result without entering the router or the unit-result cache.
@@ -2292,16 +2462,8 @@ class OpenAIHandlerMixin:
             for slot, result in batch_results:
                 routed_results[unit_index_by_slot[slot]] = (slot, result, elapsed_per_unit)
 
-        if len(small_batches) > 1 and parallelism > 1:
-            executor = _openai_responses_unit_executor()
-            for start in range(0, len(small_batches), parallelism):
-                batch_group = small_batches[start : start + parallelism]
-                futures = [executor.submit(_compress_batch, batch) for batch in batch_group]
-                for future in as_completed(futures):
-                    _record_batch_result(future.result())
-        else:
-            for batch in small_batches:
-                _record_batch_result(_compress_batch(batch))
+        for batch in small_batches:
+            _record_batch_result(_compress_batch(batch))
 
         ordered_routed_results = [result for result in routed_results if result is not None]
 
@@ -2370,11 +2532,14 @@ class OpenAIHandlerMixin:
                     strategy_chain_union.append(s)
             cat = result.reason_category or "applied"
             units_by_category[cat] = units_by_category.get(cat, 0) + 1
-            # A unit "reached the router" iff the result carries a
-            # router_result OR was modified — both indicate we got
-            # past the early gates. Units that were size-floored,
-            # role-protected, or in a frozen cache_zone don't count.
-            if result.router_result is not None or result.modified:
+            # A unit reached active compression iff it produced a router
+            # result, was modified by deterministic CCR, or deterministic
+            # CCR explicitly rejected it for not being smaller.
+            if (
+                result.router_result is not None
+                or result.modified
+                or result.reason == "rejected_not_smaller"
+            ):
                 attempted_input_tokens += result.tokens_before
             if debug_enabled:
                 _log(
@@ -2483,6 +2648,7 @@ class OpenAIHandlerMixin:
         request_id: str,
         timing: dict[str, float] | None = None,
         client: str | None = None,
+        router_max_bytes: int | None = None,
         savings_tags: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
@@ -2744,6 +2910,7 @@ class OpenAIHandlerMixin:
             request_id=request_id,
             pass_id=pass_id,
             timing=timing_sink,
+            router_max_bytes=router_max_bytes,
         )
         _add_timing("compression_live_units_total", live_units_started)
         if router_modified:
@@ -2858,6 +3025,90 @@ class OpenAIHandlerMixin:
             attempted_input_tokens,
         )
 
+    def _compress_openai_responses_payload_inline(
+        self,
+        payload: dict[str, Any],
+        *,
+        model: str,
+        request_id: str,
+        client: str | None = None,
+        savings_tags: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
+        timing: dict[str, float] = {}
+
+        shape_labels, shape_mutated = _shape_openai_responses_payload(
+            payload,
+            model=model,
+            request_id=request_id,
+            output_shaper_enabled=(
+                getattr(getattr(self, "config", None), "rollout", None).is_enabled(
+                    "proxy_output_shaper"
+                )
+                if getattr(getattr(self, "config", None), "rollout", None) is not None
+                else None
+            ),
+        )
+        preflight_started = time.perf_counter()
+        has_compressible_live_text = _openai_responses_has_compressible_live_text(
+            payload,
+            min_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
+        )
+        timing["compression_preflight_live_text_scan"] = (
+            time.perf_counter() - preflight_started
+        ) * 1000.0
+        if not has_compressible_live_text:
+            payload_bytes = _json_byte_len(payload)
+            return (
+                payload,
+                shape_mutated,
+                0,
+                shape_labels,
+                "no_compressible_live_text",
+                payload_bytes,
+                payload_bytes,
+                0,
+                timing,
+            )
+        inline_started = time.perf_counter()
+        compression_kwargs: dict[str, Any] = {
+            "model": model,
+            "request_id": request_id,
+            "timing": timing,
+            "client": client,
+            "router_max_bytes": self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
+        }
+        if savings_tags is not None:
+            compression_kwargs["savings_tags"] = savings_tags
+        while True:
+            try:
+                result = self._compress_openai_responses_payload(payload, **compression_kwargs)
+                break
+            except TypeError as exc:
+                unsupported_kwarg = next(
+                    (
+                        name
+                        for name in ("savings_tags", "client", "timing", "router_max_bytes")
+                        if f"unexpected keyword argument '{name}'" in str(exc)
+                        and name in compression_kwargs
+                    ),
+                    None,
+                )
+                if unsupported_kwarg is None:
+                    raise
+                compression_kwargs.pop(unsupported_kwarg)
+        if shape_labels:
+            result = (
+                result[0],
+                result[1] or shape_mutated,
+                result[2],
+                [*shape_labels, *result[3]],
+                *result[4:],
+            )
+        timing["compression_inline_live_text"] = (time.perf_counter() - inline_started) * 1000.0
+        if len(result) == 8:
+            return (*result, timing)
+        return result
+
     async def _compress_openai_responses_payload_in_executor(
         self,
         payload: dict[str, Any],
@@ -2868,78 +3119,36 @@ class OpenAIHandlerMixin:
         client: str | None = None,
         savings_tags: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
-        timing: dict[str, float] = {}
+        """Run one complete Responses compression pass on the bounded executor.
 
-        def _compress():  # noqa: ANN202
-            # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER) runs before
-            # compression so the turn classifier sees the client's input as
-            # sent, and the steering/effort mutations ride the same rewrite
-            # path as compression at every call site (HTTP /v1/responses, WS
-            # first frame, WS subsequent frames). Runs inside the executor
-            # closure so the extra payload serialization stays off the event
-            # loop.
-            shape_labels, shape_mutated = _shape_openai_responses_payload(
+        Per-unit compression is synchronous, so submitting the whole pass once
+        keeps CPU/model work off the event loop without recreating the nested
+        executor that could outlive an outer timeout and exhaust worker capacity.
+        """
+        # The bounded structural scan is cheap and lets schema-only/small
+        # payloads avoid consuming executor capacity altogether. The inline
+        # helper returns before compressor/model work for this case.
+        if not _openai_responses_has_compressible_live_text(
+            payload,
+            min_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
+        ):
+            return self._compress_openai_responses_payload_inline(
                 payload,
                 model=model,
                 request_id=request_id,
-                output_shaper_enabled=(
-                    getattr(getattr(self, "config", None), "rollout", None).is_enabled(
-                        "proxy_output_shaper"
-                    )
-                    if getattr(getattr(self, "config", None), "rollout", None) is not None
-                    else None
-                ),
+                client=client,
+                savings_tags=savings_tags,
             )
-            compression_kwargs: dict[str, Any] = {
-                "model": model,
-                "request_id": request_id,
-                "timing": timing,
-                "client": client,
-            }
-            if savings_tags is not None:
-                compression_kwargs["savings_tags"] = savings_tags
-            while True:
-                try:
-                    result = self._compress_openai_responses_payload(
-                        payload,
-                        **compression_kwargs,
-                    )
-                    break
-                except TypeError as exc:
-                    unsupported_kwarg = next(
-                        (
-                            name
-                            for name in ("savings_tags", "client", "timing")
-                            if f"unexpected keyword argument '{name}'" in str(exc)
-                            and name in compression_kwargs
-                        ),
-                        None,
-                    )
-                    if unsupported_kwarg is None:
-                        raise
-                    compression_kwargs.pop(unsupported_kwarg)
-            if shape_labels:
-                # Carry the shaper labels on the transforms channel so the
-                # outcome funnel feeds the output-savings ledger
-                # (outcome.py record_from_labels). The modified flag is
-                # forced only when shaping actually mutated the payload, so
-                # every call site's rewrite path serializes the shaped bytes.
-                result = (
-                    result[0],
-                    result[1] or shape_mutated,
-                    result[2],
-                    [*shape_labels, *result[3]],
-                    *result[4:],
-                )
-            return result
-
-        result = await self._run_compression_in_executor(
-            _compress,
+        return await self._run_compression_in_executor(
+            lambda: self._compress_openai_responses_payload_inline(
+                payload,
+                model=model,
+                request_id=request_id,
+                client=client,
+                savings_tags=savings_tags,
+            ),
             timeout=timeout,
         )
-        if len(result) == 8:
-            return (*result, timing)
-        return result
 
     async def handle_openai_chat(
         self,

@@ -257,6 +257,7 @@ class RemoteKompressCompressor:
                 result.compressed += (
                     f"\n[{result.original_tokens} items compressed to "
                     f"{result.compressed_tokens} (from {source_lines} source {line_word})."
+                    f" Original content preserved."
                     f" Retrieve more: hash={cache_key}]"
                 )
 

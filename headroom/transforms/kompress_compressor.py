@@ -1708,6 +1708,7 @@ class KompressCompressor(Transform):
                     result.compressed += (
                         f"\n[{n_words} items compressed to {compressed_count}"
                         f" (from {source_lines} source {line_word})."
+                        f" Original content preserved."
                         f" Retrieve more: hash={cache_key}]"
                     )
 
@@ -2106,6 +2107,7 @@ class KompressCompressor(Transform):
                     result.compressed += (
                         f"\n[{n_words} items compressed to {compressed_count}"
                         f" (from {source_lines} source {line_word})."
+                        f" Original content preserved."
                         f" Retrieve more: hash={cache_key}]"
                     )
 

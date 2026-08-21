@@ -30,6 +30,9 @@ def _app() -> Any:
 
 
 def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> None:
+    # This routing test uses reserved, intentionally unresolvable hostnames.
+    # Explicitly allow them so the SSRF guard can remain fail-closed on DNS errors.
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "azure.example,custom.example,opencode.ai")
     calls: list[tuple[str, str, str, str]] = []
     gemini_calls: list[tuple[str, str, str, str]] = []
     gemini_count_calls: list[tuple[str, str, str, str]] = []
@@ -496,7 +499,9 @@ def test_provider_specific_routes_delegate_to_expected_proxy_handlers(monkeypatc
             "handle_anthropic_batch_passthrough"
         )
         assert client.post("/v1/chat/completions").json()["handler"] == "handle_openai_chat"
+        assert client.post("/chat/completions").json()["handler"] == "handle_openai_chat"
         assert client.post("/v1/responses").json()["handler"] == "handle_openai_responses"
+        assert client.post("/responses").json()["handler"] == "handle_openai_responses"
         assert client.post("/v1/codex/responses").json()["handler"] == "handle_openai_responses"
         assert client.post("/backend-api/responses").json()["handler"] == "handle_openai_responses"
         assert client.post("/backend-api/codex/responses").json()["handler"] == (

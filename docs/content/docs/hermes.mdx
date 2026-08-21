@@ -3,7 +3,7 @@ title: Hermes Agent
 description: Give Hermes a native headroom_retrieve tool so compression markers are reversible, via the bundled hermes plugin.
 ---
 
-Hermes Agent registers its own tools, so unlike Claude Code it does not automatically receive the `headroom_retrieve` MCP tool. The bundled [`plugins/hermes`](https://github.com/chopratejas/headroom/tree/main/plugins/hermes) plugin closes that loop: it gives Hermes a native `headroom_retrieve` tool that calls the proxy's `POST /v1/retrieve` endpoint directly, so compression markers like `<<ccr:abc123>>` are no longer a black box.
+Hermes Agent registers its own tools, so unlike Claude Code it does not automatically receive the `headroom_retrieve` MCP tool. The bundled [`plugins/hermes`](https://github.com/headroomlabs-ai/headroom/tree/main/plugins/hermes) plugin closes that loop: it gives Hermes a native `headroom_retrieve` tool that calls the proxy's `POST /v1/retrieve` endpoint directly, so compression markers like `<<ccr:abc123>>` are no longer a black box.
 
 Without it, the model tends to re-run the original command (wasting tokens and time) or treat `ccr:abc123` as a file path and try to `cat` it.
 
@@ -33,16 +33,17 @@ Without it, the model tends to re-run the original command (wasting tokens and t
 
 3. Restart the Hermes gateway / TUI (plugin discovery is cached per process).
 
-## Recommended proxy configuration
+## Proxy configuration
 
-Hermes tool names don't match headroom's built-in `DEFAULT_EXCLUDE_TOOLS` (which protects Claude Code's `Read` / `Grep` / `Edit`), so two exclusions are strongly recommended:
+No configuration is required to prevent the retrieval loop on current headroom releases: `headroom_retrieve` is a protected built-in — it ships in `DEFAULT_EXCLUDE_TOOLS` and `DEFAULT_VERBATIM_EXCLUDE_TOOLS` (`headroom/config.py`), and the content router has dedicated guards that never recompress retrieved originals (issue #1077). Exclusion matching also unwraps Hermes's deferred `tool_call` bridge (`tool_search` / `tool_call` indirection), so the real tool name is matched even when Hermes invokes the plugin through the bridge.
+
+The one Hermes-specific exclusion worth considering is `read_file`: Hermes's tool names don't match Claude Code's `Read` / `Grep` / `Edit` that the built-in defaults protect, and file reads are reference data the agent needs verbatim:
 
 ```bash
-HEADROOM_EXCLUDE_TOOLS=read_file,headroom_retrieve
+HEADROOM_EXCLUDE_TOOLS=read_file
 ```
 
-- `read_file` — Hermes file reads are reference data the agent needs verbatim.
-- `headroom_retrieve` — without this, retrieved originals get re-compressed on the next request, producing an endless marker → retrieve → marker loop.
+Configured exclusions merge with (rather than replace) the built-in defaults, so this leaves every built-in protection — including the `headroom_retrieve` guards — intact.
 
 ## Behavior
 

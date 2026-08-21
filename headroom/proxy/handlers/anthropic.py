@@ -1027,6 +1027,31 @@ class AnthropicHandlerMixin:
             # original, forwarded, and the recorded/replayed prefix are all identical)
             # keeps it cache-safe: overlay_cached_prefix replays the same stripped bytes.
             _strip_streaming_only_content_fields(messages)
+            _bypass = (
+                request.headers.get("x-headroom-bypass", "").lower() == "true"
+                or request.headers.get("x-headroom-mode", "").lower() == "passthrough"
+            )
+            raw_tools = body.get("tools")
+            raw_client = classify_client(dict(request.headers), default="claude")
+            from headroom.proxy.helpers import (
+                anthropic_first_party_tool_search_supported,
+                claude_code_tool_search_active,
+            )
+
+            _claude_tool_search_active = (
+                not _bypass
+                and provider_name == "anthropic"
+                and upstream_base_url is None
+                and getattr(self, "anthropic_backend", None) is None
+                and anthropic_first_party_tool_search_supported(self.ANTHROPIC_API_URL)
+                and is_token_mode(self.config.mode)
+                and claude_code_tool_search_active(
+                    client=raw_client,
+                    tools=raw_tools,
+                    anthropic_beta=request.headers.get("anthropic-beta"),
+                )
+            )
+            _locked_tools = copy.deepcopy(raw_tools) if _claude_tool_search_active else None
             pipeline_provider = provider_name
             pipeline_path = request.url.path if upstream_base_url else "/v1/messages"
             pipeline_stream = bool(body.get("stream", False) or force_stream)
@@ -1039,14 +1064,16 @@ class AnthropicHandlerMixin:
                 provider=pipeline_provider,
                 model=model,
                 messages=messages,
-                tools=body.get("tools"),
+                tools=copy.deepcopy(_locked_tools)
+                if _claude_tool_search_active
+                else body.get("tools"),
                 metadata={"path": pipeline_path, "stream": pipeline_stream},
             )
             if input_event.messages is not None:
                 messages = input_event.messages
                 with stage_timer.measure("deep_copy"):
                     original_client_messages = copy.deepcopy(messages)
-            if input_event.tools is not None:
+            if input_event.tools is not None and not _claude_tool_search_active:
                 body["tools"] = input_event.tools
 
             # Snapshot the client's cache_control breakpoints before any
@@ -1093,10 +1120,6 @@ class AnthropicHandlerMixin:
             # when the caller explicitly opts out via header.
             # Prevents Headroom from corrupting sub-agent API calls
             # (e.g., Claude Code sub-agents that inherit ANTHROPIC_BASE_URL).
-            _bypass = (
-                request.headers.get("x-headroom-bypass", "").lower() == "true"
-                or request.headers.get("x-headroom-mode", "").lower() == "passthrough"
-            )
             preserve_tool_order = _bypass or not self.config.optimize
             if _bypass:
                 logger.info(f"[{request_id}] Bypass: skipping compression (header)")
@@ -1137,6 +1160,8 @@ class AnthropicHandlerMixin:
             # from User-Agent or X-Client. Surfaced via the funnel into
             # PERF logs and RequestLog.tags — see RequestOutcome.client.
             client = classify_client(headers, default="claude")
+            if _claude_tool_search_active:
+                preserve_tool_order = True
             # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
             # headers AFTER `_extract_tags` reads them. Inbound bypass gating
             # uses `request.headers.get(...)` directly above; memory user-id
@@ -2269,8 +2294,12 @@ class AnthropicHandlerMixin:
             # existing per-request scan (it lives in the system prompt, which
             # is the cache hot zone — gated separately by the
             # `frozen_message_count > 0` guard below).
-            tools = body.get("tools")
-            _original_tools = tools  # Preserve for diagnostic / future retry
+            tools = (
+                copy.deepcopy(_locked_tools) if _claude_tool_search_active else body.get("tools")
+            )
+            _original_tools = copy.deepcopy(tools) if _claude_tool_search_active else tools
+            if _claude_tool_search_active:
+                body["tools"] = copy.deepcopy(_locked_tools)
 
             # Issue #746: when Claude Code talks to a custom ANTHROPIC_BASE_URL
             # with ENABLE_TOOL_SEARCH unset, it stops deferring tool schemas and
@@ -2310,7 +2339,9 @@ class AnthropicHandlerMixin:
             # set. The downstream uses already treat falsy as "unresolved".
             ccr_workspace_key, ccr_workspace_label = None, None
             if (
-                self.config.ccr_inject_tool or self.config.ccr_inject_system_instructions
+                self.config.ccr_inject_tool
+                or self.config.ccr_inject_system_instructions
+                or _claude_tool_search_active
             ) and not _bypass:
                 inject_system_instructions = self.config.ccr_inject_system_instructions
                 if inject_system_instructions and frozen_message_count > 0:
@@ -2351,7 +2382,7 @@ class AnthropicHandlerMixin:
                 # a session that has never compressed still gets no tool, so
                 # dropping the gate cannot start injecting into non-CCR
                 # conversations.
-                if configured_inject_tool:
+                if configured_inject_tool and not _claude_tool_search_active:
                     from headroom.proxy.helpers import (
                         apply_session_sticky_ccr_tool,
                         history_references_ccr_tool,
@@ -2423,6 +2454,7 @@ class AnthropicHandlerMixin:
                                         f"[{request_id}] CCR: skipping proactive "
                                         f"tracking for Claude Code compact summary {hash_key}"
                                     )
+
                                     continue
                                 self.ccr_context_tracker.track_compression(
                                     hash_key=hash_key,
@@ -2440,6 +2472,21 @@ class AnthropicHandlerMixin:
                             "track_compression (fail-closed — no x-headroom-cwd / "
                             "x-headroom-project-id header and no cwd: in system prompt)"
                         )
+
+                # Active Claude Tool Search owns the tools array, so CCR cannot
+                # add ``headroom_retrieve``. Resolve any newly visible CCR
+                # marker inline instead of forwarding an unredeemable marker.
+                if (
+                    _claude_tool_search_active
+                    and injector.has_compressed_content
+                    and not self._has_headroom_retrieve_tool(tools)
+                ):
+                    optimized_messages = resolve_markers_in_response(optimized_messages)
+                    logger.info(
+                        "[%s] CCR: resolved active-route markers inline because "
+                        "the client-owned tools array cannot add headroom_retrieve",
+                        request_id,
+                    )
 
             # CCR Proactive Expansion: Check if current query needs expanded context.
             # Same workspace gate as track_compression above.
@@ -2624,23 +2671,24 @@ class AnthropicHandlerMixin:
                 # turn (i.e. memory_handler.config.inject_tools and we
                 # have a memory_user_id, which the outer guard at line
                 # 1192 already enforces).
-                from headroom.proxy.helpers import (
-                    apply_session_sticky_memory_tools,
-                )
+                memory_tool_defs = []
+                mem_tools_injected = False
+                if not _claude_tool_search_active:
+                    from headroom.proxy.helpers import apply_session_sticky_memory_tools
 
-                memory_tool_defs = (
-                    self.memory_handler.compute_memory_tool_definitions("anthropic")
-                    if self.memory_handler.config.inject_tools
-                    else []
-                )
-                tools, mem_tools_injected = apply_session_sticky_memory_tools(
-                    provider="anthropic",
-                    session_id=session_id,
-                    request_id=request_id,
-                    existing_tools=tools,
-                    memory_tools_to_inject=memory_tool_defs,
-                    inject_this_turn=bool(self.memory_handler.config.inject_tools),
-                )
+                    memory_tool_defs = (
+                        self.memory_handler.compute_memory_tool_definitions("anthropic")
+                        if self.memory_handler.config.inject_tools
+                        else []
+                    )
+                    tools, mem_tools_injected = apply_session_sticky_memory_tools(
+                        provider="anthropic",
+                        session_id=session_id,
+                        request_id=request_id,
+                        existing_tools=tools,
+                        memory_tools_to_inject=memory_tool_defs,
+                        inject_this_turn=bool(self.memory_handler.config.inject_tools),
+                    )
                 if mem_tools_injected:
                     memory_tools_injected = True
                     tool_names = [
@@ -2716,7 +2764,7 @@ class AnthropicHandlerMixin:
                 )
                 if remembered_event.messages is not None:
                     optimized_messages = remembered_event.messages
-                if remembered_event.tools is not None:
+                if remembered_event.tools is not None and not _claude_tool_search_active:
                     tools = remembered_event.tools
                 if remembered_event.headers is not None:
                     headers = remembered_event.headers
@@ -2766,7 +2814,12 @@ class AnthropicHandlerMixin:
                 from headroom.proxy.tool_schema_compaction import compact_tools
 
                 _pre_compaction_tools = body.get("tools")
-                body, _tools_modified, _tools_before_bytes, _tools_after_bytes = compact_tools(body)
+                if not _claude_tool_search_active:
+                    body, _tools_modified, _tools_before_bytes, _tools_after_bytes = compact_tools(
+                        body
+                    )
+                else:
+                    _tools_modified = False
                 if _tools_modified:
                     tools = body["tools"]
                     transforms_applied.append("anthropic:tool_schema_compaction")
@@ -2799,9 +2852,12 @@ class AnthropicHandlerMixin:
                 _desc_max = tool_desc_max_chars()
                 if _desc_max > 0:
                     _pre_desc_tools = body.get("tools")
-                    body, _desc_modified, _desc_before, _desc_after = compact_tool_descriptions(
-                        body, _desc_max
-                    )
+                    if not _claude_tool_search_active:
+                        body, _desc_modified, _desc_before, _desc_after = compact_tool_descriptions(
+                            body, _desc_max
+                        )
+                    else:
+                        _desc_modified = False
                     if _desc_modified:
                         tools = body["tools"]
                         transforms_applied.append("anthropic:tool_desc_compaction")
@@ -2866,7 +2922,7 @@ class AnthropicHandlerMixin:
                 provider=pipeline_provider,
                 model=model,
                 messages=optimized_messages,
-                tools=tools,
+                tools=copy.deepcopy(_locked_tools) if _claude_tool_search_active else tools,
                 headers=headers,
                 metadata={"path": pipeline_path, "stream": stream},
             )
@@ -2874,7 +2930,7 @@ class AnthropicHandlerMixin:
             if presend_event.messages is not None:
                 optimized_messages = presend_event.messages
                 body["messages"] = optimized_messages
-            if presend_event.tools is not None:
+            if presend_event.tools is not None and not _claude_tool_search_active:
                 tools = self._tools_for_forwarding(
                     presend_event.tools,
                     preserve_order=preserve_tool_order,
@@ -2931,7 +2987,8 @@ class AnthropicHandlerMixin:
             # strip client-originated tool_search_tool_* entries above and skip
             # Headroom's own injector here.
             if (
-                provider_name == "anthropic"
+                not _claude_tool_search_active
+                and provider_name == "anthropic"
                 and anthropic_first_party_tool_search_supported(_anthropic_target_base_url)
                 and getattr(self, "anthropic_backend", None) is None
                 and os.environ.get("HEADROOM_TOOL_SEARCH", "1").strip().lower()
@@ -2980,7 +3037,11 @@ class AnthropicHandlerMixin:
                     provider="anthropic",
                     model=str(model),
                     messages=optimized_messages,
-                    tools=body.get("tools"),
+                    tools=(
+                        copy.deepcopy(_locked_tools)
+                        if _claude_tool_search_active
+                        else body.get("tools")
+                    ),
                     config=self.config,
                     tags=tags,
                     count_messages=tokenizer.count_messages,
@@ -2999,7 +3060,7 @@ class AnthropicHandlerMixin:
                 if _req_ctx.messages is not optimized_messages:
                     optimized_messages = _req_ctx.messages
                     body["messages"] = optimized_messages
-                if _req_ctx.tools is not body.get("tools"):
+                if _req_ctx.tools is not body.get("tools") and not _claude_tool_search_active:
                     tools = _req_ctx.tools
                     body["tools"] = tools
                 # A hook may shrink the tool array either by replacing it or in place,
@@ -3068,6 +3129,10 @@ class AnthropicHandlerMixin:
                     request_id,
                     _ccr_neutralized,
                 )
+
+            if _claude_tool_search_active:
+                tools = copy.deepcopy(_locked_tools)
+                body["tools"] = copy.deepcopy(_locked_tools)
 
             # Consistency: report tok_before/tok_after with ONE tokenizer. The pipeline
             # and the handler use different token estimators, and cache-mode branches
@@ -3604,9 +3669,10 @@ class AnthropicHandlerMixin:
                     if body.get("system") is not None:
                         body["system"] = _ttl_system
                     body["messages"] = _ttl_messages
-                    if body.get("tools") is not None:
+                    if body.get("tools") is not None and not _claude_tool_search_active:
                         body["tools"] = _ttl_tools
-                    tools = _ttl_tools
+                    if not _claude_tool_search_active:
+                        tools = _ttl_tools
                     body_mutation_tracker.mark_mutated("cache_control_ttl_order")
 
                 # Signed thinking locks the request to the client's original
@@ -3998,7 +4064,9 @@ class AnthropicHandlerMixin:
                                     **body,
                                     "messages": msgs,
                                 }
-                                if tls is not None:
+                                if _claude_tool_search_active:
+                                    continuation_body["tools"] = copy.deepcopy(_locked_tools)
+                                elif tls is not None:
                                     continuation_body["tools"] = tls
 
                                 # Use clean headers for continuation
@@ -4180,7 +4248,9 @@ class AnthropicHandlerMixin:
 
                                     # Make continuation API call
                                     continuation_body = {**body, "messages": continuation_messages}
-                                    if tools:
+                                    if _claude_tool_search_active:
+                                        continuation_body["tools"] = copy.deepcopy(_locked_tools)
+                                    elif tools:
                                         continuation_body["tools"] = tools
 
                                     cont_response = await self._retry_request(

@@ -13,9 +13,11 @@
 //! payload bytes, with a `SETEX` TTL applied on every write. The TTL is
 //! an **idle window** (#2604): every successful `get` re-arms the key's
 //! expiry, bounded by an absolute max lifetime tracked in a companion
-//! `ccr:{hash}:born` key whose own expiry marks the ceiling. Redis
-//! handles purging via key expiry — no application-side sweep needed
-//! (matching the SQLite backend's lazy-purge but at the Redis level).
+//! `ccr:{hash}:born` key. That marker outlives the ceiling it encodes by
+//! a grace period (see `born_grace_seconds`), so its *remaining* TTL —
+//! not its existence — is what carries the ceiling. Redis handles
+//! purging via key expiry — no application-side sweep needed (matching
+//! the SQLite backend's lazy-purge but at the Redis level).
 //!
 //! # Concurrency
 //!
@@ -78,10 +80,38 @@ impl RedisCcrStore {
         format!("{}:{}", self.key_prefix, hash)
     }
 
-    /// Companion key whose expiry marks the entry's absolute max
-    /// lifetime; its remaining TTL caps every idle-window re-arm.
+    /// Companion key carrying the entry's absolute max lifetime; its
+    /// remaining TTL, less `born_grace_seconds`, caps every idle-window
+    /// re-arm.
     fn born_key_for(&self, hash: &str) -> String {
         format!("{}:{}:born", self.key_prefix, hash)
+    }
+
+    /// Seconds the born marker is kept *past* the ceiling it encodes.
+    ///
+    /// The marker cannot expire exactly at the ceiling. `TTL` has
+    /// whole-second resolution, so a born key that expires at the ceiling
+    /// disappears between two `get`s rather than being observed at zero —
+    /// and a missing born key is indistinguishable from a legacy entry
+    /// that never had one, which sends `get` down the backfill path and
+    /// resets the very ceiling it was enforcing. An entry under constant
+    /// access is then pinned indefinitely.
+    ///
+    /// Holding the marker `default_ttl_seconds` longer than the ceiling
+    /// guarantees it outlives the payload key it governs — that key's own
+    /// TTL is never more than `default_ttl_seconds` — so a past-the-
+    /// ceiling entry is always observed as `remaining == 0` while its
+    /// marker still exists, and the purge fires on the next `get`.
+    fn born_grace_seconds(&self) -> u64 {
+        // `max(1)` keeps the guarantee at a zero idle TTL, where the
+        // grace would otherwise collapse to nothing.
+        self.default_ttl_seconds.max(1)
+    }
+
+    /// TTL to write on the born marker: the ceiling plus the grace.
+    fn born_key_ttl_seconds(&self) -> u64 {
+        self.max_lifetime_seconds
+            .saturating_add(self.born_grace_seconds())
     }
 
     /// Default TTL (seconds) applied on every `put`.
@@ -122,7 +152,7 @@ impl CcrStore for RedisCcrStore {
         // idle-window re-arm in `get`, so constant access cannot pin an
         // entry past `max_lifetime_seconds`.
         let born: redis::RedisResult<()> =
-            conn.set_ex(self.born_key_for(hash), 1_u8, self.max_lifetime_seconds);
+            conn.set_ex(self.born_key_for(hash), 1_u8, self.born_key_ttl_seconds());
         if let Err(err) = born {
             tracing::warn!(
                 target = "ccr.redis",
@@ -167,12 +197,16 @@ impl CcrStore for RedisCcrStore {
         let born_key = self.born_key_for(hash);
         let born_remaining: i64 = conn.ttl(&born_key).unwrap_or(-1);
         let remaining = if born_remaining >= 0 {
-            born_remaining as u64
+            // The marker outlives the ceiling by the grace period, so strip
+            // it back off to get the ceiling actually remaining. Saturates
+            // to zero once the ceiling has passed, which is the purge
+            // signal below.
+            (born_remaining as u64).saturating_sub(self.born_grace_seconds())
         } else {
             // Legacy entry written by a pre-sliding build (no born key):
             // backfill the ceiling from now rather than dropping data.
             let backfill: redis::RedisResult<()> =
-                conn.set_ex(&born_key, 1_u8, self.max_lifetime_seconds);
+                conn.set_ex(&born_key, 1_u8, self.born_key_ttl_seconds());
             if let Err(err) = backfill {
                 tracing::warn!(
                     target = "ccr.redis",

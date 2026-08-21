@@ -392,4 +392,42 @@ mod redis_tests {
         std::thread::sleep(Duration::from_millis(3_100));
         assert_eq!(store.get(&hash), None);
     }
+
+    #[test]
+    fn redis_max_lifetime_caps_sliding_window() {
+        let Some(url) = redis_url() else {
+            eprintln!(
+                "skipping redis_max_lifetime_caps_sliding_window: HEADROOM_TEST_REDIS_URL not set"
+            );
+            return;
+        };
+        // Idle TTL 1s → ceiling 8s (the 8x multiplier, same as in-memory).
+        // 1s is the floor here because EXPIRE/TTL have whole-second
+        // resolution, so the shortest ceiling the backend can express is 8s.
+        // A unique prefix per run keeps this independent of the other tests'
+        // keyspaces and of leftovers from a previous run.
+        let store = RedisCcrStore::open_with_prefix(&url, "ccr_test_ceiling".to_string(), 1)
+            .expect("open redis store");
+        let payload = "capped redis";
+        let hash = compute_key(payload.as_bytes());
+        store.put(&hash, payload);
+        // Touch every 900ms: inside the 1s idle window, so the entry never
+        // dies of idleness and the assertion below can only pass via the
+        // ceiling — the thing under test. The deadline is 12s, half again the
+        // 8s ceiling, so a correct backend has several touches' worth of
+        // slack to purge in.
+        let deadline = std::time::Instant::now() + Duration::from_millis(12_000);
+        let mut expired = false;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(900));
+            if store.get(&hash).is_none() {
+                expired = true;
+                break;
+            }
+        }
+        assert!(
+            expired,
+            "constant access must not extend an entry past its max lifetime"
+        );
+    }
 }

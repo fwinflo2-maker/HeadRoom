@@ -9,7 +9,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from headroom.cache.compression_store import get_compression_store, reset_compression_store
-from headroom.ccr.marker_resolution import resolve_markers_in_text
 from headroom.pipeline import PipelineStage
 from headroom.proxy.server import ProxyConfig, create_app
 from headroom.proxy.turn_hooks import TurnContext, clear_turn_hooks, register_turn_hook
@@ -223,7 +222,10 @@ def test_replacement_attempts_cannot_replace_active_tools() -> None:
 def test_active_route_injection_cannot_add_proxy_tools(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HEADROOM_TOOL_SEARCH", "true")
     inbound = _body(result=_workitems())
-    with _client() as client:
+    with _client(
+        ccr_inject_tool=True,
+        ccr_inject_system_instructions=True,
+    ) as client:
         outbound, _ = _capture(client, inbound)
     assert outbound["tools"] == inbound["tools"]
 
@@ -242,6 +244,9 @@ def test_active_route_with_memory_enabled_keeps_memory_state_initialized() -> No
         def has_memory_tool_calls(self, response: dict[str, Any], provider: str) -> bool:
             return False
 
+        def compute_memory_tool_definitions(self, provider: str) -> list[dict[str, Any]]:
+            return [{"name": "memory_search", "input_schema": {"type": "object"}}]
+
     inbound = _body(result=_workitems())
     with _client() as client:
         client.app.state.proxy.memory_handler = MemoryHandler()
@@ -249,27 +254,20 @@ def test_active_route_with_memory_enabled_keeps_memory_state_initialized() -> No
     assert outbound["tools"] == inbound["tools"]
 
 
-@pytest.mark.parametrize(
-    "marker_template",
-    [
-        "<<ccr:{hash}>>",
-        "[100 items compressed to 10. Retrieve more: hash={hash}]",
-        "[Read content stale. Retrieve original: hash={hash}]",
-    ],
-)
-def test_direct_marker_resolver_supports_all_ccr_forms(marker_template: str) -> None:
-    marker_hash = "abc123def456abc123def456"
-    reset_compression_store()
-    get_compression_store().store(
-        original="expanded tool result",
-        compressed="[100 items compressed to 10]",
-        explicit_hash=marker_hash,
-    )
-    try:
-        resolved = resolve_markers_in_text(marker_template.format(hash=marker_hash))
-        assert resolved == "expanded tool result"
-    finally:
-        reset_compression_store()
+def test_active_route_beta_marker_locks_tools_without_tool_search_definition() -> None:
+    inbound = _body(result=_workitems())
+    inbound["tools"][0] = {
+        "name": "ordinary_tool",
+        "description": "A provider-owned tool.",
+        "input_schema": {"type": "object", "properties": {"value": {"type": "string"}}},
+    }
+    with _client() as client:
+        outbound, _ = _capture(
+            client,
+            inbound,
+            **{"anthropic-beta": "advanced-tool-use-2025-11-20"},
+        )
+    assert outbound["tools"] == inbound["tools"]
 
 
 @pytest.mark.parametrize(
@@ -374,6 +372,84 @@ def test_continuation_tools_use_locked_snapshot() -> None:
         outbound, _ = _capture(client, inbound)
     assert outbound["tools"] == inbound["tools"]
     assert continuation_capture["body"]["tools"] == inbound["tools"]
+
+
+def test_memory_continuation_uses_locked_snapshot() -> None:
+    inbound = _body(result=_workitems())
+
+    class MemoryConfig:
+        inject_context = False
+        inject_tools = True
+        project_root_override = ""
+
+    class FakeMemory:
+        config = MemoryConfig()
+        initialized = True
+        backend = object()
+
+        def has_memory_tool_calls(self, response: dict[str, Any], provider: str) -> bool:
+            return True
+
+        async def handle_memory_tool_calls(
+            self,
+            response: dict[str, Any],
+            user_id: str,
+            provider: str,
+            *,
+            request_context: Any,
+        ) -> list[dict[str, Any]]:
+            return [{"type": "tool_result", "content": "memory result"}]
+
+        def compute_memory_tool_definitions(self, provider: str) -> list[dict[str, Any]]:
+            return [{"name": "memory_search", "input_schema": {"type": "object"}}]
+
+    with _client() as client:
+        client.app.state.proxy.memory_handler = FakeMemory()
+        outbound, _ = _capture(client, inbound, **{"x-headroom-user-id": "test-user"})
+
+    assert outbound["tools"] == inbound["tools"]
+    assert outbound["messages"][-1]["content"] == [
+        {"type": "tool_result", "content": "memory result"}
+    ]
+
+
+def test_response_hook_continuation_uses_locked_snapshot() -> None:
+    inbound = _body(result=_workitems())
+
+    class ResponseHook:
+        name = "response-reload"
+
+        async def on_response(
+            self,
+            ctx: TurnContext,
+            response: dict[str, Any],
+            call_model: Any,
+        ) -> dict[str, Any]:
+            ctx.tools = [{"name": "response-hook-replacement"}]
+            return await call_model([{"role": "user", "content": "reload"}])
+
+    register_turn_hook(ResponseHook())
+    with _client() as client:
+        outbound, _ = _capture(client, inbound)
+
+    assert outbound["tools"] == inbound["tools"]
+    assert outbound["messages"] == [{"role": "user", "content": "reload"}]
+
+
+def test_active_route_description_compaction_leaves_tools_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import headroom.proxy.tool_schema_compaction as compaction
+
+    monkeypatch.setenv("HEADROOM_TOOL_DESC_MAX_CHARS", "20")
+    compaction._TOOL_DESC_MAX_CHARS = None
+    inbound = _body(result=_workitems())
+    inbound["tools"][1]["description"] = (
+        "This description is deliberately much longer than twenty characters."
+    )
+    with _client() as client:
+        outbound, _ = _capture(client, inbound)
+    assert outbound["tools"] == inbound["tools"]
 
 
 def test_cache_mode_route_capture_keeps_active_token_lock_off(

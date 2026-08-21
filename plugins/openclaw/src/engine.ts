@@ -24,6 +24,13 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
+async function delegateCompactionToRuntime(params: Record<string, unknown>): Promise<any> {
+  // Keep OpenClaw an optional peer: source-only tests and non-OpenClaw imports
+  // must not resolve the host SDK until compaction actually needs it.
+  const sdk = await import("openclaw/plugin-sdk/core");
+  return sdk.delegateCompactionToRuntime(params as any);
+}
+
 export interface HeadroomEngineConfig extends ProxyManagerConfig {
   enabled?: boolean;
   requestTimeoutMs?: number;
@@ -55,7 +62,11 @@ export class HeadroomContextEngine {
     name: "Headroom Context Compression",
     version: "0.1.0",
     acceptedHostParams: ["runtimeContext"],
-    ownsCompaction: true,
+    // OpenClaw owns the durable compaction transaction. Headroom still
+    // compresses assembled prompts, while compact() delegates persistence to
+    // the host when the runtime does not expose its maintenance-only rewrite
+    // capability.
+    ownsCompaction: false,
   };
 
   private proxyManager: ProxyManager;
@@ -203,6 +214,23 @@ export class HeadroomContextEngine {
    * runtime-owned transcript rewrite operation so it remains serialized with
    * concurrent session appends.
    */
+  async maintain(params: {
+    sessionId: string;
+    sessionFile: string;
+    tokenBudget?: number;
+    force?: boolean;
+    runtimeContext?: HeadroomRuntimeContext;
+  }): Promise<{
+    ok: boolean;
+    compacted: boolean;
+    reason?: string;
+    result?: { tokensBefore: number; tokensAfter?: number };
+  }> {
+    // OpenClaw supplies rewriteTranscriptEntries on maintain(). Reuse the
+    // guarded transform here so the host serializes the rewrite with appends.
+    return this.compact(params);
+  }
+
   async compact(params: {
     sessionId: string;
     sessionFile: string;
@@ -224,12 +252,10 @@ export class HeadroomContextEngine {
 
     const rewriteTranscriptEntries = params.runtimeContext?.rewriteTranscriptEntries;
     if (!rewriteTranscriptEntries) {
-      return {
-        ok: false,
-        compacted: false,
-        reason:
-          "OpenClaw did not provide its serialized transcript rewrite capability; refusing an unsafe file replacement",
-      };
+      // Current OpenClaw releases expose rewriteTranscriptEntries to
+      // maintain(), not compact(). Delegate the complete compaction
+      // transaction rather than touching the append-only transcript here.
+      return delegateCompactionToRuntime(params as any);
     }
 
     try {

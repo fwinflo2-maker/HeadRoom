@@ -19,6 +19,14 @@ vi.mock("headroom-ai", () => ({
   compress: mocked.compress,
 }));
 
+vi.mock("openclaw/plugin-sdk/core", () => ({
+  delegateCompactionToRuntime: vi.fn(async () => ({
+    ok: true,
+    compacted: true,
+    reason: "delegated",
+  })),
+}), { virtual: true });
+
 vi.mock("../src/proxy-manager.js", () => ({
   ProxyManager: class {
     start = mocked.start;
@@ -552,7 +560,7 @@ describe("HeadroomContextEngine compaction", () => {
     }
   });
 
-  it("fails closed without OpenClaw's serialized rewrite capability", async () => {
+  it("delegates to OpenClaw when compact has no maintenance rewrite capability", async () => {
     const session = await createSessionFile([
       { type: "session", version: 1, id: "session-1" },
       {
@@ -572,13 +580,11 @@ describe("HeadroomContextEngine compaction", () => {
     try {
       await expect(
         engine.compact({ sessionId: "session-1", sessionFile: session.path }),
-      ).resolves.toMatchObject({
-        ok: false,
-        compacted: false,
-        reason: expect.stringContaining("serialized transcript rewrite capability"),
-      });
+      ).resolves.toEqual({ ok: true, compacted: true, reason: "delegated" });
       expect(await readFile(session.path, "utf8")).toBe(original);
-      expect((await stat(session.path)).mode & 0o777).toBe(0o600);
+      if (process.platform !== "win32") {
+        expect((await stat(session.path)).mode & 0o777).toBe(0o600);
+      }
       expect(await readFile(collidingTemporaryPath, "utf8")).toBe("do not touch");
       expect(mocked.compress).not.toHaveBeenCalled();
       expect(engine.getStats().compactions).toBe(0);
@@ -682,7 +688,9 @@ describe("HeadroomContextEngine compaction", () => {
           runtimeContext: { rewriteTranscriptEntries },
         }),
       ).resolves.toMatchObject({ ok: true, compacted: true });
-      expect((await stat(session.path)).mode & 0o777).toBe(0o600);
+      if (process.platform !== "win32") {
+        expect((await stat(session.path)).mode & 0o777).toBe(0o600);
+      }
       expect(await readdir(session.directory)).toEqual(["session.jsonl"]);
     } finally {
       await rm(session.directory, { recursive: true, force: true });

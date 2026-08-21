@@ -14,7 +14,7 @@ import logging
 import threading
 from collections import defaultdict
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from headroom.observability import HeadroomOtelMetrics
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 from headroom import savings_ledger
 from headroom.observability import get_otel_metrics
-from headroom.proxy.savings_tracker import SavingsTracker
+from headroom.proxy.savings_tracker import SavingsTracker, estimate_request_savings_usd
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -142,6 +142,8 @@ class PrometheusMetrics:
         # they saved so per-extension contribution is observable via /stats,
         # mirroring the per-strategy compression breakdown above.
         self.extension_savings: dict[str, int] = defaultdict(int)
+        # Named savings attribution; realized and projected rows stay separate.
+        self.savings_by_source: dict[str, dict[str, str | int | float | bool]] = {}
 
         # Fail-open compression failures, keyed by reason ("timeout",
         # "error"). The proxy fails open on any optimization error so the
@@ -149,6 +151,14 @@ class PrometheusMetrics:
         # visible as a log line. Splitting timeout from other errors tells us
         # whether the compression budget is too tight vs. a real bug.
         self.compression_failed_by_reason: dict[str, int] = defaultdict(int)
+
+        # Upstream transport failures on the streaming path, keyed by provider.
+        # Raised when every connect retry is exhausted and the proxy synthesizes
+        # its own error response instead of forwarding an upstream status. That
+        # path emits no upstream status code to attribute the failure to, so
+        # without this counter it is invisible in metrics and survives only as a
+        # log line.
+        self.upstream_connection_errors_by_provider: dict[str, int] = defaultdict(int)
 
         # Kompress size-gate outcomes, keyed by outcome ("within",
         # "exceeded"). The gate routes oversized blocks away from ML
@@ -350,8 +360,10 @@ class PrometheusMetrics:
             self.compressions_by_strategy.clear()
             self.tokens_saved_by_strategy.clear()
             self.extension_savings.clear()
+            self.savings_by_source.clear()
             with self._obs_counter_lock:
                 self.compression_failed_by_reason.clear()
+                self.upstream_connection_errors_by_provider.clear()
                 self.kompress_size_gate_by_outcome.clear()
                 self.compression_quarantine_by_event.clear()
 
@@ -565,6 +577,18 @@ class PrometheusMetrics:
         with self._obs_counter_lock:
             self.compression_failed_by_reason[reason or "error"] += 1
 
+    def record_upstream_connection_error(self, provider: str) -> None:
+        """Record one exhausted-retries upstream transport failure.
+
+        Called from the streaming handler's ``httpx.TransportError`` fallback
+        (handlers/streaming.py), where the proxy synthesizes its own 502
+        because no upstream response ever arrived. Guarded by
+        ``_obs_counter_lock`` for the same reason as
+        ``record_compression_failed``.
+        """
+        with self._obs_counter_lock:
+            self.upstream_connection_errors_by_provider[provider or "unknown"] += 1
+
     def record_kompress_size_gate(self, outcome: str) -> None:
         """Record one kompress size-gate decision, bucketed by ``outcome``.
 
@@ -730,6 +754,7 @@ class PrometheusMetrics:
         client: str | None = None,
         tool_search_saved: int = 0,
         local_input_tokens: int | None = None,
+        savings_attribution: list[dict[str, Any]] | None = None,
     ):
         """Record metrics for a request.
 
@@ -757,6 +782,13 @@ class PrometheusMetrics:
                 model,
             )
             tokens_saved = 0
+        savings_usd = estimate_request_savings_usd(
+            model,
+            compression_tokens_saved=tokens_saved,
+            tool_schema_tokens_saved=tool_search_saved,
+            output_tokens_saved=output_tokens_saved,
+            cache_read_tokens=cache_read_tokens,
+        )
         async with self._lock:
             self.requests_total += 1
             self.requests_by_provider[provider] += 1
@@ -787,6 +819,26 @@ class PrometheusMetrics:
             self.tokens_output_total += output_tokens
             self.tokens_saved_total += tokens_saved
             self.tool_search_saved_total += max(0, int(tool_search_saved))
+            for item in savings_attribution or ():
+                source = str(item.get("source") or "other")[:64]
+                realized = bool(item.get("realized", True))
+                key = f"{source}:{int(realized)}"
+                row = self.savings_by_source.setdefault(
+                    key,
+                    {
+                        "source": source,
+                        "realized": realized,
+                        "events": 0,
+                        "tokens": 0,
+                        "usd": 0.0,
+                    },
+                )
+                row["events"] = int(row["events"]) + 1
+                row["tokens"] = int(row["tokens"]) + max(0, int(item.get("tokens", 0) or 0))
+                row["usd"] = round(
+                    float(row["usd"]) + float(item.get("usd", 0.0) or 0.0),
+                    12,
+                )
             # See the attribute definition for why this is the right
             # denominator for the active-compression ratio.
             self.attempted_input_tokens_total += max(0, int(attempted_input_tokens))
@@ -883,6 +935,14 @@ class PrometheusMetrics:
                 model=model,
                 input_tokens=input_tokens,
                 tokens_saved=tokens_saved,
+                # ``tokens_saved`` is message-only; deferral rides separately and
+                # the two are disjoint. This argument was the missing link: the
+                # value arrives at this method (see the parameter above) and is
+                # already folded into ``savings_usd`` below, but it stopped here,
+                # so per-model tokens under-reported by exactly the deferral while
+                # per-model dollars did not — a tool-heavy model showed real money
+                # saved next to "0 tokens saved".
+                tool_search_saved=tool_search_saved,
                 provider=provider,
                 project=project,
                 cache_read_tokens=cache_read_tokens,
@@ -891,6 +951,7 @@ class PrometheusMetrics:
                 total_input_tokens=total_input_tokens,
                 total_input_cost_usd=total_input_cost_usd,
                 output_tokens_saved=output_tokens_saved,
+                estimated_savings_usd=savings_usd,
             )
 
         # Also append to the durable, multi-process savings ledger so
@@ -945,7 +1006,8 @@ class PrometheusMetrics:
                 source="proxy",
             )
 
-        self._get_otel_metrics().record_proxy_request(
+        otel_metrics = self._get_otel_metrics()
+        otel_metrics.record_proxy_request(
             provider=provider,
             model=model,
             input_tokens=input_tokens,
@@ -961,7 +1023,15 @@ class PrometheusMetrics:
             cache_write_5m_tokens=cache_write_5m_tokens,
             cache_write_1h_tokens=cache_write_1h_tokens,
             uncached_input_tokens=uncached_input_tokens,
+            attempted_input_tokens=attempted_input_tokens,
+            output_tokens_saved=output_tokens_saved,
+            savings_usd=savings_usd,
+            project=project,
+            client=client,
         )
+        record_attribution = getattr(otel_metrics, "record_savings_attribution", None)
+        if record_attribution is not None and savings_attribution:
+            record_attribution(savings_attribution)
 
     async def record_stage_timings(
         self,
@@ -1157,6 +1227,47 @@ class PrometheusMetrics:
                 help_text="Tokens saved by optimization",
                 value=self.tokens_saved_total,
             )
+            if self.savings_by_source:
+                lines.extend(
+                    [
+                        "# HELP headroom_savings_attribution_events_total Per-request savings attribution events",
+                        "# TYPE headroom_savings_attribution_events_total counter",
+                    ]
+                )
+                for row in self.savings_by_source.values():
+                    labels = _format_labels(
+                        {"source": str(row["source"]), "realized": str(row["realized"]).lower()}
+                    )
+                    lines.append(
+                        f"headroom_savings_attribution_events_total{labels} {row['events']}"
+                    )
+                lines.extend(
+                    [
+                        "",
+                        "# HELP headroom_savings_attributed_tokens_total Tokens attributed to a savings source",
+                        "# TYPE headroom_savings_attributed_tokens_total counter",
+                    ]
+                )
+                for row in self.savings_by_source.values():
+                    labels = _format_labels(
+                        {"source": str(row["source"]), "realized": str(row["realized"]).lower()}
+                    )
+                    lines.append(
+                        f"headroom_savings_attributed_tokens_total{labels} {row['tokens']}"
+                    )
+                lines.extend(
+                    [
+                        "",
+                        "# HELP headroom_savings_attributed_usd_total Cost savings attributed to a source; may be negative",
+                        "# TYPE headroom_savings_attributed_usd_total gauge",
+                    ]
+                )
+                for row in self.savings_by_source.values():
+                    labels = _format_labels(
+                        {"source": str(row["source"]), "realized": str(row["realized"]).lower()}
+                    )
+                    lines.append(f"headroom_savings_attributed_usd_total{labels} {row['usd']}")
+                lines.append("")
             _append_metric(
                 lines,
                 name="headroom_persistent_savings_requests_total",
@@ -1322,8 +1433,22 @@ class PrometheusMetrics:
             # then format outside it (see _obs_counter_lock).
             with self._obs_counter_lock:
                 compression_failed = dict(self.compression_failed_by_reason)
+                upstream_conn_errors = dict(self.upstream_connection_errors_by_provider)
                 kompress_size_gate = dict(self.kompress_size_gate_by_outcome)
                 compression_quarantine = dict(self.compression_quarantine_by_event)
+
+            if upstream_conn_errors:
+                lines.extend(
+                    [
+                        "# HELP headroom_upstream_connection_errors_total Exhausted-retries upstream transport failures by provider; the proxy answered 502 itself because no upstream response arrived",
+                        "# TYPE headroom_upstream_connection_errors_total counter",
+                    ]
+                )
+                for prov, count in upstream_conn_errors.items():
+                    lines.append(
+                        f'headroom_upstream_connection_errors_total{{provider="{_escape_label_value(prov)}"}} {count}'
+                    )
+                lines.append("")
 
             if compression_failed:
                 lines.extend(

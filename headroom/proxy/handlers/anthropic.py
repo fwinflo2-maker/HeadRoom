@@ -2343,7 +2343,11 @@ class AnthropicHandlerMixin:
                 or self.config.ccr_inject_system_instructions
                 or _claude_tool_search_active
             ) and not _bypass:
-                inject_system_instructions = self.config.ccr_inject_system_instructions
+                # Claude Tool Search owns the tools array, so do not advertise
+                # Headroom's retrieval tool in a system prompt it cannot call.
+                inject_system_instructions = (
+                    self.config.ccr_inject_system_instructions and not _claude_tool_search_active
+                )
                 if inject_system_instructions and frozen_message_count > 0:
                     logger.info(
                         f"[{request_id}] CCR: skipping system instruction injection "

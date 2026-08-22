@@ -218,12 +218,27 @@ def test_replacement_attempts_cannot_replace_active_tools() -> None:
 
 def test_active_route_injection_cannot_add_proxy_tools(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HEADROOM_TOOL_SEARCH", "true")
-    inbound = _body(result=_workitems())
-    with _client(
-        ccr_inject_tool=True,
-        ccr_inject_system_instructions=True,
-    ) as client:
-        outbound, _ = _capture(client, inbound)
+    marker_hash = "abc123def456abc123def456"
+    reset_compression_store()
+    get_compression_store().store(
+        original="expanded tool result",
+        compressed="[100 items compressed to 10]",
+        explicit_hash=marker_hash,
+    )
+    try:
+        inbound = _body(result=f"[100 items compressed to 10. Retrieve more: hash={marker_hash}]")
+        with _client(
+            ccr_inject_tool=True,
+            ccr_inject_system_instructions=True,
+        ) as client:
+            outbound, _ = _capture(client, inbound)
+    finally:
+        reset_compression_store()
+
+    serialized = json.dumps(outbound)
+    assert "headroom_retrieve" not in serialized
+    assert "expanded tool result" in serialized
+    assert "Retrieve more: hash=" not in serialized
     assert outbound["tools"] == inbound["tools"]
 
 

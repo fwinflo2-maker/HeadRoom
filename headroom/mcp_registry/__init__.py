@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 from .claude import ClaudeRegistrar
+from .codebuddy import CodeBuddyRegistrar
 from .codex import CodexRegistrar
 from .display import any_succeeded, format_result, format_results
 from .grok import GrokRegistrar
@@ -31,6 +32,7 @@ from .server_json import build_server_json, render_server_json
 __all__ = [
     "DEFAULT_PROXY_URL",
     "ClaudeRegistrar",
+    "CodeBuddyRegistrar",
     "CodexRegistrar",
     "GrokRegistrar",
     "MCPRegistrar",

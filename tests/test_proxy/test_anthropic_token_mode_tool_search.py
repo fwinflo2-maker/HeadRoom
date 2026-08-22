@@ -19,7 +19,6 @@ def _tools() -> list[dict[str, Any]]:
         {
             "type": "tool_search_tool_regex_20251119",
             "name": "tool_search_tool_regex",
-            "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}},
         },
         {
             "name": "WaitForMcpServers",
@@ -54,20 +53,18 @@ def _messages(result: str | None = None) -> list[dict[str, Any]]:
             "type": "server_tool_use",
             "id": "search_1",
             "name": "tool_search_tool_regex",
-            "input": {"query": "Azure DevOps"},
+            "input": {"pattern": "Azure DevOps", "limit": 5},
         },
         {
             "type": "tool_search_tool_result",
             "tool_use_id": "search_1",
-            "content": [
-                {
-                    "type": "tool_search_tool_search_result",
-                    "tool_references": [
-                        {"type": "tool_reference", "tool_name": "WaitForMcpServers"},
-                        {"type": "tool_reference", "tool_name": "work_items"},
-                    ],
-                }
-            ],
+            "content": {
+                "type": "tool_search_tool_search_result",
+                "tool_references": [
+                    {"type": "tool_reference", "tool_name": "WaitForMcpServers"},
+                    {"type": "tool_reference", "tool_name": "work_items"},
+                ],
+            },
         },
         {
             "type": "tool_use",
@@ -442,7 +439,7 @@ def test_active_route_description_compaction_leaves_tools_unchanged(
     import headroom.proxy.tool_schema_compaction as compaction
 
     monkeypatch.setenv("HEADROOM_TOOL_DESC_MAX_CHARS", "20")
-    compaction._TOOL_DESC_MAX_CHARS = None
+    monkeypatch.setattr(compaction, "_TOOL_DESC_MAX_CHARS", None)
     inbound = _body(result=_workitems())
     inbound["tools"][1]["description"] = (
         "This description is deliberately much longer than twenty characters."

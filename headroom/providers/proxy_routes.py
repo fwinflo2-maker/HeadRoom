@@ -67,7 +67,7 @@ from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
 from headroom.proxy.request_scope import normalize_request_path, set_scope_header
-from headroom.proxy.upstream_guard import is_safe_upstream_url, is_safe_upstream_url_async
+from headroom.proxy.upstream_guard import is_safe_upstream_url_async
 
 logger = logging.getLogger("headroom.proxy.routes")
 

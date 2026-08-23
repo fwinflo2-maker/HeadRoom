@@ -45,7 +45,9 @@ def spec_fingerprint(spec: ServerSpec) -> str:
 def record_install(agent: str, spec: ServerSpec, *, path: Path | None = None) -> None:
     """Record that Headroom installed ``spec`` for ``agent``."""
     ledger_file = path or ledger_path()
-    data = _read_ledger(ledger_file, for_mutation=True)
+    # Automatic installs must recover from a stale or damaged ledger. The
+    # explicit reconcile route performs strict validation before config writes.
+    data = _read_ledger(ledger_file)
     agents = data.setdefault("agents", {})
     agent_entry = agents.setdefault(agent, {})
     agent_entry[spec.name] = {
@@ -58,7 +60,7 @@ def record_install(agent: str, spec: ServerSpec, *, path: Path | None = None) ->
 def clear_install(agent: str, server_name: str, *, path: Path | None = None) -> None:
     """Remove one ledger entry if present."""
     ledger_file = path or ledger_path()
-    data = _read_ledger(ledger_file, for_mutation=True)
+    data = _read_ledger(ledger_file)
     agents = data.get("agents")
     if not isinstance(agents, dict):
         return

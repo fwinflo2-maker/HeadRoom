@@ -10,6 +10,7 @@ from click.testing import CliRunner
 
 from headroom.cli.main import main
 from headroom.mcp_registry import ClaudeRegistrar, build_serena_spec
+from headroom.mcp_registry.ledger import headroom_installed_matching
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "headroom-issue-3054.json"
 
@@ -110,6 +111,7 @@ def test_reconcile_state_matrix(monkeypatch, tmp_path: Path, state: str, adopt: 
     config, ledger = _setup(monkeypatch, tmp_path)
     data = json.loads(config.read_text())
     recommended = build_serena_spec("claude-code")
+    owned_spec = None
     if state == "absent":
         del data["mcpServers"]["serena"]
     elif state == "matching":
@@ -117,13 +119,45 @@ def test_reconcile_state_matrix(monkeypatch, tmp_path: Path, state: str, adopt: 
             "command": recommended.command,
             "args": list(recommended.args),
         }
+    elif state == "user-drift":
+        data["mcpServers"]["serena"]["args"] = ["--from", "user-managed"]
     elif state == "headroom-drift":
         from headroom.mcp_registry.ledger import record_install
 
-        record_install("claude", recommended, path=ledger)
+        stale = build_serena_spec("claude-code")
+        stale.args = ("--from", "headroom-installed-old")
+        owned_spec = stale
+        data["mcpServers"]["serena"] = {
+            "command": stale.command,
+            "args": list(stale.args),
+        }
+        record_install("claude", stale, path=ledger)
     config.write_text(json.dumps(data))
+    if owned_spec is not None:
+        assert headroom_installed_matching("claude", owned_spec, path=ledger)
     result = CliRunner().invoke(main, ["mcp", "reconcile"] + (["--adopt"] if adopt else []))
     assert result.exit_code == 0, result.output
+    observed = json.loads(config.read_text())["mcpServers"].get("serena")
+    ownership = observed is not None and headroom_installed_matching(
+        "claude",
+        build_serena_spec("claude-code") if observed["args"] == list(recommended.args) else None,
+        path=ledger,
+    )
+    if adopt:
+        assert observed == {
+            "command": recommended.command,
+            "args": list(recommended.args),
+        }
+        assert ownership
+        assert "Adopted Headroom" in result.output
+    elif state == "headroom-drift":
+        assert observed["args"] == ["--from", "headroom-installed-old"]
+        assert headroom_installed_matching("claude", owned_spec, path=ledger)
+        assert ownership is False
+        assert "observed: present" in result.output
+    else:
+        assert not ownership
+        assert "Serena reconciliation for Claude" in result.output
 
 
 def test_only_adopt_is_a_reconcile_mutation(monkeypatch, tmp_path: Path):
@@ -139,11 +173,12 @@ def test_ordinary_install_does_not_adopt_serena(monkeypatch, tmp_path: Path):
     config, _ = _setup(monkeypatch, tmp_path)
     before = config.read_bytes()
     monkeypatch.setitem(sys.modules, "mcp", object())
-    monkeypatch.setattr(
-        "headroom.mcp_registry.install_everywhere", lambda **kwargs: {"codex": object()}
-    )
-    monkeypatch.setattr("headroom.mcp_registry.format_results", lambda *args, **kwargs: [])
-    monkeypatch.setattr("headroom.mcp_registry.any_succeeded", lambda results: True)
-    result = CliRunner().invoke(main, ["mcp", "install", "--agent", "codex"])
+    registrar = ClaudeRegistrar(claude_cli=None, home_dir=tmp_path)
+    monkeypatch.setattr("headroom.mcp_registry.install.get_all_registrars", lambda: [registrar])
+    result = CliRunner().invoke(main, ["mcp", "install", "--agent", "claude"])
     assert result.exit_code == 0, result.output
-    assert config.read_bytes() == before
+    after = json.loads(config.read_text())
+    before_data = json.loads(before)
+    assert after["mcpServers"]["serena"] == before_data["mcpServers"]["serena"]
+    assert after["mcpServers"]["headroom"]["args"] == ["mcp", "serve"]
+    assert "mcp reconcile --adopt" not in result.output

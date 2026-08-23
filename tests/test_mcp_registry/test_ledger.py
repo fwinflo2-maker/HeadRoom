@@ -46,3 +46,13 @@ def test_read_matching_tolerates_corrupt_ledger(tmp_path):
     ledger = tmp_path / "mcp_installs.json"
     ledger.write_text("not json")
     assert not headroom_installed_matching("claude", _spec(), path=ledger)
+
+
+def test_record_install_recovers_from_corrupt_ledger(tmp_path):
+    ledger = tmp_path / "mcp_installs.json"
+    ledger.write_text("not json")
+    spec = _spec()
+
+    record_install("claude", spec, path=ledger)
+
+    assert headroom_installed_matching("claude", spec, path=ledger)

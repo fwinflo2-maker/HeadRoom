@@ -9,10 +9,10 @@ from headroom.mcp_registry.ledger import headroom_installed_matching, record_ins
 
 
 class _Registrar:
-    name = "claude"
     display_name = "Claude Code"
 
-    def __init__(self, current: ServerSpec | None):
+    def __init__(self, current: ServerSpec | None, *, name: str = "claude"):
+        self.name = name
         self.current = current
         self.force_calls: list[bool] = []
 
@@ -70,3 +70,31 @@ def test_automatic_wrap_preserves_user_managed_warning(monkeypatch, tmp_path: Pa
     assert registrar.current == user
     assert registrar.force_calls == [False]
     assert "existing config differs" in capsys.readouterr().out
+
+
+def test_automatic_wrap_recovers_from_malformed_ledger(monkeypatch, tmp_path: Path):
+    _quiet(monkeypatch)
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text("not json")
+    monkeypatch.setattr("headroom.mcp_registry.ledger.ledger_path", lambda: ledger)
+    registrar = _Registrar(None)
+
+    wrap_cli._setup_serena_mcp(registrar, context="claude-code", verbose=True)
+
+    current = registrar.get_server("serena")
+    assert current == build_serena_spec("claude-code")
+    assert headroom_installed_matching("claude", current)
+
+
+def test_non_claude_wrap_keeps_usable_remediation_hint(monkeypatch, tmp_path: Path, capsys):
+    _quiet(monkeypatch)
+    monkeypatch.setattr(
+        "headroom.mcp_registry.ledger.ledger_path", lambda: tmp_path / "ledger.json"
+    )
+    registrar = _Registrar(ServerSpec("serena", "uvx", ("--from", "user")), name="codex")
+
+    wrap_cli._setup_serena_mcp(registrar, context="codex", verbose=True)
+
+    output = capsys.readouterr().out
+    assert "update or remove the existing serena MCP entry" in output
+    assert "mcp reconcile --adopt" not in output

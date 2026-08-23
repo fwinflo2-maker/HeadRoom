@@ -4386,14 +4386,10 @@ def _launch_tool(
         port_holder[0] = actual_port
         _push_runtime_env(actual_port, no_proxy)
 
-        # If port fell back, update env URLs to point at the actual port
+        # If port fell back, update environment URLs to point at the actual port.
         if actual_port != port:
             for k, v in dict(env).items():
                 env[k] = v.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
-            env_vars_display[:] = [
-                value.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
-                for value in env_vars_display
-            ]
 
         if configure_launch is not None:
             args, env, env_vars_display = configure_launch(actual_port, args, env, env_vars_display)
@@ -6320,9 +6316,20 @@ def kimi(
         click.echo("Install Kimi CLI: https://github.com/MoonshotAI/kimi-cli")
         raise SystemExit(1)
 
-    env, env_vars_display = _build_kimi_launch_env(
-        port, os.environ, project=_project_name_from_cwd()
-    )
+    project = _project_name_from_cwd()
+    env, env_vars_display = _build_kimi_launch_env(port, os.environ, project=project)
+
+    def configure_kimi_launch(
+        actual_port: int,
+        current_args: tuple,
+        current_env: dict[str, str],
+        current_display: list[str],
+    ) -> tuple[tuple, dict[str, str], list[str]]:
+        del current_display
+        updated_env, updated_display = _build_kimi_launch_env(
+            actual_port, current_env, project=project
+        )
+        return current_args, updated_env, updated_display
 
     _launch_tool(
         binary=kimi_bin,
@@ -6337,6 +6344,7 @@ def kimi(
         agent_type="kimi",
         code_graph=code_graph,
         openai_api_url=kimi_api_url,
+        configure_launch=configure_kimi_launch,
     )
 
 

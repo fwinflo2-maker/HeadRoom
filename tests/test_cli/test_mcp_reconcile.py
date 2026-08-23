@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 from click.testing import CliRunner
 
 from headroom.cli.main import main
 from headroom.mcp_registry import ClaudeRegistrar, build_serena_spec_for_agent
+from headroom.mcp_registry.base import RegisterResult, RegisterStatus
 
 
 def _setup(monkeypatch, tmp_path: Path):
@@ -58,6 +60,55 @@ def test_validation_rejects_multiple_actions(monkeypatch, tmp_path: Path):
     result = CliRunner().invoke(main, ["mcp", "reconcile", "--acknowledge", "--clear"])
     assert result.exit_code != 0
     assert "at most one" in result.output
+
+
+def test_validation_rejects_unknown_server(monkeypatch, tmp_path: Path):
+    _setup(monkeypatch, tmp_path)
+    result = CliRunner().invoke(main, ["mcp", "reconcile", "--server", "other"])
+    assert result.exit_code != 0
+    assert "only --server serena" in result.output
+
+
+def test_clear_acknowledgement_and_reject_absent_entry(monkeypatch, tmp_path: Path):
+    config, _ = _setup(monkeypatch, tmp_path)
+    acknowledged = CliRunner().invoke(main, ["mcp", "reconcile", "--acknowledge"])
+    assert acknowledged.exit_code == 0, acknowledged.output
+    cleared = CliRunner().invoke(main, ["mcp", "reconcile", "--clear"])
+    assert cleared.exit_code == 0, cleared.output
+
+    data = json.loads(config.read_text())
+    del data["mcpServers"]["serena"]
+    config.write_text(json.dumps(data))
+    absent = CliRunner().invoke(main, ["mcp", "reconcile", "--acknowledge"])
+    assert absent.exit_code != 0
+    assert "absent Serena entry" in absent.output
+
+
+def test_malformed_ledger_is_treated_as_unacknowledged(monkeypatch, tmp_path: Path):
+    _setup(monkeypatch, tmp_path)
+    (tmp_path / "ledger.json").write_text("not json")
+    result = CliRunner().invoke(main, ["mcp", "reconcile"])
+    assert result.exit_code == 0, result.output
+    assert "none/stale" in result.output
+
+
+def test_ordinary_install_forwards_force_without_reconcile(monkeypatch, tmp_path: Path):
+    _setup(monkeypatch, tmp_path)
+    monkeypatch.setitem(sys.modules, "mcp", object())
+    calls: list[dict] = []
+
+    def fake_install_everywhere(**kwargs):
+        calls.append(kwargs)
+        return [RegisterResult(RegisterStatus.REGISTERED, "installed")]
+
+    monkeypatch.setattr("headroom.mcp_registry.install_everywhere", fake_install_everywhere)
+    monkeypatch.setattr(
+        "headroom.mcp_registry.format_results", lambda results, **kwargs: ["installed"]
+    )
+    monkeypatch.setattr("headroom.mcp_registry.any_succeeded", lambda results: True)
+    result = CliRunner().invoke(main, ["mcp", "install", "--agent", "claude", "--force"])
+    assert result.exit_code == 0, result.output
+    assert calls == [{"proxy_url": "http://127.0.0.1:8787", "agents": ["claude"], "force": True}]
 
 
 def test_ordinary_install_has_no_reconcile_flags():

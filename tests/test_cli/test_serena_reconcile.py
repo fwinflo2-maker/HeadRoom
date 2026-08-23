@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from headroom.cli import wrap as wrap_cli
@@ -44,8 +45,12 @@ def test_reproduction_acknowledgement_suppresses_current_drift_without_mutation(
     _quiet_serena_side_effects(monkeypatch)
     ledger = tmp_path / "mcp_installs.json"
     monkeypatch.setattr("headroom.mcp_registry.ledger.ledger_path", lambda: ledger)
+    fixture = json.loads(
+        (Path(__file__).parents[1] / "fixtures" / "headroom-issue-3054.json").read_text()
+    )
     recommended = build_serena_spec_for_agent("claude")
-    observed = ServerSpec(name="serena", command="uvx", args=("--from", "old-serena"))
+    observed = ServerSpec(name="serena", command="uvx", args=tuple(fixture["old_serena_args"]))
+    assert list(recommended.args) == fixture["recommended_serena_args"]
     registrar = _Registrar(observed)
 
     wrap_cli._setup_serena_mcp(registrar, verbose=True)

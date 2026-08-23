@@ -184,9 +184,10 @@ Install Headroom so it's globally on PATH — `uv tool install "headroom-ai[mcp]
 | Cursor | Supported | Add to Cursor MCP settings |
 | Codex | If supported | Configure MCP server |
 | Any MCP host | Yes | Point to `headroom mcp serve` |
-| Serena reconciliation | User-managed drift | `headroom mcp reconcile [--acknowledge|--adopt|--clear]` |
 
 ## Architecture
+
+For user-managed Serena drift, run `headroom mcp reconcile` to inspect the current recommendation. Use `--acknowledge`, `--adopt`, or `--clear` for the explicit action.
 
 ### MCP only (no proxy)
 

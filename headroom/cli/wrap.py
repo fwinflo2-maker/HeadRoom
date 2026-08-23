@@ -2002,7 +2002,7 @@ def _setup_serena_mcp(
     """
     from headroom.mcp_registry import (
         acknowledgement_matches,
-        build_serena_spec_for_agent,
+        build_serena_spec,
         format_result,
         serena_context_for_agent,
     )
@@ -2025,7 +2025,7 @@ def _setup_serena_mcp(
     if agent_context is None:
         click.echo(f"  Serena MCP: unsupported agent {registrar.name} — skipping")
         return
-    spec = build_serena_spec_for_agent(registrar.name)
+    spec = build_serena_spec(agent_context)
     result = registrar.register_server(spec, force=force)
 
     # Migrate a stale Headroom-installed entry. register_server won't overwrite
@@ -2055,7 +2055,7 @@ def _setup_serena_mcp(
         result,
         label="Serena MCP",
         verbose=verbose,
-        overwrite_hint="update or remove the existing serena MCP entry, then rerun headroom wrap",
+        overwrite_hint=f"run headroom mcp reconcile --agent {registrar.name} --server serena",
         restart_hint=f"restart {registrar.display_name} if it was already running",
     )
     if line is not None:

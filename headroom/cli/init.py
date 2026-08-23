@@ -32,6 +32,7 @@ from headroom.install.providers import _apply_unix_env_scope, _apply_windows_env
 from headroom.install.runtime import (
     acquire_runtime_start_lock,
     resolve_headroom_command,
+    runtime_ownership,
     runtime_status,
     start_detached_agent,
     start_persistent_docker,
@@ -756,7 +757,7 @@ def _ensure_profile_running(profile: str) -> None:
                     if wait_ready(manifest, timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS):
                         return
                     stop_runtime(manifest)
-                if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+                if runtime_ownership(manifest) == "docker-supervisor":
                     start_persistent_docker(manifest)
                 elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
                     start_supervisor(manifest)

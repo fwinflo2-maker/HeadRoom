@@ -204,9 +204,9 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
 def runtime_ownership(manifest: DeploymentManifest) -> str:
     """Classify the owner that must launch and supervise this runtime."""
 
-    if (
-        manifest.preset == InstallPreset.PERSISTENT_DOCKER.value
-        and manifest.runtime_kind == RuntimeKind.DOCKER.value
+    runtime_kind = getattr(manifest, "runtime_kind", None)
+    if runtime_kind == RuntimeKind.DOCKER.value or (
+        runtime_kind is None and manifest.preset == InstallPreset.PERSISTENT_DOCKER.value
     ):
         return "docker-supervisor"
     if (
@@ -235,17 +235,50 @@ def _read_pid(profile: str) -> int | None:
         return None
 
 
+def _read_proc_metadata(pid: int) -> tuple[list[str], dict[str, str]] | None:
+    """Read process identity without requiring the optional psutil package."""
+
+    try:
+        cmdline = [
+            part.decode(errors="replace")
+            for part in (Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0"))
+            if part
+        ]
+        environ = {
+            part.split(b"=", 1)[0].decode(errors="replace"): part.split(b"=", 1)[1].decode(
+                errors="replace"
+            )
+            for part in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+            if b"=" in part
+        }
+    except (OSError, ValueError):
+        return None
+    return cmdline, environ
+
+
 def _process_matches_runtime(pid: int, manifest: DeploymentManifest) -> bool:
-    """Verify the PID still belongs to Headroom, without durable sidecar state."""
-    if pid == os.getpid() and runtime_ownership(manifest) == "launchd-exec":
-        return True
+    """Verify the PID's deployment identity before lifecycle operations."""
+    if pid == os.getpid():
+        return False
     try:
         import psutil  # type: ignore[import-untyped]  # optional dependency
 
-        cmdline = psutil.Process(pid).cmdline()
+        process = psutil.Process(pid)
+        cmdline = process.cmdline()
+        environ = process.environ()
     except Exception:
+        metadata = _read_proc_metadata(pid)
+        if metadata is None:
+            return False
+        cmdline, environ = metadata
+    if "proxy" not in cmdline or str(manifest.port) not in cmdline:
         return False
-    return "headroom.cli" in cmdline and "proxy" in cmdline
+    if environ:
+        return (
+            environ.get("HEADROOM_DEPLOYMENT_PROFILE") == manifest.profile
+            and environ.get("HEADROOM_DEPLOYMENT_RUNTIME") == manifest.runtime_kind
+        )
+    return any("headroom.cli" in part or Path(part).name == "headroom" for part in cmdline)
 
 
 def _clear_pid(profile: str, *, expected_pid: int | None = None) -> None:
@@ -401,7 +434,7 @@ def start_persistent_docker(manifest: DeploymentManifest) -> None:
 def stop_runtime(manifest: DeploymentManifest) -> None:
     """Stop the raw runtime for the deployment."""
 
-    if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+    if runtime_ownership(manifest) == "docker-supervisor":
         run(
             ["docker", "stop", manifest.container_name],
             capture_output=True,
@@ -441,7 +474,7 @@ def wait_ready(manifest: DeploymentManifest, timeout_seconds: int = 30) -> bool:
 def runtime_status(manifest: DeploymentManifest) -> str:
     """Return a short status string for the deployment runtime."""
 
-    if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+    if runtime_ownership(manifest) == "docker-supervisor":
         result = run(
             ["docker", "ps", "--format", "{{.Names}}"],
             capture_output=True,

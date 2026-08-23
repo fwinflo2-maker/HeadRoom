@@ -3525,8 +3525,13 @@ def _find_persistent_manifest(port: int) -> Any:
 def _recover_persistent_proxy(port: int) -> bool:
     """Start or recover a matching persistent deployment for the requested port."""
     from headroom.install.health import probe_ready
-    from headroom.install.models import InstallPreset, SupervisorKind
-    from headroom.install.runtime import start_detached_agent, start_persistent_docker, wait_ready
+    from headroom.install.models import SupervisorKind
+    from headroom.install.runtime import (
+        runtime_ownership,
+        start_detached_agent,
+        start_persistent_docker,
+        wait_ready,
+    )
     from headroom.install.supervisors import start_supervisor
 
     manifest = _find_persistent_manifest(port)
@@ -3545,7 +3550,7 @@ def _recover_persistent_proxy(port: int) -> bool:
 
     click.echo(f"  Recovering persistent deployment '{manifest.profile}' on port {port}...")
     try:
-        if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+        if runtime_ownership(manifest) == "docker-supervisor":
             start_persistent_docker(manifest)
         elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
             start_supervisor(manifest)
@@ -3567,8 +3572,9 @@ def _recover_persistent_proxy(port: int) -> bool:
 
 def _restart_persistent_proxy(manifest: Any, port: int) -> bool:
     """Restart a persistent deployment after an idle stale-version detection."""
-    from headroom.install.models import InstallPreset, SupervisorKind
+    from headroom.install.models import SupervisorKind
     from headroom.install.runtime import (
+        runtime_ownership,
         start_detached_agent,
         start_persistent_docker,
         stop_runtime,
@@ -3581,7 +3587,7 @@ def _restart_persistent_proxy(manifest: Any, port: int) -> bool:
         f"with Headroom {_HEADROOM_VERSION}..."
     )
     try:
-        if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+        if runtime_ownership(manifest) == "docker-supervisor":
             stop_runtime(manifest)
             start_persistent_docker(manifest)
         elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:

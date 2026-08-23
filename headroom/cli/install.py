@@ -28,6 +28,7 @@ from headroom.install.providers import apply_mutations, revert_mutations
 from headroom.install.runtime import (
     acquire_runtime_start_lock,
     run_foreground,
+    runtime_ownership,
     runtime_status,
     start_detached_agent,
     start_persistent_docker,
@@ -156,7 +157,7 @@ def _start_deployment(manifest: DeploymentManifest, *, assume_start_lock: bool =
 
     if probe_ready(manifest.health_url):
         return
-    if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value and shutil.which("docker") is None:
+    if runtime_ownership(manifest) == "docker-supervisor" and shutil.which("docker") is None:
         raise click.ClickException(
             "Docker is required for this deployment but 'docker' was not found on PATH."
         )
@@ -166,7 +167,7 @@ def _start_deployment(manifest: DeploymentManifest, *, assume_start_lock: bool =
         stop_runtime(manifest)
 
     try:
-        if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+        if runtime_ownership(manifest) == "docker-supervisor":
             start_persistent_docker(manifest)
         elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
             start_supervisor(manifest)
@@ -188,7 +189,10 @@ def _start_deployment(manifest: DeploymentManifest, *, assume_start_lock: bool =
 
 
 def _stop_deployment(manifest: DeploymentManifest) -> None:
-    if manifest.supervisor_kind == SupervisorKind.SERVICE.value:
+    if (
+        runtime_ownership(manifest) != "docker-supervisor"
+        and manifest.supervisor_kind == SupervisorKind.SERVICE.value
+    ):
         stop_supervisor(manifest)
     stop_runtime(manifest)
 

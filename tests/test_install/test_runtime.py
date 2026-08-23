@@ -604,11 +604,16 @@ def test_runtime_ownership_classifier_covers_launchd_docker_and_foreground(monke
     monkeypatch.setattr("headroom.install.runtime.sys.platform", "darwin")
     assert runtime_ownership(python_manifest) == "launchd-exec"
 
-    docker_manifest = _python_service_manifest()
-    docker_manifest.preset = InstallPreset.PERSISTENT_DOCKER.value
-    docker_manifest.runtime_kind = "docker"
-    docker_manifest.supervisor_kind = "none"
-    assert runtime_ownership(docker_manifest) == "docker-supervisor"
+    for preset, supervisor in (
+        (InstallPreset.PERSISTENT_DOCKER.value, "none"),
+        (InstallPreset.PERSISTENT_SERVICE.value, "service"),
+        (InstallPreset.PERSISTENT_TASK.value, "task"),
+    ):
+        docker_manifest = _python_service_manifest()
+        docker_manifest.preset = preset
+        docker_manifest.runtime_kind = "docker"
+        docker_manifest.supervisor_kind = supervisor
+        assert runtime_ownership(docker_manifest) == "docker-supervisor"
 
     python_manifest.preset = "persistent-task"
     python_manifest.supervisor_kind = "task"
@@ -678,17 +683,44 @@ def test_process_identity_must_match_headroom_command(monkeypatch) -> None:
             self.pid = pid
 
         def cmdline(self) -> list[str]:
-            return ["python", "unrelated-service.py"]
+            return ["python", "unrelated-service.py", "--port", "8787"]
+
+        def environ(self) -> dict[str, str]:
+            return {}
 
     monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(Process=FakeProcess))
     assert not _process_matches_runtime(4321, _python_service_manifest())
 
     class MatchingProcess(FakeProcess):
         def cmdline(self) -> list[str]:
-            return ["python", "-m", "headroom.cli", "proxy"]
+            return ["python", "-m", "headroom.cli", "proxy", "--port", "8787"]
+
+        def environ(self) -> dict[str, str]:
+            return {}
 
     monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(Process=MatchingProcess))
     assert _process_matches_runtime(4321, _python_service_manifest())
+
+
+def test_process_identity_falls_back_without_psutil(monkeypatch) -> None:
+    manifest = _python_service_manifest()
+    monkeypatch.setattr(
+        "headroom.install.runtime._read_proc_metadata",
+        lambda pid: (
+            ["python", "-m", "headroom.cli", "proxy", "--port", "8787"],
+            {
+                "HEADROOM_DEPLOYMENT_PROFILE": "default",
+                "HEADROOM_DEPLOYMENT_RUNTIME": "python",
+            },
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    assert _process_matches_runtime(4321, manifest)
+
+
+def test_process_identity_rejects_current_pid(monkeypatch) -> None:
+    monkeypatch.setattr("headroom.install.runtime.os.getpid", lambda: 4321)
+    assert not _process_matches_runtime(4321, _python_service_manifest())
 
 
 def test_darwin_task_preserves_popen_path(monkeypatch, tmp_path: Path) -> None:

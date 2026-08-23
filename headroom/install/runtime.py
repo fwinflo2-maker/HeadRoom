@@ -258,6 +258,11 @@ def _read_proc_metadata(pid: int) -> tuple[list[str], dict[str, str]] | None:
 
 def _process_matches_runtime(pid: int, manifest: DeploymentManifest) -> bool:
     """Verify the PID's deployment identity before lifecycle operations."""
+    return _process_identity(pid, manifest) is True
+
+
+def _process_identity(pid: int, manifest: DeploymentManifest) -> bool | None:
+    """Return whether a PID matches, or ``None`` when identity is unavailable."""
     if pid == os.getpid():
         return False
     try:
@@ -269,16 +274,14 @@ def _process_matches_runtime(pid: int, manifest: DeploymentManifest) -> bool:
     except Exception:
         metadata = _read_proc_metadata(pid)
         if metadata is None:
-            return False
+            return None
         cmdline, environ = metadata
     if "proxy" not in cmdline or str(manifest.port) not in cmdline:
         return False
-    if environ:
-        return (
-            environ.get("HEADROOM_DEPLOYMENT_PROFILE") == manifest.profile
-            and environ.get("HEADROOM_DEPLOYMENT_RUNTIME") == manifest.runtime_kind
-        )
-    return any("headroom.cli" in part or Path(part).name == "headroom" for part in cmdline)
+    return (
+        environ.get("HEADROOM_DEPLOYMENT_PROFILE") == manifest.profile
+        and environ.get("HEADROOM_DEPLOYMENT_RUNTIME") == manifest.runtime_kind
+    )
 
 
 def _clear_pid(profile: str, *, expected_pid: int | None = None) -> None:
@@ -345,6 +348,10 @@ def acquire_runtime_start_lock(profile: str) -> Iterator[bool]:
 def run_foreground(manifest: DeploymentManifest) -> int:
     """Run the raw runtime command in the foreground."""
 
+    if runtime_ownership(manifest) == "docker-supervisor":
+        raise RuntimeError(
+            "Docker deployments must be started by the Docker supervisor, not run_foreground"
+        )
     command = build_runtime_command(manifest)
     env = _runtime_env(manifest)
     log_file_path = log_path(manifest.profile)
@@ -450,7 +457,10 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
     pid = _read_pid(manifest.profile)
     if pid is None:
         return
-    if not _process_matches_runtime(pid, manifest):
+    identity = _process_identity(pid, manifest)
+    if identity is None:
+        return
+    if not identity:
         _clear_pid(manifest.profile, expected_pid=pid)
         return
     try:
@@ -489,9 +499,13 @@ def runtime_status(manifest: DeploymentManifest) -> str:
     # Windows-safe liveness probe: a bare os.kill(pid, 0) here raised WinError 87
     # as a SystemError against the detached agent, crashing status and taking the
     # live proxy down with it (#1544).
-    if not pid_alive(pid) or (
-        not _process_matches_runtime(pid, manifest) and not probe_ready(manifest.health_url)
-    ):
+    if not pid_alive(pid):
+        _clear_pid(manifest.profile, expected_pid=pid)
+        return "stopped"
+    identity = _process_identity(pid, manifest)
+    if identity is None:
+        return "unknown"
+    if not identity:
         _clear_pid(manifest.profile, expected_pid=pid)
         return "stopped"
     return "running"

@@ -536,6 +536,25 @@ def test_install_restart_uses_internal_helpers(monkeypatch) -> None:
     ]
 
 
+@pytest.mark.parametrize("supervisor_kind", ["service", "task"])
+def test_stop_deployment_stops_external_supervisor_before_docker(
+    monkeypatch, supervisor_kind: str
+) -> None:
+    calls: list[str] = []
+    manifest = SimpleNamespace(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="docker",
+        supervisor_kind=supervisor_kind,
+    )
+    monkeypatch.setattr(inst, "stop_supervisor", lambda current: calls.append("supervisor"))
+    monkeypatch.setattr(inst, "stop_runtime", lambda current: calls.append("runtime"))
+
+    inst._stop_deployment(manifest)
+
+    assert calls == ["supervisor", "runtime"]
+
+
 def test_install_start_noops_when_already_healthy(monkeypatch) -> None:
     runner = CliRunner()
     calls: list[str] = []
@@ -550,6 +569,7 @@ def test_install_start_noops_when_already_healthy(monkeypatch) -> None:
         mutations = [object()]
 
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "running")
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
     monkeypatch.setattr(
         "headroom.cli.install.start_supervisor", lambda manifest: calls.append("start_supervisor")
@@ -575,6 +595,7 @@ def test_install_start_noops_for_healthy_docker_without_docker_on_path(monkeypat
         mutations = [object()]
 
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "running")
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
     monkeypatch.setattr("headroom.cli.install.shutil.which", lambda name, *args, **kwargs: None)
 
@@ -1109,8 +1130,10 @@ def test_install_agent_ensure_reports_already_healthy(monkeypatch) -> None:
     class Manifest:
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
+        mutations = []
 
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "running")
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
 
     result = runner.invoke(main, ["install", "agent", "ensure"])
@@ -1144,6 +1167,7 @@ def test_install_agent_ensure_no_spawn_when_lock_not_acquired(monkeypatch) -> No
         health_url = "http://127.0.0.1:8787/readyz"
 
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "stopped")
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
 
     import contextlib
@@ -1285,6 +1309,7 @@ def test_install_agent_ensure_no_duplicate_spawn_after_lock_recheck(monkeypatch)
     # First probe_ready (before lock) returns False, second (after lock) returns True
     probe_results = iter([False, True])
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "running")
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: next(probe_results))
 
     monkeypatch.setattr(

@@ -155,13 +155,18 @@ def _start_deployment(manifest: DeploymentManifest, *, assume_start_lock: bool =
             _start_deployment(manifest, assume_start_lock=True)
             return
 
-    if probe_ready(manifest.health_url):
+    status = runtime_status(manifest)
+    if status == "running" and probe_ready(manifest.health_url):
         return
+    if status == "unknown":
+        raise click.ClickException(
+            f"Cannot start deployment '{manifest.profile}': runtime identity is unavailable."
+        )
     if runtime_ownership(manifest) == "docker-supervisor" and shutil.which("docker") is None:
         raise click.ClickException(
             "Docker is required for this deployment but 'docker' was not found on PATH."
         )
-    if runtime_status(manifest) == "running":
+    if status == "running":
         if wait_ready(manifest, timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS):
             return
         stop_runtime(manifest)
@@ -189,10 +194,10 @@ def _start_deployment(manifest: DeploymentManifest, *, assume_start_lock: bool =
 
 
 def _stop_deployment(manifest: DeploymentManifest) -> None:
-    if (
-        runtime_ownership(manifest) != "docker-supervisor"
-        and manifest.supervisor_kind == SupervisorKind.SERVICE.value
-    ):
+    if manifest.supervisor_kind in {
+        SupervisorKind.SERVICE.value,
+        SupervisorKind.TASK.value,
+    }:
         stop_supervisor(manifest)
     stop_runtime(manifest)
 
@@ -924,7 +929,7 @@ def install_agent_ensure(profile: str) -> None:
     """Ensure a persistent deployment is healthy, starting it when needed."""
 
     manifest = _require_manifest(profile)
-    if probe_ready(manifest.health_url):
+    if runtime_status(manifest) == "running" and probe_ready(manifest.health_url):
         click.echo(f"Deployment '{profile}' is already healthy.")
         return
     with acquire_runtime_start_lock(manifest.profile) as acquired:
@@ -933,7 +938,7 @@ def install_agent_ensure(profile: str) -> None:
             return
         # Double-check after acquiring the lock — another ensure may have
         # started the runtime while we waited for the lock.
-        if probe_ready(manifest.health_url):
+        if runtime_status(manifest) == "running" and probe_ready(manifest.health_url):
             click.echo(f"Deployment '{profile}' is already healthy.")
             return
         if runtime_status(manifest) == "running":

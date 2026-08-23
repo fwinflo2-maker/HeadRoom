@@ -14,6 +14,7 @@ from headroom.install.runtime import (
     _clear_pid,
     _deployment_env,
     _mount_source,
+    _process_identity,
     _process_matches_runtime,
     _read_pid,
     _runtime_env,
@@ -571,7 +572,7 @@ def test_launchd_exec_preserves_runtime_contract(monkeypatch, tmp_path: Path) ->
     assert dup2_calls == [(42, 1), (42, 2)]
 
 
-def test_launchd_exec_handoff_keeps_docker_runtime_on_popen(monkeypatch, tmp_path: Path) -> None:
+def test_docker_runtime_rejects_run_foreground_split_owner(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr("headroom.install.runtime.sys.platform", "darwin")
     command = ["docker", "run", "--rm", "headroom:test"]
@@ -579,15 +580,9 @@ def test_launchd_exec_handoff_keeps_docker_runtime_on_popen(monkeypatch, tmp_pat
     monkeypatch.setattr("headroom.install.runtime.build_runtime_command", lambda manifest: command)
     monkeypatch.setattr("headroom.install.runtime._runtime_env", lambda manifest: env)
 
-    class FakeProc:
-        pid = 4322
-
-        def wait(self, timeout: int | None = None) -> int:
-            return 0
-
     monkeypatch.setattr(
         "headroom.install.runtime.subprocess.Popen",
-        lambda *args, **kwargs: FakeProc(),
+        lambda *args, **kwargs: pytest.fail("Docker supervisor must own the container lifecycle"),
     )
     monkeypatch.setattr(
         "headroom.install.runtime.os.execvpe",
@@ -596,7 +591,8 @@ def test_launchd_exec_handoff_keeps_docker_runtime_on_popen(monkeypatch, tmp_pat
 
     manifest = _python_service_manifest()
     manifest.runtime_kind = "docker"
-    assert run_foreground(manifest) == 0
+    with pytest.raises(RuntimeError, match="Docker deployments must be started"):
+        run_foreground(manifest)
 
 
 def test_runtime_ownership_classifier_covers_launchd_docker_and_foreground(monkeypatch) -> None:
@@ -664,9 +660,7 @@ def test_status_and_stop_reject_a_reused_pid_without_signaling(monkeypatch, tmp_
     _write_pid("default", 123)
     monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
     monkeypatch.setattr("headroom.install.runtime.probe_ready", lambda url: False)
-    monkeypatch.setattr(
-        "headroom.install.runtime._process_matches_runtime", lambda pid, current: False
-    )
+    monkeypatch.setattr("headroom.install.runtime._process_identity", lambda pid, current: False)
     monkeypatch.setattr(
         "headroom.install.runtime.os.kill",
         lambda *args: pytest.fail("reused PID must not be signaled"),
@@ -686,7 +680,10 @@ def test_process_identity_must_match_headroom_command(monkeypatch) -> None:
             return ["python", "unrelated-service.py", "--port", "8787"]
 
         def environ(self) -> dict[str, str]:
-            return {}
+            return {
+                "HEADROOM_DEPLOYMENT_PROFILE": "default",
+                "HEADROOM_DEPLOYMENT_RUNTIME": "python",
+            }
 
     monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(Process=FakeProcess))
     assert not _process_matches_runtime(4321, _python_service_manifest())
@@ -696,7 +693,10 @@ def test_process_identity_must_match_headroom_command(monkeypatch) -> None:
             return ["python", "-m", "headroom.cli", "proxy", "--port", "8787"]
 
         def environ(self) -> dict[str, str]:
-            return {}
+            return {
+                "HEADROOM_DEPLOYMENT_PROFILE": "default",
+                "HEADROOM_DEPLOYMENT_RUNTIME": "python",
+            }
 
     monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(Process=MatchingProcess))
     assert _process_matches_runtime(4321, _python_service_manifest())
@@ -716,6 +716,40 @@ def test_process_identity_falls_back_without_psutil(monkeypatch) -> None:
     )
     monkeypatch.setitem(sys.modules, "psutil", None)
     assert _process_matches_runtime(4321, manifest)
+
+
+def test_process_identity_without_supported_metadata_is_unknown_and_safe(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    monkeypatch.setattr("headroom.install.runtime._read_proc_metadata", lambda pid: None)
+    manifest = _python_service_manifest()
+    _write_pid("default", 4321)
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
+    monkeypatch.setattr(
+        "headroom.install.runtime.os.kill",
+        lambda *args: pytest.fail("unknown identity must not be signaled"),
+    )
+
+    assert _process_identity(4321, manifest) is None
+    assert runtime_status(manifest) == "unknown"
+    stop_runtime(manifest)
+    assert _read_pid("default") == 4321
+
+
+def test_runtime_status_does_not_use_ready_probe_for_failed_identity(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = _python_service_manifest()
+    _write_pid("default", 4321)
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
+    monkeypatch.setattr("headroom.install.runtime._process_identity", lambda pid, m: False)
+    monkeypatch.setattr("headroom.install.runtime.probe_ready", lambda url: True)
+
+    assert runtime_status(manifest) == "stopped"
+    assert _read_pid("default") is None
 
 
 def test_process_identity_rejects_current_pid(monkeypatch) -> None:
@@ -873,9 +907,7 @@ def test_start_stop_wait_and_runtime_status_branches(monkeypatch, tmp_path: Path
     monkeypatch.setattr(
         "headroom.install.runtime.os.kill", lambda pid, sig: killed.append((pid, sig))
     )
-    monkeypatch.setattr(
-        "headroom.install.runtime._process_matches_runtime", lambda pid, manifest: True
-    )
+    monkeypatch.setattr("headroom.install.runtime._process_identity", lambda pid, manifest: True)
     stop_runtime(python_manifest)
     assert killed == [(123, signal.SIGTERM)]
     assert _read_pid("default") is None
@@ -978,9 +1010,7 @@ def test_runtime_status_reads_container_and_pid_state(monkeypatch, tmp_path: Pat
     pid_file.parent.mkdir(parents=True)
     pid_file.write_text("123", encoding="utf-8")
     monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
-    monkeypatch.setattr(
-        "headroom.install.runtime._process_matches_runtime", lambda pid, manifest: True
-    )
+    monkeypatch.setattr("headroom.install.runtime._process_identity", lambda pid, manifest: True)
     python_manifest = DeploymentManifest(
         profile="default",
         preset="persistent-service",
@@ -1023,9 +1053,7 @@ def test_runtime_status_reports_live_pid_without_terminating(monkeypatch, tmp_pa
 
     monkeypatch.setattr("headroom.install.runtime.os.kill", fail_kill)
     monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
-    monkeypatch.setattr(
-        "headroom.install.runtime._process_matches_runtime", lambda pid, manifest: True
-    )
+    monkeypatch.setattr("headroom.install.runtime._process_identity", lambda pid, manifest: True)
 
     assert runtime_status(_python_service_manifest()) == "running"
     assert pid_file.exists()  # status left the deployment untouched

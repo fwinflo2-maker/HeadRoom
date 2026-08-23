@@ -216,6 +216,86 @@ def mcp_uninstall() -> None:
         click.echo("Headroom MCP is not configured. Nothing to uninstall.")
 
 
+@mcp.command("reconcile")
+@click.option(
+    "--agent",
+    type=click.Choice(["claude", "codex", "grok", "opencode"]),
+    default="claude",
+    show_default=True,
+)
+@click.option("--server", default="serena", show_default=True)
+@click.option("--acknowledge", is_flag=True, help="Acknowledge the current observed Serena drift.")
+@click.option("--adopt", is_flag=True, help="Replace only the Serena entry with Headroom's spec.")
+@click.option("--clear", "clear_ack", is_flag=True, help="Clear the Serena drift acknowledgement.")
+def mcp_reconcile(
+    agent: str,
+    server: str,
+    acknowledge: bool,
+    adopt: bool,
+    clear_ack: bool,
+) -> None:
+    """Inspect or explicitly reconcile a user-managed Serena MCP entry."""
+    if server != "serena":
+        raise click.ClickException("only --server serena is supported")
+    actions = sum((acknowledge, adopt, clear_ack))
+    if actions > 1:
+        raise click.ClickException("choose at most one of --acknowledge, --adopt, or --clear")
+
+    from headroom.mcp_registry import (
+        ClaudeRegistrar,
+        RegisterStatus,
+        build_serena_spec_for_agent,
+        get_all_registrars,
+    )
+    from headroom.mcp_registry.ledger import (
+        acknowledgement_matches,
+        clear_acknowledgement,
+        record_acknowledgement,
+        record_install,
+    )
+
+    registrar = (
+        ClaudeRegistrar()
+        if agent == "claude"
+        else next((item for item in get_all_registrars() if item.name == agent), None)
+    )
+    if registrar is None or not registrar.detect():
+        raise click.ClickException(f"{agent} is not detected")
+    recommended = build_serena_spec_for_agent(agent)
+    observed = registrar.get_server(server)
+    current_ack = acknowledgement_matches(agent, server, recommended, observed)
+
+    if clear_ack:
+        clear_acknowledgement(agent, server)
+        click.echo(f"Cleared Serena acknowledgement for {agent}.")
+        return
+    if acknowledge:
+        if observed is None:
+            raise click.ClickException("cannot acknowledge an absent Serena entry")
+        record_acknowledgement(agent, server, recommended, observed)
+        click.echo(f"Acknowledged current Serena configuration for {agent}.")
+        return
+    if adopt:
+        result = registrar.register_server(recommended, force=True)
+        if result.status not in (RegisterStatus.REGISTERED, RegisterStatus.ALREADY):
+            raise click.ClickException(result.detail or "could not adopt Serena configuration")
+        record_install(agent, recommended)
+        clear_acknowledgement(agent, server)
+        click.echo(
+            f"Adopted Headroom's Serena configuration for {agent}; unrelated config preserved."
+        )
+        return
+
+    click.echo(f"Serena reconciliation for {agent}")
+    click.echo(f"  observed: {'absent' if observed is None else 'present'}")
+    click.echo(f"  recommendation: {recommended.command} {' '.join(recommended.args)}")
+    click.echo(f"  acknowledgement: {'current' if current_ack else 'none/stale'}")
+    if observed is not None and observed != recommended:
+        click.echo(
+            "  action: use --acknowledge to suppress this current drift or --adopt to replace it"
+        )
+
+
 @mcp.command("status")
 def mcp_status() -> None:
     """Check Headroom MCP configuration status.

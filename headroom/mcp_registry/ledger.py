@@ -19,6 +19,7 @@ from headroom import paths
 from .base import ServerSpec
 
 _LEDGER_FILE = "mcp_installs.json"
+_ACKNOWLEDGEMENTS = "acknowledgements"
 
 
 def ledger_path() -> Path:
@@ -66,6 +67,76 @@ def clear_install(agent: str, server_name: str, *, path: Path | None = None) -> 
         del agents[agent]
     if not agents:
         data.pop("agents", None)
+    _write_ledger(ledger_file, data)
+
+
+def record_acknowledgement(
+    agent: str,
+    server_name: str,
+    recommended: ServerSpec,
+    observed: ServerSpec,
+    *,
+    path: Path | None = None,
+) -> None:
+    """Remember a user's acknowledgement without changing install ownership."""
+    ledger_file = path or ledger_path()
+    data = _read_ledger(ledger_file)
+    acknowledgements = data.setdefault(_ACKNOWLEDGEMENTS, {})
+    agent_entry = acknowledgements.setdefault(agent, {})
+    agent_entry[server_name] = {
+        "recommended_fingerprint": spec_fingerprint(recommended),
+        "observed_fingerprint": spec_fingerprint(observed),
+        "acknowledged_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_ledger(ledger_file, data)
+
+
+def get_acknowledgement(
+    agent: str, server_name: str, *, path: Path | None = None
+) -> dict[str, Any] | None:
+    """Return the acknowledgement record, if one exists."""
+    data = _read_ledger(path or ledger_path())
+    try:
+        record = data[_ACKNOWLEDGEMENTS][agent][server_name]
+    except (KeyError, TypeError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def acknowledgement_matches(
+    agent: str,
+    server_name: str,
+    recommended: ServerSpec,
+    observed: ServerSpec | None,
+    *,
+    path: Path | None = None,
+) -> bool:
+    """Return true only when both sides still match the acknowledged pair."""
+    if observed is None:
+        return False
+    record = get_acknowledgement(agent, server_name, path=path)
+    return bool(
+        record
+        and record.get("recommended_fingerprint") == spec_fingerprint(recommended)
+        and record.get("observed_fingerprint") == spec_fingerprint(observed)
+    )
+
+
+def clear_acknowledgement(agent: str, server_name: str, *, path: Path | None = None) -> None:
+    """Clear acknowledgement state while leaving install ownership intact."""
+    ledger_file = path or ledger_path()
+    data = _read_ledger(ledger_file)
+    acknowledgements = data.get(_ACKNOWLEDGEMENTS)
+    if not isinstance(acknowledgements, dict):
+        return
+    agent_entry = acknowledgements.get(agent)
+    if not isinstance(agent_entry, dict) or server_name not in agent_entry:
+        return
+    del agent_entry[server_name]
+    if not agent_entry:
+        del acknowledgements[agent]
+    if not acknowledgements:
+        data.pop(_ACKNOWLEDGEMENTS, None)
     _write_ledger(ledger_file, data)
 
 

@@ -1986,7 +1986,7 @@ def _index_serena_project(*, verbose: bool = False) -> None:
 
 
 def _setup_serena_mcp(
-    registrar: Any, *, context: str, verbose: bool = False, force: bool = False
+    registrar: Any, *, context: str | None = None, verbose: bool = False, force: bool = False
 ) -> None:
     """Register Serena MCP with the given agent (idempotent).
 
@@ -2000,8 +2000,13 @@ def _setup_serena_mcp(
     user-managed Serena (absent from our ledger) is left untouched and the
     mismatch is reported as before.
     """
-    from headroom.mcp_registry import build_serena_spec, format_result
-    from headroom.mcp_registry.base import RegisterStatus
+    from headroom.mcp_registry import (
+        acknowledgement_matches,
+        build_serena_spec_for_agent,
+        format_result,
+        serena_context_for_agent,
+    )
+    from headroom.mcp_registry.base import RegisterResult, RegisterStatus
     from headroom.mcp_registry.ledger import headroom_installed_matching, record_install
 
     if not registrar.detect():
@@ -2016,7 +2021,11 @@ def _setup_serena_mcp(
     # Serena is a real launch now — make sure it won't pop a browser tab.
     _ensure_serena_dashboard_disabled(verbose=verbose)
 
-    spec = build_serena_spec(context)
+    agent_context = serena_context_for_agent(registrar.name) or context
+    if agent_context is None:
+        click.echo(f"  Serena MCP: unsupported agent {registrar.name} — skipping")
+        return
+    spec = build_serena_spec_for_agent(registrar.name)
     result = registrar.register_server(spec, force=force)
 
     # Migrate a stale Headroom-installed entry. register_server won't overwrite
@@ -2032,6 +2041,11 @@ def _setup_serena_mcp(
         result = registrar.register_server(spec, force=True)
         if result.status == RegisterStatus.REGISTERED:
             click.echo("  Serena MCP: migrated previously-installed entry to current spec")
+
+    if result.status == RegisterStatus.MISMATCH and acknowledgement_matches(
+        registrar.name, "serena", spec, registrar.get_server("serena")
+    ):
+        result = RegisterResult(RegisterStatus.ALREADY, "acknowledged current mismatch")
 
     if result.status == RegisterStatus.REGISTERED:
         record_install(registrar.name, spec)

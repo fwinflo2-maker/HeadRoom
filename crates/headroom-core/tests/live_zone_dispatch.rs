@@ -12,108 +12,11 @@
 //! Plus the cache-safety invariant: bytes outside the rewritten
 //! block are byte-identical to the input (SHA-256 prefix + suffix).
 
-use headroom_core::transforms::live_zone::DEFAULT_MODEL;
-use headroom_core::transforms::{
-    compress_anthropic_live_zone, AuthMode, BlockAction, LiveZoneOutcome,
-};
+mod common;
+
+use common::{body_with_tool_result, dispatch, kompress_available, python_module_source, sha256};
+use headroom_core::transforms::{BlockAction, LiveZoneOutcome};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
-
-fn body_of(value: Value) -> Vec<u8> {
-    serde_json::to_vec(&value).unwrap()
-}
-
-fn dispatch(body: &[u8]) -> LiveZoneOutcome {
-    compress_anthropic_live_zone(body, 0, AuthMode::Payg, DEFAULT_MODEL)
-        .expect("dispatcher returns Ok on valid bodies")
-}
-
-/// Find the byte range of the FIRST occurrence of `needle` inside
-/// `haystack`. Used by the byte-fidelity test below to identify the
-/// JSON-encoded tool_result.content slot we expect the dispatcher to
-/// rewrite. Returns `(start, end)` half-open.
-fn find_byte_range(haystack: &[u8], needle: &[u8]) -> (usize, usize) {
-    let pos = haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .unwrap_or_else(|| {
-            panic!(
-                "needle of {} bytes not found in haystack of {} bytes",
-                needle.len(),
-                haystack.len()
-            )
-        });
-    (pos, pos + needle.len())
-}
-
-fn sha256(bytes: &[u8]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    h.finalize().into()
-}
-
-/// Build a body with one user message containing one `tool_result`
-/// whose `content` is `text`. Returns the full body and the byte
-/// range of the JSON-encoded `content` slot (including the surrounding
-/// quotes) within that body — useful for byte-fidelity assertions.
-fn body_with_tool_result(text: &str) -> (Vec<u8>, (usize, usize)) {
-    let body = body_of(json!({
-        "model": "claude-sonnet-4-6",
-        "max_tokens": 64,
-        "system": "you are a helpful assistant",
-        "messages": [{
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": "toolu_dispatch_test",
-                "content": text,
-            }],
-        }],
-    }));
-    // The JSON-encoded `content` slot is exactly `serde_json::to_vec(&text)`,
-    // since text is shorter than the whole body and serde uses the same
-    // encoding for the embedded string.
-    let needle = serde_json::to_vec(&text).unwrap();
-    let range = find_byte_range(&body, &needle);
-    (body, range)
-}
-
-/// Build a syntactically valid Python module with `n` small functions,
-/// each carrying a one-line docstring and a body long enough (> 5 lines,
-/// the CodeAwareCompressor's `max_body_lines` default) that body-elision
-/// actually has something to trim. Real Python, not a fixture that only
-/// *looks* like code — the compressor re-parses and reverts on syntax
-/// errors, so this must round-trip through tree-sitter cleanly. Built
-/// with explicit `push_str` calls (rather than a multi-line literal) so
-/// the indentation is unambiguous to read and verify.
-fn python_module_source(n: usize) -> String {
-    let mut code = String::new();
-    code.push_str(
-        "\"\"\"Example data-processing module used by the live-zone dispatch tests.\"\"\"\n",
-    );
-    code.push('\n');
-    code.push_str("import json\n");
-    code.push_str("import os\n");
-    code.push_str("from typing import Any, Optional\n");
-    code.push_str("\n\n");
-    for i in 0..n {
-        code.push_str(&format!("def process_record_{i}(record: dict) -> dict:\n"));
-        code.push_str(&format!(
-            "    \"\"\"Normalize record {i} and compute its derived fields.\"\"\"\n"
-        ));
-        code.push_str("    result = dict(record)\n");
-        code.push_str(&format!("    result[\"index\"] = {i}\n"));
-        code.push_str("    result[\"doubled\"] = record.get(\"value\", 0) * 2\n");
-        code.push_str("    result[\"source\"] = \"batch\"\n");
-        code.push_str("    if result[\"doubled\"] > 100:\n");
-        code.push_str("        result[\"flag\"] = \"high\"\n");
-        code.push_str("    else:\n");
-        code.push_str("        result[\"flag\"] = \"low\"\n");
-        code.push_str("    return result\n");
-        code.push_str("\n\n");
-    }
-    code
-}
 
 // ─── Routing tests ─────────────────────────────────────────────────────
 
@@ -441,85 +344,17 @@ fn plain_text_below_threshold_no_op() {
     }
 }
 
-/// HuggingFace hub cache roots, mirroring the RUNTIME loader's resolution
-/// (`kompress.rs::hf_hub_roots`): `HF_HUB_CACHE` → `HF_HOME/hub` →
-/// `{HOME|USERPROFILE}/.cache/huggingface/hub`. The skip check MUST agree
-/// with production or the skip is a lie: a `$HOME`-only check silently
-/// skips on every Windows host (a PowerShell environment exports no
-/// `HOME`) and on any host relocating its cache via `HF_HOME` /
-/// `HF_HUB_CACHE` — machines where `Kompress::from_cache` loads the model
-/// happily, leaving the routing assertion below green without ever
-/// running.
-fn hf_hub_roots() -> Vec<std::path::PathBuf> {
-    let mut roots = Vec::new();
-    for (var, suffix) in [
-        ("HF_HUB_CACHE", &[][..]),
-        ("HF_HOME", &["hub"][..]),
-        ("HOME", &[".cache", "huggingface", "hub"][..]),
-        ("USERPROFILE", &[".cache", "huggingface", "hub"][..]),
-    ] {
-        if let Ok(v) = std::env::var(var) {
-            if !v.is_empty() {
-                let mut p = std::path::PathBuf::from(v);
-                for s in suffix {
-                    p = p.join(s);
-                }
-                roots.push(p);
-            }
-        }
-    }
-    roots
-}
-
-/// Locate a HuggingFace Hub cache artifact under any production cache
-/// root. Candidate-relative paths are tried in order, mirroring the
-/// runtime's own fallback list where the caller passes several.
-fn hf_cache_file(repo_dir: &str, candidates: &[&[&str]]) -> Option<std::path::PathBuf> {
-    for root in hf_hub_roots() {
-        let snapshots = root.join(repo_dir).join("snapshots");
-        let Ok(entries) = std::fs::read_dir(&snapshots) else {
-            continue;
-        };
-        for snap in entries.filter_map(|e| e.ok()) {
-            for rel in candidates {
-                let mut cand = snap.path();
-                for part in *rel {
-                    cand = cand.join(part);
-                }
-                if cand.exists() {
-                    return Some(cand);
-                }
-            }
-        }
-    }
-    None
-}
-
 #[test]
 fn plain_text_routes_to_kompress_when_model_cached() {
-    // RUNTIME-SKIP pattern (kompress_parity.rs:39-52): if the ModernBERT
-    // tokenizer + kompress-v2-base ONNX artifact are not present in the
-    // local HuggingFace cache, skip rather than download the model.
-    let tok = hf_cache_file(
-        "models--answerdotai--ModernBERT-base",
-        &[&["tokenizer.json"]],
-    );
-    // All four runtime candidates, in `kompress.rs::ONNX_CANDIDATES`
-    // order — a host holding only e.g. the fp32 artifact runs Kompress in
-    // production and must run this test too, not skip it.
-    let onnx = hf_cache_file(
-        "models--chopratejas--kompress-v2-base",
-        &[
-            &["onnx", "kompress-fp32-static512.onnx"],
-            &["onnx", "kompress-int8-wo.onnx"],
-            &["onnx", "kompress-fp32.onnx"],
-            &["onnx", "kompress-int8.onnx"],
-        ],
-    );
-    if tok.is_none() || onnx.is_none() {
+    // RUNTIME-SKIP: ask the loader itself whether the model is
+    // cache-resident, rather than re-deriving cache paths here. A
+    // hand-rolled probe has to be kept byte-compatible with
+    // `Kompress::from_cache`'s own root and artifact resolution, and
+    // when it drifts the skip becomes a lie — the test silently stops
+    // running on hosts where production would load the model.
+    if !kompress_available() {
         eprintln!(
-            "SKIP: kompress model/tokenizer not in HF cache; \
-             run `python scripts/record_kompress_trace.py` first"
+            "SKIP: kompress model/tokenizer not cache-resident;              run `python scripts/record_kompress_trace.py` first"
         );
         return;
     }

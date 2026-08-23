@@ -1,296 +1,140 @@
-//! Env-var kill-switch for the PR-B4 dispatch arms — dedicated
+//! Env-var kill-switch for the live-zone dispatch arms — dedicated
 //! integration test file.
 //!
 //! `disabled_arms` (`crates/headroom-core/src/transforms/live_zone.rs`)
-//! reads `HEADROOM_LIVE_ZONE_DISABLE_ARMS` once per process and latches
+//! reads `HEADROOM_LIVE_ZONE_DISABLE_ARMS` on first dispatch and latches
 //! the parsed set behind a process-global `OnceLock` (the determinism
 //! invariant — a run's arm-disable set cannot change mid-flight).
-//! Environment variables are process-global too, so setting
-//! `HEADROOM_LIVE_ZONE_DISABLE_ARMS` must happen in a test process that
-//! does nothing else — any other test in the same binary that dispatches
-//! `SourceCode` or `PlainText` content first would freeze the `OnceLock`
-//! against whatever it saw at that point (most likely: unset, i.e. no
-//! arms disabled). That's why this file holds exactly ONE `#[test]` fn:
-//! a dedicated file is a dedicated test binary, so no other test can
-//! race the `OnceLock` initialization. Same isolation reasoning as
-//! `live_zone_kompress_absent.rs`.
+//! Environment variables are process-global too, so setting the variable
+//! must happen in a test process that does nothing else: any other test
+//! in the same binary that dispatched first would freeze the `OnceLock`
+//! against whatever it saw at that point. That is why this file holds
+//! exactly ONE `#[test]` fn — a dedicated file is a dedicated test
+//! binary, so no other test can race the initialization.
 //!
 //! Do NOT add more tests to this file.
+//!
+//! **On `set_var`.** `std::env::set_var` is unsound in a multi-threaded
+//! process (it races any concurrent reader of the environment, including
+//! ones inside libc) and becomes `unsafe` in edition 2024. It is used
+//! here because the switch's input genuinely *is* the environment and
+//! this binary is single-threaded at the point of the call. The parsing
+//! contract itself — aliases, trimming, unknown tokens — is covered
+//! without any environment mutation by
+//! `live_zone_disable_arms_parsing.rs` against the pure
+//! `parse_disabled_arms`. Threading an explicit config value into the
+//! dispatcher would remove the need for this file entirely; see the PR
+//! description.
 
-use headroom_core::transforms::live_zone::DEFAULT_MODEL;
-use headroom_core::transforms::{
-    compress_anthropic_live_zone, AuthMode, BlockAction, LiveZoneOutcome,
+mod common;
+
+use common::{
+    body_with_tool_result, dispatch, json_array_of_dicts, kompress_available, plain_prose,
+    python_module_source, tool_result_action,
 };
-use serde_json::{json, Value};
+use headroom_core::transforms::{BlockAction, LiveZoneOutcome};
 
-fn body_of(value: Value) -> Vec<u8> {
-    serde_json::to_vec(&value).unwrap()
-}
-
-fn dispatch(body: &[u8]) -> LiveZoneOutcome {
-    compress_anthropic_live_zone(body, 0, AuthMode::Payg, DEFAULT_MODEL)
-        .expect("dispatcher returns Ok on valid bodies")
-}
-
-/// Build a body with one user message containing one `tool_result` whose
-/// `content` is `text`. Same shape as `live_zone_dispatch.rs`'s helper of
-/// the same name — duplicated here rather than shared, since integration
-/// test files are independent crates (see module doc for why this file
-/// must stand alone).
-fn body_with_tool_result(text: &str) -> Vec<u8> {
-    body_of(json!({
-        "model": "claude-sonnet-4-6",
-        "max_tokens": 64,
-        "messages": [{
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": "toolu_disable_arms_test",
-                "content": text,
-            }],
-        }],
-    }))
-}
-
-/// Build a syntactically valid Python module with `n` small functions —
-/// long enough to clear the SourceCode byte threshold (2048) and, if the
-/// CodeAwareCompressor ran, dense enough to shrink. Same generator style
-/// as `live_zone_dispatch.rs::python_module_source` (duplicated, not
-/// shared — see module doc).
-fn python_module_source(n: usize) -> String {
-    let mut code = String::new();
-    code.push_str("\"\"\"Example data-processing module used by the disable-arms test.\"\"\"\n");
-    code.push('\n');
-    code.push_str("import json\n");
-    code.push_str("import os\n");
-    code.push_str("from typing import Any, Optional\n");
-    code.push_str("\n\n");
-    for i in 0..n {
-        code.push_str(&format!("def process_record_{i}(record: dict) -> dict:\n"));
-        code.push_str(&format!(
-            "    \"\"\"Normalize record {i} and compute its derived fields.\"\"\"\n"
-        ));
-        code.push_str("    result = dict(record)\n");
-        code.push_str(&format!("    result[\"index\"] = {i}\n"));
-        code.push_str("    result[\"doubled\"] = record.get(\"value\", 0) * 2\n");
-        code.push_str("    result[\"source\"] = \"batch\"\n");
-        code.push_str("    if result[\"doubled\"] > 100:\n");
-        code.push_str("        result[\"flag\"] = \"high\"\n");
-        code.push_str("    else:\n");
-        code.push_str("        result[\"flag\"] = \"low\"\n");
-        code.push_str("    return result\n");
-        code.push_str("\n\n");
-    }
-    code
-}
-
-/// Build repetitive plain prose at least `min_bytes` long. Same
-/// repetition style as `live_zone_dispatch.rs`'s Kompress fixture
-/// (duplicated, not shared — see module doc for why this file must
-/// stand alone).
-fn plain_prose(min_bytes: usize) -> String {
-    let mut text = String::new();
-    let mut i = 0usize;
-    while text.len() < min_bytes {
-        text.push_str(&format!(
-            "City officials announced today that the downtown revitalization \
-             project will proceed as planned despite budget concerns raised \
-             during round {i} of public comment. "
-        ));
-        i += 1;
-    }
-    text
-}
-
-/// True when the Kompress ONNX artifact and ModernBERT tokenizer are
-/// cache-resident under any production HF cache root — the same
-/// resolution `kompress.rs::hf_hub_roots` + `ONNX_CANDIDATES` use
-/// (duplicated, not shared — see module doc for why this file stands
-/// alone). Used only for the honesty note after assertion (b).
-fn kompress_model_cached() -> bool {
-    fn any_snapshot_has(repo_dir: &str, candidates: &[&[&str]]) -> bool {
-        let mut roots = Vec::new();
-        for (var, suffix) in [
-            ("HF_HUB_CACHE", &[][..]),
-            ("HF_HOME", &["hub"][..]),
-            ("HOME", &[".cache", "huggingface", "hub"][..]),
-            ("USERPROFILE", &[".cache", "huggingface", "hub"][..]),
-        ] {
-            if let Ok(v) = std::env::var(var) {
-                if !v.is_empty() {
-                    let mut p = std::path::PathBuf::from(v);
-                    for s in suffix {
-                        p = p.join(s);
-                    }
-                    roots.push(p);
-                }
-            }
+/// Assert the single `tool_result` block was left uncompressed.
+fn assert_no_compression(label: &str, body: &[u8]) {
+    let out = dispatch(body);
+    let manifest = match &out {
+        LiveZoneOutcome::NoChange { manifest } => manifest,
+        LiveZoneOutcome::Modified { manifest, .. } => {
+            panic!(
+                "disabled {label} arm must not rewrite bytes; got Modified. manifest: {manifest:?}"
+            )
         }
-        for root in roots {
-            let snapshots = root.join(repo_dir).join("snapshots");
-            let Ok(entries) = std::fs::read_dir(&snapshots) else {
-                continue;
-            };
-            for snap in entries.filter_map(|e| e.ok()) {
-                for rel in candidates {
-                    let mut cand = snap.path();
-                    for part in *rel {
-                        cand = cand.join(part);
-                    }
-                    if cand.exists() {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
-    }
-    any_snapshot_has(
-        "models--answerdotai--ModernBERT-base",
-        &[&["tokenizer.json"]],
-    ) && any_snapshot_has(
-        "models--chopratejas--kompress-v2-base",
-        &[
-            &["onnx", "kompress-fp32-static512.onnx"],
-            &["onnx", "kompress-int8-wo.onnx"],
-            &["onnx", "kompress-fp32.onnx"],
-            &["onnx", "kompress-int8.onnx"],
-        ],
-    )
+    };
+    let action = tool_result_action(manifest);
+    assert!(
+        matches!(action, BlockAction::NoCompressionApplied { .. }),
+        "disabled {label} arm must yield NoCompressionApplied, got {action:?}"
+    );
 }
 
 #[test]
 fn disabled_arms_route_to_no_op_others_unaffected() {
-    // `source_code, plain_text, bogus_type` — the internal spaces
-    // exercise the `token.trim()` path, and `bogus_type` exercises the
-    // unknown-token branch (logged and ignored — must not panic; this is
-    // covered implicitly by the test reaching completion, since
-    // `disabled_arms()` parses this value on the very first
-    // `arm_disabled` call below).
+    // `source_code, plain_text, json_array, bogus_type` — the internal
+    // spaces exercise the trim path and `bogus_type` the unknown-token
+    // branch (logged and ignored, never a panic).
     std::env::set_var(
         "HEADROOM_LIVE_ZONE_DISABLE_ARMS",
-        "source_code, plain_text, bogus_type",
+        "source_code, plain_text, json_array, bogus_type",
     );
 
-    // (a) SourceCode arm disabled: a >2048-byte Python tool_result must
-    // NOT reach the CodeAwareCompressor — NoCompressionApplied, not
-    // Compressed.
+    // (a) SourceCode disabled: a >2048-byte Python tool_result must not
+    // reach the CodeAwareCompressor. Deterministic on every host — the
+    // code arm has no model-cache dependency.
     let code = python_module_source(10);
     assert!(
         code.len() > 2048,
         "fixture must clear the SourceCode byte threshold (2048); got {} bytes",
         code.len()
     );
-    let code_out = dispatch(&body_with_tool_result(&code));
-    let code_manifest = match &code_out {
-        LiveZoneOutcome::NoChange { manifest } => manifest,
-        LiveZoneOutcome::Modified { manifest, .. } => panic!(
-            "disabled SourceCode arm must not rewrite bytes; got Modified. manifest: {manifest:?}"
-        ),
-    };
-    let code_action = code_manifest
-        .block_outcomes
-        .iter()
-        .find(|b| b.block_type == "tool_result")
-        .expect("tool_result block present in manifest")
-        .action
-        .clone();
-    assert!(
-        matches!(code_action, BlockAction::NoCompressionApplied { .. }),
-        "disabled SourceCode arm must yield NoCompressionApplied, got {code_action:?}"
-    );
+    assert_no_compression("SourceCode", &body_with_tool_result(&code).0);
 
-    // (b) PlainText arm disabled: a >5120-byte plain-prose tool_result
-    // must NOT reach the PlainText compressor (Kompress) — NoCompressionApplied,
-    // not Compressed. TWO vacuity traps here, not one:
-    //
-    // 1. The fixture MUST clear THRESHOLD_PLAIN_TEXT (5120 bytes in
-    //    live_zone.rs) — below that, `compress_one_block`'s
-    //    byte-threshold gate short-circuits before dispatch even runs,
-    //    and the assertion below would pass regardless of the kill
-    //    switch. Do NOT shrink this fixture below 5120 bytes.
-    // 2. On a COLD HuggingFace cache this assertion cannot fail either:
-    //    the enabled arm's cache-cold path returns the identical no-op,
-    //    so a deleted kill-switch guard would still pass here (and in
-    //    upstream CI, which never primes the Kompress cache). The
-    //    warm-host discrimination comes from this assertion PAIRED with
-    //    `live_zone_dispatch.rs::plain_text_routes_to_kompress_when_model_cached`,
-    //    which proves the same prose shape DOES compress when the arm is
-    //    enabled; the cold-cache honesty note after (b) says which case
-    //    a given run actually exercised.
-    let prose = plain_prose(5200);
-    assert!(
-        prose.len() > 5120,
-        "fixture must clear the PlainText byte threshold (5120); got {} bytes",
-        prose.len()
-    );
-    let prose_out = dispatch(&body_with_tool_result(&prose));
-    let prose_manifest = match &prose_out {
-        LiveZoneOutcome::NoChange { manifest } => manifest,
-        LiveZoneOutcome::Modified { manifest, .. } => panic!(
-            "disabled PlainText arm must not rewrite bytes; got Modified. manifest: {manifest:?}"
-        ),
-    };
-    let prose_action = prose_manifest
-        .block_outcomes
-        .iter()
-        .find(|b| b.block_type == "tool_result")
-        .expect("tool_result block present in manifest")
-        .action
-        .clone();
-    assert!(
-        matches!(prose_action, BlockAction::NoCompressionApplied { .. }),
-        "disabled PlainText arm must yield NoCompressionApplied, got {prose_action:?}"
-    );
-    if !kompress_model_cached() {
-        eprintln!(
-            "NOTE: cold HF cache — assertion (b) passed but could not discriminate \
-             the PlainText kill switch from an absent model this run (the enabled \
-             arm's cache-cold path yields the same no-op). Warm-host coverage: \
-             live_zone_dispatch.rs::plain_text_routes_to_kompress_when_model_cached."
-        );
-    }
-
-    // (c) Other arms unaffected: a >512-byte JSON-array tool_result must
-    // still compress via smart_crusher (the kill switch only guards the
-    // SourceCode / PlainText arms).
-    let array_of_dicts: Vec<Value> = (0..200)
-        .map(|i| {
-            json!({
-                "id": i,
-                "status": "ok",
-                "value": format!("repeat-pattern-{}", i % 3),
-            })
-        })
-        .collect();
-    let payload = serde_json::to_string(&array_of_dicts).unwrap();
+    // (b) JsonArray disabled: SmartCrusher must not fire on a shape it
+    // would otherwise compress on any host. This is the case that
+    // discriminates the kill switch unconditionally — unlike (c), it
+    // cannot be satisfied by an absent model — and it also pins that the
+    // switch is generic across arms rather than special-cased to the two
+    // this PR wires.
+    let payload = json_array_of_dicts(200);
     assert!(
         payload.len() > 512,
         "fixture must clear the JsonArray byte threshold (512); got {} bytes",
         payload.len()
     );
-    let json_out = dispatch(&body_with_tool_result(&payload));
-    let json_manifest = match &json_out {
+    assert_no_compression("JsonArray", &body_with_tool_result(&payload).0);
+
+    // (c) PlainText disabled: a >5120-byte prose tool_result must not
+    // reach Kompress. Two vacuity traps, not one:
+    //
+    // 1. The fixture MUST clear THRESHOLD_PLAIN_TEXT (5120) or the
+    //    byte-threshold gate short-circuits before dispatch and the
+    //    assertion passes regardless of the switch.
+    // 2. On a cold HuggingFace cache the enabled arm's fall-open path
+    //    returns the identical no-op, so this cannot discriminate there.
+    //    `kompress_available()` says which case actually ran; (b) above
+    //    carries the unconditional coverage.
+    let prose = plain_prose(5_200);
+    assert!(
+        prose.len() > 5120,
+        "fixture must clear the PlainText byte threshold (5120); got {} bytes",
+        prose.len()
+    );
+    assert_no_compression("PlainText", &body_with_tool_result(&prose).0);
+    if !kompress_available() {
+        eprintln!(
+            "NOTE: cold model cache — the PlainText case passed but could not discriminate \
+             the kill switch from an absent model this run. Unconditional coverage comes \
+             from the JsonArray case above."
+        );
+    }
+
+    // (d) An arm NOT named in the list still compresses: build output
+    // routes to LogCompressor as usual, proving the switch is selective
+    // rather than a global off.
+    let logs = "\
+ERROR src/main.rs:42 connection refused
+WARN  src/pool.rs:17 retrying in 250ms
+ERROR src/main.rs:42 connection refused
+WARN  src/pool.rs:17 retrying in 500ms
+"
+    .repeat(40);
+    let out = dispatch(&body_with_tool_result(&logs).0);
+    let manifest = match &out {
         LiveZoneOutcome::Modified { manifest, .. } => manifest,
         LiveZoneOutcome::NoChange { manifest } => panic!(
-            "smart_crusher arm must be unaffected by the SourceCode/PlainText kill switch; \
-             got NoChange. manifest: {manifest:?}"
+            "an arm absent from the disable list must be unaffected; got NoChange. \
+             manifest: {manifest:?}"
         ),
     };
-    let json_action = json_manifest
-        .block_outcomes
-        .iter()
-        .find(|b| b.block_type == "tool_result")
-        .expect("tool_result block present in manifest")
-        .action
-        .clone();
-    match json_action {
-        BlockAction::Compressed { strategy, .. } => {
-            assert_eq!(
-                strategy, "smart_crusher",
-                "expected SmartCrusher dispatch, unaffected by the disabled SourceCode/PlainText arms"
-            );
-        }
-        other => panic!("expected BlockAction::Compressed via smart_crusher, got {other:?}"),
+    match tool_result_action(manifest) {
+        BlockAction::Compressed { strategy, .. } => assert_eq!(
+            strategy, "log_compressor",
+            "expected LogCompressor dispatch, unaffected by the disabled arms"
+        ),
+        other => panic!("expected BlockAction::Compressed via log_compressor, got {other:?}"),
     }
 }

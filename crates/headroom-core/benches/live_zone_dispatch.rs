@@ -221,61 +221,21 @@ fn check_ort_dylib_path() {
     }
 }
 
-/// True when the Kompress ONNX artifact and tokenizer are cache-resident
-/// under any production HF cache root (mirrors `kompress.rs`'s
-/// `hf_hub_roots` + `ONNX_CANDIDATES`; duplicated — benches, like
-/// integration tests, only see the crate's public API).
-#[cfg(windows)]
+/// Whether the Kompress model is cache-resident, asked of the loader
+/// itself. A hand-rolled probe would have to mirror
+/// `Kompress::from_cache`'s root and artifact resolution and would go
+/// stale silently; this cannot.
+#[cfg(all(windows, feature = "ml"))]
 fn kompress_model_cached() -> bool {
-    fn any_snapshot_has(repo_dir: &str, candidates: &[&[&str]]) -> bool {
-        let mut roots = Vec::new();
-        for (var, suffix) in [
-            ("HF_HUB_CACHE", &[][..]),
-            ("HF_HOME", &["hub"][..]),
-            ("HOME", &[".cache", "huggingface", "hub"][..]),
-            ("USERPROFILE", &[".cache", "huggingface", "hub"][..]),
-        ] {
-            if let Ok(v) = std::env::var(var) {
-                if !v.is_empty() {
-                    let mut p = std::path::PathBuf::from(v);
-                    for s in suffix {
-                        p = p.join(s);
-                    }
-                    roots.push(p);
-                }
-            }
-        }
-        for root in roots {
-            let snapshots = root.join(repo_dir).join("snapshots");
-            let Ok(entries) = std::fs::read_dir(&snapshots) else {
-                continue;
-            };
-            for snap in entries.filter_map(|e| e.ok()) {
-                for rel in candidates {
-                    let mut cand = snap.path();
-                    for part in *rel {
-                        cand = cand.join(part);
-                    }
-                    if cand.exists() {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
-    }
-    any_snapshot_has(
-        "models--answerdotai--ModernBERT-base",
-        &[&["tokenizer.json"]],
-    ) && any_snapshot_has(
-        "models--chopratejas--kompress-v2-base",
-        &[
-            &["onnx", "kompress-fp32-static512.onnx"],
-            &["onnx", "kompress-int8-wo.onnx"],
-            &["onnx", "kompress-fp32.onnx"],
-            &["onnx", "kompress-int8.onnx"],
-        ],
-    )
+    use headroom_core::transforms::kompress::{Kompress, KompressConfig};
+
+    matches!(Kompress::from_cache(KompressConfig::default()), Ok(Some(_)))
+}
+
+/// Without the `ml` feature there is no ONNX session to deadlock on.
+#[cfg(all(windows, not(feature = "ml")))]
+fn kompress_model_cached() -> bool {
+    false
 }
 
 criterion_group!(benches, bench_dispatch);

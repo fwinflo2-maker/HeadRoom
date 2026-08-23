@@ -2,27 +2,16 @@
 //! `CodeAwareCompressor`, `PlainText` → Kompress, cache-only) plus the
 //! round-trip test that closes the kill-switch alias bug class.
 //!
-//! Background: `content_type_from_name`
-//! (`crates/headroom-core/src/transforms/live_zone.rs`) used to accept
-//! only each `ContentType` variant's `as_str()` tag, so an
-//! `HEADROOM_LIVE_ZONE_DISABLE_ARMS` token spelled the "natural" way a
-//! human is more likely to write (e.g. `plain_text`, `search_results`)
-//! silently failed to match. The token fell through to the
-//! unknown-token branch, the arm was never disabled, and there was no
-//! error — a misconfiguration that looked like a no-op. `PlainText`
-//! (`"text"` / `"plain_text"`) was fixed first; this file's round-trip
-//! test below pins the fix for the three remaining variants
-//! (`SearchResults`, `BuildOutput`, `GitDiff`).
-//!
-//! **Review note:** an earlier version of this comment claimed
-//! that the round-trip test's exhaustive `natural_name_for` match alone
-//! "makes adding an 8th `ContentType` variant force a compile-time
-//! visit" in a way that keeps the test's coverage complete. A review
-//! proved that overclaimed: the exhaustive match only forces picking
-//! *a* string for the new variant, not adding it to the array the
-//! round-trip test iterates. See the honesty note on `natural_name_for`
-//! below for the corrected, precise claim and why a fully
-//! compiler-forced guarantee isn't achievable here in stable Rust.
+//! Background: `ContentType`'s string parsing used to accept only each
+//! variant's `as_str()` tag, so an `HEADROOM_LIVE_ZONE_DISABLE_ARMS`
+//! token spelled the "natural" way a human is more likely to write
+//! (e.g. `plain_text`, `search_results`) silently failed to match. The
+//! token fell through to the unknown-token branch, the arm was never
+//! disabled, and there was no error — a misconfiguration that looked
+//! like a no-op. Both spellings now parse (`ContentType`'s `FromStr`),
+//! and the round-trip test below pins that for every variant by
+//! iterating `ContentType::ALL` rather than a hand-maintained copy of
+//! the variant list.
 //!
 //! Property-test coverage for the dispatch arms themselves follows
 //! below: no-panic and determinism properties (proptest), plus a
@@ -38,232 +27,54 @@
 //! `headroom-proxy/tests/sse_framing.rs:156-200` for case-count order
 //! of magnitude and the comment style explaining the choice.
 
-use headroom_core::transforms::live_zone::{content_type_from_name, DEFAULT_MODEL};
-use headroom_core::transforms::{
-    compress_anthropic_live_zone, detect_content_type, AuthMode, BlockAction, ContentType,
-    LiveZoneOutcome,
-};
+mod common;
+
+use common::{body_with_tool_result, dispatch, python_module_source, sha256};
+use headroom_core::transforms::live_zone::threshold_for;
+use headroom_core::transforms::{detect_content_type, BlockAction, ContentType, LiveZoneOutcome};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::{RngAlgorithm, TestRng, TestRunner};
-use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
-
-fn body_of(value: Value) -> Vec<u8> {
-    serde_json::to_vec(&value).unwrap()
-}
-
-fn dispatch(body: &[u8]) -> LiveZoneOutcome {
-    compress_anthropic_live_zone(body, 0, AuthMode::Payg, DEFAULT_MODEL)
-        .expect("dispatcher returns Ok on valid bodies")
-}
-
-/// Find the byte range of the FIRST occurrence of `needle` inside
-/// `haystack`. Same helper as `live_zone_dispatch.rs::find_byte_range`
-/// (duplicated, not shared — each integration test file is its own
-/// crate).
-fn find_byte_range(haystack: &[u8], needle: &[u8]) -> (usize, usize) {
-    let pos = haystack
-        .windows(needle.len().max(1))
-        .position(|w| w == needle)
-        .unwrap_or_else(|| {
-            panic!(
-                "needle of {} bytes not found in haystack of {} bytes",
-                needle.len(),
-                haystack.len()
-            )
-        });
-    (pos, pos + needle.len())
-}
-
-fn sha256(bytes: &[u8]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    h.finalize().into()
-}
-
-/// Build a body with one user message containing one `tool_result`
-/// whose `content` is `text`. Returns the full body and the byte
-/// range of the JSON-encoded `content` slot (including surrounding
-/// quotes). Same shape as `live_zone_dispatch.rs::body_with_tool_result`
-/// (duplicated, not shared — integration test files are independent
-/// crates).
-fn body_with_tool_result(text: &str) -> (Vec<u8>, (usize, usize)) {
-    let body = body_of(json!({
-        "model": "claude-sonnet-4-6",
-        "max_tokens": 64,
-        "system": "you are a helpful assistant",
-        "messages": [{
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": "toolu_arm_properties_test",
-                "content": text,
-            }],
-        }],
-    }));
-    let needle = serde_json::to_vec(&text).unwrap();
-    let range = find_byte_range(&body, &needle);
-    (body, range)
-}
-
-/// Build a syntactically valid Python module with `n` small functions
-/// — long enough to clear the SourceCode byte threshold (2048) and
-/// dense enough for the CodeAwareCompressor to shrink. Same generator
-/// style as `live_zone_dispatch.rs::python_module_source` (duplicated,
-/// not shared).
-fn python_module_source(n: usize) -> String {
-    let mut code = String::new();
-    code.push_str("\"\"\"Example data-processing module used by the arm-properties tests.\"\"\"\n");
-    code.push('\n');
-    code.push_str("import json\n");
-    code.push_str("import os\n");
-    code.push_str("from typing import Any, Optional\n");
-    code.push_str("\n\n");
-    for i in 0..n {
-        code.push_str(&format!("def process_record_{i}(record: dict) -> dict:\n"));
-        code.push_str(&format!(
-            "    \"\"\"Normalize record {i} and compute its derived fields.\"\"\"\n"
-        ));
-        code.push_str("    result = dict(record)\n");
-        code.push_str(&format!("    result[\"index\"] = {i}\n"));
-        code.push_str("    result[\"doubled\"] = record.get(\"value\", 0) * 2\n");
-        code.push_str("    result[\"source\"] = \"batch\"\n");
-        code.push_str("    if result[\"doubled\"] > 100:\n");
-        code.push_str("        result[\"flag\"] = \"high\"\n");
-        code.push_str("    else:\n");
-        code.push_str("        result[\"flag\"] = \"low\"\n");
-        code.push_str("    return result\n");
-        code.push_str("\n\n");
-    }
-    code
-}
+use serde_json::Value;
 
 // ─── Part 0: kill-switch alias round trip (bug class extinction) ──────
 
-/// Single source of truth: every `ContentType` variant paired with the
-/// natural-name alias an operator is more likely to write in
-/// `HEADROOM_LIVE_ZONE_DISABLE_ARMS`. Both round-trip assertions in
-/// `content_type_from_name_round_trips_all_variants` iterate THIS array
-/// — not a separately-maintained list — so there is exactly one place
-/// (plus `natural_name_for` below, kept only as an independent
-/// cross-check) that has to be edited when a variant's alias changes.
+/// The bug class this test makes extinct: a valid natural-name spelling
+/// of a `ContentType` failing to parse, so
+/// `HEADROOM_LIVE_ZONE_DISABLE_ARMS` looks like it disabled an arm but
+/// didn't.
 ///
-/// This replaces an earlier scheme, where the round-trip
-/// test carried its own hand-written `[ContentType; 7]` array
-/// completely independent of `natural_name_for`'s match. See the
-/// honesty note on `natural_name_for` for why this still isn't a fully
-/// compiler-forced guarantee against a variant going missing here.
-const VARIANT_TABLE: [(ContentType, &str); 7] = [
-    (ContentType::JsonArray, "json_array"),
-    (ContentType::SourceCode, "source_code"),
-    (ContentType::SearchResults, "search_results"),
-    (ContentType::BuildOutput, "build_output"),
-    (ContentType::GitDiff, "git_diff"),
-    (ContentType::Html, "html"),
-    (ContentType::PlainText, "plain_text"),
-];
-
-/// Manually mirrors `ContentType`'s variant count (content_detector.rs).
-/// The compile-time assertion below catches `VARIANT_TABLE`'s own
-/// `[(..); N]` length annotation drifting from THIS number (e.g. a row
-/// is added but the array-size annotation isn't bumped to match, which
-/// would otherwise be a plain array-literal-length compile error anyway
-/// — so this mostly documents intent). It cannot verify that `7` is
-/// still `ContentType`'s TRUE variant count: Rust has no stable
-/// reflection API for "how many variants does this enum have" (that is
-/// exactly the gap crates like `strum`'s `EnumCount` derive macro exist
-/// to close), and pulling in such a crate is out of scope for a fix
-/// confined to this single test file. This is the strongest
-/// compile-time check available under that constraint, not a full
-/// guarantee — see `natural_name_for`'s honesty note for the complete
-/// picture of what is and isn't actually enforced.
-const CONTENT_TYPE_VARIANT_COUNT: usize = 7;
-const _: () = assert!(VARIANT_TABLE.len() == CONTENT_TYPE_VARIANT_COUNT);
-
-/// Natural-name alias for each `ContentType` variant, expressed as an
-/// exhaustive match — kept as an INDEPENDENT source from `VARIANT_TABLE`
-/// (rather than generating one from the other) specifically so
-/// `variant_table_agrees_with_natural_name_for` below is a real
-/// cross-check and not a tautology.
-///
-/// Deliberately an exhaustive match with no wildcard arm: adding an 8th
-/// `ContentType` variant without touching this function is a compile
-/// error.
-///
-/// **Honesty note:** that compile
-/// error is the ONLY part of this file's variant-coverage mechanism the
-/// Rust compiler actually enforces. It forces a human to choose *some*
-/// string for the new variant right here — it does NOT force them to
-/// also add a row to `VARIANT_TABLE` above, or to bump
-/// `CONTENT_TYPE_VARIANT_COUNT`. A reviewer proved this gap
-/// empirically: in a scratch crate, adding a hypothetical 8th
-/// `ContentType` variant and touching ONLY this function (picking an
-/// arbitrary placeholder string to satisfy the compiler) left both the
-/// production `content_type_from_name` (which necessarily ends in a
-/// `_ => None` wildcard — string matches over an enum can't be
-/// exhaustive) and the test's variant array untouched, and it compiled
-/// clean with the round-trip test staying green while the original
-/// alias bug reproduced for the new variant. Rust has no stable
-/// "enumerate every variant of this enum" reflection primitive without
-/// an external derive-macro crate (e.g. `strum`), and adding one is out
-/// of scope for a fix confined to this test file. So: this exhaustive
-/// match plus `VARIANT_TABLE` plus the two cross-check tests below is
-/// the STRONGEST APPROXIMATION available in stable Rust without a new
-/// dependency, not a fully compiler-forced guarantee. An earlier
-/// version of this comment implied otherwise; corrected here per the
-/// review.
-fn natural_name_for(content_type: ContentType) -> &'static str {
-    match content_type {
-        ContentType::JsonArray => "json_array",
-        ContentType::SourceCode => "source_code",
-        ContentType::SearchResults => "search_results",
-        ContentType::BuildOutput => "build_output",
-        ContentType::GitDiff => "git_diff",
-        ContentType::Html => "html",
-        ContentType::PlainText => "plain_text",
-    }
-}
-
-/// The bug class this test makes extinct: `content_type_from_name`
-/// silently rejecting a valid natural-name spelling of a
-/// `ContentType`, so `HEADROOM_LIVE_ZONE_DISABLE_ARMS` looks like it
-/// disabled an arm but didn't. For EVERY variant in `VARIANT_TABLE`,
-/// both the `as_str()` tag and the natural-name alias must parse back
-/// to that same variant.
+/// Iterates `ContentType::ALL`, so a variant added later is covered
+/// here automatically — the earlier version of this test carried its
+/// own hand-maintained variant array plus a mirrored count and a
+/// compile-time length assertion, none of which could actually tell
+/// that a new variant had gone missing from the array.
 #[test]
-fn content_type_from_name_round_trips_all_variants() {
-    for &(content_type, natural) in VARIANT_TABLE.iter() {
+fn content_type_parses_from_both_spellings_for_all_variants() {
+    for content_type in ContentType::ALL {
         let tag = content_type.as_str();
         assert_eq!(
-            content_type_from_name(tag),
-            Some(content_type),
+            tag.parse::<ContentType>(),
+            Ok(content_type),
             "as_str() tag {tag:?} must round-trip back to {content_type:?}"
         );
 
+        let natural = content_type.natural_name();
         assert_eq!(
-            content_type_from_name(natural),
-            Some(content_type),
+            natural.parse::<ContentType>(),
+            Ok(content_type),
             "natural-name alias {natural:?} must parse to {content_type:?}"
         );
     }
 }
 
-/// Cross-check the two independently hand-maintained sources of
-/// natural-name truth — `VARIANT_TABLE`'s literal strings and
-/// `natural_name_for`'s exhaustive match — against each other for every
-/// `VARIANT_TABLE` row. This catches the two drifting apart (e.g. a
-/// typo fixed in one but not the other). It does NOT catch a variant
-/// missing from `VARIANT_TABLE` altogether — see the honesty note on
-/// `natural_name_for` for why that half of the guarantee isn't
-/// achievable at compile time here.
+/// An unknown name must be a parse error, not a silently-wrong variant.
 #[test]
-fn variant_table_agrees_with_natural_name_for() {
-    for &(content_type, natural) in VARIANT_TABLE.iter() {
-        assert_eq!(
-            natural_name_for(content_type),
-            natural,
-            "VARIANT_TABLE says {content_type:?} -> {natural:?}, natural_name_for disagrees"
+fn content_type_rejects_unknown_names() {
+    for name in ["", "bogus_type", "Source_Code", "SOURCE_CODE", "plaintext"] {
+        assert!(
+            name.parse::<ContentType>().is_err(),
+            "{name:?} must not parse to a ContentType"
         );
     }
 }
@@ -844,6 +655,69 @@ fn byte_fidelity_outside_compressed_source_block() {
     assert_eq!(parsed["system"], "you are a helpful assistant");
 }
 
+/// The same byte-fidelity invariant for the PlainText/Kompress arm.
+///
+/// Kompress is cache-only: on a host with no cached model the arm falls
+/// open to a no-op by design, so a test that merely tolerates both
+/// outcomes asserts nothing on a cold host. This one establishes ground
+/// truth FIRST — asking the loader directly whether the model is
+/// cache-resident — and then requires the dispatcher to agree:
+/// available means the arm MUST compress and preserve the bytes outside
+/// the block; unavailable means it MUST be a no-op. Either way the
+/// assertion is real, and a regression that silently disabled the arm
+/// on a warm host fails here rather than passing as "cold cache".
+#[test]
+fn plain_text_arm_preserves_bytes_outside_the_compressed_block() {
+    let prose = common::plain_prose(8_000);
+    assert!(
+        prose.len() > 5_120,
+        "fixture must clear the PlainText byte threshold (5120); got {} bytes",
+        prose.len()
+    );
+    let (body, (start, end)) = body_with_tool_result(&prose);
+    let prefix_hash = sha256(&body[..start]);
+    let suffix_hash = sha256(&body[end..]);
+
+    let kompress_available = common::kompress_available();
+
+    match dispatch(&body) {
+        LiveZoneOutcome::NoChange { manifest } => {
+            assert!(
+                !kompress_available,
+                "Kompress IS cache-resident on this host, so the PlainText arm should have                  compressed a {}-byte prose block above the 5120-byte threshold -- a NoChange                  here means the arm is unwired or silently disabled, which is exactly the                  regression this test exists to catch. manifest: {manifest:?}",
+                prose.len()
+            );
+        }
+        LiveZoneOutcome::Modified { new_body, .. } => {
+            assert!(
+                kompress_available,
+                "the PlainText arm compressed a block while the loader reports no cached model"
+            );
+            let new_bytes = new_body.get().as_bytes().to_vec();
+            let suffix_len = body.len() - end;
+            assert!(
+                new_bytes.len() > start + suffix_len,
+                "rewritten body is too short to contain the untouched prefix and suffix"
+            );
+            let new_end = new_bytes.len() - suffix_len;
+            assert_eq!(
+                sha256(&new_bytes[..start]),
+                prefix_hash,
+                "PlainText arm rewrote bytes BEFORE the compressed block"
+            );
+            assert_eq!(
+                sha256(&new_bytes[new_end..]),
+                suffix_hash,
+                "PlainText arm rewrote bytes AFTER the compressed block"
+            );
+            assert!(
+                new_bytes.len() < body.len(),
+                "arm reported Modified without shrinking the body"
+            );
+        }
+    }
+}
+
 // ─── Part 1, instrumentation: measured dispatch-reach fractions ───────
 //
 // A review quantified (from pinned
@@ -852,30 +726,6 @@ fn byte_fidelity_outside_compressed_source_block() {
 // 0% ever reached SourceCode. This section re-measures the same
 // quantity against the CURRENT generator empirically, rather than just
 // asserting the fix worked.
-
-/// Mirror of the dispatcher's private per-content-type byte thresholds
-/// (`live_zone.rs`'s `THRESHOLD_*` consts, read via `threshold_for`),
-/// duplicated here because this instrumentation test needs to decide
-/// "would this case have cleared the byte-threshold gate" without
-/// reimplementing `compress_one_block` itself. Values: SourceCode 2048,
-/// PlainText 5120, everything else 512 (all pinned in `live_zone.rs`).
-/// If production's thresholds
-/// ever change, this drifts and the printed/asserted fractions below
-/// become stale — it cannot hide a panic or a wrong *classification*,
-/// both of which are still independently caught by
-/// `dispatch_no_panic_on_arbitrary_text` and by using the real
-/// `detect_content_type` (not a reimplementation) for classification.
-fn mirrored_threshold_for(content_type: ContentType) -> usize {
-    match content_type {
-        ContentType::SourceCode => 2_048,
-        ContentType::PlainText => 5_120,
-        ContentType::JsonArray
-        | ContentType::SearchResults
-        | ContentType::BuildOutput
-        | ContentType::GitDiff
-        | ContentType::Html => 512,
-    }
-}
 
 /// Sample count for the reach-fraction measurement below. Classification
 /// runs through `detect_content_type` only — no compressor is ever
@@ -935,7 +785,7 @@ fn dispatch_reach_fractions_meet_floor() {
         }
         sampled += 1;
         let detected = detect_content_type(&text);
-        let reached = text.len() >= mirrored_threshold_for(detected.content_type);
+        let reached = text.len() >= threshold_for(detected.content_type);
         if reached {
             reached_total += 1;
             match detected.content_type {

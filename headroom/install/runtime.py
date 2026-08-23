@@ -258,8 +258,37 @@ def _read_proc_metadata(pid: int) -> tuple[list[str], dict[str, str]] | None:
         except (OSError, ValueError):
             return None
 
+    if _is_windows():
+        # WMI is part of Windows and exposes the full command line without
+        # requiring psutil. Environment blocks are not exposed reliably, so
+        # the command-line identity is checked together with the PID file.
+        try:
+            result = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        raw = result.stdout.strip()
+        if result.returncode != 0 or not raw:
+            return None
+        try:
+            return shlex.split(raw, posix=False), {}
+        except ValueError:
+            return None
+
     # macOS does not expose /proc by default. `ps -wwE` is the supported
     # system interface that returns the complete command and inherited env.
+    if sys.platform != "darwin":
+        return None
     try:
         result = subprocess.run(
             ["ps", "-wwE", "-p", str(pid), "-o", "command="],
@@ -323,6 +352,8 @@ def _process_identity(pid: int, manifest: DeploymentManifest) -> bool | None:
         cmdline, environ = metadata
     if not _proxy_command_matches(cmdline, manifest):
         return False
+    if _is_windows() and not environ:
+        return True
     return (
         environ.get("HEADROOM_DEPLOYMENT_PROFILE") == manifest.profile
         and environ.get("HEADROOM_DEPLOYMENT_RUNTIME") == manifest.runtime_kind

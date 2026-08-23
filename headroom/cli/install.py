@@ -167,7 +167,9 @@ def _start_deployment(manifest: DeploymentManifest, *, assume_start_lock: bool =
             "Docker is required for this deployment but 'docker' was not found on PATH."
         )
     if status == "running":
-        if wait_ready(manifest, timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS):
+        if wait_ready(
+            manifest, timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS, require_identity=True
+        ):
             return
         stop_runtime(manifest)
 
@@ -187,19 +189,27 @@ def _start_deployment(manifest: DeploymentManifest, *, assume_start_lock: bool =
             f"({' '.join(map(str, e.cmd)) if isinstance(e.cmd, list | tuple) else e.cmd})"
         ) from None
 
-    if not wait_ready(manifest, timeout_seconds=45):
+    if not wait_ready(manifest, timeout_seconds=45, require_identity=True):
         raise click.ClickException(
             f"Deployment '{manifest.profile}' did not become ready after start."
         )
 
 
 def _stop_deployment(manifest: DeploymentManifest) -> None:
+    supervisor_error: Exception | None = None
     if manifest.supervisor_kind in {
         SupervisorKind.SERVICE.value,
         SupervisorKind.TASK.value,
     }:
-        stop_supervisor(manifest)
-    stop_runtime(manifest)
+        try:
+            stop_supervisor(manifest)
+        except Exception as exc:
+            supervisor_error = exc
+    try:
+        stop_runtime(manifest)
+    finally:
+        if supervisor_error is not None:
+            raise supervisor_error
 
 
 def _deactivate_deployment_mutations(
@@ -219,18 +229,21 @@ def _activate_deployment_mutations(manifest: DeploymentManifest) -> None:
 
 
 def _remove_deployment(manifest: DeploymentManifest) -> None:
+    cleanup_error: Exception | None = None
     try:
         _deactivate_deployment_mutations(manifest, persist_manifest=False)
-    except Exception:
-        pass
+    except Exception as exc:
+        cleanup_error = exc
     try:
         _stop_deployment(manifest)
-    except Exception:
-        pass
+    except Exception as exc:
+        cleanup_error = cleanup_error or exc
     try:
         remove_supervisor(manifest)
-    except Exception:
-        pass
+    except Exception as exc:
+        cleanup_error = cleanup_error or exc
+    if cleanup_error is not None:
+        raise cleanup_error
     delete_manifest(manifest.profile)
 
 
@@ -888,16 +901,7 @@ def install_remove(profile: str) -> None:
     """Remove a persistent deployment and undo managed config."""
 
     manifest = _require_manifest(profile)
-    _deactivate_deployment_mutations(manifest, persist_manifest=False)
-    try:
-        _stop_deployment(manifest)
-    except Exception:
-        pass
-    try:
-        remove_supervisor(manifest)
-    except Exception:
-        pass
-    delete_manifest(profile)
+    _remove_deployment(manifest)
     click.echo(f"Removed deployment '{profile}'.")
 
 

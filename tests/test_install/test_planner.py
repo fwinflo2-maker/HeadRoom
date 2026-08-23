@@ -52,6 +52,28 @@ def test_build_manifest_for_persistent_docker_sets_expected_defaults() -> None:
     assert "--memory-db-path" not in manifest.proxy_args
 
 
+def test_build_manifest_docker_runtime_never_installs_native_supervisor() -> None:
+    manifest = build_manifest(
+        profile="default",
+        preset=InstallPreset.PERSISTENT_SERVICE.value,
+        runtime_kind="docker",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        proxy_mode="token",
+        memory_enabled=False,
+        telemetry_enabled=False,
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
+    )
+
+    assert manifest.supervisor_kind == "none"
+    assert manifest.preset == InstallPreset.PERSISTENT_TASK.value
+
+
 def test_build_manifest_python_runtime_keeps_explicit_memory_db_path() -> None:
     manifest = build_manifest(
         profile="default",

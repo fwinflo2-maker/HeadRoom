@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+import headroom.mcp_registry.ledger as ledger_module
 from headroom.mcp_registry.base import ServerSpec
 from headroom.mcp_registry.ledger import (
     LedgerMutationError,
@@ -51,6 +52,22 @@ def test_mutation_preflight_rejects_unsafe_shapes(tmp_path, value):
     ledger = tmp_path / "mcp_installs.json"
     ledger.write_text(value if isinstance(value, str) else json.dumps(value))
     with pytest.raises(LedgerMutationError):
+        validate_ledger_for_mutation(ledger)
+
+
+def test_mutation_preflight_rejects_unreadable_ledger(monkeypatch, tmp_path):
+    ledger = tmp_path / "mcp_installs.json"
+    ledger.write_text('{"agents": {}}')
+    original_read_text = ledger_module.Path.read_text
+
+    def unreadable(path, *args, **kwargs):
+        if path == ledger:
+            raise PermissionError("test unreadable ledger")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(ledger_module.Path, "read_text", unreadable)
+
+    with pytest.raises(LedgerMutationError, match="unreadable"):
         validate_ledger_for_mutation(ledger)
 
 

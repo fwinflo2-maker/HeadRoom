@@ -137,6 +137,68 @@ def test_reconcile_adopt_preserves_malformed_config(monkeypatch, tmp_path: Path)
     assert config.read_bytes() == before
 
 
+def test_adopt_rejects_malformed_modern_before_touching_valid_legacy(monkeypatch, tmp_path: Path):
+    modern = tmp_path / ".claude.json"
+    legacy = tmp_path / ".claude" / "mcp.json"
+    legacy.parent.mkdir()
+    modern.write_text("not json")
+    legacy.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "serena": {"command": "uvx", "args": ["--from", "user"]},
+                    "other": {"command": "other"},
+                }
+            }
+        )
+    )
+    registrar = ClaudeRegistrar(claude_cli=None, home_dir=tmp_path)
+    monkeypatch.setattr("headroom.mcp_registry.ClaudeRegistrar", lambda: registrar)
+    ledger = tmp_path / "ledger.json"
+    monkeypatch.setattr("headroom.mcp_registry.ledger.ledger_path", lambda: ledger)
+    before = (modern.read_bytes(), legacy.read_bytes())
+
+    result = CliRunner().invoke(main, ["mcp", "reconcile", "--adopt"])
+
+    assert result.exit_code != 0
+    assert "not valid JSON" in result.output
+    assert (modern.read_bytes(), legacy.read_bytes()) == before
+
+
+def test_adopt_rejects_non_dict_mcp_servers_in_legacy_root(monkeypatch, tmp_path: Path):
+    modern, _ = _setup(monkeypatch, tmp_path)
+    legacy = tmp_path / ".claude" / "mcp.json"
+    legacy.parent.mkdir()
+    legacy.write_text(json.dumps({"mcpServers": []}))
+    before = (modern.read_bytes(), legacy.read_bytes())
+
+    result = CliRunner().invoke(main, ["mcp", "reconcile", "--adopt"])
+
+    assert result.exit_code != 0
+    assert "non-object mcpServers" in result.output
+    assert (modern.read_bytes(), legacy.read_bytes()) == before
+
+
+def test_unreadable_ledger_blocks_adopt_without_partial_mutation(monkeypatch, tmp_path: Path):
+    config, ledger = _setup(monkeypatch, tmp_path)
+    ledger.write_text(json.dumps({"agents": {}}))
+    before = (config.read_bytes(), ledger.read_bytes())
+    original_read_text = Path.read_text
+
+    def unreadable(path: Path, *args, **kwargs):
+        if path == ledger:
+            raise PermissionError("test unreadable ledger")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+
+    result = CliRunner().invoke(main, ["mcp", "reconcile", "--adopt"])
+
+    assert result.exit_code != 0
+    assert "unreadable" in result.output
+    assert (config.read_bytes(), ledger.read_bytes()) == before
+
+
 @pytest.mark.parametrize("state", ["absent", "matching", "user-drift", "headroom-drift"])
 @pytest.mark.parametrize("adopt", [False, True])
 def test_reconcile_state_matrix(monkeypatch, tmp_path: Path, state: str, adopt: bool):

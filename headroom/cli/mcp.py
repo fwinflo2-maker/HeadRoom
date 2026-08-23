@@ -222,6 +222,7 @@ def mcp_reconcile(adopt: bool) -> None:
     """Inspect or explicitly reconcile a user-managed Serena MCP entry."""
     from headroom.mcp_registry import (
         CLAUDE_SERENA_CONTEXT,
+        ClaudeConfigMutationError,
         ClaudeRegistrar,
         RegisterStatus,
         build_serena_spec,
@@ -240,8 +241,9 @@ def mcp_reconcile(adopt: bool) -> None:
 
     if adopt:
         try:
+            registrar.validate_configs_for_mutation()
             validate_ledger_for_mutation()
-        except LedgerMutationError as exc:
+        except (ClaudeConfigMutationError, LedgerMutationError) as exc:
             raise click.ClickException(str(exc)) from exc
     if adopt:
         result = registrar.register_server(recommended, force=True)

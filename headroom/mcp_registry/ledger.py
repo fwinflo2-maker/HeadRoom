@@ -109,7 +109,11 @@ def validate_ledger_for_mutation(path: Path | None = None) -> None:
 def _read_ledger(path: Path, *, for_mutation: bool = False) -> dict[str, Any]:
     try:
         raw = path.read_text(encoding="utf-8")
-    except OSError:
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        if for_mutation:
+            raise LedgerMutationError(f"MCP install ledger is unreadable: {path}") from exc
         return {}
     try:
         data = json.loads(raw)

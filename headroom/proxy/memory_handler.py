@@ -156,7 +156,7 @@ class MemoryConfig:
     qdrant_api_key: str | None = field(default_factory=qdrant_env.qdrant_env_api_key)
     neo4j_uri: str = "neo4j://localhost:7687"
     neo4j_user: str = "neo4j"
-    neo4j_password: str = "password"
+    neo4j_password: str = field(default_factory=lambda: os.environ.get("NEO4J_PASSWORD", ""))
     # cognee config (defaults resolve from HEADROOM_COGNEE_* env vars)
     cognee_dataset: str = field(default_factory=cognee_env.cognee_env_dataset)
     cognee_system_root: str | None = field(default_factory=cognee_env.cognee_env_system_root)

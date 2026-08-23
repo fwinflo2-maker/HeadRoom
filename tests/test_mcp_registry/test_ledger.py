@@ -1,72 +1,48 @@
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from headroom.mcp_registry.base import ServerSpec
 from headroom.mcp_registry.ledger import (
-    acknowledgement_matches,
-    clear_acknowledgement,
+    LedgerMutationError,
     clear_install,
-    get_acknowledgement,
     headroom_installed_matching,
-    record_acknowledgement,
     record_install,
     spec_fingerprint,
+    validate_ledger_for_mutation,
 )
 
 
 def _spec(command: str = "uvx") -> ServerSpec:
-    return ServerSpec(
-        name="serena",
-        command=command,
-        args=("--from", "git+https://github.com/oraios/serena", "serena"),
-    )
+    return ServerSpec("serena", command, ("--from", "serena-agent", "serena"))
 
 
-def test_ledger_records_matching_install(tmp_path):
-    ledger = tmp_path / "mcp_installs.json"
-    spec = _spec()
-
-    record_install("claude", spec, path=ledger)
-
-    assert headroom_installed_matching("claude", spec, path=ledger) is True
-
-
-def test_ledger_rejects_changed_spec(tmp_path):
-    ledger = tmp_path / "mcp_installs.json"
-
-    record_install("claude", _spec(), path=ledger)
-
-    assert (
-        headroom_installed_matching("claude", _spec(command="/custom/serena"), path=ledger) is False
-    )
-
-
-def test_clear_install_removes_entry(tmp_path):
+def test_ledger_records_and_clears_matching_install(tmp_path):
     ledger = tmp_path / "mcp_installs.json"
     spec = _spec()
     record_install("claude", spec, path=ledger)
-
+    assert headroom_installed_matching("claude", spec, path=ledger)
     clear_install("claude", "serena", path=ledger)
+    assert not headroom_installed_matching("claude", spec, path=ledger)
 
-    assert headroom_installed_matching("claude", spec, path=ledger) is False
 
-
-def test_spec_fingerprint_stable_for_env_order():
-    a = ServerSpec(name="serena", command="uvx", env={"B": "2", "A": "1"})
-    b = ServerSpec(name="serena", command="uvx", env={"A": "1", "B": "2"})
-
+def test_spec_fingerprint_is_stable_for_env_order():
+    a = ServerSpec("serena", "uvx", env={"B": "2", "A": "1"})
+    b = ServerSpec("serena", "uvx", env={"A": "1", "B": "2"})
     assert spec_fingerprint(a) == spec_fingerprint(b)
 
 
-def test_authorship_acknowledgement_is_separate_from_install_ownership(tmp_path):
+@pytest.mark.parametrize("value", ["not json", [], {"agents": []}, {"agents": {"claude": []}}])
+def test_mutation_preflight_rejects_unsafe_shapes(tmp_path, value):
     ledger = tmp_path / "mcp_installs.json"
-    recommended = _spec(command="recommended")
-    observed = _spec(command="user-managed")
+    ledger.write_text(value if isinstance(value, str) else json.dumps(value))
+    with pytest.raises(LedgerMutationError):
+        validate_ledger_for_mutation(ledger)
 
-    record_acknowledgement("claude", "serena", recommended, observed, path=ledger)
 
-    assert acknowledgement_matches("claude", "serena", recommended, observed, path=ledger)
-    assert headroom_installed_matching("claude", observed, path=ledger) is False
-    assert get_acknowledgement("claude", "serena", path=ledger) is not None
-
-    clear_acknowledgement("claude", "serena", path=ledger)
-    assert get_acknowledgement("claude", "serena", path=ledger) is None
+def test_read_matching_tolerates_corrupt_ledger(tmp_path):
+    ledger = tmp_path / "mcp_installs.json"
+    ledger.write_text("not json")
+    assert not headroom_installed_matching("claude", _spec(), path=ledger)

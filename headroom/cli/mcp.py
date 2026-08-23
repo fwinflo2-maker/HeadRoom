@@ -217,86 +217,42 @@ def mcp_uninstall() -> None:
 
 
 @mcp.command("reconcile")
-@click.option(
-    "--agent",
-    type=click.Choice(["claude"]),
-    default="claude",
-    show_default=True,
-)
-@click.option("--server", default="serena", show_default=True)
-@click.option("--acknowledge", is_flag=True, help="Acknowledge the current observed Serena drift.")
 @click.option("--adopt", is_flag=True, help="Replace only the Serena entry with Headroom's spec.")
-@click.option("--clear", "clear_ack", is_flag=True, help="Clear the Serena drift acknowledgement.")
-def mcp_reconcile(
-    agent: str,
-    server: str,
-    acknowledge: bool,
-    adopt: bool,
-    clear_ack: bool,
-) -> None:
+def mcp_reconcile(adopt: bool) -> None:
     """Inspect or explicitly reconcile a user-managed Serena MCP entry."""
-    if server != "serena":
-        raise click.ClickException("only --server serena is supported")
-    actions = sum((acknowledge, adopt, clear_ack))
-    if actions > 1:
-        raise click.ClickException("choose at most one of --acknowledge, --adopt, or --clear")
-
-    from headroom.mcp_registry import (
-        ClaudeRegistrar,
-        RegisterStatus,
-        build_serena_spec_for_agent,
-    )
+    from headroom.mcp_registry import ClaudeRegistrar, RegisterStatus, build_serena_spec
     from headroom.mcp_registry.ledger import (
         LedgerMutationError,
-        acknowledgement_matches,
-        clear_acknowledgement,
-        record_acknowledgement,
         record_install,
         validate_ledger_for_mutation,
     )
 
     registrar = ClaudeRegistrar()
-    if registrar is None or not registrar.detect():
-        raise click.ClickException(f"{agent} is not detected")
-    recommended = build_serena_spec_for_agent(agent)
-    observed = registrar.get_server(server)
-    current_ack = acknowledgement_matches(agent, server, recommended, observed)
+    if not registrar.detect():
+        raise click.ClickException("claude is not detected")
+    recommended = build_serena_spec("claude-code")
+    observed = registrar.get_server("serena")
 
-    if acknowledge or adopt or clear_ack:
+    if adopt:
         try:
             validate_ledger_for_mutation()
         except LedgerMutationError as exc:
             raise click.ClickException(str(exc)) from exc
-
-    if clear_ack:
-        clear_acknowledgement(agent, server)
-        click.echo(f"Cleared Serena acknowledgement for {agent}.")
-        return
-    if acknowledge:
-        if observed is None:
-            raise click.ClickException("cannot acknowledge an absent Serena entry")
-        record_acknowledgement(agent, server, recommended, observed)
-        click.echo(f"Acknowledged current Serena configuration for {agent}.")
-        return
     if adopt:
         result = registrar.register_server(recommended, force=True)
         if result.status not in (RegisterStatus.REGISTERED, RegisterStatus.ALREADY):
             raise click.ClickException(result.detail or "could not adopt Serena configuration")
-        record_install(agent, recommended)
-        clear_acknowledgement(agent, server)
+        record_install("claude", recommended)
         click.echo(
-            f"Adopted Headroom's Serena configuration for {agent}; unrelated config preserved."
+            "Adopted Headroom's Serena configuration for Claude; unrelated config preserved."
         )
         return
 
-    click.echo(f"Serena reconciliation for {agent}")
+    click.echo("Serena reconciliation for Claude")
     click.echo(f"  observed: {'absent' if observed is None else 'present'}")
     click.echo(f"  recommendation: {recommended.command} {' '.join(recommended.args)}")
-    click.echo(f"  acknowledgement: {'current' if current_ack else 'none/stale'}")
     if observed is not None and observed != recommended:
-        click.echo(
-            "  action: use --acknowledge to suppress this current drift or --adopt to replace it"
-        )
+        click.echo("  action: use --adopt to replace it")
 
 
 @mcp.command("status")

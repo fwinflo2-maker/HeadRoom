@@ -1,20 +1,20 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from headroom.cli import wrap as wrap_cli
-from headroom.mcp_registry import ClaudeRegistrar, build_serena_spec_for_agent
+from headroom.mcp_registry import build_serena_spec
 from headroom.mcp_registry.base import RegisterResult, RegisterStatus, ServerSpec
-from headroom.mcp_registry.ledger import record_acknowledgement
+from headroom.mcp_registry.ledger import headroom_installed_matching, record_install
 
 
 class _Registrar:
     name = "claude"
     display_name = "Claude Code"
 
-    def __init__(self, current: ServerSpec):
+    def __init__(self, current: ServerSpec | None):
         self.current = current
+        self.force_calls: list[bool] = []
 
     def detect(self) -> bool:
         return True
@@ -23,15 +23,16 @@ class _Registrar:
         return self.current if name == "serena" else None
 
     def register_server(self, spec: ServerSpec, *, force: bool = False) -> RegisterResult:
+        self.force_calls.append(force)
         if self.current == spec:
             return RegisterResult(RegisterStatus.ALREADY, "matches")
-        if not force:
+        if self.current is not None and not force:
             return RegisterResult(RegisterStatus.MISMATCH, "different")
         self.current = spec
         return RegisterResult(RegisterStatus.REGISTERED, "updated")
 
 
-def _quiet_serena_side_effects(monkeypatch):
+def _quiet(monkeypatch):
     monkeypatch.setattr(wrap_cli, "_ensure_serena_dashboard_disabled", lambda **kwargs: None)
     monkeypatch.setattr(wrap_cli, "_inject_serena_instructions", lambda *args, **kwargs: None)
     monkeypatch.setattr(wrap_cli, "_serena_project_skip_reason", lambda root: "test")
@@ -39,70 +40,33 @@ def _quiet_serena_side_effects(monkeypatch):
     monkeypatch.setattr(wrap_cli.shutil, "which", lambda name: "uvx" if name == "uvx" else None)
 
 
-def test_reproduction_acknowledgement_suppresses_current_drift_without_mutation(
-    tmp_path: Path, monkeypatch, capsys
+def test_automatic_wrap_migrates_owned_drift_and_recurs_to_noop(
+    monkeypatch, tmp_path: Path, capsys
 ):
-    _quiet_serena_side_effects(monkeypatch)
-    ledger = tmp_path / "mcp_installs.json"
-    monkeypatch.setattr("headroom.mcp_registry.ledger.ledger_path", lambda: ledger)
-    fixture = json.loads(
-        (Path(__file__).parents[1] / "fixtures" / "headroom-issue-3054.json").read_text()
+    _quiet(monkeypatch)
+    monkeypatch.setattr(
+        "headroom.mcp_registry.ledger.ledger_path", lambda: tmp_path / "ledger.json"
     )
-    recommended = build_serena_spec_for_agent("claude")
-    observed = ServerSpec(name="serena", command="uvx", args=tuple(fixture["old_serena_args"]))
-    assert list(recommended.args) == fixture["recommended_serena_args"]
-    config = tmp_path / ".claude.json"
-    config.write_text(
-        json.dumps(
-            {
-                "oauthAccount": {"email": "user@example.com"},
-                "mcpServers": {
-                    "serena": {"command": observed.command, "args": list(observed.args)},
-                    "other": {"command": "other", "args": []},
-                },
-                "projects": {"/repo": {"trust": True}},
-            }
-        )
+    stale = ServerSpec("serena", "uvx", ("--from", "old"))
+    record_install("claude", stale)
+    registrar = _Registrar(stale)
+    wrap_cli._setup_serena_mcp(registrar, context="claude-code", verbose=True)
+    assert registrar.current == build_serena_spec("claude-code")
+    assert registrar.force_calls == [False, True]
+    assert headroom_installed_matching("claude", registrar.current)
+    capsys.readouterr()
+    wrap_cli._setup_serena_mcp(registrar, context="claude-code", verbose=True)
+    assert registrar.force_calls == [False, True, False]
+
+
+def test_automatic_wrap_preserves_user_managed_warning(monkeypatch, tmp_path: Path, capsys):
+    _quiet(monkeypatch)
+    monkeypatch.setattr(
+        "headroom.mcp_registry.ledger.ledger_path", lambda: tmp_path / "ledger.json"
     )
-    before = config.read_bytes()
-    registrar = ClaudeRegistrar(claude_cli=None, home_dir=tmp_path)
-    assert registrar.get_server("serena") == observed
-
-    wrap_cli._setup_serena_mcp(registrar, verbose=True)
-    assert "existing config differs" in capsys.readouterr().out
-
-    record_acknowledgement("claude", "serena", recommended, observed)
-    wrap_cli._setup_serena_mcp(registrar, verbose=True)
-    output = capsys.readouterr().out
-    assert "existing config differs" not in output
-    assert registrar.get_server("serena") == observed
-    assert config.read_bytes() == before
-
-
-def test_context_map_recommendation_moved_rearms_acknowledgement(
-    tmp_path: Path, monkeypatch, capsys
-):
-    _quiet_serena_side_effects(monkeypatch)
-    ledger = tmp_path / "mcp_installs.json"
-    monkeypatch.setattr("headroom.mcp_registry.ledger.ledger_path", lambda: ledger)
-    observed = ServerSpec(name="serena", command="uvx", args=("--from", "old-serena"))
-    old_recommended = ServerSpec(
-        name="serena", command="uvx", args=("--from", "old-recommendation")
-    )
-    record_acknowledgement("claude", "serena", old_recommended, observed)
-
-    wrap_cli._setup_serena_mcp(_Registrar(observed), verbose=True)
-    assert "existing config differs" in capsys.readouterr().out
-
-
-def test_user_edit_after_acknowledgement_rearms_warning(tmp_path: Path, monkeypatch, capsys):
-    _quiet_serena_side_effects(monkeypatch)
-    ledger = tmp_path / "mcp_installs.json"
-    monkeypatch.setattr("headroom.mcp_registry.ledger.ledger_path", lambda: ledger)
-    recommended = build_serena_spec_for_agent("claude")
-    observed = ServerSpec(name="serena", command="uvx", args=("--from", "old-serena"))
-    record_acknowledgement("claude", "serena", recommended, observed)
-
-    edited = ServerSpec(name="serena", command="uvx", args=("--from", "edited"))
-    wrap_cli._setup_serena_mcp(_Registrar(edited), verbose=True)
+    user = ServerSpec("serena", "uvx", ("--from", "user"))
+    registrar = _Registrar(user)
+    wrap_cli._setup_serena_mcp(registrar, context="claude-code", verbose=True)
+    assert registrar.current == user
+    assert registrar.force_calls == [False]
     assert "existing config differs" in capsys.readouterr().out

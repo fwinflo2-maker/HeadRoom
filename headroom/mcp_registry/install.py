@@ -15,27 +15,6 @@ from .opencode import OpencodeRegistrar
 #: Default proxy URL used when none is given.
 DEFAULT_PROXY_URL = "http://127.0.0.1:8787"
 
-SERENA_CONTEXT_BY_AGENT = {
-    "claude": "claude-code",
-    "codex": "codex",
-    "grok": "grok",
-    "opencode": "agent",
-}
-
-
-def serena_context_for_agent(agent: str) -> str | None:
-    """Return the supported Serena context for a registered agent."""
-    return SERENA_CONTEXT_BY_AGENT.get(agent)
-
-
-def build_serena_spec_for_agent(agent: str) -> ServerSpec:
-    """Build the canonical Serena spec for a supported agent."""
-    try:
-        context = SERENA_CONTEXT_BY_AGENT[agent]
-    except KeyError as exc:
-        raise ValueError(f"unsupported Serena agent: {agent}") from exc
-    return build_serena_spec(context)
-
 
 def get_all_registrars() -> list[MCPRegistrar]:
     """Return one instance of every registrar implemented today.

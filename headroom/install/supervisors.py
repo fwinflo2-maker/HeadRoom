@@ -518,6 +518,8 @@ def stop_supervisor(manifest: DeploymentManifest) -> None:
     if manifest.supervisor_kind == SupervisorKind.NONE.value:
         return
     if sys.platform.startswith("linux"):
+        if manifest.supervisor_kind == SupervisorKind.TASK.value:
+            return
         flags = [] if manifest.scope == "system" else ["--user"]
         subprocess.run(["systemctl", *flags, "stop", manifest.service_name], check=True)
         return

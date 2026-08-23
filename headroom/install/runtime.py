@@ -330,6 +330,21 @@ def _proxy_command_matches(cmdline: list[str], manifest: DeploymentManifest) -> 
     return False
 
 
+def _proxy_deployment_markers_match(cmdline: list[str], manifest: DeploymentManifest) -> bool:
+    """Match the deployment identity embedded in supervisor-launched argv."""
+    markers = {
+        "--headroom-deployment-profile": manifest.profile,
+        "--headroom-deployment-runtime": manifest.runtime_kind,
+    }
+    for name, expected in markers.items():
+        if not any(
+            cmdline[index : index + 2] == [name, str(expected)] or value == f"{name}={expected}"
+            for index, value in enumerate(cmdline)
+        ):
+            return False
+    return True
+
+
 def _process_matches_runtime(pid: int, manifest: DeploymentManifest) -> bool:
     """Verify the PID's deployment identity before lifecycle operations."""
     return _process_identity(pid, manifest) is True
@@ -353,6 +368,8 @@ def _process_identity(pid: int, manifest: DeploymentManifest) -> bool | None:
     if not _proxy_command_matches(cmdline, manifest):
         return False
     if _is_windows() and not environ:
+        if not _proxy_deployment_markers_match(cmdline, manifest):
+            return None
         return True
     return (
         environ.get("HEADROOM_DEPLOYMENT_PROFILE") == manifest.profile

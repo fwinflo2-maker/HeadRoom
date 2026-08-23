@@ -460,14 +460,25 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
         _start_deployment(manifest)
         _activate_deployment_mutations(manifest)
     except Exception as exc:
-        _remove_deployment(manifest)
+        cleanup_error: Exception | None = None
+        try:
+            _remove_deployment(manifest)
+        except Exception as cleanup_exc:
+            cleanup_error = cleanup_exc
         if existing is not None:
             click.echo(f"Restoring previous deployment '{manifest.profile}'...")
             _restore_deployment(existing)
         # Surface non-Click errors (OSError, CalledProcessError, ...) as a clean
         # message rather than a raw traceback; Click errors pass through as-is.
         if isinstance(exc, click.ClickException | click.Abort):
+            if cleanup_error is not None:
+                raise exc from cleanup_error
             raise
+        if cleanup_error is not None:
+            raise click.ClickException(
+                f"Failed to install deployment '{manifest.profile}': {exc} "
+                f"(cleanup also failed: {cleanup_error})"
+            ) from exc
         raise click.ClickException(
             f"Failed to install deployment '{manifest.profile}': {exc}"
         ) from exc
@@ -943,7 +954,9 @@ def install_agent_ensure(profile: str) -> None:
         if runtime_status(manifest) == "running":
             # Runtime exists but isn't ready yet — give it a grace period
             # before deciding it's wedged and restarting.
-            if wait_ready(manifest, timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS):
+            if wait_ready(
+                manifest, timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS, require_identity=True
+            ):
                 click.echo(f"Deployment '{profile}' is healthy.")
                 return
             _deactivate_deployment_mutations(manifest)

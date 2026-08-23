@@ -911,6 +911,33 @@ def test_install_apply_restores_previous_deployment_after_failed_update(monkeypa
     ]
 
 
+def test_install_apply_restores_previous_deployment_when_failed_cleanup_raises(monkeypatch) -> None:
+    previous = SimpleNamespace(profile="default")
+    new = SimpleNamespace(profile="default")
+    restored: list[object] = []
+
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: previous)
+
+    def fail_new_cleanup(manifest):
+        if manifest is new:
+            raise RuntimeError("new deployment cleanup failed")
+
+    monkeypatch.setattr(inst, "_remove_deployment", fail_new_cleanup)
+    monkeypatch.setattr(inst, "install_supervisor", lambda manifest: [])
+    monkeypatch.setattr(inst, "save_manifest", lambda manifest: None)
+    monkeypatch.setattr(
+        inst,
+        "_start_deployment",
+        lambda manifest: (_ for _ in ()).throw(click.ClickException("startup failed")),
+    )
+    monkeypatch.setattr(inst, "_restore_deployment", lambda manifest: restored.append(manifest))
+
+    with pytest.raises(click.ClickException, match="startup failed"):
+        inst._apply_manifest(new)
+
+    assert restored == [previous]
+
+
 def test_install_start_rejects_task_lifecycle(monkeypatch) -> None:
     runner = CliRunner()
 
@@ -1283,9 +1310,13 @@ def test_install_agent_ensure_stops_wedged_runtime_before_restart(monkeypatch) -
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
     monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "running")
-    monkeypatch.setattr(
-        "headroom.cli.install.wait_ready", lambda manifest, timeout_seconds, **kwargs: False
-    )
+    wait_calls: list[dict[str, object]] = []
+
+    def fake_wait_ready(manifest, timeout_seconds, **kwargs):
+        wait_calls.append(kwargs)
+        return False
+
+    monkeypatch.setattr("headroom.cli.install.wait_ready", fake_wait_ready)
     monkeypatch.setattr(
         "headroom.cli.install.revert_mutations", lambda manifest: calls.append("revert")
     )
@@ -1321,6 +1352,7 @@ def test_install_agent_ensure_stops_wedged_runtime_before_restart(monkeypatch) -
     assert calls.index("revert") < calls.index("stop")
     assert calls.index("stop") < calls.index("start_deployment")
     assert calls.index("start_deployment") < calls.index("apply")
+    assert wait_calls == [{"require_identity": True}]
     assert "start_agent" not in calls
     assert "start_docker" not in calls
 

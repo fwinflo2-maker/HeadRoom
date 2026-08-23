@@ -742,7 +742,10 @@ def test_process_identity_uses_windows_wmi_command_line_without_psutil(monkeypat
 
     class Result:
         returncode = 0
-        stdout = '"C:\\Python\\python.exe" -m headroom.cli proxy --port 8787'
+        stdout = (
+            '"C:\\Python\\python.exe" -m headroom.cli proxy --port 8787 '
+            "--headroom-deployment-profile default --headroom-deployment-runtime python"
+        )
 
     calls: list[list[str]] = []
     monkeypatch.setattr(
@@ -764,7 +767,10 @@ def test_windows_runtime_status_and_stop_use_wmi_identity(monkeypatch, tmp_path:
 
     class Result:
         returncode = 0
-        stdout = '"C:\\Python\\python.exe" -m headroom.cli proxy --port 8787'
+        stdout = (
+            '"C:\\Python\\python.exe" -m headroom.cli proxy --port 8787 '
+            "--headroom-deployment-profile default --headroom-deployment-runtime python"
+        )
 
     monkeypatch.setattr("headroom.install.runtime.subprocess.run", lambda *a, **k: Result())
     killed: list[tuple[int, int]] = []
@@ -776,6 +782,32 @@ def test_windows_runtime_status_and_stop_use_wmi_identity(monkeypatch, tmp_path:
     stop_runtime(manifest)
     assert killed == [(4321, signal.SIGTERM)]
     assert _read_pid("default") is None
+
+
+def test_windows_wmi_same_port_without_deployment_markers_is_unknown_and_safe(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("headroom.install.runtime.sys.platform", "win32")
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    manifest = _python_service_manifest()
+
+    class Result:
+        returncode = 0
+        stdout = '"C:\\Python\\python.exe" -m headroom.cli proxy --port 8787'
+
+    monkeypatch.setattr("headroom.install.runtime.subprocess.run", lambda *a, **k: Result())
+    _write_pid("default", 4321)
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
+    monkeypatch.setattr(
+        "headroom.install.runtime.os.kill",
+        lambda *args: pytest.fail("unidentified same-port process must not be signaled"),
+    )
+
+    assert _process_identity(4321, manifest) is None
+    assert runtime_status(manifest) == "unknown"
+    stop_runtime(manifest)
+    assert _read_pid("default") == 4321
 
 
 def test_process_identity_without_supported_metadata_is_unknown_and_safe(

@@ -500,6 +500,16 @@ class _LaunchctlResult:
         self.stdout = stdout
 
 
+def test_linux_persistent_task_stop_does_not_call_systemctl(monkeypatch) -> None:
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "linux")
+    monkeypatch.setattr(
+        "headroom.install.supervisors.subprocess.run",
+        lambda *args, **kwargs: pytest.fail("cron task stop must not call systemctl"),
+    )
+
+    stop_supervisor(_manifest(supervisor=SupervisorKind.TASK.value))
+
+
 def test_start_and_stop_supervisor_darwin_windows_and_none(monkeypatch) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr(

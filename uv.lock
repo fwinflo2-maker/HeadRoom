@@ -2360,7 +2360,7 @@ requires-dist = [
     { name = "boto3", marker = "extra == 'bedrock'", specifier = ">=1.41.0" },
     { name = "botocore", extras = ["crt"], marker = "extra == 'bedrock'", specifier = ">=1.41.0" },
     { name = "click", specifier = ">=8.3.3" },
-    { name = "cognee", marker = "extra == 'cognee'", specifier = ">=1.4.0,<2.0.0" },
+    { name = "cognee", marker = "extra == 'cognee'", specifier = ">=1.5.3,<2.0.0" },
     { name = "crewai", marker = "extra == 'crewai'", specifier = ">=1.0" },
     { name = "datasets", marker = "extra == 'evals'", specifier = ">=5.0.1" },
     { name = "datasets", marker = "extra == 'voice-train'", specifier = ">=5.0.1" },

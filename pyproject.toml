@@ -151,7 +151,7 @@ memory-stack = [
 # tree (LLM + graph + vector stack), so intentionally excluded from [all];
 # opt in with `pip install headroom-ai[cognee]`.
 cognee = [
-    "cognee>=1.4.0,<2.0.0",
+    "cognee>=1.5.3,<2.0.0",
 ]
 # Apple-Silicon GPU (MPS) offload for the memory embedder. Opt in at runtime with
 # HEADROOM_EMBEDDER_RUNTIME=pytorch_mps. macOS-only; intentionally excluded from [all].

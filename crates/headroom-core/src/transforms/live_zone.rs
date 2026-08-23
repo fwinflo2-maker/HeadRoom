@@ -53,12 +53,16 @@
 //!   `JsonArray` → SmartCrusher; `BuildOutput` → LogCompressor;
 //!   `SearchResults` → SearchCompressor; `GitDiff` → DiffCompressor —
 //!   leaving `SourceCode` / `PlainText` / `Html` as documented no-ops.
-//! - **PR-B4** (this PR) added the tokenizer-validation gate (per-block
+//! - **PR-B4** specifies the tokenizer-validation gate (per-block
 //!   `compressed.tokens >= original.tokens` → fall back) and the
-//!   per-content-type byte thresholds, and wires the two remaining
-//!   compressor arms: `SourceCode` → CodeAwareCompressor (falling back
-//!   to cached Kompress when the compressor returns its input
-//!   unchanged) and `PlainText` → cached Kompress. `Html` stays no-op.
+//!   per-content-type byte thresholds. The gate and the threshold
+//!   plumbing already shipped; **this PR** completes the item by wiring
+//!   the two remaining compressor arms — `SourceCode` →
+//!   CodeAwareCompressor (falling back to cached Kompress when the
+//!   compressor returns its input unchanged) and `PlainText` → cached
+//!   Kompress — and by moving the `SourceCode` / `PlainText` thresholds
+//!   off their placeholder 512 to the specified 2048 / 5120. `Html`
+//!   stays no-op.
 //! - **PR-B7** wires CCR retrieval-marker injection.
 //!
 //! # Cache safety invariant

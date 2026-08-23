@@ -18,8 +18,9 @@ def build_launch_env(
 
     Kimi CLI (``kimi`` / ``kimi-cli``) talks to its managed coding endpoint with
     an OpenAI-compatible ``/chat/completions`` client (``kosong``'s ``Kimi``
-    provider wraps ``AsyncOpenAI``). Its base URL is overridable via the
-    ``KIMI_BASE_URL`` environment variable, so we point it at the local proxy.
+    provider wraps ``AsyncOpenAI``). Its base URL is overridable via
+    ``KIMI_CODE_BASE_URL`` for the managed client and ``KIMI_BASE_URL`` for
+    legacy clients, so both point at the local proxy.
     The proxy forwards the request — including Kimi's own OAuth ``Authorization``
     bearer (passthrough auth mode) — to the real upstream configured by
     ``--openai-api-url`` (``https://api.kimi.com/coding/v1``).
@@ -30,5 +31,9 @@ def build_launch_env(
     """
     env = dict(environ or os.environ)
     base_url = with_project_prefix(codex_proxy_base_url(port), project)
+    env["KIMI_CODE_BASE_URL"] = base_url
     env["KIMI_BASE_URL"] = base_url
-    return env, [f"KIMI_BASE_URL={base_url}"]
+    return env, [
+        f"KIMI_CODE_BASE_URL={base_url}",
+        f"KIMI_BASE_URL={base_url}",
+    ]

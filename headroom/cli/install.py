@@ -890,12 +890,7 @@ def install_remove(profile: str) -> None:
     manifest = _require_manifest(profile)
     _deactivate_deployment_mutations(manifest, persist_manifest=False)
     try:
-        if manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-            stop_supervisor(manifest)
-    except Exception:
-        pass
-    try:
-        stop_runtime(manifest)
+        _stop_deployment(manifest)
     except Exception:
         pass
     try:

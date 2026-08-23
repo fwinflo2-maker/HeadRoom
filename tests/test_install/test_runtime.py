@@ -718,6 +718,23 @@ def test_process_identity_falls_back_without_psutil(monkeypatch) -> None:
     assert _process_matches_runtime(4321, manifest)
 
 
+def test_process_identity_uses_macos_ps_fallback_without_psutil(monkeypatch) -> None:
+    manifest = _python_service_manifest()
+    monkeypatch.setattr("headroom.install.runtime.sys.platform", "darwin")
+    monkeypatch.setitem(sys.modules, "psutil", None)
+
+    class Result:
+        returncode = 0
+        stdout = (
+            "/usr/bin/python3 -m headroom.cli proxy --port 8787 "
+            "HEADROOM_DEPLOYMENT_PROFILE=default "
+            "HEADROOM_DEPLOYMENT_RUNTIME=python"
+        )
+
+    monkeypatch.setattr("headroom.install.runtime.subprocess.run", lambda *a, **k: Result())
+    assert _process_matches_runtime(4321, manifest)
+
+
 def test_process_identity_without_supported_metadata_is_unknown_and_safe(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -1121,6 +1138,17 @@ class TestRestartCurrentDeployment:
         assert result["mode"] == "docker"
         assert result["command"] == "headroom install restart --profile default"
         assert popen_calls == []  # cannot run docker from inside the container
+
+    def test_runtime_env_docker_returns_host_command_without_restarting(self, monkeypatch) -> None:
+        from headroom.install import runtime as rt
+
+        monkeypatch.setenv("HEADROOM_DEPLOYMENT_PROFILE", "default")
+        monkeypatch.setenv("HEADROOM_DEPLOYMENT_RUNTIME", "docker")
+        monkeypatch.delenv("HEADROOM_DEPLOYMENT_PRESET", raising=False)
+        monkeypatch.setattr(rt, "load_manifest", lambda profile: None)
+
+        _manifest, mode = rt.detect_current_deployment()
+        assert mode == "docker"
 
     def test_task_mode_detected_and_not_restarted(self, monkeypatch) -> None:
         """A persistent-task deployment must not be told it's a self-restartable 'service'.

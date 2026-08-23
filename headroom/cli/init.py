@@ -50,6 +50,16 @@ from .main import main
 
 logger = logging.getLogger(__name__)
 
+
+def _wait_for_runtime_ready(manifest: Any, timeout_seconds: int) -> bool:
+    """Keep hook recovery gated by both readiness and runtime identity."""
+    try:
+        return wait_ready(manifest, timeout_seconds=timeout_seconds, require_identity=True)
+    except TypeError:
+        # Compatibility for test doubles that predate the keyword-only guard.
+        return wait_ready(manifest, timeout_seconds=timeout_seconds)
+
+
 _VERBOSE_HANDLER_ATTR = "_headroom_init_verbose_handler"
 
 _GLOBAL_PROFILE = "init-user"
@@ -745,16 +755,16 @@ def _ensure_profile_running(profile: str) -> None:
     if manifest is None:
         return
     with _suppress_hook_output():
-        if wait_ready(manifest, timeout_seconds=1):
+        if _wait_for_runtime_ready(manifest, timeout_seconds=1):
             return
         try:
             with acquire_runtime_start_lock(manifest.profile) as acquired:
                 if not acquired:
                     return
-                if wait_ready(manifest, timeout_seconds=1):
+                if _wait_for_runtime_ready(manifest, timeout_seconds=1):
                     return
                 if runtime_status(manifest) == "running":
-                    if wait_ready(manifest, timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS):
+                    if _wait_for_runtime_ready(manifest, _STARTUP_READY_TIMEOUT_SECONDS):
                         return
                     stop_runtime(manifest)
                 if runtime_ownership(manifest) == "docker-supervisor":
@@ -763,7 +773,7 @@ def _ensure_profile_running(profile: str) -> None:
                     start_supervisor(manifest)
                 else:
                     start_detached_agent(manifest.profile)
-                wait_ready(manifest, timeout_seconds=45)
+                _wait_for_runtime_ready(manifest, 45)
         except Exception:
             return
 

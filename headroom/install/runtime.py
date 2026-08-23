@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -205,8 +206,9 @@ def runtime_ownership(manifest: DeploymentManifest) -> str:
     """Classify the owner that must launch and supervise this runtime."""
 
     runtime_kind = getattr(manifest, "runtime_kind", None)
-    if runtime_kind == RuntimeKind.DOCKER.value or (
-        runtime_kind is None and manifest.preset == InstallPreset.PERSISTENT_DOCKER.value
+    if (
+        runtime_kind == RuntimeKind.DOCKER.value
+        or manifest.preset == InstallPreset.PERSISTENT_DOCKER.value
     ):
         return "docker-supervisor"
     if (
@@ -238,22 +240,65 @@ def _read_pid(profile: str) -> int | None:
 def _read_proc_metadata(pid: int) -> tuple[list[str], dict[str, str]] | None:
     """Read process identity without requiring the optional psutil package."""
 
+    if Path(f"/proc/{pid}/cmdline").exists():
+        try:
+            cmdline = [
+                part.decode(errors="replace")
+                for part in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+                if part
+            ]
+            environ = {
+                part.split(b"=", 1)[0].decode(errors="replace"): part.split(b"=", 1)[1].decode(
+                    errors="replace"
+                )
+                for part in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+                if b"=" in part
+            }
+            return cmdline, environ
+        except (OSError, ValueError):
+            return None
+
+    # macOS does not expose /proc by default. `ps -wwE` is the supported
+    # system interface that returns the complete command and inherited env.
     try:
-        cmdline = [
-            part.decode(errors="replace")
-            for part in (Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0"))
-            if part
-        ]
-        environ = {
-            part.split(b"=", 1)[0].decode(errors="replace"): part.split(b"=", 1)[1].decode(
-                errors="replace"
-            )
-            for part in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
-            if b"=" in part
-        }
-    except (OSError, ValueError):
+        result = subprocess.run(
+            ["ps", "-wwE", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
         return None
-    return cmdline, environ
+    raw = result.stdout.strip()
+    if result.returncode != 0 or not raw:
+        return None
+    try:
+        fields = shlex.split(raw)
+    except ValueError:
+        return None
+    environ = {}
+    for field in fields:
+        if field.startswith("HEADROOM_") and "=" in field:
+            name, value = field.split("=", 1)
+            environ[name] = value
+    return fields, environ
+
+
+def _proxy_command_matches(cmdline: list[str], manifest: DeploymentManifest) -> bool:
+    """Require the real Headroom proxy argv shape and configured port."""
+    shape = any(
+        cmdline[index : index + 3] == ["-m", "headroom.cli", "proxy"]
+        or cmdline[index : index + 2] == ["headroom", "proxy"]
+        for index in range(len(cmdline))
+    )
+    if not shape:
+        return False
+    for index, value in enumerate(cmdline):
+        if value == "--port" and index + 1 < len(cmdline):
+            return cmdline[index + 1] == str(manifest.port)
+        if value.startswith("--port="):
+            return value.split("=", 1)[1] == str(manifest.port)
+    return False
 
 
 def _process_matches_runtime(pid: int, manifest: DeploymentManifest) -> bool:
@@ -276,7 +321,7 @@ def _process_identity(pid: int, manifest: DeploymentManifest) -> bool | None:
         if metadata is None:
             return None
         cmdline, environ = metadata
-    if "proxy" not in cmdline or str(manifest.port) not in cmdline:
+    if not _proxy_command_matches(cmdline, manifest):
         return False
     return (
         environ.get("HEADROOM_DEPLOYMENT_PROFILE") == manifest.profile
@@ -471,14 +516,34 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
     _clear_pid(manifest.profile, expected_pid=pid)
 
 
-def wait_ready(manifest: DeploymentManifest, timeout_seconds: int = 30) -> bool:
+def wait_ready(
+    manifest: DeploymentManifest, timeout_seconds: int = 30, *, require_identity: bool = False
+) -> bool:
     """Wait for the deployment to report ready."""
 
     for _ in range(timeout_seconds):
-        if probe_ready(manifest.health_url):
+        if probe_ready(manifest.health_url) and (
+            not require_identity or runtime_status(manifest) == "running"
+        ):
             return True
         time.sleep(1)
     return False
+
+
+def runtime_ready(manifest: DeploymentManifest) -> bool:
+    """Return ready only when health and deployment identity both match."""
+    from .health import probe_ready as current_probe_ready
+
+    if not hasattr(manifest, "runtime_kind"):
+        return bool(getattr(manifest, "health_url", None)) and current_probe_ready(
+            manifest.health_url
+        )
+    try:
+        return runtime_status(manifest) == "running" and current_probe_ready(manifest.health_url)
+    except AttributeError:
+        # Test doubles and old third-party callers may provide only the health
+        # contract; persisted DeploymentManifest instances always have identity.
+        return False
 
 
 def runtime_status(manifest: DeploymentManifest) -> str:
@@ -531,7 +596,8 @@ def detect_current_deployment() -> tuple[DeploymentManifest | None, str]:
     if not profile:
         return None, "foreground"
     manifest = load_manifest(profile)
-    if preset == InstallPreset.PERSISTENT_DOCKER.value:
+    runtime = os.environ.get("HEADROOM_DEPLOYMENT_RUNTIME")
+    if preset == InstallPreset.PERSISTENT_DOCKER.value or runtime == RuntimeKind.DOCKER.value:
         return manifest, "docker"
     if manifest is None:
         return None, "foreground"

@@ -56,9 +56,9 @@
 //! - **PR-B4** (this PR) added the tokenizer-validation gate (per-block
 //!   `compressed.tokens >= original.tokens` → fall back) and the
 //!   per-content-type byte thresholds, and wires the two remaining
-//!   compressor arms: `SourceCode` → CodeAwareCompressor (with a
-//!   cached-Kompress no-shrink fallback) and `PlainText` → cached
-//!   Kompress. `Html` stays no-op.
+//!   compressor arms: `SourceCode` → CodeAwareCompressor (falling back
+//!   to cached Kompress when the compressor returns its input
+//!   unchanged) and `PlainText` → cached Kompress. `Html` stays no-op.
 //! - **PR-B7** wires CCR retrieval-marker injection.
 //!
 //! # Cache safety invariant
@@ -126,11 +126,10 @@ const STRATEGY_DIFF_COMPRESSOR: &str = "diff_compressor";
 /// Strategy tag emitted when CodeAwareCompressor rewrote a source-code block.
 const STRATEGY_CODE_COMPRESSOR: &str = "code_compressor";
 /// Strategy tag emitted when Kompress rewrote a plain-text block (also
-/// used by the SourceCode arm's no-shrink fallback — see
-/// [`dispatch_compressor`]). Only referenced from the `#[cfg(feature =
-/// "ml")]` branch of `kompress_or_noop`, so it's dead code in a
-/// `--no-default-features` build.
-#[cfg_attr(not(feature = "ml"), allow(dead_code))]
+/// used by the SourceCode arm's passthrough fallback — see
+/// [`dispatch_compressor`]). Only the `ml` build has a Kompress arm to
+/// emit it.
+#[cfg(feature = "ml")]
 const STRATEGY_KOMPRESS: &str = "kompress";
 
 /// Empty query context passed to compressors that take a relevance
@@ -192,7 +191,12 @@ const THRESHOLD_HTML: usize = 512;
 /// Map a content type to its byte threshold. Returning `usize` rather
 /// than an `Option` because every variant has a sensible default;
 /// `Html` is a no-op anyway so the threshold check never fires.
-fn threshold_for(content_type: ContentType) -> usize {
+///
+/// `pub` so tests and benches can ask "would this block have cleared the
+/// gate?" against the real constants instead of mirroring them — a
+/// mirrored copy drifts silently the moment a threshold moves.
+#[must_use]
+pub const fn threshold_for(content_type: ContentType) -> usize {
     match content_type {
         ContentType::JsonArray => THRESHOLD_JSON_ARRAY,
         ContentType::BuildOutput => THRESHOLD_BUILD_OUTPUT,
@@ -599,16 +603,16 @@ fn kompress_cached() -> Option<&'static Kompress> {
 }
 
 /// Route `text` through Kompress when the model is cache-resident;
-/// otherwise (or when the `ml` feature is disabled) fall back to a
-/// deterministic no-op. Shared by the `PlainText` arm and the
-/// `SourceCode` arm's no-shrink fallback (mirrors the Python router's
-/// no-shrink → Kompress fallback chain).
+/// otherwise fall back to a deterministic no-op. Shared by the
+/// `PlainText` arm and the `SourceCode` arm's passthrough fallback.
 ///
-/// `text` is only read inside the `#[cfg(feature = "ml")]` branch below,
-/// so it's unused in a `--no-default-features` build.
-#[cfg_attr(not(feature = "ml"), allow(unused_variables))]
+/// Not a full port of the Python router's fallback chain: that one also
+/// re-runs Kompress when the code compressor returns *changed but not
+/// smaller* output, whereas this arm sends only an exact passthrough
+/// here and leaves the changed-but-not-smaller case to the
+/// tokenizer-rejection gate in `compress_one_block`.
+#[cfg(feature = "ml")]
 fn kompress_or_noop(text: &str, content_type: ContentType) -> DispatchResult {
-    #[cfg(feature = "ml")]
     if let Some(k) = kompress_cached() {
         let result = k.compress(text);
         if !result.is_passthrough() && result.compressed != text {
@@ -623,101 +627,71 @@ fn kompress_or_noop(text: &str, content_type: ContentType) -> DispatchResult {
     }
 }
 
+/// Kompress is an `ml`-feature transform; without it the arm is a
+/// deterministic no-op. Separate definition rather than a lint-silenced
+/// unused parameter, so the no-ml build has no dead argument to explain.
+#[cfg(not(feature = "ml"))]
+fn kompress_or_noop(_text: &str, content_type: ContentType) -> DispatchResult {
+    DispatchResult::NoOp {
+        content_type: content_type.as_str(),
+    }
+}
+
 // ─── Kill switch (env-var arm disable) ─────────────────────────────────
 //
-// Experiment control and rollback affordance for the PR-B4 arms: set
+// Experiment control and rollback affordance: set
 // `HEADROOM_LIVE_ZONE_DISABLE_ARMS=source_code,plain_text` (a
-// comma-separated list of `ContentType::as_str()` names or their
-// natural-name aliases, see `content_type_from_name`) to force those
+// comma-separated list of content-type names, in either the
+// `ContentType::as_str()` or `natural_name()` spelling) to force those
 // arms to a deterministic no-op, bypassing their compressor entirely.
-// Two operator-facing caveats, both logged below rather than silently
-// accepted: only the two PR-B4 arms consult the switch today — naming
-// any other arm parses but disables nothing — and granularity is per
-// ARM, not per compressor: `plain_text` alone does not stop Kompress
-// runs reached through the SourceCode arm's no-shrink fallback;
-// disabling `source_code` as well is what removes Kompress from traffic
-// entirely (at the cost of also disabling the code compressor).
+//
+// One operator-facing caveat: granularity is per ARM, not per
+// compressor. `plain_text` alone does not stop Kompress runs reached
+// through the SourceCode arm's passthrough fallback; disabling
+// `source_code` as well is what removes Kompress from traffic entirely
+// (at the cost of also disabling the code compressor).
 
-/// Arms disabled via `HEADROOM_LIVE_ZONE_DISABLE_ARMS` (comma-separated
-/// `ContentType::as_str()` names). Read once per process: the set is
-/// latched on first dispatch so a run's behavior cannot change mid-flight
-/// (determinism invariant). Unknown names are ignored with a warning.
+/// Parse the comma-separated arm list. Blank entries are skipped;
+/// unknown names are ignored with a warning rather than failing the
+/// request, because a typo in an operator's rollback switch must not
+/// take the proxy down.
 ///
-/// The mechanism itself is generic — any `ContentType` name in the list
-/// is honored — but only the PR-B4 arms ([`ContentType::SourceCode`] and
-/// [`ContentType::PlainText`]) consult it today; see the `arm_disabled`
-/// call sites in [`dispatch_compressor`].
+/// Pure and `pub` so the parsing contract can be tested directly. The
+/// alternative — asserting on it through the process environment —
+/// requires `std::env::set_var`, which is unsound in a multi-threaded
+/// process and becomes `unsafe` in edition 2024.
+#[must_use]
+pub fn parse_disabled_arms(raw: &str) -> HashSet<ContentType> {
+    let mut set = HashSet::new();
+    for token in raw.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        match token.parse::<ContentType>() {
+            Ok(ct) => {
+                set.insert(ct);
+            }
+            Err(_) => tracing::warn!(event = "disable_arms_unknown_token", token = %token),
+        }
+    }
+    set
+}
+
+/// Arms disabled via `HEADROOM_LIVE_ZONE_DISABLE_ARMS`.
+///
+/// Latched on **first dispatch**, not at process start: the value is read
+/// the first time a block is routed and cached for the process lifetime,
+/// so a run's arm-disable set cannot change mid-flight (determinism
+/// invariant). A non-UTF-8 value is read lossily rather than silently
+/// treated as unset.
 fn disabled_arms() -> &'static HashSet<ContentType> {
     static INSTANCE: OnceLock<HashSet<ContentType>> = OnceLock::new();
     INSTANCE.get_or_init(|| {
-        let mut set = HashSet::new();
-        if let Ok(raw) = std::env::var("HEADROOM_LIVE_ZONE_DISABLE_ARMS") {
-            for token in raw.split(',') {
-                let token = token.trim();
-                if token.is_empty() {
-                    continue;
-                }
-                match content_type_from_name(token) {
-                    Some(ct) => {
-                        if !matches!(ct, ContentType::SourceCode | ContentType::PlainText) {
-                            // A valid-but-unconsulted name would otherwise be
-                            // the worst outcome: no warning, no effect — an
-                            // operator mid-incident believes the arm is off.
-                            tracing::warn!(
-                                event = "disable_arms_unconsulted_arm",
-                                token = %token,
-                                "only the source_code and plain_text arms consult the kill switch; this token parses but disables nothing"
-                            );
-                        }
-                        set.insert(ct);
-                    }
-                    None => tracing::warn!(event = "disable_arms_unknown_token", token = %token),
-                }
-            }
-        }
-        set
+        std::env::var_os("HEADROOM_LIVE_ZONE_DISABLE_ARMS")
+            .map(|raw| parse_disabled_arms(&raw.to_string_lossy()))
+            .unwrap_or_default()
     })
-}
-
-/// Reverse of [`ContentType::as_str`]. `ContentType` (content_detector.rs)
-/// has no public `from_str`-style constructor and this kill switch isn't
-/// reason enough to grow the crate's curated public API, so this small
-/// mapping mirrors each variant's string tag instead of living on
-/// `ContentType` itself. `pub` (not re-exported from
-/// `transforms::{...}`'s curated list in `mod.rs`) purely so
-/// `live_zone_arm_properties.rs`'s exhaustive round-trip test can reach
-/// it via the full `transforms::live_zone::content_type_from_name` path
-/// — the same convention already used for [`DEFAULT_MODEL`] in the
-/// existing integration tests.
-///
-/// Several variants accept both their `as_str()` tag (for consistency
-/// with log/metric field values elsewhere) and a natural-name alias — the
-/// operator-facing spelling a human is more likely to write. `PlainText`
-/// accepts `"text"` and `"plain_text"`: `"plain_text"` is the example the
-/// kill-switch section banner above uses
-/// (`HEADROOM_LIVE_ZONE_DISABLE_ARMS=source_code,plain_text`). Without
-/// that alias the documented example silently no-ops: `"plain_text"`
-/// doesn't match `"text"`, so it falls through to the unknown-token
-/// branch and the PlainText arm never actually gets disabled. The same
-/// trap applies to `SearchResults` (`"search"` / `"search_results"`),
-/// `BuildOutput` (`"build"` / `"build_output"`), and `GitDiff`
-/// (`"diff"` / `"git_diff"`) — each gets the identical additive alias.
-/// Caught by `live_zone_arm_properties.rs`'s round-trip test across all
-/// variants, and end-to-end — on a warm-cache host only — by
-/// `live_zone_disable_arms.rs`'s PlainText assertion (a cold-cache run
-/// cannot tell a disabled PlainText arm from an absent model; see the
-/// comments in that test).
-pub fn content_type_from_name(name: &str) -> Option<ContentType> {
-    match name {
-        "json_array" => Some(ContentType::JsonArray),
-        "source_code" => Some(ContentType::SourceCode),
-        "search" | "search_results" => Some(ContentType::SearchResults),
-        "build" | "build_output" => Some(ContentType::BuildOutput),
-        "diff" | "git_diff" => Some(ContentType::GitDiff),
-        "html" => Some(ContentType::Html),
-        "text" | "plain_text" => Some(ContentType::PlainText),
-        _ => None,
-    }
 }
 
 /// True when `content_type`'s dispatch arm has been disabled via
@@ -1501,12 +1475,26 @@ enum DispatchResult {
 /// - `BuildOutput` → LogCompressor
 /// - `SearchResults` → SearchCompressor
 /// - `GitDiff` → DiffCompressor
-/// - `SourceCode` → CodeAwareCompressor, cached-Kompress no-shrink
-///   fallback (PR-B4)
+/// - `SourceCode` → CodeAwareCompressor, falling back to cached
+///   Kompress on exact passthrough (PR-B4)
 /// - `PlainText` → cached Kompress, cache-cold → no-op (PR-B4)
 /// - `Html` → no-op (no compressor)
+///
+/// Any arm whose content type is named in
+/// `HEADROOM_LIVE_ZONE_DISABLE_ARMS` short-circuits to a no-op before
+/// the table below is consulted.
 fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult {
     if text.is_empty() {
+        return DispatchResult::NoOp {
+            content_type: content_type.as_str(),
+        };
+    }
+
+    // Kill switch, checked once for every arm rather than per arm: an
+    // operator naming any content type gets that arm disabled, instead
+    // of the switch silently covering only the two arms whose bodies
+    // happened to consult it.
+    if arm_disabled(content_type) {
         return DispatchResult::NoOp {
             content_type: content_type.as_str(),
         };
@@ -1576,13 +1564,14 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
         // to Kompress rather than giving up — mirrors the Python
         // router's no-shrink → Kompress fallback.
         ContentType::SourceCode => {
-            if arm_disabled(ContentType::SourceCode) {
-                return DispatchResult::NoOp {
-                    content_type: content_type.as_str(),
-                };
-            }
             let result = code_compressor().compress(text);
             if result.compressed == text {
+                // Exact passthrough only: the compressor declined
+                // (min-token floor, unknown language, parse failure,
+                // ratio guard), so hand the block to Kompress. A
+                // rewrite that changed bytes without shrinking tokens
+                // is NOT retried here — `compress_one_block`'s
+                // tokenizer gate rejects it and forwards the original.
                 return kompress_or_noop(text, content_type);
             }
             DispatchResult::Compressed {
@@ -1595,14 +1584,7 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
         // design. `kompress_or_noop` degrades to a deterministic no-op
         // when the model isn't cache-resident (or the `ml` feature is
         // off) — no network call ever happens on this path.
-        ContentType::PlainText => {
-            if arm_disabled(ContentType::PlainText) {
-                return DispatchResult::NoOp {
-                    content_type: content_type.as_str(),
-                };
-            }
-            kompress_or_noop(text, content_type)
-        }
+        ContentType::PlainText => kompress_or_noop(text, content_type),
         // No HTML compressor on the Rust side; pages are handled by
         // upstream extractors, not the proxy.
         ContentType::Html => DispatchResult::NoOp {

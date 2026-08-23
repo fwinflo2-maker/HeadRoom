@@ -393,7 +393,7 @@ def test_runtime_start_lock_blocks_another_process(monkeypatch, tmp_path: Path) 
     assert result.stdout.strip() == "False"
 
 
-def test_run_foreground_and_detached_helpers(monkeypatch, tmp_path: Path) -> None:
+def test_non_launchd_foreground_and_detached_helpers(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(
         "headroom.install.runtime.build_runtime_command", lambda manifest: ["headroom", "proxy"]
@@ -474,6 +474,116 @@ def test_run_foreground_and_detached_helpers(monkeypatch, tmp_path: Path) -> Non
         "headroom.install.runtime.subprocess.Popen", lambda command, **kwargs: fake_proc_posix
     )
     assert start_detached_agent("demo") is fake_proc_posix
+
+
+def test_launchd_exec_handoff_uses_current_pid_and_never_popens(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("headroom.install.runtime.sys.platform", "darwin")
+    monkeypatch.setattr(
+        "headroom.install.runtime.build_runtime_command",
+        lambda manifest: ["/usr/bin/python3", "-m", "headroom.cli", "proxy"],
+    )
+    expected_env = {"HEADROOM_TEST": "exec"}
+    monkeypatch.setattr("headroom.install.runtime._runtime_env", lambda manifest: expected_env)
+    monkeypatch.setattr("headroom.install.runtime.os.getpid", lambda: 4321)
+
+    exec_calls: list[tuple[str, list[str], dict[str, str]]] = []
+    pid_at_exec: list[int | None] = []
+
+    def fake_execvpe(file: str, args: list[str], env: dict[str, str]) -> None:
+        exec_calls.append((file, args, env))
+        pid_at_exec.append(_read_pid("default"))
+        raise OSError("exec failed")
+
+    monkeypatch.setattr("headroom.install.runtime.os.execvpe", fake_execvpe)
+    monkeypatch.setattr("headroom.install.runtime.os.dup2", lambda source, target: None)
+    monkeypatch.setattr(
+        "headroom.install.runtime.subprocess.Popen",
+        lambda *args, **kwargs: pytest.fail("launchd handoff must not spawn a child"),
+    )
+
+    with pytest.raises(OSError, match="exec failed"):
+        run_foreground(_python_service_manifest())
+
+    assert exec_calls == [
+        (
+            "/usr/bin/python3",
+            ["/usr/bin/python3", "-m", "headroom.cli", "proxy"],
+            expected_env,
+        )
+    ]
+    assert pid_at_exec == [4321]
+    assert _read_pid("default") is None
+
+
+def test_launchd_exec_preserves_runtime_contract(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("headroom.install.runtime.sys.platform", "darwin")
+    command = ["/usr/bin/python3", "-m", "headroom.cli", "proxy", "--port", "8787"]
+    env = {"HEADROOM_DEPLOYMENT_PROFILE": "default", "HEADROOM_SECRET": "test"}
+    monkeypatch.setattr("headroom.install.runtime.build_runtime_command", lambda manifest: command)
+    monkeypatch.setattr("headroom.install.runtime._runtime_env", lambda manifest: env)
+    monkeypatch.setattr("headroom.install.runtime.os.getpid", lambda: 9876)
+
+    dup2_calls: list[tuple[int, int]] = []
+    exec_calls: list[tuple[str, list[str], dict[str, str]]] = []
+
+    def fake_dup2(source: int, target: int) -> None:
+        dup2_calls.append((source, target))
+
+    def fake_execvpe(file: str, args: list[str], runtime_env: dict[str, str]) -> None:
+        exec_calls.append((file, args, runtime_env))
+        raise OSError("exec failed")
+
+    monkeypatch.setattr("headroom.install.runtime.os.dup2", fake_dup2)
+    monkeypatch.setattr("headroom.install.runtime.os.execvpe", fake_execvpe)
+    monkeypatch.setattr(
+        "headroom.install.runtime.subprocess.Popen",
+        lambda *args, **kwargs: pytest.fail("launchd handoff must not spawn a child"),
+    )
+
+    with pytest.raises(OSError, match="exec failed"):
+        run_foreground(_python_service_manifest())
+
+    assert exec_calls == [(command[0], command, env)]
+    assert len(dup2_calls) == 2
+    assert dup2_calls[0][1:] == (1,)
+    assert dup2_calls[1][1:] == (2,)
+    assert dup2_calls[0][0] == dup2_calls[1][0]
+
+
+def test_darwin_task_preserves_popen_path(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("headroom.install.runtime.sys.platform", "darwin")
+    monkeypatch.setattr(
+        "headroom.install.runtime.build_runtime_command", lambda manifest: ["headroom", "proxy"]
+    )
+    monkeypatch.setattr("headroom.install.runtime._runtime_env", lambda manifest: {"ENV": "1"})
+
+    class FakeProc:
+        pid = 8765
+
+        def wait(self, timeout: int | None = None) -> int:
+            return 0
+
+    popen_calls: list[tuple[list[str], dict]] = []
+    monkeypatch.setattr(
+        "headroom.install.runtime.subprocess.Popen",
+        lambda command, **kwargs: popen_calls.append((command, kwargs)) or FakeProc(),
+    )
+    monkeypatch.setattr(
+        "headroom.install.runtime.os.execvpe",
+        lambda *args: pytest.fail("Darwin task must preserve Popen"),
+    )
+
+    task_manifest = _python_service_manifest()
+    task_manifest.preset = "persistent-task"
+    task_manifest.supervisor_kind = "task"
+    assert run_foreground(task_manifest) == 0
+    assert popen_calls[0][0] == ["headroom", "proxy"]
+    assert _read_pid("default") is None
 
 
 def test_start_detached_agent_closes_parent_log_fd(monkeypatch, tmp_path: Path) -> None:

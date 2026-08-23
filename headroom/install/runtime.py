@@ -285,6 +285,21 @@ def run_foreground(manifest: DeploymentManifest) -> int:
     log_file_path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(log_file_path, "a", encoding="utf-8", errors="replace") as log_file:
+        if (
+            sys.platform == "darwin"
+            and manifest.preset == InstallPreset.PERSISTENT_SERVICE.value
+            and manifest.runtime_kind == RuntimeKind.PYTHON.value
+            and manifest.supervisor_kind == SupervisorKind.SERVICE.value
+        ):
+            _write_pid(manifest.profile, os.getpid())
+            try:
+                os.dup2(log_file.fileno(), 1)
+                os.dup2(log_file.fileno(), 2)
+                os.execvpe(command[0], command, env)
+            except BaseException:
+                _clear_pid(manifest.profile)
+                raise
+
         proc = subprocess.Popen(command, env=env, stdout=log_file, stderr=log_file)
         _write_pid(manifest.profile, proc.pid)
 

@@ -84,7 +84,16 @@ def test_adopt_preserves_unrelated_config_and_records_ownership(monkeypatch, tmp
 
 
 @pytest.mark.parametrize(
-    "contents", ["not json", "[]", '{"agents": []}', '{"agents": {"claude": []}}']
+    "contents",
+    [
+        "not json",
+        "[]",
+        '{"agents": null}',
+        '{"agents": []}',
+        '{"agents": {"claude": null}}',
+        '{"agents": {"claude": []}}',
+        '{"agents": {"claude": {"serena": null}}}',
+    ],
 )
 def test_malformed_ledger_blocks_adopt_before_config_write(
     monkeypatch, tmp_path: Path, contents: str
@@ -103,6 +112,29 @@ def test_corrupt_ledger_is_tolerated_by_read_only(monkeypatch, tmp_path: Path):
     ledger.write_text('{"agents": []}')
     result = CliRunner().invoke(main, ["mcp", "reconcile"])
     assert result.exit_code == 0, result.output
+
+
+def test_reconcile_rejects_absent_claude(monkeypatch, tmp_path: Path):
+    _, _ = _setup(monkeypatch, tmp_path)
+    registrar = ClaudeRegistrar(claude_cli=None, home_dir=tmp_path)
+    monkeypatch.setattr(registrar, "detect", lambda: False)
+    monkeypatch.setattr("headroom.mcp_registry.ClaudeRegistrar", lambda: registrar)
+
+    result = CliRunner().invoke(main, ["mcp", "reconcile", "--adopt"])
+
+    assert result.exit_code != 0
+    assert "claude is not detected" in result.output
+
+
+def test_reconcile_adopt_preserves_malformed_config(monkeypatch, tmp_path: Path):
+    config, _ = _setup(monkeypatch, tmp_path)
+    config.write_text("not json")
+    before = config.read_bytes()
+
+    result = CliRunner().invoke(main, ["mcp", "reconcile", "--adopt"])
+
+    assert result.exit_code != 0
+    assert config.read_bytes() == before
 
 
 @pytest.mark.parametrize("state", ["absent", "matching", "user-drift", "headroom-drift"])
@@ -182,3 +214,16 @@ def test_ordinary_install_does_not_adopt_serena(monkeypatch, tmp_path: Path):
     assert after["mcpServers"]["serena"] == before_data["mcpServers"]["serena"]
     assert after["mcpServers"]["headroom"]["args"] == ["mcp", "serve"]
     assert "mcp reconcile --adopt" not in result.output
+
+
+def test_mcp_install_force_preserves_user_managed_serena(monkeypatch, tmp_path: Path):
+    config, _ = _setup(monkeypatch, tmp_path)
+    before = json.loads(config.read_text())["mcpServers"]["serena"]
+    monkeypatch.setitem(sys.modules, "mcp", object())
+    registrar = ClaudeRegistrar(claude_cli=None, home_dir=tmp_path)
+    monkeypatch.setattr("headroom.mcp_registry.install.get_all_registrars", lambda: [registrar])
+
+    result = CliRunner().invoke(main, ["mcp", "install", "--agent", "claude", "--force"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(config.read_text())["mcpServers"]["serena"] == before

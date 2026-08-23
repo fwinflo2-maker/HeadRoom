@@ -48,8 +48,14 @@ def record_install(agent: str, spec: ServerSpec, *, path: Path | None = None) ->
     # Automatic installs must recover from a stale or damaged ledger. The
     # explicit reconcile route performs strict validation before config writes.
     data = _read_ledger(ledger_file)
-    agents = data.setdefault("agents", {})
-    agent_entry = agents.setdefault(agent, {})
+    agents = data.get("agents")
+    if not isinstance(agents, dict):
+        agents = {}
+        data["agents"] = agents
+    agent_entry = agents.get(agent)
+    if not isinstance(agent_entry, dict):
+        agent_entry = {}
+        agents[agent] = agent_entry
     agent_entry[spec.name] = {
         "fingerprint": spec_fingerprint(spec),
         "installed_at": datetime.now(timezone.utc).isoformat(),
@@ -118,8 +124,6 @@ def _read_ledger(path: Path, *, for_mutation: bool = False) -> dict[str, Any]:
     if for_mutation:
         for section in ("agents",):
             section_data = data.get(section)
-            if section_data is None:
-                continue
             if not isinstance(section_data, dict) or any(
                 not isinstance(agent_entry, dict)
                 or any(

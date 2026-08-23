@@ -220,7 +220,12 @@ def mcp_uninstall() -> None:
 @click.option("--adopt", is_flag=True, help="Replace only the Serena entry with Headroom's spec.")
 def mcp_reconcile(adopt: bool) -> None:
     """Inspect or explicitly reconcile a user-managed Serena MCP entry."""
-    from headroom.mcp_registry import ClaudeRegistrar, RegisterStatus, build_serena_spec
+    from headroom.mcp_registry import (
+        CLAUDE_SERENA_CONTEXT,
+        ClaudeRegistrar,
+        RegisterStatus,
+        build_serena_spec,
+    )
     from headroom.mcp_registry.ledger import (
         LedgerMutationError,
         record_install,
@@ -230,7 +235,7 @@ def mcp_reconcile(adopt: bool) -> None:
     registrar = ClaudeRegistrar()
     if not registrar.detect():
         raise click.ClickException("claude is not detected")
-    recommended = build_serena_spec("claude-code")
+    recommended = build_serena_spec(CLAUDE_SERENA_CONTEXT)
     observed = registrar.get_server("serena")
 
     if adopt:

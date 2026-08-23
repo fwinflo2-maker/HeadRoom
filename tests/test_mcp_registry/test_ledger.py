@@ -34,7 +34,19 @@ def test_spec_fingerprint_is_stable_for_env_order():
     assert spec_fingerprint(a) == spec_fingerprint(b)
 
 
-@pytest.mark.parametrize("value", ["not json", [], {"agents": []}, {"agents": {"claude": []}}])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "not json",
+        [],
+        {"agents": None},
+        {"agents": []},
+        {"agents": {"claude": None}},
+        {"agents": {"claude": []}},
+        {"agents": {"claude": {"serena": None}}},
+        {"agents": {"claude": {"serena": {"fingerprint": "only"}}}},
+    ],
+)
 def test_mutation_preflight_rejects_unsafe_shapes(tmp_path, value):
     ledger = tmp_path / "mcp_installs.json"
     ledger.write_text(value if isinstance(value, str) else json.dumps(value))
@@ -56,3 +68,13 @@ def test_record_install_recovers_from_corrupt_ledger(tmp_path):
     record_install("claude", spec, path=ledger)
 
     assert headroom_installed_matching("claude", spec, path=ledger)
+
+
+@pytest.mark.parametrize("contents", ['{"agents": null}', '{"agents": {"claude": null}}'])
+def test_record_install_recovers_from_unsafe_ledger_shape(tmp_path, contents):
+    ledger = tmp_path / "mcp_installs.json"
+    ledger.write_text(contents)
+
+    record_install("claude", _spec(), path=ledger)
+
+    assert headroom_installed_matching("claude", _spec(), path=ledger)

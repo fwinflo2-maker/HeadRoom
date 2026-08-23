@@ -59,6 +59,30 @@ def test_automatic_wrap_migrates_owned_drift_and_recurs_to_noop(
     assert registrar.force_calls == [False, True, False]
 
 
+def test_automatic_wrap_owned_drift_suggests_rerun_wrap(monkeypatch, tmp_path: Path, capsys):
+    _quiet(monkeypatch)
+    monkeypatch.setattr(
+        "headroom.mcp_registry.ledger.ledger_path", lambda: tmp_path / "ledger.json"
+    )
+    stale = ServerSpec("serena", "uvx", ("--from", "old"))
+    record_install("claude", stale)
+
+    class _FailedMigrationRegistrar(_Registrar):
+        def register_server(self, spec, *, force=False):
+            if force:
+                self.force_calls.append(force)
+                return RegisterResult(RegisterStatus.MISMATCH, "still different")
+            return super().register_server(spec, force=force)
+
+    wrap_cli._setup_serena_mcp(
+        _FailedMigrationRegistrar(stale), context="claude-code", verbose=True
+    )
+
+    output = capsys.readouterr().out
+    assert "run headroom wrap again" in output
+    assert "mcp reconcile --adopt" not in output
+
+
 def test_automatic_wrap_preserves_user_managed_warning(monkeypatch, tmp_path: Path, capsys):
     _quiet(monkeypatch)
     monkeypatch.setattr(

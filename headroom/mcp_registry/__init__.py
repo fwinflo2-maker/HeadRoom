@@ -19,6 +19,7 @@ from .codex import CodexRegistrar
 from .display import any_succeeded, format_result, format_results
 from .grok import GrokRegistrar
 from .install import (
+    CLAUDE_SERENA_CONTEXT,
     DEFAULT_PROXY_URL,
     build_headroom_spec,
     build_serena_spec,
@@ -30,6 +31,7 @@ from .server_json import build_server_json, render_server_json
 
 __all__ = [
     "DEFAULT_PROXY_URL",
+    "CLAUDE_SERENA_CONTEXT",
     "ClaudeRegistrar",
     "CodexRegistrar",
     "GrokRegistrar",

@@ -4390,6 +4390,10 @@ def _launch_tool(
         if actual_port != port:
             for k, v in dict(env).items():
                 env[k] = v.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
+            env_vars_display[:] = [
+                value.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
+                for value in env_vars_display
+            ]
 
         if configure_launch is not None:
             args, env, env_vars_display = configure_launch(actual_port, args, env, env_vars_display)
@@ -6297,8 +6301,8 @@ def kimi(
     \b
     Sets KIMI_CODE_BASE_URL for managed Kimi Code and KIMI_BASE_URL for legacy
     kimi-cli to route OpenAI-compatible /chat/completions traffic through
-    Headroom. Kimi's own OAuth bearer is forwarded upstream, so no extra login
-    is required — run `kimi` once to authenticate first.
+    Headroom. Managed Kimi Code needs one `/login` after the proxy URL changes
+    so its OAuth slot matches that URL; legacy kimi-cli keeps its existing login.
 
     \b
     Examples:

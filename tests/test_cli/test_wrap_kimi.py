@@ -42,9 +42,10 @@ def test_environment_precedence() -> None:
 
 def test_managed_route_reproduction() -> None:
     direct = "https://api.kimi.com/coding/v1"
+    configured = {"base_url": direct, "oauth": {"key": "oauth/kimi-code"}}
     env, _ = build_launch_env(8787, {"KIMI_BASE_URL": direct}, project="repo")
 
-    selected_url = env.get("KIMI_CODE_BASE_URL", direct)
+    selected_url = env.get("KIMI_CODE_BASE_URL") or configured["base_url"]
 
     assert selected_url == "http://127.0.0.1:8787/p/repo/v1"
     assert selected_url != direct
@@ -142,8 +143,10 @@ def test_legacy_stale_config(
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
     monkeypatch.setenv("KIMI_TEST_UNRELATED", "preserved")
-    config = tmp_path / "config.toml"
+    config = tmp_path / ".kimi-code" / "config.toml"
+    config.parent.mkdir()
     config.write_text('base_url = "https://api.kimi.com/coding/v1"\n', encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path))
     before = config.read_text(encoding="utf-8")
     captured: dict[str, Any] = {}
 
@@ -190,7 +193,9 @@ def test_subprocess_launch_environment() -> None:
 
     assert raised.value.code == 0
     subprocess_mod.run.assert_called_once_with(["kimi", "--version"], env=env)
-    assert subprocess_mod.run.call_args.kwargs["env"]["KIMI_CODE_BASE_URL"] == env["KIMI_BASE_URL"]
+    actual_env = subprocess_mod.run.call_args.kwargs["env"]
+    assert actual_env["KIMI_CODE_BASE_URL"] == "http://127.0.0.1:8787/v1"
+    assert actual_env["KIMI_BASE_URL"] == "http://127.0.0.1:8787/v1"
     assert subprocess_mod.run.call_args.kwargs["env"]["KIMI_TEST_UNRELATED"] == "preserved"
 
 
@@ -266,6 +271,10 @@ def test_port_fallback_rewrites_both_urls() -> None:
     expected = "http://127.0.0.1:9001/p/repo/v1"
     assert actual_env["KIMI_CODE_BASE_URL"] == expected
     assert actual_env["KIMI_BASE_URL"] == expected
+    assert display == [
+        f"KIMI_CODE_BASE_URL={expected}",
+        f"KIMI_BASE_URL={expected}",
+    ]
 
 
 def test_wrap_kimi_custom_api_url(

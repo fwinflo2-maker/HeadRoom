@@ -569,28 +569,56 @@ def test_launchd_exec_preserves_runtime_contract(monkeypatch, tmp_path: Path) ->
     assert dup2_calls == [(42, 1), (42, 2)]
 
 
-def test_launchd_exec_handoff_supports_docker_runtime(monkeypatch, tmp_path: Path) -> None:
+def test_launchd_exec_handoff_keeps_docker_runtime_on_popen(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr("headroom.install.runtime.sys.platform", "darwin")
     command = ["docker", "run", "--rm", "headroom:test"]
     env = {"HEADROOM_DEPLOYMENT_RUNTIME": "docker"}
     monkeypatch.setattr("headroom.install.runtime.build_runtime_command", lambda manifest: command)
     monkeypatch.setattr("headroom.install.runtime._runtime_env", lambda manifest: env)
-    monkeypatch.setattr("headroom.install.runtime.os.dup2", lambda source, target: None)
 
-    def fake_execvpe(*args):
-        raise OSError("exec failed")
+    class FakeProc:
+        pid = 4322
 
-    monkeypatch.setattr("headroom.install.runtime.os.execvpe", fake_execvpe)
+        def wait(self, timeout: int | None = None) -> int:
+            return 0
+
     monkeypatch.setattr(
         "headroom.install.runtime.subprocess.Popen",
-        lambda *args, **kwargs: pytest.fail("launchd handoff must not spawn a child"),
+        lambda *args, **kwargs: FakeProc(),
+    )
+    monkeypatch.setattr(
+        "headroom.install.runtime.os.execvpe",
+        lambda *args: pytest.fail("Docker launchd service must keep the daemon-owned Popen path"),
     )
 
     manifest = _python_service_manifest()
     manifest.runtime_kind = "docker"
-    with pytest.raises(OSError, match="exec failed"):
-        run_foreground(manifest)
+    assert run_foreground(manifest) == 0
+
+
+def test_runtime_status_ignores_reused_pid(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("headroom.install.runtime._process_identity", lambda pid: ("psutil", 2.0))
+    _write_pid("default", 123)
+    monkeypatch.setattr("headroom.install.runtime._process_identity", lambda pid: ("psutil", 3.0))
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
+    assert runtime_status(_python_service_manifest()) == "stopped"
+    assert _read_pid("default") is None
+
+
+def test_stop_runtime_does_not_signal_reused_pid(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("headroom.install.runtime._process_identity", lambda pid: ("psutil", 2.0))
+    _write_pid("default", 123)
+    monkeypatch.setattr("headroom.install.runtime._process_identity", lambda pid: ("psutil", 3.0))
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
+    monkeypatch.setattr(
+        "headroom.install.runtime.os.kill",
+        lambda *args: pytest.fail("reused PID must not be signaled"),
+    )
+    stop_runtime(_python_service_manifest())
+    assert _read_pid("default") is None
 
 
 def test_darwin_task_preserves_popen_path(monkeypatch, tmp_path: Path) -> None:

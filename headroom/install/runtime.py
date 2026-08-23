@@ -205,6 +205,12 @@ def _write_pid(profile: str, pid: int) -> None:
     path = pid_path(profile)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(str(pid))
+    identity = _process_identity(pid)
+    identity_path = path.with_name("runner.pid.identity")
+    if identity is None:
+        identity_path.unlink(missing_ok=True)
+    else:
+        identity_path.write_text(f"{identity[0]}:{identity[1]}")
 
 
 def _read_pid(profile: str) -> int | None:
@@ -217,10 +223,39 @@ def _read_pid(profile: str) -> int | None:
         return None
 
 
-def _clear_pid(profile: str) -> None:
+def _process_identity(pid: int) -> tuple[str, float] | None:
+    """Return a best-effort process start identity for PID-reuse checks."""
+    try:
+        import psutil  # type: ignore[import-untyped]  # optional dependency
+
+        return ("psutil", float(psutil.Process(pid).create_time()))
+    except Exception:
+        pass
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_bytes().rpartition(b")")[2].split()
+        return ("proc", float(fields[19]))
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _pid_reused(profile: str, pid: int) -> bool:
+    identity_path = pid_path(profile).with_name("runner.pid.identity")
+    try:
+        source, value = identity_path.read_text().split(":", 1)
+        recorded = (source, float(value))
+    except (OSError, ValueError):
+        return False
+    current = _process_identity(pid)
+    return current is not None and current[0] == recorded[0] and current[1] != recorded[1]
+
+
+def _clear_pid(profile: str, *, expected_pid: int | None = None) -> None:
     path = pid_path(profile)
+    if expected_pid is not None and _read_pid(profile) != expected_pid:
+        return
     if path.exists():
         path.unlink()
+    path.with_name("runner.pid.identity").unlink(missing_ok=True)
 
 
 @contextmanager
@@ -288,6 +323,7 @@ def run_foreground(manifest: DeploymentManifest) -> int:
         if (
             sys.platform == "darwin"
             and manifest.preset == InstallPreset.PERSISTENT_SERVICE.value
+            and manifest.runtime_kind == RuntimeKind.PYTHON.value
             and manifest.supervisor_kind == SupervisorKind.SERVICE.value
         ):
             _write_pid(manifest.profile, os.getpid())
@@ -296,7 +332,7 @@ def run_foreground(manifest: DeploymentManifest) -> int:
                 os.dup2(log_file.fileno(), 2)
                 os.execvpe(command[0], command, env)
             except BaseException:
-                _clear_pid(manifest.profile)
+                _clear_pid(manifest.profile, expected_pid=os.getpid())
                 raise
 
         proc = subprocess.Popen(command, env=env, stdout=log_file, stderr=log_file)
@@ -315,7 +351,7 @@ def run_foreground(manifest: DeploymentManifest) -> int:
         try:
             return proc.wait()
         finally:
-            _clear_pid(manifest.profile)
+            _clear_pid(manifest.profile, expected_pid=proc.pid)
 
 
 def start_detached_agent(profile: str) -> subprocess.Popen[str]:
@@ -388,12 +424,15 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
     pid = _read_pid(manifest.profile)
     if pid is None:
         return
+    if _pid_reused(manifest.profile, pid):
+        _clear_pid(manifest.profile, expected_pid=pid)
+        return
     try:
         os.kill(pid, signal.SIGTERM)
     except (OSError, SystemError):
         # SystemError covers the Windows WinError 87 surfacing described in #1544.
         pass
-    _clear_pid(manifest.profile)
+    _clear_pid(manifest.profile, expected_pid=pid)
 
 
 def wait_ready(manifest: DeploymentManifest, timeout_seconds: int = 30) -> bool:
@@ -424,8 +463,8 @@ def runtime_status(manifest: DeploymentManifest) -> str:
     # Windows-safe liveness probe: a bare os.kill(pid, 0) here raised WinError 87
     # as a SystemError against the detached agent, crashing status and taking the
     # live proxy down with it (#1544).
-    if not pid_alive(pid):
-        _clear_pid(manifest.profile)
+    if not pid_alive(pid) or _pid_reused(manifest.profile, pid):
+        _clear_pid(manifest.profile, expected_pid=pid)
         return "stopped"
     return "running"
 

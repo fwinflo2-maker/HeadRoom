@@ -395,6 +395,7 @@ def test_runtime_start_lock_blocks_another_process(monkeypatch, tmp_path: Path) 
 
 def test_non_launchd_foreground_and_detached_helpers(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("headroom.install.runtime.sys.platform", "win32")
     monkeypatch.setattr(
         "headroom.install.runtime.build_runtime_command", lambda manifest: ["headroom", "proxy"]
     )
@@ -530,6 +531,20 @@ def test_launchd_exec_preserves_runtime_contract(monkeypatch, tmp_path: Path) ->
     dup2_calls: list[tuple[int, int]] = []
     exec_calls: list[tuple[str, list[str], dict[str, str]]] = []
 
+    class FakeLog:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback) -> None:
+            return None
+
+        def fileno(self) -> int:
+            return 42
+
+    monkeypatch.setattr(
+        "headroom.install.runtime.open", lambda *args, **kwargs: FakeLog(), raising=False
+    )
+
     def fake_dup2(source: int, target: int) -> None:
         dup2_calls.append((source, target))
 
@@ -551,7 +566,31 @@ def test_launchd_exec_preserves_runtime_contract(monkeypatch, tmp_path: Path) ->
     assert len(dup2_calls) == 2
     assert dup2_calls[0][1:] == (1,)
     assert dup2_calls[1][1:] == (2,)
-    assert dup2_calls[0][0] == dup2_calls[1][0]
+    assert dup2_calls == [(42, 1), (42, 2)]
+
+
+def test_launchd_exec_handoff_supports_docker_runtime(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("headroom.install.runtime.sys.platform", "darwin")
+    command = ["docker", "run", "--rm", "headroom:test"]
+    env = {"HEADROOM_DEPLOYMENT_RUNTIME": "docker"}
+    monkeypatch.setattr("headroom.install.runtime.build_runtime_command", lambda manifest: command)
+    monkeypatch.setattr("headroom.install.runtime._runtime_env", lambda manifest: env)
+    monkeypatch.setattr("headroom.install.runtime.os.dup2", lambda source, target: None)
+
+    def fake_execvpe(*args):
+        raise OSError("exec failed")
+
+    monkeypatch.setattr("headroom.install.runtime.os.execvpe", fake_execvpe)
+    monkeypatch.setattr(
+        "headroom.install.runtime.subprocess.Popen",
+        lambda *args, **kwargs: pytest.fail("launchd handoff must not spawn a child"),
+    )
+
+    manifest = _python_service_manifest()
+    manifest.runtime_kind = "docker"
+    with pytest.raises(OSError, match="exec failed"):
+        run_foreground(manifest)
 
 
 def test_darwin_task_preserves_popen_path(monkeypatch, tmp_path: Path) -> None:
@@ -744,6 +783,7 @@ def test_start_stop_wait_and_runtime_status_branches(monkeypatch, tmp_path: Path
     _write_pid("default", 125)
     monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: False)
     assert runtime_status(python_manifest) == "stopped"
+    assert _read_pid("default") is None
 
 
 def test_stop_runtime_for_docker_stops_and_removes_container(monkeypatch) -> None:

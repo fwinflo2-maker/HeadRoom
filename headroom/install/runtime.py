@@ -288,7 +288,6 @@ def run_foreground(manifest: DeploymentManifest) -> int:
         if (
             sys.platform == "darwin"
             and manifest.preset == InstallPreset.PERSISTENT_SERVICE.value
-            and manifest.runtime_kind == RuntimeKind.PYTHON.value
             and manifest.supervisor_kind == SupervisorKind.SERVICE.value
         ):
             _write_pid(manifest.profile, os.getpid())
@@ -425,7 +424,10 @@ def runtime_status(manifest: DeploymentManifest) -> str:
     # Windows-safe liveness probe: a bare os.kill(pid, 0) here raised WinError 87
     # as a SystemError against the detached agent, crashing status and taking the
     # live proxy down with it (#1544).
-    return "running" if pid_alive(pid) else "stopped"
+    if not pid_alive(pid):
+        _clear_pid(manifest.profile)
+        return "stopped"
+    return "running"
 
 
 def detect_current_deployment() -> tuple[DeploymentManifest | None, str]:

@@ -731,7 +731,7 @@ def test_process_identity_uses_macos_ps_fallback_without_psutil(monkeypatch) -> 
             "HEADROOM_DEPLOYMENT_RUNTIME=python"
         )
 
-    monkeypatch.setattr("headroom.install.runtime.subprocess.run", lambda *a, **k: Result())
+    monkeypatch.setattr("headroom.install.runtime.run", lambda *a, **k: Result())
     assert _process_matches_runtime(4321, manifest)
 
 
@@ -749,7 +749,7 @@ def test_process_identity_uses_windows_wmi_command_line_without_psutil(monkeypat
 
     calls: list[list[str]] = []
     monkeypatch.setattr(
-        "headroom.install.runtime.subprocess.run",
+        "headroom.install.runtime.run",
         lambda command, **kwargs: calls.append(command) or Result(),
     )
 
@@ -772,7 +772,7 @@ def test_windows_runtime_status_and_stop_use_wmi_identity(monkeypatch, tmp_path:
             "--headroom-deployment-profile default --headroom-deployment-runtime python"
         )
 
-    monkeypatch.setattr("headroom.install.runtime.subprocess.run", lambda *a, **k: Result())
+    monkeypatch.setattr("headroom.install.runtime.run", lambda *a, **k: Result())
     killed: list[tuple[int, int]] = []
     monkeypatch.setattr(
         "headroom.install.runtime.os.kill", lambda pid, sig: killed.append((pid, sig))
@@ -796,7 +796,7 @@ def test_windows_wmi_same_port_without_deployment_markers_is_unknown_and_safe(
         returncode = 0
         stdout = '"C:\\Python\\python.exe" -m headroom.cli proxy --port 8787'
 
-    monkeypatch.setattr("headroom.install.runtime.subprocess.run", lambda *a, **k: Result())
+    monkeypatch.setattr("headroom.install.runtime.run", lambda *a, **k: Result())
     _write_pid("default", 4321)
     monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
     monkeypatch.setattr(

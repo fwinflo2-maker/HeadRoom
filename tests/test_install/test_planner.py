@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import click
 import pytest
 
@@ -71,7 +73,12 @@ def test_build_manifest_docker_runtime_never_installs_native_supervisor() -> Non
     )
 
     assert manifest.supervisor_kind == "none"
-    assert manifest.preset == InstallPreset.PERSISTENT_TASK.value
+    expected_preset = (
+        InstallPreset.PERSISTENT_TASK.value
+        if sys.platform.startswith("win")
+        else InstallPreset.PERSISTENT_SERVICE.value
+    )
+    assert manifest.preset == expected_preset
 
 
 def test_build_manifest_python_runtime_keeps_explicit_memory_db_path() -> None:

@@ -263,7 +263,7 @@ def _read_proc_metadata(pid: int) -> tuple[list[str], dict[str, str]] | None:
         # requiring psutil. Environment blocks are not exposed reliably, so
         # the command-line identity is checked together with the PID file.
         try:
-            result = subprocess.run(
+            result = run(
                 [
                     "powershell.exe",
                     "-NoProfile",
@@ -290,7 +290,7 @@ def _read_proc_metadata(pid: int) -> tuple[list[str], dict[str, str]] | None:
     if sys.platform != "darwin":
         return None
     try:
-        result = subprocess.run(
+        result = run(
             ["ps", "-wwE", "-p", str(pid), "-o", "command="],
             capture_output=True,
             text=True,
@@ -371,7 +371,7 @@ def _process_identity(pid: int, manifest: DeploymentManifest) -> bool | None:
         if not _proxy_deployment_markers_match(cmdline, manifest):
             return None
         return True
-    return (
+    return bool(
         environ.get("HEADROOM_DEPLOYMENT_PROFILE") == manifest.profile
         and environ.get("HEADROOM_DEPLOYMENT_RUNTIME") == manifest.runtime_kind
     )

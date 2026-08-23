@@ -219,7 +219,7 @@ def mcp_uninstall() -> None:
 @mcp.command("reconcile")
 @click.option(
     "--agent",
-    type=click.Choice(["claude", "codex", "grok", "opencode"]),
+    type=click.Choice(["claude"]),
     default="claude",
     show_default=True,
 )
@@ -245,25 +245,28 @@ def mcp_reconcile(
         ClaudeRegistrar,
         RegisterStatus,
         build_serena_spec_for_agent,
-        get_all_registrars,
     )
     from headroom.mcp_registry.ledger import (
+        LedgerMutationError,
         acknowledgement_matches,
         clear_acknowledgement,
         record_acknowledgement,
         record_install,
+        validate_ledger_for_mutation,
     )
 
-    registrar = (
-        ClaudeRegistrar()
-        if agent == "claude"
-        else next((item for item in get_all_registrars() if item.name == agent), None)
-    )
+    registrar = ClaudeRegistrar()
     if registrar is None or not registrar.detect():
         raise click.ClickException(f"{agent} is not detected")
     recommended = build_serena_spec_for_agent(agent)
     observed = registrar.get_server(server)
     current_ack = acknowledgement_matches(agent, server, recommended, observed)
+
+    if acknowledge or adopt or clear_ack:
+        try:
+            validate_ledger_for_mutation()
+        except LedgerMutationError as exc:
+            raise click.ClickException(str(exc)) from exc
 
     if clear_ack:
         clear_acknowledgement(agent, server)

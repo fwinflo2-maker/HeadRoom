@@ -92,6 +92,16 @@ def test_malformed_ledger_is_treated_as_unacknowledged(monkeypatch, tmp_path: Pa
     assert "none/stale" in result.output
 
 
+def test_malformed_ledger_rejects_mutation_before_adopt(monkeypatch, tmp_path: Path):
+    config, _ = _setup(monkeypatch, tmp_path)
+    before = config.read_bytes()
+    (tmp_path / "ledger.json").write_text(json.dumps({"acknowledgements": []}))
+    result = CliRunner().invoke(main, ["mcp", "reconcile", "--adopt"])
+    assert result.exit_code != 0
+    assert "ledger section 'acknowledgements' is malformed" in result.output
+    assert config.read_bytes() == before
+
+
 def test_ordinary_install_forwards_force_without_reconcile(monkeypatch, tmp_path: Path):
     _setup(monkeypatch, tmp_path)
     monkeypatch.setitem(sys.modules, "mcp", object())

@@ -22,6 +22,10 @@ _LEDGER_FILE = "mcp_installs.json"
 _ACKNOWLEDGEMENTS = "acknowledgements"
 
 
+class LedgerMutationError(ValueError):
+    """Raised when a ledger cannot be safely updated."""
+
+
 def ledger_path() -> Path:
     """Return the Headroom MCP install ledger path."""
     return paths.workspace_dir() / _LEDGER_FILE
@@ -42,7 +46,7 @@ def spec_fingerprint(spec: ServerSpec) -> str:
 def record_install(agent: str, spec: ServerSpec, *, path: Path | None = None) -> None:
     """Record that Headroom installed ``spec`` for ``agent``."""
     ledger_file = path or ledger_path()
-    data = _read_ledger(ledger_file)
+    data = _read_ledger(ledger_file, for_mutation=True)
     agents = data.setdefault("agents", {})
     agent_entry = agents.setdefault(agent, {})
     agent_entry[spec.name] = {
@@ -55,7 +59,7 @@ def record_install(agent: str, spec: ServerSpec, *, path: Path | None = None) ->
 def clear_install(agent: str, server_name: str, *, path: Path | None = None) -> None:
     """Remove one ledger entry if present."""
     ledger_file = path or ledger_path()
-    data = _read_ledger(ledger_file)
+    data = _read_ledger(ledger_file, for_mutation=True)
     agents = data.get("agents")
     if not isinstance(agents, dict):
         return
@@ -80,7 +84,7 @@ def record_acknowledgement(
 ) -> None:
     """Remember a user's acknowledgement without changing install ownership."""
     ledger_file = path or ledger_path()
-    data = _read_ledger(ledger_file)
+    data = _read_ledger(ledger_file, for_mutation=True)
     acknowledgements = data.setdefault(_ACKNOWLEDGEMENTS, {})
     agent_entry = acknowledgements.setdefault(agent, {})
     agent_entry[server_name] = {
@@ -125,7 +129,7 @@ def acknowledgement_matches(
 def clear_acknowledgement(agent: str, server_name: str, *, path: Path | None = None) -> None:
     """Clear acknowledgement state while leaving install ownership intact."""
     ledger_file = path or ledger_path()
-    data = _read_ledger(ledger_file)
+    data = _read_ledger(ledger_file, for_mutation=True)
     acknowledgements = data.get(_ACKNOWLEDGEMENTS)
     if not isinstance(acknowledgements, dict):
         return
@@ -160,16 +164,36 @@ def headroom_installed_matching(
     return entry.get("fingerprint") == spec_fingerprint(current_spec)
 
 
-def _read_ledger(path: Path) -> dict[str, Any]:
+def validate_ledger_for_mutation(path: Path | None = None) -> None:
+    """Reject malformed ledger structure before a config mutation."""
+    _read_ledger(path or ledger_path(), for_mutation=True)
+
+
+def _read_ledger(path: Path, *, for_mutation: bool = False) -> dict[str, Any]:
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError:
         return {}
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        if for_mutation:
+            raise LedgerMutationError(f"MCP install ledger is invalid JSON: {path}") from exc
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        if for_mutation:
+            raise LedgerMutationError("MCP install ledger must contain a JSON object")
+        return {}
+    if for_mutation:
+        for section in ("agents", _ACKNOWLEDGEMENTS):
+            section_data = data.get(section)
+            if section_data is None:
+                continue
+            if not isinstance(section_data, dict) or any(
+                not isinstance(entry, dict) for entry in section_data.values()
+            ):
+                raise LedgerMutationError(f"MCP install ledger section {section!r} is malformed")
+    return data
 
 
 def _write_ledger(path: Path, data: dict[str, Any]) -> None:

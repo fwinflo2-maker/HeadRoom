@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from headroom.cli import wrap as wrap_cli
-from headroom.mcp_registry import build_serena_spec_for_agent
+from headroom.mcp_registry import ClaudeRegistrar, build_serena_spec_for_agent
 from headroom.mcp_registry.base import RegisterResult, RegisterStatus, ServerSpec
 from headroom.mcp_registry.ledger import record_acknowledgement
 
@@ -51,7 +51,22 @@ def test_reproduction_acknowledgement_suppresses_current_drift_without_mutation(
     recommended = build_serena_spec_for_agent("claude")
     observed = ServerSpec(name="serena", command="uvx", args=tuple(fixture["old_serena_args"]))
     assert list(recommended.args) == fixture["recommended_serena_args"]
-    registrar = _Registrar(observed)
+    config = tmp_path / ".claude.json"
+    config.write_text(
+        json.dumps(
+            {
+                "oauthAccount": {"email": "user@example.com"},
+                "mcpServers": {
+                    "serena": {"command": observed.command, "args": list(observed.args)},
+                    "other": {"command": "other", "args": []},
+                },
+                "projects": {"/repo": {"trust": True}},
+            }
+        )
+    )
+    before = config.read_bytes()
+    registrar = ClaudeRegistrar(claude_cli=None, home_dir=tmp_path)
+    assert registrar.get_server("serena") == observed
 
     wrap_cli._setup_serena_mcp(registrar, verbose=True)
     assert "existing config differs" in capsys.readouterr().out
@@ -60,7 +75,8 @@ def test_reproduction_acknowledgement_suppresses_current_drift_without_mutation(
     wrap_cli._setup_serena_mcp(registrar, verbose=True)
     output = capsys.readouterr().out
     assert "existing config differs" not in output
-    assert registrar.current == observed
+    assert registrar.get_server("serena") == observed
+    assert config.read_bytes() == before
 
 
 def test_context_map_recommendation_moved_rearms_acknowledgement(

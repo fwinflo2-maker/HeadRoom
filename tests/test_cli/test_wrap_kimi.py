@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, patch
@@ -42,10 +44,20 @@ def test_environment_precedence() -> None:
 
 def test_managed_route_reproduction() -> None:
     direct = "https://api.kimi.com/coding/v1"
-    configured = {"base_url": direct, "oauth": {"key": "oauth/kimi-code"}}
     env, _ = build_launch_env(8787, {"KIMI_BASE_URL": direct}, project="repo")
 
-    selected_url = env.get("KIMI_CODE_BASE_URL") or configured["base_url"]
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import os; print(os.environ.get('KIMI_CODE_BASE_URL') or os.environ.get('KIMI_BASE_URL') or '')",
+        ],
+        env=env,
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    selected_url = child.stdout.strip()
 
     assert selected_url == "http://127.0.0.1:8787/p/repo/v1"
     assert selected_url != direct
@@ -148,21 +160,28 @@ def test_legacy_stale_config(
     config.write_text('base_url = "https://api.kimi.com/coding/v1"\n', encoding="utf-8")
     monkeypatch.setenv("HOME", str(tmp_path))
     before = config.read_text(encoding="utf-8")
-    captured: dict[str, Any] = {}
-
-    def fake_launch_tool(**kwargs: Any) -> None:  # noqa: ANN003
-        captured.update(kwargs)
 
     def fake_which(name: str) -> str | None:
         return "/usr/local/bin/kimi-cli" if name == "kimi-cli" else None
 
-    with patch.object(wrap_mod.shutil, "which", side_effect=fake_which):
-        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
-            result = runner.invoke(main, ["wrap", "kimi"])
+    completed = Mock(returncode=0)
+    with (
+        patch.object(wrap_mod.shutil, "which", side_effect=fake_which),
+        patch.object(wrap_mod, "_make_cleanup", return_value=lambda: None),
+        patch.object(wrap_mod.signal, "signal"),
+        patch.object(wrap_mod, "_register_proxy_client"),
+        patch.object(wrap_mod, "_ensure_proxy", return_value=(None, 8787)),
+        patch.object(wrap_mod, "_push_runtime_env"),
+        patch.object(wrap_mod, "_configure_quiet_cli_env", return_value=[]),
+        patch.object(wrap_mod, "subprocess") as subprocess_mod,
+    ):
+        subprocess_mod.run.return_value = completed
+        result = runner.invoke(main, ["wrap", "kimi"])
 
     assert result.exit_code == 0, result.output
-    assert captured["binary"] == "/usr/local/bin/kimi-cli"
-    assert captured["env"]["KIMI_TEST_UNRELATED"] == "preserved"
+    subprocess_mod.run.assert_called_once()
+    assert subprocess_mod.run.call_args.args[0][0] == "/usr/local/bin/kimi-cli"
+    assert subprocess_mod.run.call_args.kwargs["env"]["KIMI_TEST_UNRELATED"] == "preserved"
     assert config.read_text(encoding="utf-8") == before
 
 

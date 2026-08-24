@@ -817,8 +817,11 @@ class CogneeBackend:
 
         texts: list[tuple[str, dict[str, Any]]] = []
         for res in raw_results or []:
-            # cognee <=1.4 returns result objects with attributes; cognee >=1.5
-            # returns plain dicts of {dataset_id, dataset_name, search_result}.
+            # cognee's search() return shape depends on backend access control
+            # (on by default with the embedded LanceDB/Kuzu stores, any 1.x):
+            # per-dataset dict envelopes of {dataset_id, dataset_name,
+            # search_result} when on, bare result payloads when off. Attribute
+            # access is kept for object-shaped results (older clients/fakes).
             if isinstance(res, dict):
                 payload = res.get("search_result", res)
                 dataset_id = res.get("dataset_id", "")

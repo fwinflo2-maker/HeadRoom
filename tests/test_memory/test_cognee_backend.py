@@ -904,6 +904,111 @@ class TestBestEffortHardDelete:
         assert await backend.delete_memory(memory.id) is True
         assert await backend.search_memories(query="q", user_id="alice") == []
 
+    async def test_hard_delete_skips_other_datasets(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Data items in unrelated datasets are never touched."""
+        module, _ = _make_fake_cognee()
+        data_items = [
+            SimpleNamespace(id="data-1", content_hash=_md5("doomed fact"), raw_content_hash=None),
+        ]
+        calls = _attach_fake_datasets_api(module, "someone_elses_dataset", data_items)
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds"))
+        memory = await backend.save_memory(content="doomed fact", user_id="alice", importance=0.5)
+        assert await backend.delete_memory(memory.id) is True
+        assert calls.deleted == []
+
+    async def test_hard_delete_survives_unavailable_cognee(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If cognee cannot initialize, the hard delete is skipped silently."""
+        module, _ = _make_fake_cognee()
+        monkeypatch.setitem(sys.modules, "cognee", module)
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds"))
+
+        async def broken_init() -> None:
+            raise RuntimeError("cognee is down")
+
+        monkeypatch.setattr(backend, "_ensure_initialized", broken_init)
+        # Must not raise: durable tombstones remain the enforcement layer.
+        await backend._try_hard_delete(["doomed fact"])
+
+
+# =============================================================================
+# Edge paths: import guard details, text extraction fallbacks, fact handling
+# =============================================================================
+
+
+class TestEdgePaths:
+    async def test_import_error_when_search_type_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cognee module without SearchType is unusable and fails like a missing install."""
+        module, _ = _make_fake_cognee()
+        del module.SearchType
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig())
+        with pytest.raises(ImportError):
+            await backend.ensure_initialized()
+
+    def test_extract_text_fallbacks(self) -> None:
+        backend = CogneeBackend(CogneeConfig())
+        assert backend._extract_text("plain") == "plain"
+        assert backend._extract_text({"text": "keyed"}) == "keyed"
+        # Dict without any known text key falls back to its repr.
+        assert backend._extract_text({"weird": 1}) == str({"weird": 1})
+        # Non-str scalars stringify; None becomes empty (and is dropped later).
+        assert backend._extract_text(42) == "42"
+        assert backend._extract_text(None) == ""
+
+    async def test_search_drops_items_without_text(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        module, _ = _make_fake_cognee(search_results=[_fake_hit(["", None, "real chunk"])])
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig())
+        results = await backend.search_memories(query="q", user_id="alice")
+        assert [r.memory.content for r in results] == ["real chunk"]
+
+    async def test_update_tombstones_old_facts_without_cognify(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Update tombstones the old content AND its facts; auto_cognify=False skips enrichment."""
+        module, calls = _make_fake_cognee(
+            search_results=[_fake_hit(["old content", "old fact", "new content"])]
+        )
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(auto_cognify=False))
+        memory = await backend.save_memory(
+            content="old content",
+            user_id="alice",
+            importance=0.5,
+            facts=["old fact", ""],  # falsey fact entries are ignored
+        )
+        await backend.update_memory(memory.id, "new content", user_id="alice")
+
+        assert calls.cognify == []  # auto_cognify off: never called on save or update
+        results = await backend.search_memories(query="q", user_id="alice")
+        # Old content and its fact are tombstoned; only the new content survives.
+        assert [r.memory.content for r in results] == ["new content"]
+
+    async def test_delete_tombstones_facts_ignoring_falsey_entries(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        module, _ = _make_fake_cognee(search_results=[_fake_hit(["doomed", "doomed fact"])])
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig())
+        memory = await backend.save_memory(
+            content="doomed",
+            user_id="alice",
+            importance=0.5,
+            facts=["doomed fact", "", None],  # type: ignore[list-item]
+        )
+        assert await backend.delete_memory(memory.id) is True
+        assert await backend.search_memories(query="q", user_id="alice") == []
+
 
 # =============================================================================
 # Durable state: restarts and multiple live instances share one metadata DB

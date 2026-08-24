@@ -300,3 +300,70 @@ class TestCogneeProjectScoping:
         assert scope.mode is MemoryStorageMode.PROJECT
         assert scope.project_key is None
         assert effective_user_id == "alice"
+
+
+# =============================================================================
+# CLI: --memory-backend cognee and --memory-cognee-* flags reach ProxyConfig
+# =============================================================================
+
+
+class TestProxyCLICogneeFlags:
+    def _invoke(self, args: list[str]):
+        from unittest.mock import patch
+
+        from click.testing import CliRunner
+
+        from headroom.cli.main import main
+
+        captured: dict[str, object] = {}
+
+        def fake_run_server(config, **kwargs):
+            captured["config"] = config
+            raise SystemExit(0)
+
+        with patch("headroom.proxy.server.run_server", side_effect=fake_run_server):
+            result = CliRunner().invoke(main, args)
+        assert result.exit_code == 0, result.output
+        assert "config" in captured, result.output
+        return captured["config"]
+
+    def test_cognee_flags_reach_proxy_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = self._invoke(
+            [
+                "proxy",
+                "--memory",
+                "--memory-backend",
+                "cognee",
+                "--memory-cognee-dataset",
+                "cli_ds",
+                "--memory-cognee-system-root",
+                "/tmp/cognee-sys",
+                "--memory-cognee-data-root",
+                "/tmp/cognee-data",
+                "--memory-cognee-search-type",
+                "GRAPH_COMPLETION",
+                "--no-memory-cognee-auto-cognify",
+                "--memory-cognee-metadata-db",
+                "/tmp/cognee-meta.db",
+            ]
+        )
+        assert config.memory_backend == "cognee"
+        assert config.memory_cognee_dataset == "cli_ds"
+        assert config.memory_cognee_system_root == "/tmp/cognee-sys"
+        assert config.memory_cognee_data_root == "/tmp/cognee-data"
+        assert config.memory_cognee_search_type == "GRAPH_COMPLETION"
+        assert config.memory_cognee_auto_cognify is False
+        assert config.memory_cognee_metadata_db_path == "/tmp/cognee-meta.db"
+
+    def test_omitted_cognee_flags_fall_back_to_env_defaults(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without CLI flags, ProxyConfig resolves HEADROOM_COGNEE_* env defaults."""
+        monkeypatch.delenv("HEADROOM_MEMORY_BACKEND", raising=False)
+        monkeypatch.setenv("HEADROOM_COGNEE_DATASET", "env_ds")
+
+        config = self._invoke(["proxy", "--memory"])
+        assert config.memory_backend == "local"
+        assert config.memory_cognee_dataset == "env_ds"
+        assert config.memory_cognee_system_root is None
+        assert config.memory_cognee_auto_cognify is True

@@ -411,3 +411,86 @@ def test_responses_debug_path_with_excluded_list_output(monkeypatch):
     new_payload, _modified, _s, _t, _u, _c, _a = _run(handler, payload)
 
     assert new_payload["input"][1]["output"] == parts
+
+
+def test_responses_read_command_with_releasable_json_output_compresses(monkeypatch):
+    """Content gate: a read command whose output is confidently DATA (JSON array)
+    is released to compression even with HEADROOM_PROTECT_READS=1."""
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    handler = _handler_with_router(_lossy_router())
+    json_output = "[" + ",".join(f'{{"line": {i}, "text": "value {i}"}}' for i in range(60)) + "]"
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_json",
+                "name": "bash",
+                "arguments": '{"command": "cat data.json"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_json",
+                "output": json_output,
+            },
+        ],
+    }
+
+    new_payload, modified, _s, _t, _u, _c, _a = _run(handler, payload)
+
+    assert modified is True
+    assert new_payload["input"][1]["output"] == "kept words"
+
+
+def test_responses_local_shell_call_string_command_read_stays_verbatim(monkeypatch):
+    """local_shell_call with a string (not argv) command is also covered."""
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    handler = _handler_with_router(_lossy_router())
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "local_shell_call",
+                "call_id": "call_lsc_str",
+                "action": {"type": "exec", "command": "cat src/app.py"},
+            },
+            {
+                "type": "local_shell_call_output",
+                "call_id": "call_lsc_str",
+                "output": _NL_OUTPUT,
+            },
+        ],
+    }
+
+    new_payload, _modified, _s, _t, _u, _c, _a = _run(handler, payload)
+
+    assert new_payload["input"][1]["output"] == _NL_OUTPUT
+
+
+def test_responses_debug_path_with_read_protected_output(monkeypatch):
+    """Debug logging over a read-protected output records and does not raise."""
+    from headroom.proxy.handlers import openai as openai_handler
+
+    monkeypatch.setattr(openai_handler, "_log_codex_compression_debug", lambda *a, **k: None)
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    handler = _handler_with_router(_lossy_router())
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_dbg",
+                "name": "bash",
+                "arguments": '{"command": "nl -ba ROADMAP.md"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_dbg",
+                "output": _NL_OUTPUT,
+            },
+        ],
+    }
+
+    new_payload, _modified, _s, _t, _u, _c, _a = _run(handler, payload)
+
+    assert new_payload["input"][1]["output"] == _NL_OUTPUT

@@ -74,7 +74,7 @@ jobs:
     # run, and the suite is executed against each in turn: the backend claims
     # to be RESP-compatible rather than Redis-specific, and a claim about two
     # servers is only proven by testing two servers. They are cheap to run
-    # together — the whole backend surface is PING/SETEX/GET/TTL/EXPIRE/DEL,
+    # together — the whole backend surface is PING/SETEX/GET/EXPIRE/DEL,
     # with no Lua, no module and no cluster command, so neither sidecar needs
     # anything beyond a stock image.
     #
@@ -225,6 +225,14 @@ jobs:
           HEADROOM_TEST_REDIS_URL: redis://127.0.0.1:6379
         run: cargo test -p headroom-core --features redis --test ccr_backends
       - name: cargo test CCR backends against Valkey
+        # `!cancelled()` rather than the default (an implicit `success()`),
+        # because a step with no `if:` is skipped once an earlier step has
+        # failed. Without it a Redis failure aborts the job before this
+        # step runs and there is no Valkey result at all — which defeats
+        # the reason for having two named steps. Both servers must always
+        # report, so that "both red" (a bug in the backend) stays
+        # distinguishable from "one red" (a genuine RESP divergence).
+        if: ${{ !cancelled() }}
         env:
           HEADROOM_TEST_REDIS_URL: redis://127.0.0.1:6380
         run: cargo test -p headroom-core --features redis --test ccr_backends

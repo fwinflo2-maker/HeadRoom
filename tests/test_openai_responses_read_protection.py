@@ -494,3 +494,38 @@ def test_responses_debug_path_with_read_protected_output(monkeypatch):
     new_payload, _modified, _s, _t, _u, _c, _a = _run(handler, payload)
 
     assert new_payload["input"][1]["output"] == _NL_OUTPUT
+
+
+def test_responses_read_scan_tolerates_non_dict_and_missing_call_id(monkeypatch):
+    """The producer scan must skip non-dict items and calls without a string
+    call_id without breaking normal compression."""
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    handler = _handler_with_router(_lossy_router())
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            "a bare string item",
+            {
+                "type": "function_call",
+                "name": "bash",
+                "arguments": '{"command": "cat src/app.py"}',
+            },
+            {
+                "type": "function_call",
+                "call_id": 42,
+                "name": "bash",
+                "arguments": '{"command": "cat src/app.py"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_x",
+                "output": _NL_OUTPUT,
+            },
+        ],
+    }
+
+    new_payload, modified, _s, _t, _u, _c, _a = _run(handler, payload)
+
+    assert modified is True
+    assert new_payload["input"][0] == "a bare string item"
+    assert new_payload["input"][3]["output"] == "kept words"

@@ -195,6 +195,15 @@ def _import_and_configure_cognee(system_root: str | None, data_root: str | None)
                 )
             return _process_cognee, _process_search_type_cls
 
+        # cognee >=1.5 enables session memory by default: searches run through
+        # a session-aware completion layer that adds an LLM call per query and
+        # can replay a previous turn's results — including content this backend
+        # has since deleted/tombstoned. Headroom is itself the memory layer, so
+        # it needs plain deterministic retrieval. setdefault respects an
+        # explicit operator override; part of the immutable process-wide
+        # configuration established here.
+        os.environ.setdefault("CACHING", "false")
+
         env_before = dict(os.environ)
         try:
             cognee = importlib.import_module("cognee")
@@ -792,15 +801,35 @@ class CogneeBackend:
         if query_type.name == "GRAPH_COMPLETION":
             search_kwargs["only_context"] = True
 
-        raw_results = await self._cognee.search(**search_kwargs)
+        try:
+            raw_results = await self._cognee.search(**search_kwargs)
+        except Exception as error:
+            # A dataset that exists but was never cognified has no vector
+            # collections yet; cognee raises NoDataError instead of returning
+            # nothing. An empty store is an empty result, not a failure.
+            if type(error).__name__ == "NoDataError":
+                logger.info(
+                    "cognee dataset %s has no searchable data yet; returning no results",
+                    self._config.dataset_name,
+                )
+                return []
+            raise
 
         texts: list[tuple[str, dict[str, Any]]] = []
         for res in raw_results or []:
-            payload = getattr(res, "search_result", res)
+            # cognee <=1.4 returns result objects with attributes; cognee >=1.5
+            # returns plain dicts of {dataset_id, dataset_name, search_result}.
+            if isinstance(res, dict):
+                payload = res.get("search_result", res)
+                dataset_id = res.get("dataset_id", "")
+                dataset_name = res.get("dataset_name")
+            else:
+                payload = getattr(res, "search_result", res)
+                dataset_id = getattr(res, "dataset_id", "")
+                dataset_name = getattr(res, "dataset_name", None)
             res_meta = {
-                "_cognee_dataset_id": str(getattr(res, "dataset_id", "") or ""),
-                "_cognee_dataset_name": getattr(res, "dataset_name", None)
-                or self._config.dataset_name,
+                "_cognee_dataset_id": str(dataset_id or ""),
+                "_cognee_dataset_name": dataset_name or self._config.dataset_name,
             }
             items = payload if isinstance(payload, list) else [payload]
             for item in items:

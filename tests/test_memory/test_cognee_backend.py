@@ -509,6 +509,70 @@ class TestSearchMemories:
         assert scores[0] == 1.0
         assert all(0.5 < s <= 1.0 for s in scores)
 
+    async def test_unwraps_cognee_15_dict_results(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """cognee >=1.5 returns plain dicts; the payload must be unwrapped, not str()'d."""
+        hit = {
+            "dataset_id": "ds-1",
+            "dataset_name": "ds",
+            "dataset_tenant_id": None,
+            "search_result": [{"id": "n-1", "type": "IndexSchema", "text": "dict-shaped chunk"}],
+        }
+        module, _ = _make_fake_cognee(search_results=[hit])
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds"))
+        results = await backend.search_memories(query="q", user_id="alice")
+
+        assert [r.memory.content for r in results] == ["dict-shaped chunk"]
+        assert results[0].memory.metadata["_cognee_dataset_name"] == "ds"
+        assert results[0].memory.metadata["_cognee_dataset_id"] == "ds-1"
+
+    async def test_dict_results_resolve_saved_canonical_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A 1.5-style dict result for saved content returns the saved memory's ID."""
+        content = "Vasilije prefers uv over poetry"
+        hit = {"dataset_name": "ds", "search_result": [{"text": content}]}
+        module, _ = _make_fake_cognee(search_results=[hit])
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds"))
+        saved = await backend.save_memory(content=content, user_id="alice", importance=0.5)
+        results = await backend.search_memories(query="q", user_id="alice")
+        assert results[0].memory.id == saved.id
+
+    async def test_returns_empty_when_store_never_cognified(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """cognee raises NoDataError before any cognify has run; that is an empty result."""
+
+        class NoDataError(Exception):
+            pass
+
+        async def search(**kwargs):
+            raise NoDataError("No data found in the system, please add data first.")
+
+        module, _ = _make_fake_cognee()
+        module.search = search
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig())
+        assert await backend.search_memories(query="q", user_id="alice") == []
+
+    async def test_other_search_errors_still_raise(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Only the empty-store signal is swallowed; real failures propagate."""
+
+        async def search(**kwargs):
+            raise RuntimeError("boom")
+
+        module, _ = _make_fake_cognee()
+        module.search = search
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig())
+        with pytest.raises(RuntimeError, match="boom"):
+            await backend.search_memories(query="q", user_id="alice")
+
     async def test_result_ids_are_stable_and_registered(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -971,6 +1035,30 @@ class TestProcessWideConfiguration:
         # The first tenant's configuration was never overwritten.
         assert calls.system_root == ["/sys/x"]
         assert calls.data_root == ["/data/x"]
+
+    async def test_disables_cognee_session_caching_by_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """cognee >=1.5 session memory can replay deleted content; headroom opts out."""
+        module, _ = _make_fake_cognee()
+        monkeypatch.setitem(sys.modules, "cognee", module)
+        monkeypatch.delenv("CACHING", raising=False)
+
+        backend = CogneeBackend(CogneeConfig())
+        await backend.ensure_initialized()
+        assert os.environ["CACHING"] == "false"
+
+    async def test_respects_operator_caching_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An explicitly exported CACHING value wins over the opt-out default."""
+        module, _ = _make_fake_cognee()
+        monkeypatch.setitem(sys.modules, "cognee", module)
+        monkeypatch.setenv("CACHING", "true")
+
+        backend = CogneeBackend(CogneeConfig())
+        await backend.ensure_initialized()
+        assert os.environ["CACHING"] == "true"
 
     async def test_same_roots_second_instance_succeeds(
         self, monkeypatch: pytest.MonkeyPatch

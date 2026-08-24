@@ -66,13 +66,11 @@ def _run(handler: OpenAIHandlerMixin, payload: dict):
 
 
 _FILE_CONTENT = "\n".join(
-    f"## Section {i}\nSome roadmap prose line {i} with enough words to matter"
-    for i in range(90)
+    f"## Section {i}\nSome roadmap prose line {i} with enough words to matter" for i in range(90)
 )
 
 _NL_OUTPUT = "\n".join(
-    f"{i}\tline {i} of the roadmap file with a handful of words in it"
-    for i in range(1, 110)
+    f"{i}\tline {i} of the roadmap file with a handful of words in it" for i in range(1, 110)
 )
 
 
@@ -112,9 +110,7 @@ def test_responses_bash_read_command_stays_verbatim_when_protect_reads(monkeypat
                 "type": "function_call",
                 "call_id": "call_bash",
                 "name": "bash",
-                "arguments": (
-                    '{"command": "nl -ba .overlay/ROADMAP.md | sed -n \'1,75p\'"}'
-                ),
+                "arguments": ('{"command": "nl -ba .overlay/ROADMAP.md | sed -n \'1,75p\'"}'),
             },
             {
                 "type": "function_call_output",
@@ -152,3 +148,266 @@ def test_responses_excluded_read_tool_stays_verbatim_control():
     new_payload, _modified, _saved, _t, _u, _s, _a = _run(handler, payload)
 
     assert new_payload["input"][1]["output"] == _FILE_CONTENT
+
+
+def test_responses_bash_read_compresses_when_protect_reads_disabled(monkeypatch):
+    """Control: with HEADROOM_PROTECT_READS unset/0, bash reads stay compressible."""
+    monkeypatch.delenv("HEADROOM_PROTECT_READS", raising=False)
+    handler = _handler_with_router(_lossy_router())
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_bash",
+                "name": "bash",
+                "arguments": '{"command": "cat src/main.py"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_bash",
+                "output": _NL_OUTPUT,
+            },
+        ],
+    }
+
+    new_payload, modified, _s, _t, _u, _c, _a = _run(handler, payload)
+
+    assert modified is True
+    assert new_payload["input"][1]["output"] == "kept words"
+
+
+def test_responses_non_read_bash_command_still_compresses(monkeypatch):
+    """Protection is type-specific: test/build/search output stays compressible."""
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    handler = _handler_with_router(_lossy_router())
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_test",
+                "name": "bash",
+                "arguments": '{"command": "uv run pytest tests/ -q"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_test",
+                "output": _NL_OUTPUT,
+            },
+        ],
+    }
+
+    new_payload, modified, _s, _t, _u, _c, _a = _run(handler, payload)
+
+    assert modified is True
+    assert new_payload["input"][1]["output"] == "kept words"
+
+
+def test_responses_lockfile_read_stays_compressible(monkeypatch):
+    """Lockfiles are tool-regenerated, never byte-patched: the command-level
+    carve-out keeps `cat uv.lock` compressible even with protection on."""
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    handler = _handler_with_router(_lossy_router())
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_lock",
+                "name": "bash",
+                "arguments": '{"command": "cat uv.lock"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_lock",
+                "output": _NL_OUTPUT,
+            },
+        ],
+    }
+
+    new_payload, modified, _s, _t, _u, _c, _a = _run(handler, payload)
+
+    assert modified is True
+    assert new_payload["input"][1]["output"] == "kept words"
+
+
+def test_responses_local_shell_call_read_stays_verbatim(monkeypatch):
+    """Codex native shell: local_shell_call.action.command (argv) read protected."""
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    handler = _handler_with_router(_lossy_router())
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "local_shell_call",
+                "call_id": "call_lsc",
+                "action": {"type": "exec", "command": ["nl", "-ba", "ROADMAP.md"]},
+            },
+            {
+                "type": "local_shell_call_output",
+                "call_id": "call_lsc",
+                "output": _NL_OUTPUT,
+            },
+        ],
+    }
+
+    new_payload, _modified, _s, _t, _u, _c, _a = _run(handler, payload)
+
+    assert new_payload["input"][1]["output"] == _NL_OUTPUT
+
+
+def test_responses_view_output_content_part_array_stays_verbatim():
+    """`view` output shaped as a content-part array is protected byte-exactly,
+    including non-text parts."""
+    handler = _handler_with_router(_lossy_router())
+    parts = [
+        {"type": "output_text", "text": _FILE_CONTENT},
+        {"type": "refusal", "refusal": "n/a"},
+    ]
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_view",
+                "name": "view",
+                "arguments": '{"path": "/repo/ROADMAP.md"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_view",
+                "output": parts,
+            },
+        ],
+    }
+
+    new_payload, _modified, _s, _t, _u, _c, _a = _run(handler, payload)
+
+    assert new_payload["input"][1]["output"] == parts
+
+
+def test_responses_view_json_shaped_output_stays_byte_exact():
+    """Even JSON-shaped `view` output is verbatim: the byte-exact contract beats
+    the lossless JSON minification other excluded tools accept."""
+    handler = _handler_with_router(_lossy_router())
+    pretty_json = "\n".join(
+        ["{"] + [f'  "key_{i}": {i},' for i in range(120)] + ['  "end": true', "}"]
+    )
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_view",
+                "name": "view",
+                "arguments": '{"path": "/repo/data.json"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_view",
+                "output": pretty_json,
+            },
+        ],
+    }
+
+    new_payload, _modified, _s, _t, _u, _c, _a = _run(handler, payload)
+
+    assert new_payload["input"][1]["output"] == pretty_json
+
+
+def test_responses_malformed_arguments_do_not_break_extraction(monkeypatch):
+    """Malformed function_call arguments yield no command -> normal compression."""
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    handler = _handler_with_router(_lossy_router())
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_bad",
+                "name": "bash",
+                "arguments": "{not json at all",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_bad",
+                "output": _NL_OUTPUT,
+            },
+        ],
+    }
+
+    new_payload, modified, _s, _t, _u, _c, _a = _run(handler, payload)
+
+    assert modified is True
+    assert new_payload["input"][1]["output"] == "kept words"
+
+
+def test_responses_protected_read_survives_cross_turn_dedup(monkeypatch):
+    """A repeated protected read must not be replaced by a [↑…] dedup pointer."""
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    router = _lossy_router()
+    router._cross_turn_dedup_enabled = True
+    handler = _handler_with_router(router)
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_r1",
+                "name": "bash",
+                "arguments": '{"command": "nl -ba ROADMAP.md"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_r1",
+                "output": _NL_OUTPUT,
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_r2",
+                "name": "bash",
+                "arguments": '{"command": "nl -ba ROADMAP.md"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_r2",
+                "output": _NL_OUTPUT,
+            },
+        ],
+    }
+
+    new_payload, _modified, _s, _t, _u, _c, _a = _run(handler, payload)
+
+    assert new_payload["input"][1]["output"] == _NL_OUTPUT
+    assert new_payload["input"][3]["output"] == _NL_OUTPUT
+
+
+def test_responses_debug_path_with_excluded_list_output(monkeypatch):
+    """Regression: debug logging over an excluded tool's content-part output must
+    not raise (latent unbound `fold` variable in the list branch)."""
+    from headroom.proxy.handlers import openai as openai_handler
+
+    monkeypatch.setattr(openai_handler, "_log_codex_compression_debug", lambda *a, **k: None)
+    handler = _handler_with_router(_lossy_router())
+    parts = [{"type": "output_text", "text": _FILE_CONTENT}]
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_read",
+                "name": "Read",
+                "arguments": '{"file_path": "/repo/ROADMAP.md"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_read",
+                "output": parts,
+            },
+        ],
+    }
+
+    new_payload, _modified, _s, _t, _u, _c, _a = _run(handler, payload)
+
+    assert new_payload["input"][1]["output"] == parts

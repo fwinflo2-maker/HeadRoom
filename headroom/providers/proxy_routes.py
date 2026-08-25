@@ -751,6 +751,59 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             "gemini",
         )
 
+    @app.post("/api/event_logging/batch")
+    async def claude_event_logging_batch(request: Request):
+        """Acknowledge Claude Code telemetry locally instead of passthrough.
+
+        Claude Code emits background analytics to ``/api/event_logging/batch`` on
+        the local gateway. When Headroom is repointed so the Anthropic messages
+        route goes to a local OpenAI-compatible model endpoint, this unrelated
+        telemetry path falls through the generic passthrough and returns noisy
+        404s. Accept the batch locally so the inference route stays cleanly
+        isolated.
+        """
+        headers = dict(request.headers)
+        user_agent = (headers.get("user-agent") or headers.get("User-Agent") or "").lower()
+        service_name = (
+            headers.get("x-service-name") or headers.get("X-Service-Name") or ""
+        ).lower()
+        if "claude-code/" in user_agent or "claude-cli/" in user_agent or service_name == "claude-code":
+            await request.body()
+            return Response(status_code=204)
+        return await proxy.handle_passthrough(
+            request,
+            _select_passthrough_base_url(proxy, headers),
+        )
+
+    @app.api_route("/api/hello", methods=["GET", "HEAD"])
+    async def claude_api_hello(request: Request):
+        """Acknowledge Claude Code/Bun hello probes locally instead of passthrough.
+
+        When Claude Code is routed through a local Headroom bridge, Bun-based side
+        probes hit ``/api/hello`` on the gateway before or alongside real
+        inference traffic. Our local OpenAI-compatible upstream does not expose
+        that unrelated route, so generic passthrough produces noisy 404s even
+        though ``/readyz`` and ``/v1/messages`` are healthy. Accept those probes
+        locally so operator logs reflect real failures.
+        """
+        headers = dict(request.headers)
+        user_agent = (headers.get("user-agent") or headers.get("User-Agent") or "").lower()
+        service_name = (
+            headers.get("x-service-name") or headers.get("X-Service-Name") or ""
+        ).lower()
+        if (
+            user_agent.startswith("bun/")
+            or "claude-code/" in user_agent
+            or "claude-cli/" in user_agent
+            or service_name == "claude-code"
+        ):
+            await request.body()
+            return Response(status_code=200)
+        return await proxy.handle_passthrough(
+            request,
+            _select_passthrough_base_url(proxy, headers),
+        )
+
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
     async def passthrough(request: Request, path: str):
         custom_base = request.headers.get("x-headroom-base-url")

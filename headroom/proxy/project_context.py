@@ -17,6 +17,16 @@ second, unsanitized contextvar for consumers that need the literal
 filesystem path (e.g. verifying a Read tool_result against disk). Not
 (yet) bound at the WebSocket accept paths — an absent cwd there is already
 treated as "can't resolve, don't guess."
+
+A third contextvar, ``_current_request_trusted``, records whether the
+active request's peer is loopback — a fact the HTTP middleware observes
+from the TCP connection itself, not something a caller can assert via a
+header. Consumers that turn ``_current_cwd`` into a filesystem read (again,
+disk verification) must gate on this first: the cwd header alone is never
+sufficient authority for touching disk, only a signal to interpret once the
+peer is already known to be trusted. Defaults to ``False`` so any request
+path that never calls the setter (e.g. the WebSocket accept path) is safe
+by construction.
 """
 
 from __future__ import annotations
@@ -41,6 +51,11 @@ _current_project: ContextVar[str | None] = ContextVar("headroom_current_project"
 # tool's file_path and read from disk, so it must stay the literal path.
 _current_cwd: ContextVar[str | None] = ContextVar("headroom_current_cwd", default=None)
 
+# Server-observed (not header-derived) loopback signal — see module docstring.
+_current_request_trusted: ContextVar[bool] = ContextVar(
+    "headroom_current_request_trusted", default=False
+)
+
 
 def set_current_project(project: str | None) -> None:
     """Bind the active request's project for downstream outcome recording."""
@@ -62,6 +77,16 @@ def get_current_cwd() -> str | None:
     return _current_cwd.get()
 
 
+def set_current_request_trusted(trusted: bool) -> None:
+    """Bind whether the active request's peer is loopback."""
+    _current_request_trusted.set(trusted)
+
+
+def is_current_request_trusted() -> bool:
+    """Whether the active request's peer is loopback, or ``False`` if unset."""
+    return _current_request_trusted.get()
+
+
 def strip_project_path_prefix(scope: MutableMapping[str, Any]) -> str | None:
     """Strip a ``/p/<name>`` prefix from an ASGI scope, returning the name.
 
@@ -80,8 +105,10 @@ __all__ = [
     "classify_project",
     "get_current_cwd",
     "get_current_project",
+    "is_current_request_trusted",
     "set_current_cwd",
     "set_current_project",
+    "set_current_request_trusted",
     "split_project_path",
     "strip_project_path_prefix",
     "with_project_prefix",

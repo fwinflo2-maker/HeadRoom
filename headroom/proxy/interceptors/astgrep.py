@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from enum import Enum
@@ -24,7 +25,7 @@ from typing import Any
 from headroom import binaries
 from headroom._subprocess import run
 from headroom.proxy import runtime_env
-from headroom.proxy.project_context import get_current_cwd
+from headroom.proxy.project_context import get_current_cwd, is_current_request_trusted
 
 from . import base
 
@@ -151,32 +152,108 @@ def _verify_truncation_on_disk_enabled() -> bool:
     )
 
 
+def _max_disk_verify_bytes() -> int:
+    # Live read, same hot-reload pattern as _min_chars_to_rewrite(). 5 MB
+    # comfortably covers real source files while bounding worst-case read
+    # time/memory for the disk-verify fallback.
+    try:
+        return int(runtime_env.getenv("HEADROOM_VERIFY_TRUNCATION_MAX_BYTES", "5000000"))
+    except (TypeError, ValueError):
+        return 5_000_000
+
+
+def _resolve_read_path_in_workspace(file_path: str, resolved_root: Path) -> Path | None:
+    """Confine `file_path` (relative or absolute) strictly under `resolved_root`.
+
+    Mirrors memory_handler._resolve_native_path's join/resolve/relative_to
+    pattern. `resolved_root` must already be canonicalized by the caller (a
+    single source of truth for "inside the workspace" across a call) --
+    this does not re-resolve it. `.resolve()` collapses symlinks, including
+    in intermediate path components, before the containment check runs, so
+    a symlink that points outside the workspace is rejected the same way a
+    `..` traversal is -- this is a path-segment containment check via
+    `relative_to()`, not a string-prefix check, so a sibling directory that
+    merely shares a string prefix with the root is correctly rejected too.
+    """
+    candidate = Path(file_path) if Path(file_path).is_absolute() else resolved_root / file_path
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return None
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError:
+        return None
+    return resolved
+
+
+def _read_disk_content_bounded(resolved: Path, max_bytes: int) -> str | None:
+    """Read `resolved` iff it's a regular file no larger than `max_bytes`.
+
+    Opens with O_NONBLOCK so a FIFO/special file with no writer returns
+    immediately instead of blocking the calling thread indefinitely --
+    O_NONBLOCK has no effect on reads once fstat confirms a regular file.
+    fstat runs on the already-open fd (not the path) so the type/size
+    check and the read happen on the same underlying file object, closing
+    the TOCTOU gap a separate path-based stat-then-open would leave.
+    """
+    try:
+        fd = os.open(resolved, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            fd = -1  # ownership transferred to the file object
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def _verify_read_against_disk(
     file_path: str | None,
     received_content: str,
     cwd: str | None,
+    *,
+    trusted: bool,
 ) -> tuple[ReadVerificationResult, tuple[int, int] | None]:
     """Compare `received_content` against the real file at `file_path`.
 
-    `cwd` (the `x-headroom-cwd` header) resolves a relative `file_path`.
+    `cwd` (the `x-headroom-cwd` header) is never authority on its own --
+    `trusted` (whether the request's peer is loopback, a server-observed
+    fact, not a header) must hold before `cwd` or `file_path` are even
+    inspected, let alone touch disk. Once trusted, every read must be a
+    regular file whose fully resolved path is beneath the canonically
+    resolved `cwd`; anything else is UNKNOWN, never a guess.
+
     TRUNCATED requires an exact-prefix match with strictly more on disk —
     a weaker match means the file diverged since the client read it, not
     a provable truncation, so it's UNKNOWN. Returns `(visible_lines,
     total_lines)` alongside TRUNCATED so the header can cite real numbers
     without a second, potentially racy, read.
     """
+    if not trusted:
+        return ReadVerificationResult.UNKNOWN, None
     if not file_path:
         return ReadVerificationResult.UNKNOWN, None
-    if os.path.isabs(file_path):
-        resolved = file_path
-    elif cwd:
-        resolved = os.path.join(cwd, file_path)
-    else:
+    if not cwd or not os.path.isabs(cwd):
         return ReadVerificationResult.UNKNOWN, None
     try:
-        disk_content = Path(resolved).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as e:
-        logger.debug("disk verification: cannot read %s: %s", resolved, e)
+        resolved_root = Path(cwd).resolve(strict=True)
+    except OSError:
+        return ReadVerificationResult.UNKNOWN, None
+    if not resolved_root.is_dir():
+        return ReadVerificationResult.UNKNOWN, None
+    resolved = _resolve_read_path_in_workspace(file_path, resolved_root)
+    if resolved is None:
+        return ReadVerificationResult.UNKNOWN, None
+    disk_content = _read_disk_content_bounded(resolved, _max_disk_verify_bytes())
+    if disk_content is None:
         return ReadVerificationResult.UNKNOWN, None
     if disk_content == received_content:
         return ReadVerificationResult.COMPLETE, None
@@ -233,7 +310,10 @@ class AstGrepReadOutline:
         truncation = _detect_truncation(tool_output)
         if truncation is None and _verify_truncation_on_disk_enabled():
             verdict, disk_truncation = _verify_read_against_disk(
-                _path_from_input(tool_input), tool_output, get_current_cwd()
+                _path_from_input(tool_input),
+                tool_output,
+                get_current_cwd(),
+                trusted=is_current_request_trusted(),
             )
             if verdict is ReadVerificationResult.TRUNCATED:
                 truncation = disk_truncation

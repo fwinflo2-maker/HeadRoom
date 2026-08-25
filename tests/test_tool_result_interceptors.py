@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 import textwrap
 
 import pytest
@@ -20,7 +22,11 @@ from headroom.proxy.interceptors.astgrep import (
     _verify_read_against_disk,
 )
 from headroom.proxy.interceptors.base import reset_interceptor_failure_counts
-from headroom.proxy.project_context import get_current_cwd, set_current_cwd
+from headroom.proxy.project_context import (
+    get_current_cwd,
+    set_current_cwd,
+    set_current_request_trusted,
+)
 from headroom.tokenizer import Tokenizer
 
 
@@ -370,24 +376,47 @@ def test_set_current_cwd_none_and_blank_both_clear():
 
 class TestVerifyReadAgainstDisk:
     def test_missing_file_path_is_unknown(self):
-        verdict, info = _verify_read_against_disk(None, "abc", "/repo")
+        verdict, info = _verify_read_against_disk(None, "abc", "/repo", trusted=True)
         assert verdict is ReadVerificationResult.UNKNOWN
         assert info is None
 
     def test_relative_path_without_cwd_is_unknown(self):
-        verdict, info = _verify_read_against_disk("payments.py", "abc", None)
+        verdict, info = _verify_read_against_disk("payments.py", "abc", None, trusted=True)
         assert verdict is ReadVerificationResult.UNKNOWN
         assert info is None
 
-    def test_unreadable_file_is_unknown(self, tmp_path):
-        verdict, info = _verify_read_against_disk(str(tmp_path / "missing.py"), "abc", None)
+    def test_untrusted_request_never_touches_disk(self, tmp_path, monkeypatch):
+        """A fully valid cwd/file_path/content combo that would resolve
+        COMPLETE if trusted must short-circuit to UNKNOWN -- and never call
+        os.open -- when the request isn't trusted. The regression guarantee
+        is "untrusted -> UNKNOWN without any filesystem operation," not just
+        "untrusted -> UNKNOWN.\""""
+        f = tmp_path / "payments.py"
+        f.write_text(_PY_FIXTURE, encoding="utf-8")
+        opened: list[object] = []
+        real_open = os.open
+
+        def _tracking_open(*args, **kwargs):
+            opened.append(args)
+            return real_open(*args, **kwargs)
+
+        monkeypatch.setattr(os, "open", _tracking_open)
+        verdict, info = _verify_read_against_disk(str(f), _PY_FIXTURE, str(tmp_path), trusted=False)
+        assert verdict is ReadVerificationResult.UNKNOWN
+        assert info is None
+        assert opened == []
+
+    def test_missing_file_under_workspace_root_is_unknown(self, tmp_path):
+        verdict, info = _verify_read_against_disk(
+            str(tmp_path / "missing.py"), "abc", str(tmp_path), trusted=True
+        )
         assert verdict is ReadVerificationResult.UNKNOWN
         assert info is None
 
     def test_exact_match_is_complete(self, tmp_path):
         f = tmp_path / "payments.py"
         f.write_text(_PY_FIXTURE, encoding="utf-8")
-        verdict, info = _verify_read_against_disk(str(f), _PY_FIXTURE, None)
+        verdict, info = _verify_read_against_disk(str(f), _PY_FIXTURE, str(tmp_path), trusted=True)
         assert verdict is ReadVerificationResult.COMPLETE
         assert info is None
 
@@ -395,7 +424,7 @@ class TestVerifyReadAgainstDisk:
         f = tmp_path / "payments.py"
         f.write_text(_PY_FIXTURE, encoding="utf-8")
         partial = _PY_FIXTURE[:200]
-        verdict, info = _verify_read_against_disk(str(f), partial, None)
+        verdict, info = _verify_read_against_disk(str(f), partial, str(tmp_path), trusted=True)
         assert verdict is ReadVerificationResult.TRUNCATED
         assert info == (len(partial.splitlines()), len(_PY_FIXTURE.splitlines()))
 
@@ -403,7 +432,9 @@ class TestVerifyReadAgainstDisk:
         f = tmp_path / "payments.py"
         f.write_text(_PY_FIXTURE, encoding="utf-8")
         partial = _PY_FIXTURE[:200]
-        verdict, info = _verify_read_against_disk("payments.py", partial, str(tmp_path))
+        verdict, info = _verify_read_against_disk(
+            "payments.py", partial, str(tmp_path), trusted=True
+        )
         assert verdict is ReadVerificationResult.TRUNCATED
         assert info is not None
 
@@ -411,7 +442,78 @@ class TestVerifyReadAgainstDisk:
         # File diverged since the client read it -- not a clean prefix.
         f = tmp_path / "payments.py"
         f.write_text(_PY_FIXTURE.replace("compute_subtotal", "compute_total"), encoding="utf-8")
-        verdict, info = _verify_read_against_disk(str(f), _PY_FIXTURE, None)
+        verdict, info = _verify_read_against_disk(str(f), _PY_FIXTURE, str(tmp_path), trusted=True)
+        assert verdict is ReadVerificationResult.UNKNOWN
+        assert info is None
+
+    def test_absolute_path_outside_workspace_root_is_unknown(self, tmp_path):
+        root = tmp_path / "project"
+        root.mkdir()
+        sibling = tmp_path / "other"
+        sibling.mkdir()
+        f = sibling / "secret.py"
+        f.write_text(_PY_FIXTURE, encoding="utf-8")
+        verdict, info = _verify_read_against_disk(str(f), _PY_FIXTURE, str(root), trusted=True)
+        assert verdict is ReadVerificationResult.UNKNOWN
+        assert info is None
+
+    def test_relative_traversal_escapes_workspace_is_unknown(self, tmp_path):
+        root = tmp_path / "project"
+        root.mkdir()
+        f = tmp_path / "secret.py"
+        f.write_text(_PY_FIXTURE, encoding="utf-8")
+        verdict, info = _verify_read_against_disk(
+            "../secret.py", _PY_FIXTURE, str(root), trusted=True
+        )
+        assert verdict is ReadVerificationResult.UNKNOWN
+        assert info is None
+
+    def test_sibling_directory_sharing_string_prefix_is_not_inside_workspace(self, tmp_path):
+        """`relative_to()` is a path-segment containment check, not a string
+        prefix check -- a target that merely starts with the root's string
+        must not be treated as inside it."""
+        root = tmp_path / "project"
+        root.mkdir()
+        other = tmp_path / "project-other"
+        other.mkdir()
+        f = other / "secret.py"
+        f.write_text(_PY_FIXTURE, encoding="utf-8")
+        verdict, info = _verify_read_against_disk(str(f), _PY_FIXTURE, str(root), trusted=True)
+        assert verdict is ReadVerificationResult.UNKNOWN
+        assert info is None
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="symlinks need elevated privilege on Windows"
+    )
+    def test_symlinked_file_escapes_workspace_is_unknown(self, tmp_path):
+        root = tmp_path / "project"
+        root.mkdir()
+        outside = tmp_path / "outside.py"
+        outside.write_text(_PY_FIXTURE, encoding="utf-8")
+        link = root / "link.py"
+        link.symlink_to(outside)
+        verdict, info = _verify_read_against_disk("link.py", _PY_FIXTURE, str(root), trusted=True)
+        assert verdict is ReadVerificationResult.UNKNOWN
+        assert info is None
+
+    def test_directory_passed_as_file_path_is_unknown(self, tmp_path):
+        # Also proves O_NONBLOCK doesn't need a FIFO fixture to matter: this
+        # exercises the same os.open(..., O_NONBLOCK) path, just rejected by
+        # the S_ISREG check rather than by not blocking on a missing writer.
+        root = tmp_path / "project"
+        subdir = root / "subdir"
+        subdir.mkdir(parents=True)
+        verdict, info = _verify_read_against_disk("subdir", "abc", str(root), trusted=True)
+        assert verdict is ReadVerificationResult.UNKNOWN
+        assert info is None
+
+    def test_oversized_file_exceeding_byte_cap_is_unknown(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HEADROOM_VERIFY_TRUNCATION_MAX_BYTES", "10")
+        f = tmp_path / "payments.py"
+        f.write_text(_PY_FIXTURE, encoding="utf-8")
+        assert len(_PY_FIXTURE.encode("utf-8")) > 10
+        # Content matches exactly -- would be COMPLETE without the cap.
+        verdict, info = _verify_read_against_disk(str(f), _PY_FIXTURE, str(tmp_path), trusted=True)
         assert verdict is ReadVerificationResult.UNKNOWN
         assert info is None
 
@@ -432,6 +534,7 @@ def test_astgrep_disk_verification_flags_truncation_when_no_banner(
     assert "truncated" not in partial.lower()
 
     set_current_cwd(str(tmp_path))
+    set_current_request_trusted(True)
     try:
         messages = [
             {
@@ -453,6 +556,7 @@ def test_astgrep_disk_verification_flags_truncation_when_no_banner(
         result = apply_to_messages(messages, tokenizer)
     finally:
         set_current_cwd(None)
+        set_current_request_trusted(False)
 
     assert len(result.spans) == 1
     new_content = result.messages[1]["content"][0]["content"]
@@ -477,6 +581,47 @@ def test_astgrep_disk_verification_disabled_by_default(tokenizer, tmp_path, monk
     partial = _PY_FIXTURE[: _PY_FIXTURE.index(marker)]
 
     set_current_cwd(str(tmp_path))
+    set_current_request_trusted(True)
+    try:
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "abc",
+                        "name": "Read",
+                        "input": {"file_path": "payments.py"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "abc", "content": partial}],
+            },
+        ]
+        result = apply_to_messages(messages, tokenizer)
+    finally:
+        set_current_cwd(None)
+        set_current_request_trusted(False)
+
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "truncated upstream" not in new_content
+
+
+def test_astgrep_disk_verification_skips_when_request_untrusted(tokenizer, tmp_path, monkeypatch):
+    """Same truncated-on-disk scenario, opted in and cwd bound, but the
+    request's peer was never marked loopback-trusted (the contextvar's
+    False default) -- must behave exactly like the no-signal case."""
+    monkeypatch.setenv("HEADROOM_VERIFY_TRUNCATION_ON_DISK", "1")
+    monkeypatch.setenv("HEADROOM_INTERCEPT_READ_MIN_CHARS", "50")
+    f = tmp_path / "payments.py"
+    f.write_text(_PY_FIXTURE, encoding="utf-8")
+    marker = "\n\ndef format_receipt"
+    partial = _PY_FIXTURE[: _PY_FIXTURE.index(marker)]
+
+    set_current_cwd(str(tmp_path))
+    # Deliberately not calling set_current_request_trusted(True).
     try:
         messages = [
             {

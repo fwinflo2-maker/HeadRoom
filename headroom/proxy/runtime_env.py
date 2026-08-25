@@ -80,6 +80,11 @@ RUNTIME_ENV_KNOBS: tuple[Knob, ...] = (
         "bool",
         "Verify ast-grep Read truncation against disk when no client banner is found.",
     ),
+    Knob(
+        "HEADROOM_VERIFY_TRUNCATION_MAX_BYTES",
+        "int",
+        "Max on-disk file size (bytes) the disk-verify fallback will read.",
+    ),
 )
 
 _KNOBS_BY_ENV: dict[str, Knob] = {k.env: k for k in RUNTIME_ENV_KNOBS}

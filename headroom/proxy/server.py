@@ -162,6 +162,7 @@ from headroom.proxy.project_context import (
     classify_project,
     set_current_cwd,
     set_current_project,
+    set_current_request_trusted,
     strip_project_path_prefix,
 )
 from headroom.proxy.prometheus_metrics import PrometheusMetrics  # noqa: F401
@@ -3263,8 +3264,19 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         method = request.method
         query = request.url.query
         headers = dict(request.headers.items())
+        client = getattr(request, "client", None)
+        client_addr = ""
+        client_host = None
+        if client is not None:
+            client_host = getattr(client, "host", None)
+            client_port = getattr(client, "port", None)
+            client_addr = f"{client_host}:{client_port}" if client_port else str(client_host)
         set_current_project(classify_project(headers) or prefix_project)
         set_current_cwd(headers.get("x-headroom-cwd"))
+        # Server-observed (not header-derived) trust signal for consumers that
+        # turn x-headroom-cwd into a filesystem read (e.g. astgrep disk
+        # verification) -- the header alone is never sufficient authority.
+        set_current_request_trusted(is_loopback_host(client_host))
         # Path-based Codex identification: stamp X-Client: codex on the
         # Responses endpoint for callers that don't otherwise classify (e.g.
         # Codex Desktop, whose User-Agent isn't a known codex UA). Without it
@@ -3274,12 +3286,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # makes every downstream classify_client(headers) read "codex".
         if should_stamp_codex_client(path, headers):
             request.scope["headers"].append((b"x-client", b"codex"))
-        client = getattr(request, "client", None)
-        client_addr = ""
-        if client is not None:
-            client_host = getattr(client, "host", None)
-            client_port = getattr(client, "port", None)
-            client_addr = f"{client_host}:{client_port}" if client_port else str(client_host)
         try:
             proxy.metrics.record_inbound_request(method=method, path=path)
         except Exception:

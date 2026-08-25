@@ -89,23 +89,43 @@ _PATTERNS: dict[str, list[str]] = {
 
 OUTLINE_MARKER = "    # ... (body elided by Headroom; Read a specific line range to see it)\n"
 
-# Matches a line-based truncation notice emitted by a client
-# when its own token cap cuts a Read result short, e.g. "showing lines 1-1489
-# of 1825 total". Captures the client-provided line counts that Headroom can
-# safely report without guessing. Tolerates common formatting variations
-_TRUNCATION_RE = re.compile(
-    r"showing\s+lines?\s+\d+\s*[-–]\s*(?P<end_line>\d+)\s+of\s+(?P<total_lines>\d+)\s+total",
-    re.IGNORECASE,
+# Per-client banner signatures -- add an entry only once a client's exact
+# banner text is confirmed, never a generic keyword match.
+_TRUNCATION_SIGNATURES: tuple[re.Pattern[str], ...] = (
+    # Claude Code: "[Truncated: PARTIAL view -- <path>: showing lines A-B of
+    # T total (...). Call Read with offset=N to see more.]"
+    re.compile(
+        r"\[\s*truncated\s*:\s*partial\s+view\b"
+        r"[^\[\]]*?"
+        r"showing\s+lines?\s+(?P<start_line>\d+)\s*[-–]\s*(?P<end_line>\d+)"
+        r"\s+of\s+(?P<total_lines>\d+)\s+total"
+        r"[^\[\]]*\]",
+        re.IGNORECASE,
+    ),
 )
 
 
+def _is_plausible_truncation_range(
+    start_line: int, end_line: int, total_lines: int, source_line_count: int
+) -> bool:
+    # end_line == total_lines means the whole file was shown, not truncated.
+    if start_line < 1 or end_line < start_line or end_line >= total_lines:
+        return False
+    return end_line <= source_line_count
+
+
 def _detect_truncation(source: str) -> tuple[int, int] | None:
-    """Return (end_line, total_lines) if `source` carries an upstream truncation
-    banner, else None."""
-    m = _TRUNCATION_RE.search(source)
-    if not m:
-        return None
-    return int(m.group("end_line")), int(m.group("total_lines"))
+    """Return (end_line, total_lines) if `source` carries a recognized,
+    internally-consistent upstream truncation banner, else None."""
+    source_line_count = len(source.splitlines())
+    for pattern in _TRUNCATION_SIGNATURES:
+        for m in pattern.finditer(source):
+            start_line = int(m.group("start_line"))
+            end_line = int(m.group("end_line"))
+            total_lines = int(m.group("total_lines"))
+            if _is_plausible_truncation_range(start_line, end_line, total_lines, source_line_count):
+                return end_line, total_lines
+    return None
 
 
 class AstGrepReadOutline:

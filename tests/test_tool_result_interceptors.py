@@ -248,14 +248,8 @@ def test_astgrep_flags_truncated_read(tokenizer):
     assert "def apply_promo" in new_content
 
 
-def test_astgrep_flags_truncated_read_wording_variants(tokenizer):
-    """Loosened regex should match reasonable wording variants, not just Claude Code's
-    exact phrasing — different casing, en-dash instead of hyphen, extra whitespace."""
-    truncated_source = (
-        _PY_FIXTURE
-        + "\n\nSHOWING  LINES 1–42  of 90  TOTAL. Call Read with offset=43 to see more.\n"
-    )
-    messages = [
+def _read_result_messages(content: str, file_path: str = "/repo/payments.py"):
+    return [
         {
             "role": "assistant",
             "content": [
@@ -263,17 +257,87 @@ def test_astgrep_flags_truncated_read_wording_variants(tokenizer):
                     "type": "tool_use",
                     "id": "abc",
                     "name": "Read",
-                    "input": {"file_path": "/repo/payments.py"},
+                    "input": {"file_path": file_path},
                 }
             ],
         },
         {
             "role": "user",
-            "content": [{"type": "tool_result", "tool_use_id": "abc", "content": truncated_source}],
+            "content": [{"type": "tool_result", "tool_use_id": "abc", "content": content}],
         },
     ]
+
+
+def test_astgrep_flags_truncated_read_wording_variants(tokenizer):
+    """The signature tolerates wording/casing/dash variation, but only inside
+    the recognized envelope — not as a synonym match over arbitrary prose."""
+    truncated_source = (
+        _PY_FIXTURE + "\n\n[TRUNCATED:   PARTIAL VIEW — /repo/payments.py: "
+        "SHOWING  LINES 1–42  of 90  TOTAL. Call Read with offset=43 to see more.]\n"
+    )
+    messages = _read_result_messages(truncated_source)
     result = apply_to_messages(messages, tokenizer)
     assert len(result.spans) == 1
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "truncated upstream" in new_content
+    assert "showing through line 42 of 90 total" in new_content
+
+
+def test_astgrep_ignores_truncation_phrase_in_comment(tokenizer):
+    """A count-shaped phrase in a plain comment, with no bracketed envelope,
+    must not be read as an upstream truncation claim."""
+    source_with_comment = (
+        _PY_FIXTURE + "\n\n# API pagination showing lines 10-20 of 30 total records\n"
+    )
+    messages = _read_result_messages(source_with_comment)
+    result = apply_to_messages(messages, tokenizer)
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "truncated upstream" not in new_content
+
+
+def test_astgrep_ignores_bracketed_phrase_without_signature(tokenizer):
+    """Brackets plus a count-shaped phrase aren't enough on their own — the
+    exact recognized signature phrase must also be present."""
+    source_with_bracket = (
+        _PY_FIXTURE + "\n\n[Truncation happened; showing lines 1-42 of 90 total]\n"
+    )
+    messages = _read_result_messages(source_with_bracket)
+    result = apply_to_messages(messages, tokenizer)
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "truncated upstream" not in new_content
+
+
+@pytest.mark.parametrize(
+    "banner_numbers",
+    [
+        pytest.param("50-90 of 90", id="end_equals_total"),
+        pytest.param("42-10 of 90", id="end_less_than_start"),
+        pytest.param("0-42 of 90", id="start_is_zero"),
+        pytest.param("1-5000 of 9000", id="end_exceeds_visible_payload"),
+    ],
+)
+def test_astgrep_ignores_malformed_truncation_counts(tokenizer, banner_numbers):
+    truncated_source = (
+        _PY_FIXTURE + "\n\n[Truncated: PARTIAL view — /repo/payments.py: "
+        f"showing lines {banner_numbers} total (26031 tokens, cap 25000). "
+        "Call Read with offset=43 to see more.]\n"
+    )
+    messages = _read_result_messages(truncated_source)
+    result = apply_to_messages(messages, tokenizer)
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "outlined by ast-grep" in new_content
+    assert "truncated upstream" not in new_content
+
+
+def test_astgrep_accepts_truncation_at_start_equals_end(tokenizer):
+    """`end >= start` is inclusive — a single-line visible window is valid."""
+    truncated_source = (
+        _PY_FIXTURE + "\n\n[Truncated: PARTIAL view — /repo/payments.py: "
+        "showing lines 42-42 of 90 total (26031 tokens, cap 25000). "
+        "Call Read with offset=43 to see more.]\n"
+    )
+    messages = _read_result_messages(truncated_source)
+    result = apply_to_messages(messages, tokenizer)
     new_content = result.messages[1]["content"][0]["content"]
     assert "truncated upstream" in new_content
     assert "showing through line 42 of 90 total" in new_content

@@ -169,6 +169,37 @@ def test_conversation_key_ignores_non_text_blocks() -> None:
     assert conversation_key_from_body(text_only) == conversation_key_from_body(with_image)
 
 
+def test_responses_conversation_key_reads_past_non_user_items() -> None:
+    """Seeding starts at the first user item, whatever precedes it."""
+
+    def body(question: str) -> dict[str, object]:
+        return {
+            "model": "gpt-5",
+            "input": [
+                {"role": "system", "content": "you are a helpful assistant"},
+                {"role": "user", "content": question},
+            ],
+        }
+
+    assert conversation_key_from_responses_body(
+        body("add a cache")
+    ) != conversation_key_from_responses_body(body("delete the cache"))
+
+
+def test_conversation_key_handles_a_message_with_no_text() -> None:
+    """An image-only opener still keys, and keys apart from an empty one."""
+    image_only = {
+        "model": "claude-opus-4-5",
+        "messages": [{"role": "user", "content": [{"type": "image", "source": {"data": "iVBOR"}}]}],
+    }
+    empty = {"model": "claude-opus-4-5", "messages": [{"role": "user", "content": []}]}
+    no_message = {"model": "claude-opus-4-5", "messages": []}
+
+    # No text either way, so these two agree; a message-less body does not.
+    assert conversation_key_from_body(image_only) == conversation_key_from_body(empty)
+    assert conversation_key_from_body(image_only) != conversation_key_from_body(no_message)
+
+
 def test_stratum_label_round_trips_arm_and_key() -> None:
     key = "opus|code|m|tools"
 

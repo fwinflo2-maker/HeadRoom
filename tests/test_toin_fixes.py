@@ -12,6 +12,8 @@ This file tests all the fixes made to the TOIN implementation:
 
 import json
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -690,3 +692,47 @@ class TestIntegration:
         if pattern:
             # Strategy should be tracked
             assert pattern.total_retrievals >= 1
+
+
+class TestAutoSaveLockScope:
+    """The periodic auto-save must not hold the instance lock across the write."""
+
+    def test_auto_save_writes_outside_the_instance_lock(self):
+        class _LockProbeBackend:
+            """Records whether the TOIN lock is free while save() performs I/O.
+
+            The probe runs on a second thread — a same-thread acquire can't
+            detect an RLock held reentrantly by the caller.
+            """
+
+            def __init__(self, lock: threading.RLock):
+                self._lock = lock
+                self.lock_free_during_write: bool | None = None
+
+            def save(self, data: dict) -> None:
+                acquired = []
+
+                def probe():
+                    got = self._lock.acquire(blocking=False)
+                    acquired.append(got)
+                    # An RLock may only be released by its owning thread.
+                    if got:
+                        self._lock.release()
+
+                t = threading.Thread(target=probe)
+                t.start()
+                t.join(timeout=5)
+                self.lock_free_during_write = acquired[0]
+
+            def load(self) -> None:
+                return None
+
+        toin = ToolIntelligenceNetwork(TOINConfig(auto_save_interval=600))
+        backend = _LockProbeBackend(toin._lock)
+        toin._backend = backend
+        toin._dirty = True
+        toin._last_save_time = time.time() - 2 * toin._config.auto_save_interval
+
+        toin._maybe_auto_save()
+
+        assert backend.lock_free_during_write is True

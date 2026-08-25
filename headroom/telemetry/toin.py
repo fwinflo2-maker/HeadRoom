@@ -1572,23 +1572,27 @@ class ToolIntelligenceNetwork:
     def _maybe_auto_save(self) -> None:
         """Auto-save if enough time has passed.
 
-        HIGH FIX: Check conditions under lock to prevent race where another
-        thread modifies _dirty or _last_save_time between check and save.
-        The save() method already acquires the lock, and we use RLock so
-        it's safe to hold the lock when calling save().
+        Check eligibility under lock, but call save() outside it — holding
+        the RLock across backend.save() made every concurrent record_* call
+        block for the whole disk write, defeating save()'s serialize-under /
+        write-outside design. A rare double-save from two threads passing
+        the same interval boundary is benign — serialization is locked and
+        the atomic last-write wins.
         """
         if self._backend is None or not self._config.auto_save_interval:
             return
 
-        # Check under lock to prevent race conditions
+        # Eligibility check stays under lock so a concurrent save cannot
+        # flip _dirty/_last_save_time between our check and our write.
         with self._lock:
             if not self._dirty:
                 return
 
             elapsed = time.time() - self._last_save_time
-            if elapsed >= self._config.auto_save_interval:
-                # save() uses the same RLock, so this is safe
-                self.save()
+            if elapsed < self._config.auto_save_interval:
+                return
+
+        self.save()
 
     def clear(self) -> None:
         """Clear all TOIN data. Mainly for testing."""

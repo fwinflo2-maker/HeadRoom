@@ -710,22 +710,15 @@ class TestAutoSaveLockScope:
                 self.lock_free_during_write: bool | None = None
 
             def save(self, data: dict) -> None:
-                acquired = []
-
                 def probe():
-                    got = self._lock.acquire(blocking=False)
-                    acquired.append(got)
+                    self.lock_free_during_write = self._lock.acquire(blocking=False)
                     # An RLock may only be released by its owning thread.
-                    if got:
+                    if self.lock_free_during_write:
                         self._lock.release()
 
                 t = threading.Thread(target=probe)
                 t.start()
                 t.join(timeout=5)
-                self.lock_free_during_write = acquired[0]
-
-            def load(self) -> None:
-                return None
 
         toin = ToolIntelligenceNetwork(TOINConfig(auto_save_interval=600))
         backend = _LockProbeBackend(toin._lock)
@@ -736,3 +729,50 @@ class TestAutoSaveLockScope:
         toin._maybe_auto_save()
 
         assert backend.lock_free_during_write is True
+
+    def test_mutation_during_write_is_persisted_by_the_next_pass(self):
+        writes: list[dict] = []
+        first_write_started = threading.Event()
+        release_first_write = threading.Event()
+
+        class _BlockingBackend:
+            """Blocks the first write so a commit can race the snapshot."""
+
+            def save(self, data: dict) -> None:
+                writes.append(data)
+                if len(writes) == 1:
+                    first_write_started.set()
+                    release_first_write.wait(timeout=5)
+
+        toin = ToolIntelligenceNetwork(TOINConfig(auto_save_interval=600))
+        toin._backend = _BlockingBackend()
+        toin._dirty = True
+        toin._last_save_time = time.time() - 2 * toin._config.auto_save_interval
+
+        saver = threading.Thread(target=toin._maybe_auto_save)
+        saver.start()
+        assert first_write_started.wait(timeout=5)
+
+        # Commit while the first snapshot is mid-write. The interval flip keeps
+        # record_compression's own trailing auto-save from racing this test.
+        items = [{"id": i, "score": 100 - i} for i in range(20)]
+        signature = ToolSignature.from_items(items)
+        toin._config.auto_save_interval = 0
+        toin.record_compression(
+            tool_signature=signature,
+            original_count=20,
+            compressed_count=10,
+            original_tokens=2000,
+            compressed_tokens=1000,
+            strategy="smart_sample",
+            items=items,
+        )
+        assert toin._dirty is True
+
+        release_first_write.set()
+        saver.join(timeout=5)
+
+        # The convergence pass rewrote the snapshot including the late commit.
+        assert len(writes) == 2
+        assert any(signature.structure_hash in key for key in writes[1]["patterns"])
+        assert toin._dirty is False

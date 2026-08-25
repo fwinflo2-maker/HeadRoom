@@ -3756,14 +3756,21 @@ class OpenAIHandlerMixin:
                     # Zone 1: Swap cached compressed versions
                     working_messages = comp_cache.apply_cached(messages)
 
-                    # Re-freeze boundary. Token mode can use the compression
-                    # cache's positional frozen count. Cache mode must keep the
-                    # latest observation mutable even when the compression
-                    # cache has no compressible entry for it yet; otherwise
-                    # OpenAI-compatible tool-call clients freeze the entire
-                    # conversation and report near-zero savings.
+                    # Re-freeze boundary. `compute_frozen_count` is a local
+                    # heuristic that, for tool-light / prose conversations, marks
+                    # every leading message stable and returns `len(messages) - 1`,
+                    # freezing the entire live zone and producing zero compression
+                    # (issue #987: /v1/chat/completions showed `tokens_saved=0`,
+                    # `transforms_applied=[]` while /v1/messages compressed). Clamp
+                    # with the session prefix tracker (authoritative, 0 on a cold
+                    # session) — matching the Anthropic handler — so the heuristic
+                    # can only lower the boundary, never extend past the
+                    # provider-confirmed cached prefix.
                     if not is_cache_mode(self.config.mode):
-                        openai_frozen_count = comp_cache.compute_frozen_count(messages)
+                        openai_frozen_count = min(
+                            openai_frozen_count,
+                            comp_cache.compute_frozen_count(messages),
+                        )
 
                     result = await self._run_compression_in_executor(
                         lambda: self.openai_pipeline.apply(

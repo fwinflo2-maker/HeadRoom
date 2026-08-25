@@ -444,7 +444,7 @@ So an Anthropic-native caller does not need to convert to OpenAI format first. B
 | `messages` | array | yes | Messages to compress, in either wire format. `400` if missing. Empty array returns immediately with zero metrics. |
 | `model` | string | yes | Model name. Drives tokenizer + context-limit resolution. `400` if missing. |
 | `token_budget` | integer | no | Overrides the model's context limit. Used by callers that need to fit a tighter budget. |
-| `config` | object | no | Compression options, below. A non-object value is ignored rather than rejected. |
+| `config` | object | no | Compression options, below. Unknown keys and invalid values return `400 invalid_request`. |
 
 <Callout type="warning" title="system and tools are ignored">
 Only the four fields above are read. Anthropic sends `system` and `tools` **out of band**, alongside `messages` — this endpoint accepts them without complaint (you get a `200`, no warning) and returns neither, so neither is compressed.
@@ -462,9 +462,16 @@ Keep carrying both yourself and send them upstream unchanged. Two consequences w
 | `mode` | string | unset | `ccr`, `lossy_inline`, or `lossless_then_lossy`. Unset selects the default marker-free pipeline. Any other value is a `400`. |
 | `frozen_message_count` | integer | unset | Pin a prefix: the first N messages are returned byte-for-byte unchanged while staying visible to cross-message transforms like dedup. Set it to the number of messages the provider has already cached so compression cannot rewrite the prefix and bust that cache. Must be a non-negative integer; anything else is a `400`. |
 | `compress_user_messages` | boolean | `false` | Also compress user-role messages. |
-| `target_ratio` | number | unset | Target compression ratio. |
-| `protect_recent` | integer | unset | Leave the last N messages uncompressed. |
+| `compress_system_messages` | boolean | unset | Allow compression of system-role messages. |
+| `target_ratio` | number | unset | Target compression ratio in `(0, 1]`. |
+| `protect_recent` | integer | unset | Leave the last N messages uncompressed. Must be non-negative. |
 | `protect_analysis_context` | boolean | unset | Preserve analysis context blocks. |
+| `min_tokens_to_compress` | integer | unset | Skip compression below this token count. Must be non-negative. |
+
+Only keys the caller sends override server-level configuration, including
+`HEADROOM_SAVINGS_PROFILE`. `kompress_model` and `savings_profile` remain
+operator-level: remote callers cannot trigger arbitrary model downloads or
+change the server's overall savings posture per request.
 
 **`config.mode` values:**
 

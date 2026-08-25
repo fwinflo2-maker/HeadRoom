@@ -179,6 +179,97 @@ def _strip_codex_lite_metadata(raw_msg: str) -> str:
     return json.dumps(frame) if changed else raw_msg
 
 
+# ---------------------------------------------------------------------------
+# /v1/compress per-request config (#1617-adjacent).
+# ---------------------------------------------------------------------------
+#
+# The ``config`` object on POST /v1/compress mirrors the user-facing
+# :class:`headroom.compress.CompressConfig` knobs that map 1:1 onto
+# pipeline kwargs. Deliberately excluded:
+#
+# * ``kompress_model`` — an HTTP caller must not be able to trigger
+#   arbitrary HuggingFace model downloads on the proxy host; model
+#   selection stays an operator (env/CLI) decision.
+# * ``savings_profile`` — a whole-posture server setting
+#   (HEADROOM_SAVINGS_PROFILE); per-request profile switching would
+#   silently fight the operator's configured posture.
+#
+# Validation is strict per the no-silent-fallback build constraint:
+# unknown keys and mistyped values return 400 instead of being
+# silently dropped, so callers never believe an option took effect
+# when it didn't.
+_COMPRESS_CONFIG_BOOL_FIELDS = (
+    "compress_user_messages",
+    "compress_system_messages",
+    "protect_analysis_context",
+)
+_COMPRESS_CONFIG_INT_FIELDS = (
+    "protect_recent",
+    "frozen_message_count",
+    "min_tokens_to_compress",
+)
+_COMPRESS_CONFIG_MODE_VALUES = frozenset(("ccr", "lossy_inline", "lossless_then_lossy"))
+_COMPRESS_CONFIG_ALLOWED_KEYS = frozenset(
+    (*_COMPRESS_CONFIG_BOOL_FIELDS, *_COMPRESS_CONFIG_INT_FIELDS, "target_ratio", "mode")
+)
+
+
+def _parse_compress_config(raw: Any) -> tuple[dict[str, Any], str | None]:
+    """Validate the ``config`` object of a /v1/compress request body.
+
+    Returns ``(pipeline_kwargs, None)`` on success or ``({}, error_message)``
+    when the config is invalid. Only keys the caller actually sent are
+    returned, so server-level defaults (``proxy_pipeline_kwargs``) keep
+    applying for everything left unset.
+    """
+    if raw is None:
+        return {}, None
+    if not isinstance(raw, dict):
+        return {}, "config must be a JSON object"
+
+    unknown = sorted(set(raw) - _COMPRESS_CONFIG_ALLOWED_KEYS)
+    if unknown:
+        allowed = ", ".join(sorted(_COMPRESS_CONFIG_ALLOWED_KEYS))
+        return {}, f"Unknown config key(s): {', '.join(unknown)}. Allowed keys: {allowed}"
+
+    parsed: dict[str, Any] = {}
+    for key in _COMPRESS_CONFIG_BOOL_FIELDS:
+        if key in raw:
+            value = raw[key]
+            if not isinstance(value, bool):
+                return {}, f"config.{key} must be a boolean, got {type(value).__name__}"
+            parsed[key] = value
+
+    for key in _COMPRESS_CONFIG_INT_FIELDS:
+        if key in raw:
+            value = raw[key]
+            # bool is a subclass of int — reject it explicitly.
+            if isinstance(value, bool) or not isinstance(value, int):
+                return {}, f"config.{key} must be a non-negative integer, got {value!r}"
+            if value < 0:
+                return {}, f"config.{key} must be a non-negative integer, got {value!r}"
+            parsed[key] = value
+
+    if "target_ratio" in raw:
+        value = raw["target_ratio"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return {}, f"config.target_ratio must be a number in (0, 1], got {value!r}"
+        ratio = float(value)
+        if not 0.0 < ratio <= 1.0:
+            return {}, f"config.target_ratio must be in (0, 1], got {value!r}"
+        parsed["target_ratio"] = ratio
+
+    if "mode" in raw:
+        value = raw["mode"]
+        if value is not None and (
+            not isinstance(value, str) or value not in _COMPRESS_CONFIG_MODE_VALUES
+        ):
+            allowed = ", ".join(sorted(_COMPRESS_CONFIG_MODE_VALUES))
+            return {}, f"config.mode must be one of: {allowed}"
+
+    return parsed, None
+
+
 _OPENAI_CHAT_COMPLETIONS_PATH = "/chat/completions"
 _OPENAI_RESPONSES_PATH = "/responses"
 _OPENAI_ORIGINAL_PATH_HEADER = "x-headroom-original-path"
@@ -9623,56 +9714,28 @@ class OpenAIHandlerMixin:
                 if token_budget and isinstance(token_budget, int)
                 else limit_provider.get_context_limit(model)
             )
-            # Extract CompressConfig options from request body
-            compress_config = body.get("config", {})
-            if not isinstance(compress_config, dict):
-                compress_config = {}
-            compress_user_messages = compress_config.get("compress_user_messages", False)
-            target_ratio = compress_config.get("target_ratio")
-            protect_recent = compress_config.get("protect_recent")
-            protect_analysis_context = compress_config.get("protect_analysis_context")
-            # Leading messages already in the provider's prompt cache. Callers that
-            # resend a growing conversation every turn (agent loops) need to pin the
-            # prefix they have already paid for: without it the router compresses old
-            # messages harder as the conversation grows, so their bytes change and the
-            # cache misses from that point on. `protect_recent` guards the other end of
-            # the list and cannot express this.
-            frozen_message_count = compress_config.get("frozen_message_count")
-            if frozen_message_count is not None and (
-                isinstance(frozen_message_count, bool)
-                or not isinstance(frozen_message_count, int)
-                or frozen_message_count < 0
-            ):
+            # Extract CompressConfig options from request body. Strictly
+            # validated: unknown keys / wrong types are a 400, never a
+            # silent no-op (see _parse_compress_config).
+            config_kwargs, config_error = _parse_compress_config(body.get("config"))
+            if config_error is not None:
                 return JSONResponse(
                     status_code=400,
                     content={
                         "error": {
                             "type": "invalid_request",
-                            "message": (
-                                f"Invalid config.frozen_message_count: {frozen_message_count!r}. "
-                                "Expected a non-negative integer."
-                            ),
+                            "message": config_error,
                         }
                     },
                 )
+
+            # Marker-free lossless-then-lossy mode: safe to forward downstream
+            # with no CCR retrieval round-trip (see _lossy_inline_pipeline).
+            compress_config = body.get("config") or {}
             # Mode selection. Default is marker-free (see _no_ccr_pipeline):
             # no caller of this route can resolve a CCR marker unless it opts in
             # with mode="ccr", which restores the full marker + store behaviour.
             mode = compress_config.get("mode")
-            if mode is not None and mode not in COMPRESS_MODES:
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": {
-                            "type": "invalid_request",
-                            "message": (
-                                f"Invalid config.mode: {mode!r}. "
-                                f"Valid values are: {', '.join(COMPRESS_MODES)} "
-                                "(or omit config.mode for the default marker-free mode)."
-                            ),
-                        }
-                    },
-                )
             if mode in ("lossy_inline", "lossless_then_lossy"):
                 pipeline = self._lossy_inline_pipeline()
             elif mode == "ccr":
@@ -9689,17 +9752,9 @@ class OpenAIHandlerMixin:
             pipeline_kwargs: dict = {
                 "model_limit": context_limit,
                 **proxy_pipeline_kwargs(self.config),
+                # Request-level config wins over server-level defaults/profile.
+                **config_kwargs,
             }
-            if compress_user_messages:
-                pipeline_kwargs["compress_user_messages"] = True
-            if target_ratio is not None:
-                pipeline_kwargs["target_ratio"] = float(target_ratio)
-            if protect_recent is not None:
-                pipeline_kwargs["protect_recent"] = int(protect_recent)
-            if protect_analysis_context is not None:
-                pipeline_kwargs["protect_analysis_context"] = bool(protect_analysis_context)
-            if frozen_message_count is not None:
-                pipeline_kwargs["frozen_message_count"] = frozen_message_count
 
             # Offload the CPU-bound pipeline to the bounded compression executor
             # (mirrors the request handlers above). Running apply() inline blocked

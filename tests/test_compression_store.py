@@ -26,6 +26,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from headroom.cache.backends.memory import InMemoryBackend
 from headroom.cache.compression_store import (
     CCR_TTL_SECONDS_ENV,
     DEFAULT_CCR_TTL_SECONDS,
@@ -659,6 +660,26 @@ class TestCompressionStoreTTL:
 
 class TestCompressionStoreEviction:
     """Tests for CompressionStore memory limits and eviction."""
+
+    def test_new_key_store_does_not_scan_backend_for_expiry(self):
+        """New-key store() must not trigger a backend items() expiry scan."""
+
+        class _ItemsCountingBackend(InMemoryBackend):
+            def __init__(self) -> None:
+                super().__init__()
+                self.items_calls = 0
+
+            def items(self) -> list[tuple[str, CompressionEntry]]:
+                self.items_calls += 1
+                return super().items()
+
+        backend = _ItemsCountingBackend()
+        store = CompressionStore(backend=backend)
+
+        for i in range(5):
+            store.store(original=f"content_{i}", compressed=f"compressed_{i}")
+
+        assert backend.items_calls == 0
 
     def test_eviction_at_capacity(self, store_with_small_capacity: CompressionStore):
         """Oldest entries are evicted when at capacity."""

@@ -721,13 +721,15 @@ class CompressionStore:
             self._stale_heap_entries = 0  # CRITICAL FIX: Reset stale counter
 
     def _evict_if_needed(self) -> None:
-        """Evict old entries if at capacity. Must be called with lock held.
+        """Evict oldest entries until below capacity. Must be called with lock held.
 
         MEDIUM FIX #16: Use heap for O(log n) eviction instead of O(n) scan.
         CRITICAL FIX: Track and clean stale heap entries to prevent memory leak.
         """
-        # First, remove expired entries
-        self._clean_expired()
+        # No eager TTL sweep here: it cost a full backend items() scan
+        # per new-key store(). Expiry is enforced on read (retrieve(),
+        # exists()), SQLiteBackend purges expired rows every _PURGE_INTERVAL,
+        # and capacity pressure pops oldest-first anyway.
 
         # CRITICAL FIX: Rebuild heap if too many stale entries
         # This prevents unbounded heap growth when entries are deleted/replaced

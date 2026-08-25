@@ -11,9 +11,11 @@ from headroom.proxy.context_guard import (
     StreamUsageGuard,
     believed_context_limit,
     context_guard_enabled,
+    credential_scope,
     effective_context_limit,
     has_context_1m_beta,
     note_prompt_too_long,
+    nudge_response_usage,
     reset_learned_limits,
 )
 
@@ -133,6 +135,107 @@ class TestBetaAndLimits:
         assert not context_guard_enabled()
         monkeypatch.setenv("HEADROOM_CONTEXT_GUARD", "false")
         assert not context_guard_enabled()
+
+
+class TestLearnedLimitHygiene:
+    """Regressions for what a learned limit is allowed to do."""
+
+    def test_non_string_error_bodies_do_not_raise(self):
+        # Upstreams and gateways put null, objects and lists in the message
+        # slot. This runs while the client is still waiting for the real error
+        # body, so it must return empty-handed rather than raise over it.
+        for body in (None, {"message": {"nested": True}}, ["prompt is too long"], 42):
+            assert note_prompt_too_long("claude-sonnet-4-5", None, body) is None
+        assert effective_context_limit("claude-sonnet-4-5", 200_000, None) == 200_000
+
+    def test_out_of_band_maximum_is_not_learned(self):
+        # Same wire shape, different subject: gateways report per-request quota
+        # and per-key throttles as "prompt is too long: N > M". A limit that is
+        # not a context window must not clamp the budget for the process.
+        assert (
+            note_prompt_too_long(
+                "claude-sonnet-4-5", None, "prompt is too long: 900 tokens > 1 maximum"
+            )
+            is None
+        )
+        assert (
+            note_prompt_too_long(
+                "claude-sonnet-4-5",
+                None,
+                "prompt is too long: 99000000 tokens > 50000000 maximum",
+            )
+            is None
+        )
+        assert effective_context_limit("claude-sonnet-4-5", 200_000, None) == 200_000
+
+    def test_learned_limit_is_scoped_to_one_credential(self):
+        # One tenant's capped key on a shared proxy must not clamp another's.
+        note_prompt_too_long(
+            "claude-sonnet-4-5",
+            None,
+            "prompt is too long: 213021 tokens > 200000 maximum",
+            scope=credential_scope("sk-tenant-a"),
+        )
+        assert (
+            effective_context_limit(
+                "claude-sonnet-4-5", 400_000, None, scope=credential_scope("sk-tenant-a")
+            )
+            == 200_000
+        )
+        assert (
+            effective_context_limit(
+                "claude-sonnet-4-5", 400_000, None, scope=credential_scope("sk-tenant-b")
+            )
+            == 400_000
+        )
+
+    def test_credential_scope_never_echoes_the_credential(self):
+        scope = credential_scope("sk-ant-secret-value")
+        assert "secret" not in scope
+        assert scope and scope != credential_scope("sk-ant-other-value")
+        assert credential_scope(None) == credential_scope("") == ""
+
+    def test_learned_limit_expires(self, monkeypatch):
+        # Entitlements get provisioned and gateways get repointed; a lesson
+        # from an hour ago must not hold the budget down forever.
+        from headroom.proxy import context_guard
+
+        clock = {"now": 1_000.0}
+        monkeypatch.setattr(context_guard.time, "monotonic", lambda: clock["now"])
+        note_prompt_too_long(
+            "claude-sonnet-4-5", None, "prompt is too long: 213021 tokens > 200000 maximum"
+        )
+        assert effective_context_limit("claude-sonnet-4-5", 400_000, None) == 200_000
+        clock["now"] += context_guard._LEARNED_LIMIT_TTL_SECONDS + 1
+        assert effective_context_limit("claude-sonnet-4-5", 400_000, None) == 400_000
+
+
+class TestNonStreamingNudge:
+    """The buffered path raises the same budget, so it owes the same warning."""
+
+    def test_near_limit_body_is_nudged(self):
+        payload = {
+            "type": "message",
+            "usage": {
+                "input_tokens": 185_000,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "output_tokens": 7,
+            },
+        }
+        assert nudge_response_usage(payload, believed_limit=200_000, effective_limit=200_000)
+        assert payload["usage"]["input_tokens"] == int(200_000 * REPORT_FRACTION)
+
+    def test_far_from_limit_body_is_untouched(self):
+        payload = {"type": "message", "usage": {"input_tokens": 5_000, "output_tokens": 7}}
+        assert not nudge_response_usage(payload, believed_limit=200_000, effective_limit=200_000)
+        assert payload["usage"]["input_tokens"] == 5_000
+
+    def test_bodies_without_usage_are_untouched(self):
+        for payload in ({"type": "message"}, {"type": "error"}, "not a body", None):
+            assert not nudge_response_usage(
+                payload, believed_limit=200_000, effective_limit=200_000
+            )
 
 
 class TestStreamUsageGuard:
@@ -265,6 +368,50 @@ class TestStreamUsageGuard:
         guard.feed(_message_start_event(185_000))
         delta = _message_delta_event(199_000)  # already above the 190k target
         assert guard.feed(delta) == delta
+
+
+class TestSseFraming:
+    """The scan reads the SSE envelope, never the payload text."""
+
+    def _armed_guard(self) -> StreamUsageGuard:
+        guard = StreamUsageGuard(believed_limit=200_000, effective_limit=200_000)
+        guard.feed(_message_start_event(190_000))
+        return guard
+
+    def test_assistant_text_naming_an_event_does_not_disarm(self):
+        # The model writing about message_delta -- explaining SSE, quoting a
+        # log line -- used to end the scan, so the final cumulative usage went
+        # out un-nudged and the client's gauge snapped back.
+        guard = self._armed_guard()
+        chatter = (
+            b"event: content_block_delta\ndata: "
+            + json.dumps(
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {
+                        "type": "text_delta",
+                        "text": "the final message_delta carries cumulative usage",
+                    },
+                }
+            ).encode()
+            + b"\n\n"
+        )
+        assert guard.feed(chatter) == chatter
+        nudged = guard.feed(_message_delta_event(190_000))
+        assert json.loads(nudged.split(b"data: ", 1)[1])["usage"]["input_tokens"] == int(
+            200_000 * REPORT_FRACTION
+        )
+
+    def test_keepalive_frames_before_message_start_do_not_disarm(self):
+        # An intermediary shim (nginx, a corporate egress proxy) injects SSE
+        # comments and retry fields. They are not events, so they must not be
+        # read as "a protocol we don't recognize" and switch the guard off.
+        guard = StreamUsageGuard(believed_limit=200_000, effective_limit=200_000)
+        for keepalive in (b": keepalive\n\n", b"retry: 3000\n\n", b":\n\n"):
+            assert guard.feed(keepalive) == keepalive
+        nudged = guard.feed(_message_start_event(190_000))
+        assert _parse_usage(nudged)["input_tokens"] == int(200_000 * REPORT_FRACTION)
 
 
 class TestStreamResponseIntegration:
@@ -414,7 +561,21 @@ class TestStreamResponseIntegration:
             proxy, upstream, {"x-api-key": "sk-test", "anthropic-beta": "context-1m-2025-08-07"}
         )
         assert result.status_code == 400
+        # Learned against the credential that hit the wall, not process-wide.
+        scope = credential_scope("sk-test")
         assert (
-            effective_context_limit("claude-sonnet-4-5", 200_000, "context-1m-2025-08-07")
+            effective_context_limit(
+                "claude-sonnet-4-5", 200_000, "context-1m-2025-08-07", scope=scope
+            )
             == 200_000
+        )
+        # A different key on the same proxy keeps its own (optimistic) budget.
+        assert (
+            effective_context_limit(
+                "claude-sonnet-4-5",
+                200_000,
+                "context-1m-2025-08-07",
+                scope=credential_scope("sk-other"),
+            )
+            == 1_000_000
         )

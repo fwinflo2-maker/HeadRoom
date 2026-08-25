@@ -5,6 +5,7 @@ from __future__ import annotations
 from headroom.proxy.output_savings_policy import (
     assign_arm,
     conversation_key_from_body,
+    conversation_key_from_responses_body,
     input_bucket,
     model_family,
     parse_stratum_label,
@@ -84,6 +85,66 @@ def test_conversation_key_survives_a_long_identical_client_prologue() -> None:
     assert conversation_key_from_body(body("add a cache")) == conversation_key_from_body(
         body("add a cache")
     )
+
+
+def test_conversation_key_separates_conversations_behind_a_64kb_prologue() -> None:
+    """No cutoff can hide the user's words, however long the prologue.
+
+    A character cap is a cutoff wherever it sits: put a prologue past it and
+    every conversation behind that prologue keys the same way again, which is
+    the collapse this key exists to avoid. The seed is hashed incrementally, so
+    there is no cap -- this prologue is deliberately larger than the 64KB guard
+    an earlier revision of this fix used.
+    """
+    prologue = "x" * 96_000
+
+    def body(question: str) -> dict[str, object]:
+        return {
+            "model": "claude-opus-4-5",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prologue},
+                        {"type": "text", "text": question},
+                    ],
+                }
+            ],
+        }
+
+    assert conversation_key_from_body(body("add a cache")) != conversation_key_from_body(
+        body("delete the cache")
+    )
+    # And the same opener is still one key, so the arm holds for the conversation.
+    assert conversation_key_from_body(body("add a cache")) == conversation_key_from_body(
+        body("add a cache")
+    )
+
+
+def test_responses_conversation_key_separates_past_a_long_prologue() -> None:
+    """The Responses path carried the same cut and needs the same seeding."""
+    prologue = "x" * 96_000
+
+    def body(question: str) -> dict[str, object]:
+        return {
+            "model": "gpt-5",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prologue},
+                        {"type": "input_text", "text": question},
+                    ],
+                }
+            ],
+        }
+
+    assert conversation_key_from_responses_body(
+        body("add a cache")
+    ) != conversation_key_from_responses_body(body("delete the cache"))
+    assert conversation_key_from_responses_body(
+        body("add a cache")
+    ) == conversation_key_from_responses_body(body("add a cache"))
 
 
 def test_conversation_key_ignores_non_text_blocks() -> None:

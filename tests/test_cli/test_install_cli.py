@@ -169,7 +169,7 @@ def test_install_apply_starts_service_supervisor(monkeypatch) -> None:
     assert result.exit_code == 0, result.output
     assert "Installed persistent deployment 'default'" in result.output
     assert "Targets: claude, codex" in result.output
-    assert calls == ["save", "start_service", "apply", "save"]
+    assert calls == ["save", "save", "start_service", "apply", "save"]
 
 
 def test_install_apply_announces_windows_service_fallback(monkeypatch) -> None:
@@ -896,6 +896,7 @@ def test_install_apply_restores_previous_deployment_after_failed_update(monkeypa
         "stop-runtime:codex",
         "remove-supervisor:codex",
         "delete:default",
+        "save:claude",
         "supervisor:claude",
         "save:claude",
         "start:claude",
@@ -911,31 +912,64 @@ def test_install_apply_restores_previous_deployment_after_failed_update(monkeypa
     ]
 
 
-def test_install_apply_restores_previous_deployment_when_failed_cleanup_raises(monkeypatch) -> None:
-    previous = SimpleNamespace(profile="default")
-    new = SimpleNamespace(profile="default")
-    restored: list[object] = []
+def test_install_apply_keeps_new_owner_recovery_fail_closed(monkeypatch) -> None:
+    previous = SimpleNamespace(
+        profile="default", mutations=["old-mutation"], artifacts=["old-artifact"]
+    )
+    new = SimpleNamespace(profile="default", artifacts=[], mutations=[])
+    calls: list[str] = []
 
     monkeypatch.setattr(inst, "load_manifest", lambda profile: previous)
+    monkeypatch.setattr(inst, "_save_recovery_snapshot", lambda manifest: calls.append("snapshot"))
 
-    def fail_new_cleanup(manifest):
+    def remove(manifest):
+        calls.append("remove-new" if manifest is new else "remove-old")
         if manifest is new:
             raise RuntimeError("new deployment cleanup failed")
 
-    monkeypatch.setattr(inst, "_remove_deployment", fail_new_cleanup)
-    monkeypatch.setattr(inst, "install_supervisor", lambda manifest: [])
-    monkeypatch.setattr(inst, "save_manifest", lambda manifest: None)
+    monkeypatch.setattr(inst, "_remove_deployment", remove)
+    monkeypatch.setattr(inst, "_save_apply_manifest", lambda manifest: calls.append("save-new"))
+    monkeypatch.setattr(
+        inst, "install_supervisor", lambda manifest: calls.append("install-new") or []
+    )
     monkeypatch.setattr(
         inst,
         "_start_deployment",
         lambda manifest: (_ for _ in ()).throw(click.ClickException("startup failed")),
     )
-    monkeypatch.setattr(inst, "_restore_deployment", lambda manifest: restored.append(manifest))
+    monkeypatch.setattr(inst, "_restore_deployment", lambda manifest: calls.append("restore-old"))
+    monkeypatch.setattr(
+        inst, "delete_recovery_manifest", lambda profile: calls.append("delete-snapshot")
+    )
 
-    with pytest.raises(click.ClickException, match="startup failed"):
+    with pytest.raises(click.ClickException) as exc:
         inst._apply_manifest(new)
 
-    assert restored == [previous]
+    message = str(exc.value)
+    assert "startup failed" in message
+    assert "new deployment cleanup failed" in message
+    assert "recovery snapshot" in message
+    assert "remove the new owner before restoring the snapshot" in message
+    assert calls == ["snapshot", "remove-old", "save-new", "install-new", "save-new", "remove-new"]
+
+
+def test_install_apply_persists_new_manifest_before_supervisor_install(monkeypatch) -> None:
+    new = SimpleNamespace(profile="default", artifacts=[], mutations=[])
+    calls: list[str] = []
+
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: None)
+    monkeypatch.setattr(inst, "_save_apply_manifest", lambda manifest: calls.append("save"))
+    monkeypatch.setattr(
+        inst,
+        "install_supervisor",
+        lambda manifest: (_ for _ in ()).throw(RuntimeError("install failed")),
+    )
+    monkeypatch.setattr(inst, "_remove_deployment", lambda manifest: calls.append("cleanup"))
+
+    with pytest.raises(click.ClickException, match="install failed"):
+        inst._apply_manifest(new)
+
+    assert calls == ["save", "cleanup"]
 
 
 def test_install_start_rejects_task_lifecycle(monkeypatch) -> None:

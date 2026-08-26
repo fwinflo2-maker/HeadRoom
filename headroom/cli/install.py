@@ -23,6 +23,7 @@ from headroom.install.models import (
     RuntimeKind,
     SupervisorKind,
 )
+from headroom.install.paths import recovery_manifest_path
 from headroom.install.planner import build_manifest
 from headroom.install.providers import apply_mutations, revert_mutations
 from headroom.install.runtime import (
@@ -38,9 +39,12 @@ from headroom.install.runtime import (
 from headroom.install.state import (
     ManifestError,
     delete_manifest,
+    delete_recovery_manifest,
     list_manifests,
     load_manifest,
     save_manifest,
+    save_manifest_strict,
+    save_recovery_manifest,
 )
 from headroom.install.supervisors import (
     install_supervisor,
@@ -226,6 +230,20 @@ def _deactivate_deployment_mutations(
 def _activate_deployment_mutations(manifest: DeploymentManifest) -> None:
     manifest.mutations = apply_mutations(manifest)
     save_manifest(manifest)
+
+
+def _save_apply_manifest(manifest: DeploymentManifest) -> None:
+    """Use strict persistence for real manifests while keeping helper doubles light."""
+
+    if isinstance(manifest, DeploymentManifest):
+        save_manifest_strict(manifest)
+    else:
+        save_manifest(manifest)
+
+
+def _save_recovery_snapshot(manifest: DeploymentManifest) -> None:
+    if isinstance(manifest, DeploymentManifest):
+        save_recovery_manifest(manifest)
 
 
 def _remove_deployment(manifest: DeploymentManifest) -> None:
@@ -444,6 +462,7 @@ def _capture_passthrough_env(environ: Mapping[str, str]) -> dict[str, str]:
 
 
 def _apply_manifest(manifest: DeploymentManifest) -> None:
+    recovery_saved = False
     try:
         existing = load_manifest(manifest.profile)
     except ManifestError as e:
@@ -452,11 +471,14 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
         existing = None
     if existing is not None:
         click.echo(f"Updating existing deployment profile '{manifest.profile}'...")
+        _save_recovery_snapshot(existing)
+        recovery_saved = True
         _remove_deployment(existing)
 
     try:
+        _save_apply_manifest(manifest)
         manifest.artifacts = install_supervisor(manifest)
-        save_manifest(manifest)
+        _save_apply_manifest(manifest)
         _start_deployment(manifest)
         _activate_deployment_mutations(manifest)
     except Exception as exc:
@@ -465,19 +487,35 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
             _remove_deployment(manifest)
         except Exception as cleanup_exc:
             cleanup_error = cleanup_exc
-        if existing is not None:
+        if cleanup_error is None and existing is not None:
             click.echo(f"Restoring previous deployment '{manifest.profile}'...")
-            _restore_deployment(existing)
+            try:
+                _restore_deployment(existing)
+            except Exception as restore_error:
+                raise click.ClickException(
+                    f"Failed to install deployment '{manifest.profile}': {exc} "
+                    f"(previous deployment restoration also failed: {restore_error})"
+                ) from exc
+            delete_recovery_manifest(existing.profile)
+        elif cleanup_error is None and recovery_saved:
+            delete_recovery_manifest(manifest.profile)
         # Surface non-Click errors (OSError, CalledProcessError, ...) as a clean
         # message rather than a raw traceback; Click errors pass through as-is.
         if isinstance(exc, click.ClickException | click.Abort):
             if cleanup_error is not None:
-                raise exc from cleanup_error
+                raise click.ClickException(
+                    f"Failed to install deployment '{manifest.profile}': {exc} "
+                    f"(cleanup also failed: {cleanup_error}; recovery snapshot: "
+                    f"{recovery_manifest_path(manifest.profile)}; remove the new owner "
+                    "before restoring the snapshot)"
+                ) from exc
             raise
         if cleanup_error is not None:
             raise click.ClickException(
                 f"Failed to install deployment '{manifest.profile}': {exc} "
-                f"(cleanup also failed: {cleanup_error})"
+                f"(cleanup also failed: {cleanup_error}; recovery snapshot: "
+                f"{recovery_manifest_path(manifest.profile)}; remove the new owner "
+                "before restoring the snapshot)"
             ) from exc
         raise click.ClickException(
             f"Failed to install deployment '{manifest.profile}': {exc}"

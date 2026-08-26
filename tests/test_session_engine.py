@@ -1,0 +1,182 @@
+"""Unit tests for the shared session-turn engine (headroom/proxy/session_engine).
+
+The engine is the single cache-management brain for the proxy request paths
+and the sidecar /v1/compress path; these tests pin its two freeze policies
+and the overlay finalization directly, without an HTTP harness.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from headroom.cache.compression_cache import CompressionCache
+from headroom.proxy.session_engine import (
+    FREEZE_POLICY_PROXY,
+    FREEZE_POLICY_SIDECAR,
+    finalize_turn,
+    prepare_turn,
+)
+
+
+def _tool_msg(content: str, call_id: str = "c1") -> dict:
+    return {"role": "tool", "tool_call_id": call_id, "content": content}
+
+
+def _history_with_cached_tool(
+    cache: CompressionCache, original: str, compressed: str
+) -> list[dict]:
+    """A 3-message history whose tool result has a cached compressed form."""
+    cache.store_compressed(cache.content_hash(original), compressed, tokens_saved=10)
+    return [
+        {"role": "user", "content": "get items"},
+        {"role": "assistant", "content": "calling"},
+        _tool_msg(original),
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# prepare_turn: freeze policies                                                #
+# --------------------------------------------------------------------------- #
+
+
+def test_sidecar_policy_freezes_full_replayable_prefix() -> None:
+    cache = CompressionCache()
+    messages = _history_with_cached_tool(cache, "ORIGINAL " * 100, "[compressed]")
+    messages.append({"role": "user", "content": "next"})
+
+    prep = prepare_turn(cache, messages, policy=FREEZE_POLICY_SIDECAR)
+    # user, assistant, cached tool are all stable; the trailing message is
+    # always excluded by compute_frozen_count.
+    assert prep.frozen_message_count == 3
+    # The swap replaced the tool result with its cached compressed form.
+    assert prep.pipeline_input[2]["content"] == "[compressed]"
+    # The caller's list is never mutated.
+    assert messages[2]["content"].startswith("ORIGINAL")
+
+
+def test_sidecar_policy_explicit_pin_wins_when_larger() -> None:
+    cache = CompressionCache()
+    messages = [
+        {"role": "user", "content": "a"},
+        _tool_msg("never seen before " * 50),  # not in cache -> derived stops here
+        {"role": "user", "content": "next"},
+    ]
+    derived = cache.compute_frozen_count(messages)
+    assert derived == 1  # only the leading plain message
+    prep = prepare_turn(cache, messages, policy=FREEZE_POLICY_SIDECAR, explicit_frozen=2)
+    assert prep.frozen_message_count == 2
+
+
+def test_sidecar_policy_derived_wins_when_explicit_smaller() -> None:
+    cache = CompressionCache()
+    messages = _history_with_cached_tool(cache, "ORIGINAL " * 100, "[compressed]")
+    messages.append({"role": "user", "content": "next"})
+    prep = prepare_turn(cache, messages, policy=FREEZE_POLICY_SIDECAR, explicit_frozen=1)
+    assert prep.frozen_message_count == 3
+
+
+def test_proxy_policy_clamps_by_cache_count() -> None:
+    """Provider says 5 messages are cached, but local state can only replay 3:
+    freezing past the replayable bound would forward raw bytes."""
+    cache = CompressionCache()
+    messages = _history_with_cached_tool(cache, "ORIGINAL " * 100, "[compressed]")
+    messages.append(_tool_msg("uncached " * 50, "c2"))
+    messages.append({"role": "user", "content": "next"})
+
+    prep = prepare_turn(cache, messages, policy=FREEZE_POLICY_PROXY, tracker_frozen=5)
+    assert prep.frozen_message_count == 3
+
+
+def test_proxy_policy_clamps_by_tracker() -> None:
+    """Local state could replay 3, but the provider only confirmed 1: content
+    past the confirmed prefix stays compressible (the #327 posture)."""
+    cache = CompressionCache()
+    messages = _history_with_cached_tool(cache, "ORIGINAL " * 100, "[compressed]")
+    messages.append({"role": "user", "content": "next"})
+    prep = prepare_turn(cache, messages, policy=FREEZE_POLICY_PROXY, tracker_frozen=1)
+    assert prep.frozen_message_count == 1
+
+
+def test_proxy_policy_none_tracker_freezes_nothing() -> None:
+    cache = CompressionCache()
+    messages = _history_with_cached_tool(cache, "ORIGINAL " * 100, "[compressed]")
+    prep = prepare_turn(cache, messages, policy=FREEZE_POLICY_PROXY, tracker_frozen=None)
+    assert prep.frozen_message_count == 0
+
+
+def test_unknown_policy_rejected() -> None:
+    cache = CompressionCache()
+    with pytest.raises(ValueError):
+        prepare_turn(cache, [], policy="wat")
+
+
+def test_prepare_marks_frozen_tool_results_stable() -> None:
+    cache = CompressionCache()
+    original = "ORIGINAL " * 100
+    messages = _history_with_cached_tool(cache, original, "[compressed]")
+    messages.append({"role": "user", "content": "next"})
+    prepare_turn(cache, messages, policy=FREEZE_POLICY_SIDECAR)
+    assert cache.content_hash(original) in cache._stable_hashes
+
+
+# --------------------------------------------------------------------------- #
+# finalize_turn: overlay + recount hook                                        #
+# --------------------------------------------------------------------------- #
+
+
+def _prev_pair() -> tuple[list[dict], list[dict]]:
+    prev_original = [
+        {"role": "user", "content": "ORIGINAL " * 100},
+        {"role": "assistant", "content": "ok"},
+    ]
+    prev_returned = [
+        {"role": "user", "content": "[returned-form]"},
+        {"role": "assistant", "content": "ok"},
+    ]
+    return prev_original, prev_returned
+
+
+def test_finalize_replays_previous_returned_prefix() -> None:
+    prev_original, prev_returned = _prev_pair()
+    current = prev_original + [{"role": "user", "content": "next"}]
+    # The pipeline "drifted": it emitted the raw original for message 0.
+    drifted = [dict(m) for m in current]
+
+    counted: list[int] = []
+
+    def _count(msgs: list[dict]) -> int:
+        counted.append(len(json.dumps(msgs)))
+        return 42
+
+    turn = finalize_turn(drifted, current, prev_original, prev_returned, count_tokens=_count)
+    assert turn.replayed
+    assert turn.messages[0]["content"] == "[returned-form]"
+    assert turn.messages[-1]["content"] == "next"
+    assert turn.tokens == 42
+    assert len(counted) == 1
+
+
+def test_finalize_noop_without_prev_snapshots() -> None:
+    current = [{"role": "user", "content": "hi"}]
+    calls: list[int] = []
+    turn = finalize_turn(current, current, [], [], count_tokens=lambda m: calls.append(1) or 1)
+    assert not turn.replayed
+    assert turn.messages == current
+    assert turn.tokens is None
+    assert not calls  # count_tokens only runs when the overlay fired
+
+
+def test_finalize_count_hook_failure_falls_back() -> None:
+    prev_original, prev_returned = _prev_pair()
+    current = prev_original + [{"role": "user", "content": "next"}]
+
+    def _boom(_msgs: list[dict]) -> int:
+        raise RuntimeError("tokenizer down")
+
+    turn = finalize_turn(
+        [dict(m) for m in current], current, prev_original, prev_returned, count_tokens=_boom
+    )
+    assert turn.replayed
+    assert turn.tokens is None

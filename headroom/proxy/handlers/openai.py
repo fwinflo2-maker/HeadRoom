@@ -3753,15 +3753,22 @@ class OpenAIHandlerMixin:
                 if is_token_mode(self.config.mode):
                     comp_cache = self._get_compression_cache(openai_session_id)
 
+                    # NOT migrated onto session_engine.prepare_turn (which the
+                    # anthropic token path and the /v1/compress sidecar path
+                    # use): this path deliberately (a) never calls
+                    # mark_stable_from_messages, (b) keeps the latest
+                    # observation mutable in cache mode even when the
+                    # compression cache has no entry for it yet (otherwise
+                    # OpenAI-compatible tool-call clients freeze the entire
+                    # conversation and report near-zero savings), and (c) in
+                    # token mode freezes exactly the cache's positional count
+                    # — no tracker clamp — which matches neither engine
+                    # policy's formula. Adopting the engine here would change
+                    # all three; revisit only with its own validation pass.
+
                     # Zone 1: Swap cached compressed versions
                     working_messages = comp_cache.apply_cached(messages)
 
-                    # Re-freeze boundary. Token mode can use the compression
-                    # cache's positional frozen count. Cache mode must keep the
-                    # latest observation mutable even when the compression
-                    # cache has no compressible entry for it yet; otherwise
-                    # OpenAI-compatible tool-call clients freeze the entire
-                    # conversation and report near-zero savings.
                     if not is_cache_mode(self.config.mode):
                         openai_frozen_count = comp_cache.compute_frozen_count(messages)
 
@@ -3854,18 +3861,21 @@ class OpenAIHandlerMixin:
         # Cache-safety (ALL modes): forward the previously-cached (compressed)
         # prefix byte-identical, so freezing can't bust the prompt cache. See the
         # matching guard in the Anthropic handler for the full rationale. Append-
-        # only-guarded and idempotent (cache mode already replays).
-        from headroom.cache.prefix_tracker import overlay_cached_prefix
+        # only-guarded and idempotent (cache mode already replays). Shared
+        # implementation: session_engine.finalize_turn.
+        from headroom.proxy.session_engine import finalize_turn
 
-        _ov = overlay_cached_prefix(
+        _final = finalize_turn(
             optimized_messages,
             original_client_messages,
             openai_prefix_tracker.get_last_original_messages(),
             openai_prefix_tracker.get_last_forwarded_messages(),
+            count_tokens=tokenizer.count_messages,
         )
-        if _ov != optimized_messages:
-            optimized_messages = _ov
-            optimized_tokens = tokenizer.count_messages(optimized_messages)
+        if _final.replayed:
+            optimized_messages = _final.messages
+            if _final.tokens is not None:
+                optimized_tokens = _final.tokens
 
         # Guard: if "optimization" inflated tokens, revert to originals
         if optimized_tokens > original_tokens:
@@ -9815,24 +9825,34 @@ class OpenAIHandlerMixin:
                 # The per-session lock serializes contract-violating
                 # concurrent turns so an older in-flight turn cannot tear or
                 # overwrite a newer turn's tracker snapshots mid-flight.
-                from headroom.cache.prefix_tracker import overlay_cached_prefix
+                # Cache management (freeze + swap + overlay) lives in the
+                # shared session engine — one brain for this path and the
+                # proxy request paths.
+                from headroom.proxy.session_engine import (
+                    FREEZE_POLICY_SIDECAR,
+                    finalize_turn,
+                    prepare_turn,
+                )
 
                 with comp_cache.session_turn_lock:
                     prev_original = session_tracker.get_last_original_messages()
                     prev_returned = session_tracker.get_last_forwarded_messages()
-                    derived_frozen = comp_cache.compute_frozen_count(messages)
-                    session_frozen = max(derived_frozen, frozen_message_count or 0)
-                    comp_cache.mark_stable_from_messages(messages, session_frozen)
-                    pipeline_input = comp_cache.apply_cached(messages)
+                    prep = prepare_turn(
+                        comp_cache,
+                        messages,
+                        policy=FREEZE_POLICY_SIDECAR,
+                        explicit_frozen=frozen_message_count,
+                    )
+                    session_frozen = prep.frozen_message_count
                     pipeline_kwargs["frozen_message_count"] = session_frozen
-                    result = pipeline.apply(messages=pipeline_input, model=model, **pipeline_kwargs)
+                    result = pipeline.apply(
+                        messages=prep.pipeline_input, model=model, **pipeline_kwargs
+                    )
                     # Replay last turn's exact returned prefix over any drift
                     # the pipeline introduced — byte-identical is the contract
                     # the caller forwards on.
-                    final = overlay_cached_prefix(
-                        result.messages, messages, prev_original, prev_returned
-                    )
-                    replayed = final != result.messages
+                    turn = finalize_turn(result.messages, messages, prev_original, prev_returned)
+                    final = turn.messages
                     # Savings are reported against the caller's RAW payload,
                     # not the cache-swapped pipeline input: on a warm turn the
                     # swap has already shrunk the input before the pipeline
@@ -9855,7 +9875,7 @@ class OpenAIHandlerMixin:
                     info = {
                         "id": session_id,
                         "frozen_message_count": session_frozen,
-                        "cached_prefix_replayed": replayed,
+                        "cached_prefix_replayed": turn.replayed,
                     }
                     return result, final, raw_tokens_before, final_tokens_after, info
 

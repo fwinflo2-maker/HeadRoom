@@ -265,9 +265,9 @@ def test_backpressure_still_invokes_cached_prefix_replay(monkeypatch):
 
     assert response.status_code == 200, response.text
     # Backpressure engaged (pipeline shed)...
-    assert any(
-        "pre_upstream_backpressure" in str(call) for call in info.call_args_list
-    ), "backpressure did not engage — the test setup no longer saturates"
+    assert any("pre_upstream_backpressure" in str(call) for call in info.call_args_list), (
+        "backpressure did not engage — the test setup no longer saturates"
+    )
     # ...but the replay ran (and, with no previous turn, no-op'd safely).
     assert overlay_calls, "cached-prefix replay must run under backpressure"
     assert captured[-1]["messages"] == messages

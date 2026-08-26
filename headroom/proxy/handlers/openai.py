@@ -3761,24 +3761,45 @@ class OpenAIHandlerMixin:
                 if is_token_mode(self.config.mode):
                     comp_cache = self._get_compression_cache(openai_session_id)
 
-                    # NOT migrated onto session_engine.prepare_turn (which the
-                    # anthropic token path and the /v1/compress sidecar path
-                    # use): this path deliberately (a) never calls
-                    # mark_stable_from_messages, (b) keeps the latest
-                    # observation mutable in cache mode even when the
-                    # compression cache has no entry for it yet (otherwise
-                    # OpenAI-compatible tool-call clients freeze the entire
-                    # conversation and report near-zero savings), and (c) in
-                    # token mode freezes exactly the cache's positional count
-                    # — no tracker clamp — which matches neither engine
-                    # policy's formula. Adopting the engine here would change
-                    # all three; revisit only with its own validation pass.
-
-                    # Zone 1: Swap cached compressed versions
-                    working_messages = comp_cache.apply_cached(messages)
-
                     if not is_cache_mode(self.config.mode):
-                        openai_frozen_count = comp_cache.compute_frozen_count(messages)
+                        # Token mode: shared engine, REPLAYABLE policy — its
+                        # formula with no explicit pin is exactly this path's
+                        # historical freeze (compute_frozen_count alone; the
+                        # tracker count feeds cache mode below, never token
+                        # mode). The engine also runs
+                        # mark_stable_from_messages, which this path skipped:
+                        # that marks tool_results INSIDE the frozen prefix as
+                        # stable — redundant in the common case (an in-prefix
+                        # tool_result is already stable via its cache entry)
+                        # but it keeps `_stable_hashes` bookkeeping identical
+                        # across all three paths, e.g. preserving stability
+                        # across cache-entry LRU turnover. Note it can never
+                        # mark the BOUNDARY tool_result that stopped the
+                        # count (it sits outside messages[:frozen]) — the
+                        # protection against re-compressing a passthrough
+                        # boundary tool_result under rising context pressure
+                        # is the router-level `_frozen_verdicts` pin, on every
+                        # path, unchanged by this migration.
+                        from headroom.proxy.session_engine import (
+                            FREEZE_POLICY_REPLAYABLE,
+                            prepare_turn,
+                        )
+
+                        _prep = prepare_turn(
+                            comp_cache,
+                            messages,
+                            policy=FREEZE_POLICY_REPLAYABLE,
+                        )
+                        working_messages = _prep.pipeline_input
+                        openai_frozen_count = _prep.frozen_message_count
+                    else:
+                        # Cache mode: Zone-1 swap only. The latest observation
+                        # must stay mutable even when the compression cache
+                        # has no entry for it yet (otherwise OpenAI-compatible
+                        # tool-call clients freeze the entire conversation and
+                        # report near-zero savings), so the freeze comes from
+                        # the tracker (set above), never from the cache count.
+                        working_messages = comp_cache.apply_cached(messages)
 
                     result = await self._run_compression_in_executor(
                         lambda: self.openai_pipeline.apply(
@@ -9843,7 +9864,7 @@ class OpenAIHandlerMixin:
                 # shared session engine — one brain for this path and the
                 # proxy request paths.
                 from headroom.proxy.session_engine import (
-                    FREEZE_POLICY_SIDECAR,
+                    FREEZE_POLICY_REPLAYABLE,
                     finalize_turn,
                     prepare_turn,
                 )
@@ -9867,7 +9888,7 @@ class OpenAIHandlerMixin:
                     prep = prepare_turn(
                         comp_cache,
                         messages,
-                        policy=FREEZE_POLICY_SIDECAR,
+                        policy=FREEZE_POLICY_REPLAYABLE,
                         explicit_frozen=frozen_message_count,
                     )
                     session_frozen = prep.frozen_message_count

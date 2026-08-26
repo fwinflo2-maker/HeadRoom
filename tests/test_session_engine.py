@@ -13,8 +13,8 @@ import pytest
 
 from headroom.cache.compression_cache import CompressionCache
 from headroom.proxy.session_engine import (
-    FREEZE_POLICY_PROXY,
-    FREEZE_POLICY_SIDECAR,
+    FREEZE_POLICY_CONFIRMED_CLAMP,
+    FREEZE_POLICY_REPLAYABLE,
     finalize_turn,
     prepare_turn,
 )
@@ -46,7 +46,7 @@ def test_sidecar_policy_freezes_full_replayable_prefix() -> None:
     messages = _history_with_cached_tool(cache, "ORIGINAL " * 100, "[compressed]")
     messages.append({"role": "user", "content": "next"})
 
-    prep = prepare_turn(cache, messages, policy=FREEZE_POLICY_SIDECAR)
+    prep = prepare_turn(cache, messages, policy=FREEZE_POLICY_REPLAYABLE)
     # user, assistant, cached tool are all stable; the trailing message is
     # always excluded by compute_frozen_count.
     assert prep.frozen_message_count == 3
@@ -65,7 +65,7 @@ def test_sidecar_policy_explicit_pin_wins_when_larger() -> None:
     ]
     derived = cache.compute_frozen_count(messages)
     assert derived == 1  # only the leading plain message
-    prep = prepare_turn(cache, messages, policy=FREEZE_POLICY_SIDECAR, explicit_frozen=2)
+    prep = prepare_turn(cache, messages, policy=FREEZE_POLICY_REPLAYABLE, explicit_frozen=2)
     assert prep.frozen_message_count == 2
 
 
@@ -73,7 +73,7 @@ def test_sidecar_policy_derived_wins_when_explicit_smaller() -> None:
     cache = CompressionCache()
     messages = _history_with_cached_tool(cache, "ORIGINAL " * 100, "[compressed]")
     messages.append({"role": "user", "content": "next"})
-    prep = prepare_turn(cache, messages, policy=FREEZE_POLICY_SIDECAR, explicit_frozen=1)
+    prep = prepare_turn(cache, messages, policy=FREEZE_POLICY_REPLAYABLE, explicit_frozen=1)
     assert prep.frozen_message_count == 3
 
 
@@ -85,7 +85,7 @@ def test_proxy_policy_clamps_by_cache_count() -> None:
     messages.append(_tool_msg("uncached " * 50, "c2"))
     messages.append({"role": "user", "content": "next"})
 
-    prep = prepare_turn(cache, messages, policy=FREEZE_POLICY_PROXY, tracker_frozen=5)
+    prep = prepare_turn(cache, messages, policy=FREEZE_POLICY_CONFIRMED_CLAMP, tracker_frozen=5)
     assert prep.frozen_message_count == 3
 
 
@@ -95,14 +95,14 @@ def test_proxy_policy_clamps_by_tracker() -> None:
     cache = CompressionCache()
     messages = _history_with_cached_tool(cache, "ORIGINAL " * 100, "[compressed]")
     messages.append({"role": "user", "content": "next"})
-    prep = prepare_turn(cache, messages, policy=FREEZE_POLICY_PROXY, tracker_frozen=1)
+    prep = prepare_turn(cache, messages, policy=FREEZE_POLICY_CONFIRMED_CLAMP, tracker_frozen=1)
     assert prep.frozen_message_count == 1
 
 
 def test_proxy_policy_none_tracker_freezes_nothing() -> None:
     cache = CompressionCache()
     messages = _history_with_cached_tool(cache, "ORIGINAL " * 100, "[compressed]")
-    prep = prepare_turn(cache, messages, policy=FREEZE_POLICY_PROXY, tracker_frozen=None)
+    prep = prepare_turn(cache, messages, policy=FREEZE_POLICY_CONFIRMED_CLAMP, tracker_frozen=None)
     assert prep.frozen_message_count == 0
 
 
@@ -117,7 +117,7 @@ def test_prepare_marks_frozen_tool_results_stable() -> None:
     original = "ORIGINAL " * 100
     messages = _history_with_cached_tool(cache, original, "[compressed]")
     messages.append({"role": "user", "content": "next"})
-    prepare_turn(cache, messages, policy=FREEZE_POLICY_SIDECAR)
+    prepare_turn(cache, messages, policy=FREEZE_POLICY_REPLAYABLE)
     assert cache.content_hash(original) in cache._stable_hashes
 
 
@@ -180,3 +180,46 @@ def test_finalize_count_hook_failure_falls_back() -> None:
     )
     assert turn.replayed
     assert turn.tokens is None
+
+
+# --------------------------------------------------------------------------- #
+# OpenAI proxy token-path migration: formula identity + marking benefit.       #
+# --------------------------------------------------------------------------- #
+
+
+def test_replayable_without_pin_equals_bare_cache_count() -> None:
+    """The OpenAI proxy token path historically froze on compute_frozen_count
+    alone; REPLAYABLE with no explicit pin must be formula-identical, so its
+    migration onto the engine is a pure extraction."""
+    cache = CompressionCache()
+    messages = _history_with_cached_tool(cache, "AAAA " * 50, "[c1]")
+    messages.append(_tool_msg("uncached content", call_id="c2"))
+    messages.append({"role": "user", "content": "next"})
+
+    prep = prepare_turn(cache, messages, policy=FREEZE_POLICY_REPLAYABLE)
+    assert prep.frozen_message_count == cache.compute_frozen_count(messages)
+    # And that count stops at the uncached tool_result (index 3).
+    assert prep.frozen_message_count == 3
+
+
+def test_marking_preserves_freeze_across_entry_eviction() -> None:
+    """The one real benefit mark_stable_from_messages adds on the migrated
+    path: an in-prefix tool_result stays stable via `_stable_hashes` even
+    after its compressed ENTRY is evicted by the per-cache LRU, so the frozen
+    count does not collapse at that position on the next turn."""
+    cache = CompressionCache(max_entries=100)
+    original = "BBBB " * 50
+    messages = _history_with_cached_tool(cache, original, "[c1]")
+    messages.append({"role": "user", "content": "next"})
+
+    prep = prepare_turn(cache, messages, policy=FREEZE_POLICY_REPLAYABLE)
+    assert prep.frozen_message_count == 3  # tool in prefix, marked stable
+
+    # Simulate entry LRU turnover: the compressed entry disappears.
+    h = cache.content_hash(original)
+    with cache._lock:
+        cache._cache.pop(h, None)
+
+    # Without marking, the frozen count would collapse to 2 here; the
+    # stable-hash record keeps the position frozen.
+    assert cache.compute_frozen_count(messages) == 3

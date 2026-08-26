@@ -1709,14 +1709,14 @@ class AnthropicHandlerMixin:
                         # requests. The walker has been removed; trust
                         # `prefix_tracker` clamped by `compute_frozen_count`.
                         from headroom.proxy.session_engine import (
-                            FREEZE_POLICY_PROXY,
+                            FREEZE_POLICY_CONFIRMED_CLAMP,
                             prepare_turn,
                         )
 
                         _prep = prepare_turn(
                             comp_cache,
                             messages,
-                            policy=FREEZE_POLICY_PROXY,
+                            policy=FREEZE_POLICY_CONFIRMED_CLAMP,
                             tracker_frozen=frozen_message_count,
                         )
                         frozen_message_count = _prep.frozen_message_count

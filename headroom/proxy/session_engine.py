@@ -25,7 +25,7 @@ Freeze policies
 The one deliberate behavioural difference between the modes lives in step 1,
 and it is a *policy parameter*, not a fork of the code:
 
-``FREEZE_POLICY_PROXY`` — ``min(tracker_frozen, cache_count)``.
+``FREEZE_POLICY_CONFIRMED_CLAMP`` — ``min(tracker_frozen, cache_count)``.
     The proxy sees the provider's responses, so ``tracker_frozen`` is the
     provider-confirmed cached prefix (from ``cache_read_input_tokens``).
     Freezing is clamped by BOTH bounds: never past what the provider
@@ -34,10 +34,13 @@ and it is a *policy parameter*, not a fork of the code:
     the local cache can byte-replay (freezing a message whose entry was
     evicted would pass through raw original bytes).
 
-``FREEZE_POLICY_SIDECAR`` — ``max(cache_count, explicit_frozen or 0)``.
-    The sidecar endpoint never sees the provider's response; whatever it
-    previously RETURNED is the provider's cache contract, so every
-    already-returned message must come back byte-identical. Recompressing an
+``FREEZE_POLICY_REPLAYABLE`` — ``max(cache_count, explicit_frozen or 0)``.
+    Freeze everything the local cache can byte-replay. Used by callers with
+    no provider-confirmed count to clamp against: the sidecar ``/v1/compress``
+    endpoint (it never sees the provider's response — whatever it previously
+    RETURNED is the provider's cache contract, so every already-returned
+    message must come back byte-identical), and the OpenAI proxy token path
+    (its tracker feeds cache mode, not token mode). Recompressing an
     already-returned message — even into a *smaller* form — is a bust: the
     drift was observed in practice, and ``overlay_cached_prefix``'s
     non-inflation guard cannot repair a shrunken form (replaying the larger
@@ -48,7 +51,7 @@ and it is a *policy parameter*, not a fork of the code:
     from the caller still wins when larger — the caller may know more about
     the provider cache than local state does.
 
-Why the proxy cannot simply adopt the sidecar posture: the proxy's
+Why the Anthropic proxy path cannot simply adopt the replayable posture: its
 provider-confirmed clamp deliberately KEEPS not-yet-cached content
 compressible, and its overlay inputs (tracker snapshots) are refreshed on
 every response, so drift repair is reliable there. Each posture is correct
@@ -66,10 +69,10 @@ from headroom.cache.prefix_tracker import overlay_cached_prefix
 
 logger = logging.getLogger(__name__)
 
-FREEZE_POLICY_PROXY = "proxy"
-FREEZE_POLICY_SIDECAR = "sidecar"
+FREEZE_POLICY_CONFIRMED_CLAMP = "confirmed_clamp"
+FREEZE_POLICY_REPLAYABLE = "replayable"
 
-_FREEZE_POLICIES = (FREEZE_POLICY_PROXY, FREEZE_POLICY_SIDECAR)
+_FREEZE_POLICIES = (FREEZE_POLICY_CONFIRMED_CLAMP, FREEZE_POLICY_REPLAYABLE)
 
 
 @dataclass(frozen=True)
@@ -114,7 +117,7 @@ def prepare_turn(
     Args:
         comp_cache: the session's ``CompressionCache``.
         messages: the caller's RAW message list (never mutated).
-        policy: ``FREEZE_POLICY_PROXY`` or ``FREEZE_POLICY_SIDECAR`` —
+        policy: ``FREEZE_POLICY_CONFIRMED_CLAMP`` or ``FREEZE_POLICY_REPLAYABLE`` —
             see the module docstring for why they differ.
         tracker_frozen: provider-confirmed frozen count (proxy policy only;
             ``None`` means "nothing confirmed" and freezes 0 there).
@@ -125,7 +128,7 @@ def prepare_turn(
         raise ValueError(f"unknown freeze policy: {policy!r}")
 
     cache_count = comp_cache.compute_frozen_count(messages)
-    if policy == FREEZE_POLICY_PROXY:
+    if policy == FREEZE_POLICY_CONFIRMED_CLAMP:
         # Never freeze past the provider-confirmed prefix, and never past
         # what local state can byte-replay.
         frozen = min(tracker_frozen or 0, cache_count)

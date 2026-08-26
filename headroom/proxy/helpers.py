@@ -1278,6 +1278,20 @@ try:
 except ValueError:
     COMPRESSION_CACHE_TTL_SECONDS = 3900.0
 
+# Entries per session compression cache. 10k covers a single conversation with
+# ~2x headroom even at a 1M-token context (a compressible tool_result is at
+# least a few hundred tokens, so at most ~5k can be live at once). Raise via
+# HEADROOM_COMPRESSION_CACHE_MAX_ENTRIES only for workloads that fan many
+# concurrent conversations into ONE session id (shared fallback ids, heavy
+# subagent fan-out) — entry LRU is hit-refreshed, so an undersized cap shows
+# up as misses on still-live entries, i.e. prefix-cache busts. Floor of 100.
+try:
+    COMPRESSION_CACHE_MAX_ENTRIES = max(
+        100, int(os.environ.get("HEADROOM_COMPRESSION_CACHE_MAX_ENTRIES", "10000"))
+    )
+except ValueError:
+    COMPRESSION_CACHE_MAX_ENTRIES = 10000
+
 
 # ---------------------------------------------------------------------------
 # Compression-failure escape hatch

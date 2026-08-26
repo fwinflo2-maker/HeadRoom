@@ -129,6 +129,7 @@ from headroom.proxy.cost import (
     merge_cost_stats,  # noqa: F401
 )
 from headroom.proxy.helpers import (
+    COMPRESSION_CACHE_MAX_ENTRIES,
     COMPRESSION_CACHE_TTL_SECONDS,
     COMPRESSION_TIMEOUT_SECONDS,  # noqa: F401
     EAGER_PRELOAD_TIMEOUT_SECONDS,
@@ -1671,7 +1672,7 @@ class HeadroomProxy(
                         MAX_COMPRESSION_CACHE_SESSIONS,
                     )
 
-                cache = CompressionCache()
+                cache = CompressionCache(max_entries=COMPRESSION_CACHE_MAX_ENTRIES)
                 self._compression_caches[session_id] = cache
             else:
                 self._compression_caches.move_to_end(session_id)

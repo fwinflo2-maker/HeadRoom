@@ -658,8 +658,7 @@ def test_status_and_stop_reject_a_reused_pid_without_signaling(monkeypatch, tmp_
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     manifest = _python_service_manifest()
     _write_pid("default", 123)
-    pid_states = iter([True, False])
-    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: next(pid_states))
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
     monkeypatch.setattr("headroom.install.runtime.probe_ready", lambda url: False)
     monkeypatch.setattr("headroom.install.runtime._process_identity", lambda pid, current: False)
     monkeypatch.setattr(
@@ -764,7 +763,7 @@ def test_windows_runtime_status_and_stop_use_wmi_identity(monkeypatch, tmp_path:
     monkeypatch.setitem(sys.modules, "psutil", None)
     manifest = _python_service_manifest()
     _write_pid("default", 4321)
-    pid_states = iter([True, False])
+    pid_states = iter([True, False, False])
     monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: next(pid_states))
 
     class Result:
@@ -1090,6 +1089,47 @@ def test_stop_runtime_rejects_unknown_identity(monkeypatch, tmp_path: Path) -> N
     monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
 
     with pytest.raises(RuntimeError, match="identity unknown"):
+        stop_runtime(manifest)
+    assert _read_pid("default") == 4321
+
+
+def test_stop_runtime_rejects_malformed_pid_file(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = _python_service_manifest()
+    pid_file = tmp_path / ".headroom" / "deploy" / "default" / "runner.pid"
+    pid_file.parent.mkdir(parents=True)
+    pid_file.write_text("not-a-pid", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="runner.pid is invalid"):
+        stop_runtime(manifest)
+    assert pid_file.exists()
+
+
+def test_runtime_status_reports_unknown_for_malformed_pid_file(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = _python_service_manifest()
+    pid_file = tmp_path / ".headroom" / "deploy" / "default" / "runner.pid"
+    pid_file.parent.mkdir(parents=True)
+    pid_file.write_text("not-a-pid", encoding="utf-8")
+
+    assert runtime_status(manifest) == "unknown"
+    assert pid_file.exists()
+
+
+def test_stop_runtime_rejects_identity_change_before_clearing_pid(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = _python_service_manifest()
+    _write_pid("default", 4321)
+    identities = iter([True, False])
+    monkeypatch.setattr(
+        "headroom.install.runtime._process_identity", lambda pid, current: next(identities)
+    )
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
+    monkeypatch.setattr("headroom.install.runtime.os.kill", lambda pid, sig: None)
+
+    with pytest.raises(RuntimeError, match="identity changed"):
         stop_runtime(manifest)
     assert _read_pid("default") == 4321
 

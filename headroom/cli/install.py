@@ -230,8 +230,20 @@ def _deactivate_deployment_mutations(
 
 
 def _activate_deployment_mutations(manifest: DeploymentManifest) -> None:
-    manifest.mutations = apply_mutations(manifest)
-    save_manifest(manifest)
+    try:
+        manifest.mutations = apply_mutations(manifest)
+        _save_apply_manifest(manifest)
+    except Exception as exc:
+        if manifest.mutations:
+            try:
+                revert_mutations(manifest)
+            except Exception as rollback_exc:
+                raise RuntimeError(
+                    f"mutation activation failed: {exc}; rollback failed: {rollback_exc}"
+                ) from exc
+            else:
+                manifest.mutations = []
+        raise
 
 
 def _save_apply_manifest(manifest: DeploymentManifest) -> None:
@@ -249,6 +261,16 @@ def _save_recovery_snapshot(manifest: DeploymentManifest, profile: str | None = 
         if profile is not None:
             snapshot.profile = profile
         save_recovery_manifest(snapshot)
+
+
+def _delete_recovery_snapshot(profile: str) -> None:
+    try:
+        delete_recovery_manifest(profile)
+    except Exception as exc:
+        raise click.ClickException(
+            f"Recovery snapshot {recovery_manifest_path(profile)} could not be deleted: {exc}. "
+            "It was retained; resolve the filesystem failure and retry."
+        ) from None
 
 
 def _remove_deployment(manifest: DeploymentManifest) -> None:
@@ -275,8 +297,8 @@ def _remove_deployment(manifest: DeploymentManifest) -> None:
 
 def _restore_deployment(manifest: DeploymentManifest) -> None:
     restored = deepcopy(manifest)
-    restored.artifacts = install_supervisor(restored)
-    save_manifest(restored)
+    restored.artifacts = install_supervisor(restored, start=False)
+    _save_apply_manifest(restored)
     _start_deployment(restored)
     _activate_deployment_mutations(restored)
 
@@ -501,14 +523,18 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
         except Exception:
             active_persistence_failed = True
             raise
-        manifest.artifacts = install_supervisor(manifest)
+        manifest.artifacts = install_supervisor(manifest, start=False)
         try:
             _save_apply_manifest(manifest)
         except Exception:
             active_persistence_failed = True
             raise
         _start_deployment(manifest)
-        _activate_deployment_mutations(manifest)
+        try:
+            _activate_deployment_mutations(manifest)
+        except Exception:
+            active_persistence_failed = True
+            raise
     except Exception as exc:
         cleanup_errors: list[Exception] = []
         try:
@@ -526,12 +552,12 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
                     f"recovery snapshot: {recovery_manifest_path(profile)}; "
                     "restore it after resolving the failure"
                 ) from exc
-            delete_recovery_manifest(profile)
+            _delete_recovery_snapshot(profile)
 
         def _recovery_detail() -> str:
             if recovery_saved:
                 return (
-                    f"; recovery snapshot: {recovery_manifest_path(manifest.profile)}; "
+                    f"; recovery snapshot: {recovery_manifest_path(profile)}; "
                     "remove the new owner before restoring the snapshot"
                 )
             return ""
@@ -558,7 +584,7 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
             ) from exc
         raise click.ClickException(f"Failed to install deployment '{profile}': {exc}") from exc
     if recovery_saved:
-        delete_recovery_manifest(profile)
+        _delete_recovery_snapshot(profile)
 
 
 def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed persistent") -> None:

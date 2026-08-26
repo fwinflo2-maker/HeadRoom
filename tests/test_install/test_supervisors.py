@@ -424,6 +424,32 @@ def test_install_supervisor_darwin_windows_and_unsupported(monkeypatch, tmp_path
         install_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
 
 
+def test_install_supervisor_darwin_prepare_does_not_bootstrap(monkeypatch, tmp_path: Path) -> None:
+    run_script = tmp_path / "run-headroom.sh"
+    monkeypatch.setattr(
+        "headroom.install.supervisors.render_runner_scripts",
+        lambda manifest: [type("Record", (), {"kind": "script", "path": str(run_script)})()],
+    )
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "darwin")
+    monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 123, raising=False)
+    monkeypatch.setattr(
+        "headroom.install.supervisors._macos_launchd_plist",
+        lambda manifest, script, interval=None: (tmp_path / "job.plist", "plist"),
+    )
+    bootstraps: list[list[str]] = []
+    monkeypatch.setattr(
+        "headroom.install.supervisors._bootstrap_with_retry",
+        lambda domain, path, **kwargs: bootstraps.append([domain, str(path)]),
+    )
+    monkeypatch.setattr(
+        "headroom.install.supervisors.run", lambda *args, **kwargs: _LaunchctlResult(0)
+    )
+
+    install_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value), start=False)
+
+    assert bootstraps == []
+
+
 def test_install_supervisor_retries_bootstrap_until_launchd_settles(
     monkeypatch, tmp_path: Path
 ) -> None:

@@ -10,7 +10,7 @@ from click.testing import CliRunner
 
 from headroom.cli import install as inst
 from headroom.cli.main import main
-from headroom.install.models import DeploymentManifest
+from headroom.install.models import DeploymentManifest, ManagedMutation
 from headroom.install.state import load_manifest as load_state_manifest
 
 
@@ -148,7 +148,7 @@ def test_install_apply_starts_service_supervisor(monkeypatch) -> None:
         "headroom.cli.install.apply_mutations",
         lambda deployment: calls.append("apply") or [],
     )
-    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment, **kwargs: [])
     monkeypatch.setattr(
         "headroom.cli.install.save_manifest", lambda deployment: calls.append("save")
     )
@@ -194,7 +194,7 @@ def test_install_apply_announces_windows_service_fallback(monkeypatch) -> None:
     monkeypatch.setattr("headroom.cli.install._is_windows", lambda: True)
     monkeypatch.setattr("headroom.cli.install.build_manifest", lambda **_: Manifest())
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
-    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment, **kwargs: [])
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
@@ -240,7 +240,7 @@ def test_install_apply_forwards_no_http2_to_build_manifest(monkeypatch) -> None:
     monkeypatch.setattr("headroom.cli.install.build_manifest", fake_build_manifest)
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
-    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment, **kwargs: [])
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.start_detached_agent", lambda profile: None)
@@ -275,7 +275,7 @@ def _patch_apply_pipeline(monkeypatch, captured: dict[str, object]):
     monkeypatch.setattr("headroom.cli.install.build_manifest", fake_build_manifest)
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
-    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment, **kwargs: [])
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.start_detached_agent", lambda profile: None)
@@ -397,7 +397,7 @@ def _apply_capturing_build_manifest(monkeypatch) -> dict[str, object]:
     monkeypatch.setattr("headroom.cli.install.build_manifest", fake_build_manifest)
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
-    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment, **kwargs: [])
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.start_detached_agent", lambda profile: None)
@@ -831,7 +831,7 @@ def test_install_apply_accepts_opencode_target(monkeypatch) -> None:
     monkeypatch.setattr("headroom.cli.install.build_manifest", fake_build_manifest)
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
-    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment, **kwargs: [])
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.start_detached_agent", lambda profile: None)
@@ -886,7 +886,9 @@ def test_install_apply_restores_previous_deployment_after_failed_update(monkeypa
     )
     monkeypatch.setattr(
         "headroom.cli.install.install_supervisor",
-        lambda deployment: calls.append(f"supervisor:{','.join(deployment.targets)}") or [],
+        lambda deployment, **kwargs: (
+            calls.append(f"supervisor:{','.join(deployment.targets)}") or []
+        ),
     )
     monkeypatch.setattr(
         "headroom.cli.install.save_manifest",
@@ -958,7 +960,7 @@ def test_install_apply_reports_restore_failure_with_recovery_path(monkeypatch) -
     monkeypatch.setattr(inst, "_save_recovery_snapshot", lambda *args: None)
     monkeypatch.setattr(inst, "_remove_deployment", lambda manifest: None)
     monkeypatch.setattr(inst, "_save_apply_manifest", lambda manifest: None)
-    monkeypatch.setattr(inst, "install_supervisor", lambda manifest: [])
+    monkeypatch.setattr(inst, "install_supervisor", lambda manifest, **kwargs: [])
     monkeypatch.setattr(
         inst,
         "_start_deployment",
@@ -1033,7 +1035,7 @@ def test_install_apply_uses_requested_profile_for_recovery_snapshot(
     monkeypatch.setattr(inst, "load_manifest", lambda profile: previous)
     monkeypatch.setattr(inst, "_remove_deployment", lambda manifest: None)
     monkeypatch.setattr(inst, "_save_apply_manifest", lambda manifest: None)
-    monkeypatch.setattr(inst, "install_supervisor", lambda manifest: [])
+    monkeypatch.setattr(inst, "install_supervisor", lambda manifest, **kwargs: [])
     monkeypatch.setattr(
         inst,
         "_start_deployment",
@@ -1045,6 +1047,123 @@ def test_install_apply_uses_requested_profile_for_recovery_snapshot(
 
     assert (tmp_path / ".headroom" / "deploy" / "requested-profile.recovery.json").exists()
     assert not (tmp_path / ".headroom" / "deploy" / "loaded-profile.recovery.json").exists()
+
+
+def test_restore_deployment_requires_durable_manifest_before_start(monkeypatch) -> None:
+    manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(inst, "install_supervisor", lambda current, **kwargs: [])
+    monkeypatch.setattr(
+        inst,
+        "_save_apply_manifest",
+        lambda current: (_ for _ in ()).throw(OSError("restore manifest busy")),
+    )
+    monkeypatch.setattr(inst, "_start_deployment", lambda current: calls.append("start"))
+
+    with pytest.raises(OSError, match="restore manifest busy"):
+        inst._restore_deployment(manifest)
+    assert calls == []
+
+
+def test_apply_persists_before_darwin_bootstrap_or_start_on_save_failure(monkeypatch) -> None:
+    manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    install_calls: list[bool] = []
+    bootstrap_calls: list[str] = []
+    start_calls: list[str] = []
+    save_calls = 0
+
+    def save(current) -> None:
+        nonlocal save_calls
+        save_calls += 1
+        if save_calls == 2:
+            raise OSError("active manifest busy")
+
+    def install(current, *, start=True):
+        install_calls.append(start)
+        if start:
+            bootstrap_calls.append(current.profile)
+        return []
+
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: None)
+    monkeypatch.setattr(inst, "_save_apply_manifest", save)
+    monkeypatch.setattr(inst, "install_supervisor", install)
+    monkeypatch.setattr(
+        inst, "_start_deployment", lambda current: start_calls.append(current.profile)
+    )
+    monkeypatch.setattr(inst, "_remove_deployment", lambda current: None)
+
+    with pytest.raises(click.ClickException, match="active manifest busy"):
+        inst._apply_manifest(manifest)
+
+    assert install_calls == [False]
+    assert bootstrap_calls == []
+    assert start_calls == []
+
+
+def test_activate_mutations_reverts_side_effects_when_strict_save_fails(monkeypatch) -> None:
+    manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    mutation = ManagedMutation(target="env", kind="shell-block", path="settings")
+    reverted: list[ManagedMutation] = []
+    monkeypatch.setattr(inst, "apply_mutations", lambda current: [mutation])
+    monkeypatch.setattr(
+        inst,
+        "_save_apply_manifest",
+        lambda current: (_ for _ in ()).throw(OSError("manifest busy")),
+    )
+    monkeypatch.setattr(
+        inst, "revert_mutations", lambda current: reverted.extend(current.mutations)
+    )
+
+    with pytest.raises(OSError, match="manifest busy"):
+        inst._activate_deployment_mutations(manifest)
+    assert reverted == [mutation]
+    assert manifest.mutations == []
+
+
+def test_recovery_snapshot_delete_failure_is_actionable(monkeypatch) -> None:
+    monkeypatch.setattr(
+        inst,
+        "delete_recovery_manifest",
+        lambda profile: (_ for _ in ()).throw(OSError("snapshot busy")),
+    )
+
+    with pytest.raises(click.ClickException, match="could not be deleted") as exc:
+        inst._delete_recovery_snapshot("default")
+    assert "snapshot busy" in str(exc.value)
+    assert "retained" in str(exc.value)
 
 
 def test_install_apply_keeps_new_owner_recovery_fail_closed(monkeypatch, tmp_path: Path) -> None:
@@ -1098,7 +1217,7 @@ def test_install_apply_keeps_new_owner_recovery_fail_closed(monkeypatch, tmp_pat
 
     monkeypatch.setattr(inst, "_save_apply_manifest", save_apply)
     monkeypatch.setattr(
-        inst, "install_supervisor", lambda manifest: calls.append("install-new") or []
+        inst, "install_supervisor", lambda manifest, **kwargs: calls.append("install-new") or []
     )
     monkeypatch.setattr(
         inst,
@@ -1155,7 +1274,7 @@ def test_install_apply_keeps_snapshot_when_active_persistence_fails(
     calls: list[str] = []
     monkeypatch.setattr(inst, "load_manifest", lambda profile: previous)
     monkeypatch.setattr(inst, "_remove_deployment", lambda manifest: calls.append("cleanup"))
-    monkeypatch.setattr(inst, "install_supervisor", lambda manifest: [])
+    monkeypatch.setattr(inst, "install_supervisor", lambda manifest, **kwargs: [])
     saves = 0
 
     def fail_active_save(manifest):
@@ -1189,7 +1308,7 @@ def test_install_apply_persists_new_manifest_before_supervisor_install(monkeypat
     monkeypatch.setattr(
         inst,
         "install_supervisor",
-        lambda manifest: (_ for _ in ()).throw(RuntimeError("install failed")),
+        lambda manifest, **kwargs: (_ for _ in ()).throw(RuntimeError("install failed")),
     )
     monkeypatch.setattr(inst, "_remove_deployment", lambda manifest: calls.append("cleanup"))
 
@@ -1203,7 +1322,7 @@ def test_install_apply_without_previous_has_no_recovery_guidance(monkeypatch) ->
     new = SimpleNamespace(profile="default", artifacts=[], mutations=[])
     monkeypatch.setattr(inst, "load_manifest", lambda profile: None)
     monkeypatch.setattr(inst, "_save_apply_manifest", lambda manifest: None)
-    monkeypatch.setattr(inst, "install_supervisor", lambda manifest: [])
+    monkeypatch.setattr(inst, "install_supervisor", lambda manifest, **kwargs: [])
     monkeypatch.setattr(
         inst,
         "_start_deployment",
@@ -1261,7 +1380,7 @@ def test_install_apply_uses_docker_runtime_for_persistent_docker(monkeypatch) ->
     monkeypatch.setattr("headroom.cli.install.build_manifest", lambda **_: Manifest())
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
-    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment, **kwargs: [])
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
     monkeypatch.setattr("headroom.cli.install.runtime_status", lambda deployment: "stopped")
@@ -1328,7 +1447,7 @@ def test_deploy_prefers_docker_when_available(monkeypatch) -> None:
     monkeypatch.setattr("headroom.cli.install.build_manifest", fake_build)
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
-    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment, **kwargs: [])
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
     monkeypatch.setattr("headroom.cli.install.runtime_status", lambda deployment: "stopped")
@@ -1389,7 +1508,7 @@ def test_deploy_prefers_gpu_docker_when_available(monkeypatch) -> None:
     monkeypatch.setattr("headroom.cli.install.build_manifest", fake_build)
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
-    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment, **kwargs: [])
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
     monkeypatch.setattr("headroom.cli.install.runtime_status", lambda deployment: "stopped")
@@ -1438,7 +1557,7 @@ def test_deploy_falls_back_to_detached_python_without_supervisor(monkeypatch) ->
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
     monkeypatch.setattr(
         "headroom.cli.install.install_supervisor",
-        lambda deployment: calls.append(f"supervisor:{deployment.supervisor_kind}") or [],
+        lambda deployment, **kwargs: calls.append(f"supervisor:{deployment.supervisor_kind}") or [],
     )
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)

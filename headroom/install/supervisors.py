@@ -337,7 +337,7 @@ def _register_windows_task(name: str, xml: str) -> None:
             pass
 
 
-def install_supervisor(manifest: DeploymentManifest) -> list[ArtifactRecord]:
+def install_supervisor(manifest: DeploymentManifest, *, start: bool = True) -> list[ArtifactRecord]:
     """Install service/task artifacts for the deployment."""
 
     records = render_runner_scripts(manifest)
@@ -414,7 +414,8 @@ def install_supervisor(manifest: DeploymentManifest) -> list[ArtifactRecord]:
             and manifest.supervisor_kind == SupervisorKind.SERVICE.value
             else f"gui/{os.getuid()}"
         )
-        _bootstrap_with_retry(bootstrap_domain, plist_path)
+        if start:
+            _bootstrap_with_retry(bootstrap_domain, plist_path)
         records.append(ArtifactRecord(kind="plist", path=str(plist_path)))
         return records
 

@@ -236,7 +236,7 @@ def _read_pid(profile: str) -> int | None:
         return None
     try:
         return int(path.read_text().strip())
-    except ValueError:
+    except (OSError, ValueError):
         return None
 
 
@@ -555,6 +555,10 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
 
     pid = _read_pid(manifest.profile)
     if pid is None:
+        if pid_path(manifest.profile).exists():
+            raise RuntimeError(
+                f"Cannot stop deployment '{manifest.profile}': runner.pid is invalid"
+            )
         return
     identity = _process_identity(pid, manifest)
     if identity is None:
@@ -569,8 +573,16 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
         pass
     for _ in range(_STOP_POLL_ATTEMPTS):
         if not pid_alive(pid):
-            _clear_pid(manifest.profile, expected_pid=pid)
-            return
+            if not pid_alive(pid):
+                _clear_pid(manifest.profile, expected_pid=pid)
+                return
+            raise RuntimeError(
+                f"Cannot stop deployment '{manifest.profile}': runtime identity changed"
+            )
+        if _process_identity(pid, manifest) is not True:
+            raise RuntimeError(
+                f"Cannot stop deployment '{manifest.profile}': runtime identity changed"
+            )
         time.sleep(_STOP_POLL_DELAY)
     raise RuntimeError(
         f"Cannot stop deployment '{manifest.profile}': runtime remained alive after SIGTERM"
@@ -635,6 +647,8 @@ def runtime_status(manifest: DeploymentManifest) -> str:
         return "stopped"
     pid = _read_pid(manifest.profile)
     if pid is None:
+        if pid_path(manifest.profile).exists():
+            return "unknown"
         return "stopped"
     # Windows-safe liveness probe: a bare os.kill(pid, 0) here raised WinError 87
     # as a SystemError against the detached agent, crashing status and taking the

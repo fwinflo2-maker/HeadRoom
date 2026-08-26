@@ -85,7 +85,7 @@ def build_install_target_envs(
 def apply_provider_scope_mutations(manifest: DeploymentManifest) -> list[ManagedMutation]:
     """Apply provider-scope mutations owned by provider slices."""
     mutations: list[ManagedMutation] = []
-    tracked = manifest.mutations
+    tracked = getattr(manifest, "mutations", None)
     try:
         for target in manifest.targets:
             handlers = _PROVIDER_SCOPE_HANDLERS.get(target)
@@ -94,7 +94,7 @@ def apply_provider_scope_mutations(manifest: DeploymentManifest) -> list[Managed
             mutation = handlers[0](manifest)
             if mutation is not None:
                 mutations.append(mutation)
-                if tracked is not mutations:
+                if tracked is not None and tracked is not mutations:
                     tracked.append(mutation)
     except Exception as exc:
         rollback_errors: list[Exception] = []
@@ -104,7 +104,7 @@ def apply_provider_scope_mutations(manifest: DeploymentManifest) -> list[Managed
             except Exception as rollback_exc:
                 rollback_errors.append(rollback_exc)
             else:
-                if mutation in tracked:
+                if tracked is not None and mutation in tracked:
                     tracked.remove(mutation)
         if rollback_errors:
             details = "; ".join(str(error) for error in rollback_errors)

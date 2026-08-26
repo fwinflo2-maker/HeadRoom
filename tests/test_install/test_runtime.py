@@ -1006,6 +1006,7 @@ def test_start_stop_wait_and_runtime_status_branches(monkeypatch, tmp_path: Path
         "headroom.install.runtime.os.kill", lambda pid, sig: killed.append((pid, sig))
     )
     monkeypatch.setattr("headroom.install.runtime._process_identity", lambda pid, manifest: True)
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: False)
     stop_runtime(python_manifest)
     assert killed == [(123, signal.SIGTERM)]
     assert _read_pid("default") is None

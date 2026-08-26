@@ -1593,6 +1593,14 @@ WS_FIRST_FRAME_TIMEOUT_SECONDS = 60.0
 # "lossless" would otherwise look like it worked).
 COMPRESS_MODES = ("ccr", "lossy_inline", "lossless_then_lossy")
 
+# Max wait for a sidecar session's turn lock, on the executor. MUST stay
+# well below COMPRESSION_TIMEOUT_SECONDS: with an untimed acquire, a slow
+# turn's 503-driven retries would park executor workers blocked on the lock
+# doing no work, each recording timeout debt toward the compression
+# quarantine. Failing the acquire raises TimeoutError, which maps to the
+# session-mode 503 retry path.
+_SESSION_TURN_LOCK_TIMEOUT_SECONDS = 10.0
+
 
 def _extract_codex_handshake_headers(upstream: Any) -> list[tuple[str, str]]:
     """Return the ``x-codex-*`` headers from an upstream WS handshake response.
@@ -3877,8 +3885,14 @@ class OpenAIHandlerMixin:
             if _final.tokens is not None:
                 optimized_tokens = _final.tokens
 
-        # Guard: if "optimization" inflated tokens, revert to originals
-        if optimized_tokens > original_tokens:
+        # Guard: if "optimization" inflated tokens, revert to originals.
+        # NEVER after the overlay replayed (same exemption as the Anthropic
+        # handler): the replayed prefix is the exact bytes the provider
+        # cached, and reverting to raw originals re-forwards the uncompressed
+        # prefix — trading a 90% read discount for a full cache re-write. The
+        # nominal "inflation" there is an artifact of comparing the cached
+        # (compressed) forwarding against the raw original count.
+        if optimized_tokens > original_tokens and not _final.replayed:
             logger.warning(
                 f"[{request_id}] Optimization inflated tokens "
                 f"({original_tokens} -> {optimized_tokens}), reverting to original messages"
@@ -9834,7 +9848,20 @@ class OpenAIHandlerMixin:
                     prepare_turn,
                 )
 
-                with comp_cache.session_turn_lock:
+                # TIMED acquire, strictly shorter than the executor timeout:
+                # an untimed `with lock:` here lets one slow session's
+                # 503-driven retries park executor workers doing no work —
+                # each blocked worker records timeout debt and can arm the
+                # compression quarantine for ALL traffic. Failing fast maps
+                # to the same TimeoutError → session-mode 503 → retry path.
+                if not comp_cache.session_turn_lock.acquire(
+                    timeout=_SESSION_TURN_LOCK_TIMEOUT_SECONDS
+                ):
+                    raise TimeoutError(
+                        f"session turn lock busy for {session_id!r} "
+                        "(a previous turn for this session is still running)"
+                    )
+                try:
                     prev_original = session_tracker.get_last_original_messages()
                     prev_returned = session_tracker.get_last_forwarded_messages()
                     prep = prepare_turn(
@@ -9863,7 +9890,21 @@ class OpenAIHandlerMixin:
                         _tok = get_tokenizer(model_name)
                         raw_tokens_before = _tok.count_messages(messages)
                         final_tokens_after = _tok.count_messages(final)
-                    except Exception:  # nosec B110 - fall back to pipeline counts
+                    except Exception as e:
+                        # Fail-open, but LOUD: this fallback reverts to the
+                        # pipeline's counts of the cache-swapped input, which
+                        # silently resurrects the ~0-saved warm-turn bug the
+                        # raw recount exists to fix — per-model, so it can
+                        # hide indefinitely without this log.
+                        logger.warning(
+                            "[compress:%s] raw-payload token recount failed for "
+                            "model %s (%s: %s); savings for this turn are "
+                            "reported against the cache-swapped input",
+                            session_id,
+                            model_name,
+                            type(e).__name__,
+                            e,
+                        )
                         raw_tokens_before = result.tokens_before
                         final_tokens_after = result.tokens_after
                     comp_cache.update_from_result(messages, final)
@@ -9878,6 +9919,8 @@ class OpenAIHandlerMixin:
                         "cached_prefix_replayed": turn.replayed,
                     }
                     return result, final, raw_tokens_before, final_tokens_after, info
+                finally:
+                    comp_cache.session_turn_lock.release()
 
             # Offload the CPU-bound work to the bounded compression executor
             # (mirrors the request handlers above). Running it inline blocked
@@ -9961,6 +10004,32 @@ class OpenAIHandlerMixin:
                     "desyncing replay state)",
                     COMPRESSION_TIMEOUT_SECONDS,
                     session_id,
+                )
+                # Same outcome recording as the stateless timeout path below:
+                # session timeouts hit the largest transcripts, and skipping
+                # the RequestOutcome here under-counts exactly those requests
+                # when dashboards reconcile failure counters against outcomes.
+                _timeout_latency_ms = (time.time() - start_time) * 1000
+                await self._record_request_outcome(
+                    RequestOutcome(
+                        request_id=(
+                            await self._next_request_id()
+                            if hasattr(self, "_next_request_id")
+                            else f"compress_{int(time.time())}"
+                        ),
+                        provider="compress",
+                        model=model if isinstance(model, str) else str(model),
+                        original_tokens=0,
+                        optimized_tokens=0,
+                        output_tokens=0,
+                        tokens_saved=0,
+                        attempted_input_tokens=0,
+                        total_latency_ms=_timeout_latency_ms,
+                        overhead_ms=_timeout_latency_ms,
+                        num_messages=len(messages) if isinstance(messages, list) else 0,
+                        tags=tags,
+                        client=client,
+                    )
                 )
                 return JSONResponse(
                     status_code=503,
@@ -10101,43 +10170,110 @@ class OpenAIHandlerMixin:
 
         # Same NUL-separated namespace as handle_compress: unspoofable from
         # any HTTP header. peek() (never get_or_create) so a flood of novel
-        # session ids cannot grow the tracker store — an unknown session is
-        # answered without leaving a footprint, and the session keeps the
-        # provider its compress call inferred rather than a default from here.
-        tracker = self.session_tracker_store.peek(f"compress\x00{session_id}")
-        last_returned = tracker.get_last_forwarded_messages() if tracker is not None else []
-        if not last_returned:
-            # No compress state for this session: never seen, or the tracker's
-            # session TTL reclaimed it. Note the byte-replay cache lives
-            # longer than the tracker, so a 404 here does NOT mean the next
-            # /v1/compress loses replay — it only means this telemetry landed
-            # nowhere.
+        # session ids cannot grow the tracker store — an unknown or expired
+        # session is answered without leaving a footprint, and the session
+        # keeps the provider its compress call inferred rather than a default
+        # from here.
+        _session_key = f"compress\x00{session_id}"
+        tracker = self.session_tracker_store.peek(_session_key)
+        if tracker is None:
+            return self._compress_usage_unknown_session(session_id)
+        # No create, no LRU bump: the cache is only needed for its turn lock.
+        comp_cache = self._peek_compression_cache(_session_key)
+
+        # A relay whose only present field is zero carries no positive cache
+        # signal (an OpenAI-mapped gateway naturally sends
+        # {"cache_read_input_tokens": 0} with no write field — OpenAI has no
+        # write signal). Applying it would hit update_from_response's
+        # total_cached == 0 branch and wipe the tracker's cached-prefix
+        # state — a "provider-confirmed fully cold" reset the relay never
+        # actually asserted. Only a relay with BOTH fields present may claim
+        # a genuine fully-cold turn.
+        _both_present = (
+            "cache_read_input_tokens" in usage and "cache_creation_input_tokens" in usage
+        )
+        if cache_read + cache_write == 0 and not _both_present:
             return JSONResponse(
-                status_code=404,
+                {
+                    "session_id": session_id,
+                    "frozen_message_count": tracker.get_frozen_message_count(),
+                    "applied": False,
+                    "reason": "no_cache_signal",
+                }
+            )
+
+        def _apply_usage():
+            # Off the event loop (full-transcript deepcopies + per-message
+            # token estimation live in update_from_response), and under the
+            # session turn lock: an unlocked update here races the
+            # executor-side compress turn — record_returned installs turn
+            # N+1's snapshots, then this write would roll them back to turn
+            # N's copies and the next overlay would refuse to replay.
+            lock = comp_cache.session_turn_lock if comp_cache is not None else None
+            if lock is not None and not lock.acquire(timeout=_SESSION_TURN_LOCK_TIMEOUT_SECONDS):
+                raise TimeoutError(f"session turn lock busy for {session_id!r}")
+            try:
+                last_returned = tracker.get_last_forwarded_messages()
+                if not last_returned:
+                    return None
+                tracker.update_from_response(
+                    cache_read_tokens=cache_read,
+                    cache_write_tokens=cache_write,
+                    messages=last_returned,
+                    original_messages=tracker.get_last_original_messages(),
+                )
+                return tracker.get_frozen_message_count()
+            finally:
+                if lock is not None:
+                    lock.release()
+
+        try:
+            frozen_count = await self._run_compression_in_executor(
+                _apply_usage, timeout=COMPRESSION_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            return JSONResponse(
+                status_code=503,
                 content={
                     "error": {
-                        "type": "unknown_session",
+                        "type": "session_busy",
                         "message": (
-                            f"No usage-tracking state for session {session_id!r} "
-                            "(never seen, or expired). Compression replay for the "
-                            "session may still be active; only this telemetry "
-                            "relay landed nowhere."
+                            "A compress turn for this session is in flight; retry the usage relay."
                         ),
                     }
                 },
             )
-
-        tracker.update_from_response(
-            cache_read_tokens=cache_read,
-            cache_write_tokens=cache_write,
-            messages=last_returned,
-            original_messages=tracker.get_last_original_messages(),
-        )
+        if frozen_count is None:
+            return self._compress_usage_unknown_session(session_id)
         return JSONResponse(
             {
                 "session_id": session_id,
-                "frozen_message_count": tracker.get_frozen_message_count(),
+                "frozen_message_count": frozen_count,
+                "applied": True,
             }
+        )
+
+    @staticmethod
+    def _compress_usage_unknown_session(session_id: str):
+        from fastapi.responses import JSONResponse
+
+        # No compress state for this session: never seen, or the tracker's
+        # session TTL reclaimed it. Note the byte-replay cache lives longer
+        # than the tracker, so a 404 here does NOT mean the next /v1/compress
+        # loses replay — only this telemetry relay landed nowhere.
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "type": "unknown_session",
+                    "message": (
+                        f"No usage-tracking state for session {session_id!r} "
+                        "(never seen, or expired). Compression replay for the "
+                        "session may still be active; only this telemetry "
+                        "relay landed nowhere."
+                    ),
+                }
+            },
         )
 
     async def _maybe_compress_passthrough_responses(

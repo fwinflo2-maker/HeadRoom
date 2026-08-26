@@ -57,11 +57,14 @@ for the information its mode actually has.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from headroom.cache.prefix_tracker import overlay_cached_prefix
+
+logger = logging.getLogger(__name__)
 
 FREEZE_POLICY_PROXY = "proxy"
 FREEZE_POLICY_SIDECAR = "sidecar"
@@ -163,6 +166,17 @@ def finalize_turn(
     if replayed and count_tokens is not None:
         try:
             tokens = count_tokens(final)
-        except Exception:  # nosec B110 - keep the pipeline's count on failure
+        except Exception as e:
+            # Fail-open: the turn still forwards, but the caller keeps the
+            # pipeline's count of messages that are NOT being forwarded —
+            # tokens_saved accounting is stale for this turn. Loud, not
+            # silent: a tokenizer that cannot count the replayed form is a
+            # bug worth surfacing even though it must not fail the request.
+            logger.warning(
+                "finalize_turn: token recount of replayed prefix failed "
+                "(%s: %s); keeping the pipeline's pre-overlay count",
+                type(e).__name__,
+                e,
+            )
             tokens = None
     return TurnFinal(messages=final, replayed=replayed, tokens=tokens)

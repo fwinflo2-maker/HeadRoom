@@ -159,16 +159,17 @@ def _start_deployment(manifest: DeploymentManifest, *, assume_start_lock: bool =
             _start_deployment(manifest, assume_start_lock=True)
             return
 
+    docker_owned = runtime_ownership(manifest) == "docker-supervisor"
+    if docker_owned and shutil.which("docker") is None:
+        raise click.ClickException(
+            "Docker is required for this deployment but 'docker' was not found on PATH."
+        )
     status = runtime_status(manifest)
     if status == "running" and probe_ready(manifest.health_url):
         return
     if status == "unknown":
         raise click.ClickException(
             f"Cannot start deployment '{manifest.profile}': runtime identity is unavailable."
-        )
-    if runtime_ownership(manifest) == "docker-supervisor" and shutil.which("docker") is None:
-        raise click.ClickException(
-            "Docker is required for this deployment but 'docker' was not found on PATH."
         )
     if status == "running":
         if wait_ready(
@@ -242,9 +243,12 @@ def _save_apply_manifest(manifest: DeploymentManifest) -> None:
         save_manifest(manifest)
 
 
-def _save_recovery_snapshot(manifest: DeploymentManifest) -> None:
+def _save_recovery_snapshot(manifest: DeploymentManifest, profile: str | None = None) -> None:
     if isinstance(manifest, DeploymentManifest):
-        save_recovery_manifest(manifest)
+        snapshot = deepcopy(manifest)
+        if profile is not None:
+            snapshot.profile = profile
+        save_recovery_manifest(snapshot)
 
 
 def _remove_deployment(manifest: DeploymentManifest) -> None:
@@ -466,19 +470,30 @@ def _capture_passthrough_env(environ: Mapping[str, str]) -> dict[str, str]:
 
 
 def _apply_manifest(manifest: DeploymentManifest) -> None:
+    profile = manifest.profile
     recovery_saved = False
     active_persistence_failed = False
+    existing = None
     try:
-        existing = load_manifest(manifest.profile)
-    except ManifestError as e:
-        # A corrupt existing manifest shouldn't block a fresh apply; overwrite it.
-        click.echo(f"Warning: {e}; overwriting.")
-        existing = None
-    if existing is not None:
-        click.echo(f"Updating existing deployment profile '{manifest.profile}'...")
-        _save_recovery_snapshot(existing)
-        recovery_saved = True
-        _remove_deployment(existing)
+        try:
+            existing = load_manifest(profile)
+        except ManifestError as e:
+            click.echo(f"Warning: {e}; overwriting.")
+        if existing is not None:
+            click.echo(f"Updating existing deployment profile '{profile}'...")
+            _save_recovery_snapshot(existing, profile)
+            recovery_saved = True
+            _remove_deployment(existing)
+    except Exception as exc:
+        recovery_detail = (
+            f" Recovery snapshot: {recovery_manifest_path(profile)} is retained; "
+            "no new owner was started."
+            if recovery_saved
+            else " No new owner was started."
+        )
+        raise click.ClickException(
+            f"Failed to prepare deployment '{profile}': {exc}.{recovery_detail}"
+        ) from exc
 
     try:
         try:
@@ -501,15 +516,17 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
         except Exception as cleanup_exc:
             cleanup_errors.append(cleanup_exc)
         if not cleanup_errors and not active_persistence_failed and existing is not None:
-            click.echo(f"Restoring previous deployment '{manifest.profile}'...")
+            click.echo(f"Restoring previous deployment '{profile}'...")
             try:
                 _restore_deployment(existing)
             except Exception as restore_error:
                 raise click.ClickException(
-                    f"Failed to install deployment '{manifest.profile}': {exc} "
-                    f"(previous deployment restoration also failed: {restore_error})"
+                    f"Failed to install deployment '{profile}': {exc}; "
+                    f"previous deployment restoration also failed: {restore_error}; "
+                    f"recovery snapshot: {recovery_manifest_path(profile)}; "
+                    "restore it after resolving the failure"
                 ) from exc
-            delete_recovery_manifest(existing.profile)
+            delete_recovery_manifest(profile)
 
         def _recovery_detail() -> str:
             if recovery_saved:
@@ -530,20 +547,18 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
         if isinstance(exc, click.ClickException | click.Abort):
             if cleanup_errors or persistence_detail:
                 raise click.ClickException(
-                    f"Failed to install deployment '{manifest.profile}': {exc}"
+                    f"Failed to install deployment '{profile}': {exc}"
                     f"{cleanup_detail}{persistence_detail}{_recovery_detail()}"
                 ) from exc
             raise
         if cleanup_errors or persistence_detail:
             raise click.ClickException(
-                f"Failed to install deployment '{manifest.profile}': {exc}"
+                f"Failed to install deployment '{profile}': {exc}"
                 f"{cleanup_detail}{persistence_detail}{_recovery_detail()}"
             ) from exc
-        raise click.ClickException(
-            f"Failed to install deployment '{manifest.profile}': {exc}"
-        ) from exc
+        raise click.ClickException(f"Failed to install deployment '{profile}': {exc}") from exc
     if recovery_saved:
-        delete_recovery_manifest(manifest.profile)
+        delete_recovery_manifest(profile)
 
 
 def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed persistent") -> None:
@@ -974,7 +989,13 @@ def install_remove(profile: str) -> None:
     """Remove a persistent deployment and undo managed config."""
 
     manifest = _require_manifest(profile)
-    _remove_deployment(manifest)
+    try:
+        _remove_deployment(manifest)
+    except Exception as exc:
+        raise click.ClickException(
+            f"Failed to remove deployment '{profile}': cleanup failed: {exc}. "
+            "The deployment manifest was retained; resolve the cleanup failure and retry."
+        ) from exc
     click.echo(f"Removed deployment '{profile}'.")
 
 

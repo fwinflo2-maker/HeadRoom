@@ -155,22 +155,17 @@ pub fn json_array_of_dicts(n: usize) -> String {
     serde_json::to_string(&rows).expect("fixture array serializes")
 }
 
-/// Whether the Kompress model is cache-resident on this host, asked of
-/// the loader itself rather than by re-deriving HuggingFace cache paths.
+/// Whether the Kompress model is cache-resident and loaded, asked of the
+/// production slot itself: this runs `live_zone`'s blocking warmup — the
+/// proxy's own startup path — and reports what it found, rather than
+/// re-deriving HuggingFace cache paths in a probe that could desync.
 ///
-/// The previous copies of this probe reimplemented `hf_hub_roots` plus
-/// the ONNX candidate list in four places; any change to either would
-/// have desynced the skips from production silently. `from_cache` is
-/// public and is the exact predicate the dispatcher's arm depends on.
-#[cfg(feature = "ml")]
+/// Call it BEFORE dispatching content that should reach the arm.
+/// Dispatch never waits on model construction, so an unwarmed first
+/// dispatch is a NoOp by design — the contract pinned by
+/// `live_zone_kompress_async_init.rs`. Warming here both settles the
+/// slot the dispatch under test will read and prices the probe at one
+/// shared construction instead of a throwaway one.
 pub fn kompress_available() -> bool {
-    use headroom_core::transforms::kompress::{Kompress, KompressConfig};
-
-    matches!(Kompress::from_cache(KompressConfig::default()), Ok(Some(_)))
-}
-
-/// Without the `ml` feature there is no Kompress arm to be available.
-#[cfg(not(feature = "ml"))]
-pub fn kompress_available() -> bool {
-    false
+    headroom_core::transforms::live_zone::warm_live_zone_compressors()
 }

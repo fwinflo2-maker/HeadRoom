@@ -1,14 +1,14 @@
 //! Model-absent NoOp — dedicated integration test file.
 //!
-//! `kompress_cached` (`crates/headroom-core/src/transforms/live_zone.rs`)
-//! memoizes its result behind a process-global `OnceLock`, and the cache
-//! lookup it performs reads `HF_HUB_CACHE` / `HF_HOME` / `HOME` /
-//! `USERPROFILE` on first call. Environment variables are process-global
-//! too, so forcing those four to a cold, empty cache dir must happen in a
-//! test process that does nothing else — any other test in the same
-//! binary that dispatched PlainText content first would freeze the
-//! `OnceLock` against the *ambient* environment instead. That is why this
-//! file holds exactly ONE `#[test]` fn.
+//! The Kompress slot (`crates/headroom-core/src/transforms/live_zone.rs`)
+//! latches process-globally: the first PlainText dispatch starts its
+//! background initialization, whose cache lookup reads `HF_HUB_CACHE` /
+//! `HF_HOME` / `HOME` / `USERPROFILE`. Environment variables are
+//! process-global too, so forcing those four to a cold, empty cache dir
+//! must happen in a test process that does nothing else — any other test
+//! in the same binary that dispatched PlainText content first would
+//! settle the slot against the *ambient* environment instead. That is
+//! why this file holds exactly ONE `#[test]` fn.
 //!
 //! Do NOT add more tests to this file, and do NOT move this test into
 //! `live_zone_dispatch.rs` (see
@@ -46,17 +46,35 @@ fn plain_text_model_absent_is_deterministic_no_op() {
         prose.len()
     );
 
-    let out = dispatch(&body_with_tool_result(&prose).0);
-    let manifest = match &out {
-        LiveZoneOutcome::NoChange { manifest } => manifest,
-        LiveZoneOutcome::Modified { manifest, .. } => panic!(
-            "cache-cold Kompress must not rewrite bytes; got Modified. manifest: {manifest:?}"
-        ),
+    let body = body_with_tool_result(&prose).0;
+    let assert_no_op = |label: &str| {
+        let out = dispatch(&body);
+        let manifest = match &out {
+            LiveZoneOutcome::NoChange { manifest } => manifest,
+            LiveZoneOutcome::Modified { manifest, .. } => panic!(
+                "cache-cold Kompress must not rewrite bytes ({label}); got Modified. \
+                 manifest: {manifest:?}"
+            ),
+        };
+        let action = tool_result_action(manifest);
+        assert!(
+            matches!(action, BlockAction::NoCompressionApplied { .. }),
+            "cache-cold Kompress must degrade to a deterministic NoOp ({label}), \
+             not an error: {action:?}"
+        );
     };
 
-    let action = tool_result_action(manifest);
+    // First dispatch: a NoOp by the non-blocking contract — this call is
+    // what starts the slot's background initialization.
+    assert_no_op("first dispatch, slot unsettled");
+
+    // Settle the slot off the request path and pin WHY it is empty: the
+    // loader found nothing under the forced-cold roots.
     assert!(
-        matches!(action, BlockAction::NoCompressionApplied { .. }),
-        "cache-cold Kompress must degrade to a deterministic NoOp, not an error: {action:?}"
+        !headroom_core::transforms::live_zone::warm_live_zone_compressors(),
+        "the loader reported a model ready under a forced-cold cache root"
     );
+
+    // A post-settle dispatch is the same deterministic NoOp.
+    assert_no_op("post-settle dispatch");
 }

@@ -101,6 +101,9 @@
 
 use std::{collections::HashSet, sync::OnceLock};
 
+#[cfg(feature = "ml")]
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::Value;
@@ -581,29 +584,111 @@ fn code_compressor() -> &'static CodeAwareCompressor {
     INSTANCE.get_or_init(|| CodeAwareCompressor::new(CodeCompressorConfig::default()))
 }
 
-/// Cache-only Kompress singleton. `Kompress::from_cache` never touches the
-/// network — it resolves the tokenizer + ONNX artifact from the local
-/// HuggingFace cache and returns `Ok(None)` when either is missing (a
-/// cold cache), which this function maps to `None` too so the caller can
-/// pass text through untouched. Load failures (a corrupt/unreadable cache
-/// entry) are logged and also degrade to `None` — cache-only means this
-/// path must never block the hot path on a download or a hard error.
+// ─── Kompress model slot: never initialized on the request path ────────
+//
+// `Kompress::from_cache` is cache-only — it never downloads — but it is
+// NOT cheap: it loads the tokenizer and commits a ~261 MB ONNX session,
+// whole seconds of wall time on CPU, and on Windows without
+// `ORT_DYLIB_PATH` the ONNX Runtime init can block indefinitely. A
+// request thread must never pay, or wait on, that construction: the
+// first qualifying dispatch CASes UNINIT → INITIALIZING, hands the build
+// to a background thread, and returns a NoOp; every dispatch during
+// INITIALIZING is a NoOp; READY is terminal and serves the slot — or a
+// deterministic NoOp forever when the cache was cold or the load failed,
+// which is never retried. `warm_live_zone_compressors` runs the same
+// construction synchronously off the request path (proxy startup,
+// tests), so steady-state traffic normally never meets the lazy path.
+
+#[cfg(feature = "ml")]
+mod kompress_slot {
+    pub const UNINIT: u8 = 0;
+    pub const INITIALIZING: u8 = 1;
+    pub const READY: u8 = 2;
+}
+
+#[cfg(feature = "ml")]
+static KOMPRESS_STATE: AtomicU8 = AtomicU8::new(kompress_slot::UNINIT);
+
+/// Written exactly once, by whichever initializer won the CAS; the
+/// `Release` store of `READY` publishes it to `Acquire` readers.
+#[cfg(feature = "ml")]
+static KOMPRESS_INSTANCE: OnceLock<Option<Kompress>> = OnceLock::new();
+
+/// How many times the expensive construction has actually run in this
+/// process. Exactly-once observability; asserted by
+/// `tests/live_zone_kompress_async_init.rs`.
+#[cfg(feature = "ml")]
+static KOMPRESS_INIT_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+#[doc(hidden)]
+#[cfg(feature = "ml")]
+pub fn kompress_init_runs() -> usize {
+    KOMPRESS_INIT_RUNS.load(Ordering::Relaxed)
+}
+
+/// Without the `ml` feature no construction can ever run.
+#[doc(hidden)]
+#[cfg(not(feature = "ml"))]
+pub fn kompress_init_runs() -> usize {
+    0
+}
+
+/// The one construction path. `Ok(None)` on a cold cache and hard errors
+/// both settle the slot as `None` — a deterministic NoOp for the life of
+/// the process, never retried — and the outcome is observable via the
+/// `kompress_init_complete` event's `kompress_ready` field.
+#[cfg(feature = "ml")]
+fn run_kompress_init() {
+    KOMPRESS_INIT_RUNS.fetch_add(1, Ordering::Relaxed);
+    let slot = match Kompress::from_cache(KompressConfig::default()) {
+        Ok(k) => k, // None => HF cache cold: deterministic NoOp downstream
+        Err(e) => {
+            tracing::warn!(event = "kompress_init_failed", error = %e);
+            None
+        }
+    };
+    let ready = slot.is_some();
+    let _ = KOMPRESS_INSTANCE.set(slot);
+    KOMPRESS_STATE.store(kompress_slot::READY, Ordering::Release);
+    tracing::info!(event = "kompress_init_complete", kompress_ready = ready);
+}
+
+/// Non-blocking request-path accessor for the Kompress slot.
 ///
-/// This mirrors the Python router's not-ready → passthrough behavior:
-/// when Kompress isn't loaded, PlainText content flows through unchanged
-/// rather than blocking the request or erroring.
+/// Returns the model only when a completed initialization loaded it;
+/// otherwise `None`, so the caller passes text through untouched. This
+/// mirrors the Python router's not-ready → passthrough behavior, and it
+/// NEVER waits: a virgin slot starts the build on a background thread
+/// and answers `None` for this request.
 #[cfg(feature = "ml")]
 fn kompress_cached() -> Option<&'static Kompress> {
-    static INSTANCE: OnceLock<Option<Kompress>> = OnceLock::new();
-    INSTANCE
-        .get_or_init(|| match Kompress::from_cache(KompressConfig::default()) {
-            Ok(k) => k, // None => HF cache cold: deterministic NoOp downstream
-            Err(e) => {
-                tracing::warn!(event = "kompress_init_failed", error = %e);
-                None
+    match KOMPRESS_STATE.load(Ordering::Acquire) {
+        kompress_slot::READY => KOMPRESS_INSTANCE.get().and_then(|slot| slot.as_ref()),
+        kompress_slot::UNINIT => {
+            if KOMPRESS_STATE
+                .compare_exchange(
+                    kompress_slot::UNINIT,
+                    kompress_slot::INITIALIZING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                if let Err(e) = std::thread::Builder::new()
+                    .name("kompress-init".into())
+                    .spawn(run_kompress_init)
+                {
+                    // The expensive construction never started; give the
+                    // (cheap) spawn another chance on a later dispatch.
+                    KOMPRESS_STATE.store(kompress_slot::UNINIT, Ordering::Release);
+                    tracing::warn!(event = "kompress_init_spawn_failed", error = %e);
+                }
             }
-        })
-        .as_ref()
+            None
+        }
+        // INITIALIZING (or an impossible value): fail open, never wait.
+        _ => None,
+    }
 }
 
 /// Route `text` through Kompress when the model is cache-resident;
@@ -639,6 +724,64 @@ fn kompress_or_noop(_text: &str, content_type: ContentType) -> DispatchResult {
     DispatchResult::NoOp {
         content_type: content_type.as_str(),
     }
+}
+
+/// Eagerly construct every live-zone compressor singleton, off the
+/// request path, and block until the Kompress slot has settled. Returns
+/// whether Kompress is loaded and ready to compress — `false` on a cold
+/// cache, a failed load, or a build without the `ml` feature.
+///
+/// Call it at process startup (the proxy does, from a background thread)
+/// or from tests that need the arm live before dispatching; the request
+/// path itself never blocks either way. Deliberately ignores
+/// `HEADROOM_LIVE_ZONE_DISABLE_ARMS`: the kill switch gates dispatch,
+/// not model residency, so both switch configurations run the identical
+/// warmed process and differ only in the dispatch decision.
+pub fn warm_live_zone_compressors() -> bool {
+    let _ = smart_crusher();
+    let _ = log_compressor();
+    let _ = search_compressor();
+    let _ = diff_compressor();
+    let _ = code_compressor();
+    warm_kompress_blocking()
+}
+
+/// Blocking Kompress warmup: run the construction inline if this thread
+/// wins the slot, otherwise wait for whichever initializer did. A poll
+/// loop rather than `OnceLock::wait`, deliberately: a request thread
+/// that won the CAS but failed to spawn its init thread resets the
+/// state to UNINIT without ever setting the instance, and a waiter
+/// parked on the `OnceLock` would sleep forever through that reset.
+#[cfg(feature = "ml")]
+fn warm_kompress_blocking() -> bool {
+    loop {
+        match KOMPRESS_STATE.load(Ordering::Acquire) {
+            kompress_slot::READY => {
+                return KOMPRESS_INSTANCE.get().is_some_and(|slot| slot.is_some());
+            }
+            kompress_slot::UNINIT => {
+                if KOMPRESS_STATE
+                    .compare_exchange(
+                        kompress_slot::UNINIT,
+                        kompress_slot::INITIALIZING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    run_kompress_init();
+                }
+                // Lost the race to another initializer: re-read the state.
+            }
+            _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+}
+
+/// Without the `ml` feature there is no Kompress slot to warm.
+#[cfg(not(feature = "ml"))]
+fn warm_kompress_blocking() -> bool {
+    false
 }
 
 // ─── Kill switch (env-var arm disable) ─────────────────────────────────
@@ -1586,8 +1729,9 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
         // Cache-only EXTRACTIVE prose compressor (PR-B4): Kompress drops
         // low-salience words and rejoins on single spaces — lossy by
         // design. `kompress_or_noop` degrades to a deterministic no-op
-        // when the model isn't cache-resident (or the `ml` feature is
-        // off) — no network call ever happens on this path.
+        // when the model isn't cache-resident, hasn't finished its
+        // background initialization yet, or the `ml` feature is off —
+        // no network call and no model build ever happens on this path.
         ContentType::PlainText => kompress_or_noop(text, content_type),
         // No HTML compressor on the Rust side; pages are handled by
         // upstream extractors, not the proxy.

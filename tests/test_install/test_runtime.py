@@ -658,7 +658,8 @@ def test_status_and_stop_reject_a_reused_pid_without_signaling(monkeypatch, tmp_
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     manifest = _python_service_manifest()
     _write_pid("default", 123)
-    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
+    pid_states = iter([True, False])
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: next(pid_states))
     monkeypatch.setattr("headroom.install.runtime.probe_ready", lambda url: False)
     monkeypatch.setattr("headroom.install.runtime._process_identity", lambda pid, current: False)
     monkeypatch.setattr(
@@ -763,7 +764,8 @@ def test_windows_runtime_status_and_stop_use_wmi_identity(monkeypatch, tmp_path:
     monkeypatch.setitem(sys.modules, "psutil", None)
     manifest = _python_service_manifest()
     _write_pid("default", 4321)
-    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
+    pid_states = iter([True, False])
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: next(pid_states))
 
     class Result:
         returncode = 0
@@ -806,7 +808,8 @@ def test_windows_wmi_same_port_without_deployment_markers_is_unknown_and_safe(
 
     assert _process_identity(4321, manifest) is None
     assert runtime_status(manifest) == "unknown"
-    stop_runtime(manifest)
+    with pytest.raises(RuntimeError, match="identity unknown"):
+        stop_runtime(manifest)
     assert _read_pid("default") == 4321
 
 
@@ -826,7 +829,8 @@ def test_process_identity_without_supported_metadata_is_unknown_and_safe(
 
     assert _process_identity(4321, manifest) is None
     assert runtime_status(manifest) == "unknown"
-    stop_runtime(manifest)
+    with pytest.raises(RuntimeError, match="identity unknown"):
+        stop_runtime(manifest)
     assert _read_pid("default") == 4321
 
 
@@ -935,7 +939,10 @@ def test_start_stop_wait_and_runtime_status_branches(monkeypatch, tmp_path: Path
     calls: list[list[str]] = []
     monkeypatch.setattr(
         "headroom.install.runtime.subprocess.run",
-        lambda command, **kwargs: calls.append(command) or type("Result", (), {"stdout": ""})(),
+        lambda command, **kwargs: (
+            calls.append(command)
+            or type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        ),
     )
     monkeypatch.setattr(
         "headroom.install.runtime.build_runtime_command",
@@ -1061,7 +1068,10 @@ def test_stop_runtime_for_docker_stops_and_removes_container(monkeypatch) -> Non
 
     monkeypatch.setattr(
         "headroom.install.runtime.subprocess.run",
-        lambda command, **kwargs: calls.append(command),
+        lambda command, **kwargs: (
+            calls.append(command)
+            or type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        ),
     )
 
     stop_runtime(manifest)
@@ -1070,6 +1080,60 @@ def test_stop_runtime_for_docker_stops_and_removes_container(monkeypatch) -> Non
         ["docker", "stop", "headroom-default"],
         ["docker", "rm", "-f", "headroom-default"],
     ]
+
+
+def test_stop_runtime_rejects_unknown_identity(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = _python_service_manifest()
+    _write_pid("default", 4321)
+    monkeypatch.setattr("headroom.install.runtime._process_identity", lambda pid, current: None)
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
+
+    with pytest.raises(RuntimeError, match="identity unknown"):
+        stop_runtime(manifest)
+    assert _read_pid("default") == 4321
+
+
+def test_stop_runtime_keeps_pid_when_sigterm_does_not_stop_process(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = _python_service_manifest()
+    _write_pid("default", 4321)
+    monkeypatch.setattr("headroom.install.runtime._process_identity", lambda pid, current: True)
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
+    monkeypatch.setattr("headroom.install.runtime.os.kill", lambda pid, sig: None)
+    monkeypatch.setattr("headroom.install.runtime.time.sleep", lambda seconds: None)
+
+    with pytest.raises(RuntimeError, match="remained alive"):
+        stop_runtime(manifest)
+    assert _read_pid("default") == 4321
+
+
+def test_stop_runtime_surfaces_docker_stop_failure(monkeypatch) -> None:
+    manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-docker",
+        runtime_kind="docker",
+        supervisor_kind="none",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+        container_name="headroom-default",
+    )
+
+    class Result:
+        returncode = 1
+        stdout = ""
+        stderr = "permission denied"
+
+    monkeypatch.setattr("headroom.install.runtime.run", lambda *args, **kwargs: Result())
+
+    with pytest.raises(RuntimeError, match="docker stop failed"):
+        stop_runtime(manifest)
 
 
 def test_runtime_status_reads_container_and_pid_state(monkeypatch, tmp_path: Path) -> None:

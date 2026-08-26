@@ -172,3 +172,15 @@ def test_delete_manifest_removes_profile_root(monkeypatch, tmp_path: Path) -> No
 
     assert load_manifest("default") is None
     assert not extra_file.parent.exists()
+
+
+def test_delete_manifest_propagates_removal_failure(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / ".headroom" / "deploy" / "default"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(
+        "headroom.install.state.shutil.rmtree", lambda path: (_ for _ in ()).throw(OSError("busy"))
+    )
+
+    with pytest.raises(OSError, match="busy"):
+        delete_manifest("default")

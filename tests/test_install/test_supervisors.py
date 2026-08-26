@@ -680,7 +680,11 @@ def test_remove_supervisor_linux_service_cron_path_and_missing_crontab(
 
     def fake_run(command: list[str], **kwargs):
         calls.append(command)
-        return type("Result", (), {"returncode": 1, "stdout": ""})()
+        if command == ["crontab", "-l"]:
+            return type(
+                "Result", (), {"returncode": 1, "stdout": "", "stderr": "no crontab for user"}
+            )()
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
     monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
     unit_path = tmp_path / "headroom-default.service"
@@ -711,11 +715,35 @@ def test_remove_supervisor_linux_service_cron_path_and_missing_crontab(
     assert calls[-1] == ["crontab", "-l"]
 
 
+def test_remove_supervisor_surfaces_linux_command_failure(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "linux")
+
+    class Result:
+        returncode = 1
+        stdout = ""
+        stderr = "permission denied"
+
+    monkeypatch.setattr("headroom.install.supervisors.run", lambda *args, **kwargs: Result())
+    unit_path = tmp_path / "headroom-default.service"
+    unit_path.write_text("unit", encoding="utf-8")
+    monkeypatch.setattr(
+        "headroom.install.supervisors._linux_service_unit",
+        lambda manifest, script: (unit_path, "unit"),
+    )
+
+    with pytest.raises(click.ClickException, match="systemctl disable --now failed"):
+        remove_supervisor(_manifest(supervisor=SupervisorKind.SERVICE.value))
+    assert unit_path.exists()
+
+
 def test_remove_supervisor_darwin_and_windows(monkeypatch, tmp_path: Path) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr(
         "headroom.install.supervisors.subprocess.run",
-        lambda command, **kwargs: calls.append(command),
+        lambda command, **kwargs: (
+            calls.append(command)
+            or type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        ),
     )
     monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 55, raising=False)
 

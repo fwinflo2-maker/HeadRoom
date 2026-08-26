@@ -157,4 +157,4 @@ def delete_manifest(profile: str = "default") -> None:
 
     root = profile_root(profile)
     if root.exists():
-        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(root)

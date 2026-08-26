@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import click
@@ -8,6 +10,8 @@ from click.testing import CliRunner
 
 from headroom.cli import install as inst
 from headroom.cli.main import main
+from headroom.install.models import DeploymentManifest
+from headroom.install.state import load_manifest as load_state_manifest
 
 
 def test_require_manifest_resolves_single_profile_when_default_missing(monkeypatch):
@@ -601,6 +605,33 @@ def test_remove_deployment_retains_manifest_when_supervisor_stop_fails(monkeypat
     assert calls == ["runtime", "remove-supervisor"]
 
 
+def test_remove_deployment_reports_all_cleanup_failures(monkeypatch) -> None:
+    manifest = SimpleNamespace(profile="default", mutations=[object()])
+    monkeypatch.setattr(
+        inst,
+        "_deactivate_deployment_mutations",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("mutation failed")),
+    )
+    monkeypatch.setattr(
+        inst,
+        "_stop_deployment",
+        lambda current: (_ for _ in ()).throw(RuntimeError("runtime failed")),
+    )
+    monkeypatch.setattr(
+        inst,
+        "remove_supervisor",
+        lambda current: (_ for _ in ()).throw(RuntimeError("supervisor failed")),
+    )
+
+    with pytest.raises(RuntimeError) as exc:
+        inst._remove_deployment(manifest)
+
+    message = str(exc.value)
+    assert all(
+        item in message for item in ("mutation failed", "runtime failed", "supervisor failed")
+    )
+
+
 def test_install_start_noops_when_already_healthy(monkeypatch) -> None:
     runner = CliRunner()
     calls: list[str] = []
@@ -878,6 +909,10 @@ def test_install_apply_restores_previous_deployment_after_failed_update(monkeypa
         "headroom.cli.install.delete_manifest",
         lambda profile: calls.append(f"delete:{profile}"),
     )
+    monkeypatch.setattr(
+        "headroom.cli.install.delete_recovery_manifest",
+        lambda profile: calls.append(f"delete-recovery:{profile}"),
+    )
 
     def _start(deployment) -> None:
         calls.append(f"start:{','.join(deployment.targets)}")
@@ -909,18 +944,46 @@ def test_install_apply_restores_previous_deployment_after_failed_update(monkeypa
         "start:codex",
         "apply:codex",
         "save:codex",
+        "delete-recovery:default",
     ]
 
 
-def test_install_apply_keeps_new_owner_recovery_fail_closed(monkeypatch) -> None:
-    previous = SimpleNamespace(
-        profile="default", mutations=["old-mutation"], artifacts=["old-artifact"]
+def test_install_apply_keeps_new_owner_recovery_fail_closed(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    previous = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=["old"],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
     )
-    new = SimpleNamespace(profile="default", artifacts=[], mutations=[])
+    new = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=["new"],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
     calls: list[str] = []
 
     monkeypatch.setattr(inst, "load_manifest", lambda profile: previous)
-    monkeypatch.setattr(inst, "_save_recovery_snapshot", lambda manifest: calls.append("snapshot"))
+    real_save_recovery = inst._save_recovery_snapshot
+
+    def save_recovery(manifest):
+        real_save_recovery(manifest)
+        calls.append("snapshot")
+
+    monkeypatch.setattr(inst, "_save_recovery_snapshot", save_recovery)
 
     def remove(manifest):
         calls.append("remove-new" if manifest is new else "remove-old")
@@ -928,7 +991,13 @@ def test_install_apply_keeps_new_owner_recovery_fail_closed(monkeypatch) -> None
             raise RuntimeError("new deployment cleanup failed")
 
     monkeypatch.setattr(inst, "_remove_deployment", remove)
-    monkeypatch.setattr(inst, "_save_apply_manifest", lambda manifest: calls.append("save-new"))
+    real_save_apply = inst._save_apply_manifest
+
+    def save_apply(manifest):
+        real_save_apply(manifest)
+        calls.append("save-new")
+
+    monkeypatch.setattr(inst, "_save_apply_manifest", save_apply)
     monkeypatch.setattr(
         inst, "install_supervisor", lambda manifest: calls.append("install-new") or []
     )
@@ -951,6 +1020,65 @@ def test_install_apply_keeps_new_owner_recovery_fail_closed(monkeypatch) -> None
     assert "recovery snapshot" in message
     assert "remove the new owner before restoring the snapshot" in message
     assert calls == ["snapshot", "remove-old", "save-new", "install-new", "save-new", "remove-new"]
+    assert load_state_manifest("default") is not None
+    recovery = tmp_path / ".headroom" / "deploy" / "default.recovery.json"
+    assert json.loads(recovery.read_text(encoding="utf-8"))["targets"] == ["old"]
+
+
+def test_install_apply_keeps_snapshot_when_active_persistence_fails(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    previous = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=["old"],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    new = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=["new"],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: previous)
+    monkeypatch.setattr(inst, "_remove_deployment", lambda manifest: calls.append("cleanup"))
+    monkeypatch.setattr(inst, "install_supervisor", lambda manifest: [])
+    saves = 0
+
+    def fail_active_save(manifest):
+        nonlocal saves
+        saves += 1
+        if saves == 1:
+            inst.save_manifest_strict(manifest)
+            return
+        raise OSError("active manifest busy")
+
+    monkeypatch.setattr(inst, "_save_apply_manifest", fail_active_save)
+    monkeypatch.setattr(inst, "_restore_deployment", lambda manifest: calls.append("restore"))
+    monkeypatch.setattr(inst, "delete_recovery_manifest", lambda profile: calls.append("delete"))
+
+    with pytest.raises(click.ClickException) as exc:
+        inst._apply_manifest(new)
+
+    assert "active manifest persistence failed" in str(exc.value)
+    assert "recovery snapshot:" in str(exc.value)
+    assert calls == ["cleanup", "cleanup"]
+    assert load_state_manifest("default") is not None
+    assert (tmp_path / ".headroom" / "deploy" / "default.recovery.json").exists()
 
 
 def test_install_apply_persists_new_manifest_before_supervisor_install(monkeypatch) -> None:
@@ -970,6 +1098,30 @@ def test_install_apply_persists_new_manifest_before_supervisor_install(monkeypat
         inst._apply_manifest(new)
 
     assert calls == ["save", "cleanup"]
+
+
+def test_install_apply_without_previous_has_no_recovery_guidance(monkeypatch) -> None:
+    new = SimpleNamespace(profile="default", artifacts=[], mutations=[])
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: None)
+    monkeypatch.setattr(inst, "_save_apply_manifest", lambda manifest: None)
+    monkeypatch.setattr(inst, "install_supervisor", lambda manifest: [])
+    monkeypatch.setattr(
+        inst,
+        "_start_deployment",
+        lambda manifest: (_ for _ in ()).throw(click.ClickException("startup failed")),
+    )
+    monkeypatch.setattr(
+        inst,
+        "_remove_deployment",
+        lambda manifest: (_ for _ in ()).throw(RuntimeError("cleanup failed")),
+    )
+
+    with pytest.raises(click.ClickException) as exc:
+        inst._apply_manifest(new)
+
+    message = str(exc.value)
+    assert "startup failed" in message and "cleanup failed" in message
+    assert "recovery snapshot" not in message
 
 
 def test_install_start_rejects_task_lifecycle(monkeypatch) -> None:

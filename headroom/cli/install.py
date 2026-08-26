@@ -200,7 +200,7 @@ def _start_deployment(manifest: DeploymentManifest, *, assume_start_lock: bool =
 
 
 def _stop_deployment(manifest: DeploymentManifest) -> None:
-    supervisor_error: Exception | None = None
+    errors: list[tuple[str, Exception]] = []
     if manifest.supervisor_kind in {
         SupervisorKind.SERVICE.value,
         SupervisorKind.TASK.value,
@@ -208,12 +208,13 @@ def _stop_deployment(manifest: DeploymentManifest) -> None:
         try:
             stop_supervisor(manifest)
         except Exception as exc:
-            supervisor_error = exc
+            errors.append(("supervisor stop", exc))
     try:
         stop_runtime(manifest)
-    finally:
-        if supervisor_error is not None:
-            raise supervisor_error
+    except Exception as exc:
+        errors.append(("runtime stop", exc))
+    if errors:
+        raise RuntimeError("; ".join(f"{phase}: {error}" for phase, error in errors))
 
 
 def _deactivate_deployment_mutations(
@@ -247,22 +248,25 @@ def _save_recovery_snapshot(manifest: DeploymentManifest) -> None:
 
 
 def _remove_deployment(manifest: DeploymentManifest) -> None:
-    cleanup_error: Exception | None = None
+    errors: list[tuple[str, Exception]] = []
     try:
         _deactivate_deployment_mutations(manifest, persist_manifest=False)
     except Exception as exc:
-        cleanup_error = exc
+        errors.append(("mutation cleanup", exc))
     try:
         _stop_deployment(manifest)
     except Exception as exc:
-        cleanup_error = cleanup_error or exc
+        errors.append(("owner stop", exc))
     try:
         remove_supervisor(manifest)
     except Exception as exc:
-        cleanup_error = cleanup_error or exc
-    if cleanup_error is not None:
-        raise cleanup_error
-    delete_manifest(manifest.profile)
+        errors.append(("supervisor removal", exc))
+    if errors:
+        raise RuntimeError("; ".join(f"{phase}: {error}" for phase, error in errors))
+    try:
+        delete_manifest(manifest.profile)
+    except Exception as exc:
+        raise RuntimeError(f"manifest removal: {exc}") from exc
 
 
 def _restore_deployment(manifest: DeploymentManifest) -> None:
@@ -463,6 +467,7 @@ def _capture_passthrough_env(environ: Mapping[str, str]) -> dict[str, str]:
 
 def _apply_manifest(manifest: DeploymentManifest) -> None:
     recovery_saved = False
+    active_persistence_failed = False
     try:
         existing = load_manifest(manifest.profile)
     except ManifestError as e:
@@ -476,18 +481,26 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
         _remove_deployment(existing)
 
     try:
-        _save_apply_manifest(manifest)
+        try:
+            _save_apply_manifest(manifest)
+        except Exception:
+            active_persistence_failed = True
+            raise
         manifest.artifacts = install_supervisor(manifest)
-        _save_apply_manifest(manifest)
+        try:
+            _save_apply_manifest(manifest)
+        except Exception:
+            active_persistence_failed = True
+            raise
         _start_deployment(manifest)
         _activate_deployment_mutations(manifest)
     except Exception as exc:
-        cleanup_error: Exception | None = None
+        cleanup_errors: list[Exception] = []
         try:
             _remove_deployment(manifest)
         except Exception as cleanup_exc:
-            cleanup_error = cleanup_exc
-        if cleanup_error is None and existing is not None:
+            cleanup_errors.append(cleanup_exc)
+        if not cleanup_errors and not active_persistence_failed and existing is not None:
             click.echo(f"Restoring previous deployment '{manifest.profile}'...")
             try:
                 _restore_deployment(existing)
@@ -497,29 +510,40 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
                     f"(previous deployment restoration also failed: {restore_error})"
                 ) from exc
             delete_recovery_manifest(existing.profile)
-        elif cleanup_error is None and recovery_saved:
-            delete_recovery_manifest(manifest.profile)
-        # Surface non-Click errors (OSError, CalledProcessError, ...) as a clean
-        # message rather than a raw traceback; Click errors pass through as-is.
+
+        def _recovery_detail() -> str:
+            if recovery_saved:
+                return (
+                    f"; recovery snapshot: {recovery_manifest_path(manifest.profile)}; "
+                    "remove the new owner before restoring the snapshot"
+                )
+            return ""
+
+        cleanup_detail = ""
+        if cleanup_errors:
+            cleanup_detail = "; cleanup also failed: " + " | ".join(map(str, cleanup_errors))
+        persistence_detail = (
+            "; active manifest persistence failed; keep the recovery snapshot"
+            if active_persistence_failed and recovery_saved
+            else ""
+        )
         if isinstance(exc, click.ClickException | click.Abort):
-            if cleanup_error is not None:
+            if cleanup_errors or persistence_detail:
                 raise click.ClickException(
-                    f"Failed to install deployment '{manifest.profile}': {exc} "
-                    f"(cleanup also failed: {cleanup_error}; recovery snapshot: "
-                    f"{recovery_manifest_path(manifest.profile)}; remove the new owner "
-                    "before restoring the snapshot)"
+                    f"Failed to install deployment '{manifest.profile}': {exc}"
+                    f"{cleanup_detail}{persistence_detail}{_recovery_detail()}"
                 ) from exc
             raise
-        if cleanup_error is not None:
+        if cleanup_errors or persistence_detail:
             raise click.ClickException(
-                f"Failed to install deployment '{manifest.profile}': {exc} "
-                f"(cleanup also failed: {cleanup_error}; recovery snapshot: "
-                f"{recovery_manifest_path(manifest.profile)}; remove the new owner "
-                "before restoring the snapshot)"
+                f"Failed to install deployment '{manifest.profile}': {exc}"
+                f"{cleanup_detail}{persistence_detail}{_recovery_detail()}"
             ) from exc
         raise click.ClickException(
             f"Failed to install deployment '{manifest.profile}': {exc}"
         ) from exc
+    if recovery_saved:
+        delete_recovery_manifest(manifest.profile)
 
 
 def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed persistent") -> None:

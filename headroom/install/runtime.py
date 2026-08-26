@@ -21,6 +21,9 @@ from .models import DeploymentManifest, InstallPreset, RuntimeKind, SupervisorKi
 from .paths import log_path, pid_path, profile_root
 from .state import load_manifest
 
+_STOP_POLL_ATTEMPTS = 30
+_STOP_POLL_DELAY = 0.1
+
 # Inside the container the proxy must listen on every interface so the
 # host-side published port (127.0.0.1:<port>) can reach it.
 CONTAINER_BIND_HOST = "0.0.0.0"  # noqa: S104 — container-internal bind, published only on 127.0.0.1
@@ -523,11 +526,12 @@ def start_persistent_docker(manifest: DeploymentManifest) -> None:
         manifest.container_name,
         *command[5:],  # drop initial `docker run --rm --name ...`
     ]
-    run(
+    remove = run(
         ["docker", "rm", "-f", manifest.container_name],
         capture_output=True,
         text=True,
     )
+    _require_docker_success(remove, "docker rm")
     subprocess.run(docker_cmd, check=True)
 
 
@@ -535,16 +539,18 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
     """Stop the raw runtime for the deployment."""
 
     if runtime_ownership(manifest) == "docker-supervisor":
-        run(
+        stop = run(
             ["docker", "stop", manifest.container_name],
             capture_output=True,
             text=True,
         )
-        run(
+        _require_docker_success(stop, "docker stop")
+        remove = run(
             ["docker", "rm", "-f", manifest.container_name],
             capture_output=True,
             text=True,
         )
+        _require_docker_success(remove, "docker rm")
         return
 
     pid = _read_pid(manifest.profile)
@@ -552,7 +558,7 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
         return
     identity = _process_identity(pid, manifest)
     if identity is None:
-        return
+        raise RuntimeError(f"Cannot stop deployment '{manifest.profile}': runtime identity unknown")
     if not identity:
         _clear_pid(manifest.profile, expected_pid=pid)
         return
@@ -561,7 +567,28 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
     except (OSError, SystemError):
         # SystemError covers the Windows WinError 87 surfacing described in #1544.
         pass
-    _clear_pid(manifest.profile, expected_pid=pid)
+    for _ in range(_STOP_POLL_ATTEMPTS):
+        if not pid_alive(pid):
+            _clear_pid(manifest.profile, expected_pid=pid)
+            return
+        time.sleep(_STOP_POLL_DELAY)
+    raise RuntimeError(
+        f"Cannot stop deployment '{manifest.profile}': runtime remained alive after SIGTERM"
+    )
+
+
+def _command_output(result: Any) -> str:
+    return str(
+        getattr(result, "stderr", "") or getattr(result, "stdout", "") or "unknown error"
+    ).strip()
+
+
+def _require_docker_success(result: Any, operation: str) -> None:
+    if result.returncode == 0:
+        return
+    if result.returncode == 1 and "no such container" in _command_output(result).lower():
+        return
+    raise RuntimeError(f"{operation} failed: {_command_output(result)}")
 
 
 def wait_ready(

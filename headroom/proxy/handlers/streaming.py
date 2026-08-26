@@ -1215,6 +1215,7 @@ class StreamingMixin:
                 StreamUsageGuard,
                 believed_context_limit,
                 context_guard_enabled,
+                credential_scope_from_headers,
                 effective_context_limit,
             )
 
@@ -1222,15 +1223,26 @@ class StreamingMixin:
                 if context_guard_enabled():
                     _guard_model_limit = self.anthropic_provider.get_context_limit(model)
                     _guard_beta = headers.get("anthropic-beta")
+                    _guard_scope = credential_scope_from_headers(headers)
                     context_guard = StreamUsageGuard(
                         believed_limit=believed_context_limit(_guard_model_limit, _guard_beta),
                         effective_limit=effective_context_limit(
-                            model, _guard_model_limit, _guard_beta
+                            model, _guard_model_limit, _guard_beta, scope=_guard_scope
                         ),
                         request_id=request_id,
                     )
             except Exception:
                 logger.debug("context_guard setup skipped", exc_info=True)
+
+        def _drain_context_guard() -> bytes:
+            """Held-back guard bytes, once. Safe to call on any exit path."""
+            if context_guard is None:
+                return b""
+            try:
+                return context_guard.flush()
+            except Exception:
+                logger.debug("context_guard flush skipped", exc_info=True)
+                return b""
 
         headers = await apply_copilot_api_auth(headers, url=url)
         start_time = time.time()
@@ -1473,9 +1485,22 @@ class StreamingMixin:
                 await upstream_response.aclose()
 
             if provider == "anthropic" and upstream_response.status_code == 400:
-                from headroom.proxy.context_guard import note_prompt_too_long
+                # Diagnostic only: whatever it makes of the body, the client
+                # still gets the upstream error below.
+                try:
+                    from headroom.proxy.context_guard import (
+                        credential_scope_from_headers,
+                        note_prompt_too_long,
+                    )
 
-                note_prompt_too_long(model, headers.get("anthropic-beta"), error_content)
+                    note_prompt_too_long(
+                        model,
+                        headers.get("anthropic-beta"),
+                        error_content,
+                        scope=credential_scope_from_headers(headers),
+                    )
+                except Exception:
+                    logger.debug("context_guard: limit learning skipped", exc_info=True)
 
             if _codex_wire_debug:
                 _error_text: str | None = None
@@ -1658,10 +1683,12 @@ class StreamingMixin:
 
                 # A stream that ended before its first complete event may
                 # leave held-back bytes in the context guard — release them.
-                if context_guard is not None:
-                    guarded_tail = context_guard.flush()
-                    if guarded_tail:
-                        yield guarded_tail
+                # Every exit does this, including the error paths below: bytes
+                # the guard is holding are bytes the upstream already sent, and
+                # dropping them silently truncates the client's stream.
+                guarded_tail = _drain_context_guard()
+                if guarded_tail:
+                    yield guarded_tail
 
                 # Memory tool handling after stream completes
                 # Chunks were already yielded in real-time above, so we only
@@ -1747,6 +1774,9 @@ class StreamingMixin:
 
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
                 logger.error(f"[{request_id}] Connection error to upstream API: {e}")
+                guarded_tail = _drain_context_guard()
+                if guarded_tail:
+                    yield guarded_tail
                 error_event = {
                     "type": "error",
                     "error": {
@@ -1757,10 +1787,16 @@ class StreamingMixin:
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
             except httpx.HTTPStatusError as e:
                 logger.error(f"[{request_id}] HTTP error from upstream API: {e}")
+                guarded_tail = _drain_context_guard()
+                if guarded_tail:
+                    yield guarded_tail
                 # Forward the upstream error response
                 yield e.response.content
             except Exception as e:
                 logger.error(f"[{request_id}] Unexpected streaming error: {e}")
+                guarded_tail = _drain_context_guard()
+                if guarded_tail:
+                    yield guarded_tail
                 error_event = {
                     "type": "error",
                     "error": {"type": "api_error", "message": str(e)},

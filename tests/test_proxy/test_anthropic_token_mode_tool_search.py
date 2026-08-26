@@ -182,6 +182,28 @@ class _ReplacementExtension:
         return event
 
 
+class _ProviderHistoryMutationExtension:
+    def __init__(self) -> None:
+        self.stages: list[PipelineStage] = []
+
+    def on_pipeline_event(self, event: Any) -> Any:
+        if event.messages is not None:
+            self.stages.append(event.stage)
+            replaced = copy.deepcopy(event.messages)
+            provider_blocks = [
+                block
+                for message in replaced
+                for block in message.get("content", [])
+                if block.get("type") in {"server_tool_use", "tool_search_tool_result"}
+            ]
+            provider_blocks[0]["id"] = "mutated-id"
+            provider_blocks[0]["input"]["pattern"] = "mutated"
+            provider_blocks[1]["tool_use_id"] = "mutated-tool-use-id"
+            provider_blocks[1]["content"]["tool_references"][0]["tool_name"] = "mutated"
+            event.messages = replaced
+        return event
+
+
 def test_route_contract_preserves_tools_and_nested_history_while_compressing() -> None:
     inbound = _body(result=_workitems())
     with _client() as client:
@@ -207,6 +229,10 @@ def test_replacement_attempts_cannot_replace_active_tools() -> None:
 
         def on_request(self, ctx: TurnContext) -> None:
             ctx.tools = [{"name": "hook-replacement"}]
+            ctx.messages[0]["content"][0]["input"]["pattern"] = "hook-mutated"
+            ctx.messages[0]["content"][1]["content"]["tool_references"][0]["tool_name"] = (
+                "hook-mutated"
+            )
 
     register_turn_hook(Hook())
     inbound = _body(result=_workitems())
@@ -214,6 +240,7 @@ def test_replacement_attempts_cannot_replace_active_tools() -> None:
         client.app.state.proxy.pipeline_extensions._extensions = [_ReplacementExtension()]
         outbound, _ = _capture(client, inbound)
     assert outbound["tools"] == inbound["tools"]
+    assert outbound["messages"][0] == inbound["messages"][0]
 
 
 def test_active_route_injection_cannot_add_proxy_tools(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -323,6 +350,35 @@ def test_provider_history_is_unchanged() -> None:
     assert outbound["messages"][0] == inbound["messages"][0]
 
 
+def test_pipeline_history_mutations_restore_nested_provider_blocks() -> None:
+    inbound = _body(result=_workitems())
+    extension = _ProviderHistoryMutationExtension()
+    with _client() as client:
+        client.app.state.proxy.pipeline_extensions._extensions = [extension]
+        outbound, _ = _capture(client, inbound)
+
+    assert outbound["messages"][0]["content"] == inbound["messages"][0]["content"]
+    assert PipelineStage.INPUT_COMPRESSED in extension.stages
+    if PipelineStage.INPUT_ROUTED in extension.stages:
+        assert extension.stages.count(PipelineStage.INPUT_ROUTED) == 1
+
+
+def test_non_list_message_replacement_keeps_replacement_and_provider_history() -> None:
+    class Extension:
+        def on_pipeline_event(self, event: Any) -> Any:
+            if event.stage == PipelineStage.INPUT_RECEIVED:
+                event.messages = [{"role": "user", "content": "replacement"}]
+            return event
+
+    inbound = _body(result=_workitems())
+    with _client() as client:
+        client.app.state.proxy.pipeline_extensions._extensions = [Extension()]
+        outbound, _ = _capture(client, inbound)
+
+    assert outbound["messages"][0]["content"] == inbound["messages"][0]["content"][:2]
+    assert outbound["messages"][-1] == {"role": "user", "content": "replacement"}
+
+
 def test_text_list_tool_result_remains_compressible_and_list_shaped() -> None:
     inbound = _body(result=None)
     inbound["messages"].append(
@@ -361,7 +417,10 @@ def test_continuation_tools_use_locked_snapshot() -> None:
             api_call_fn: Any,
             provider: str,
         ) -> dict[str, Any]:
-            await api_call_fn(messages, [{"name": "replacement"}])
+            mutated = copy.deepcopy(messages)
+            mutated[0]["content"][0]["input"]["pattern"] = "ccr-mutated"
+            mutated[0]["content"][1]["content"]["tool_references"][0]["tool_name"] = "ccr-mutated"
+            await api_call_fn(mutated, [{"name": "replacement"}])
             return response
 
         def residual_ccr_status(self, response: dict[str, Any], provider: str) -> None:
@@ -383,7 +442,53 @@ def test_continuation_tools_use_locked_snapshot() -> None:
         proxy.http_client = FakeHttpClient()
         outbound, _ = _capture(client, inbound)
     assert outbound["tools"] == inbound["tools"]
+    assert outbound["messages"][0] == inbound["messages"][0]
     assert continuation_capture["body"]["tools"] == inbound["tools"]
+    assert continuation_capture["body"]["messages"][0] == inbound["messages"][0]
+
+
+def test_continuation_reapplies_unsupported_history_repair() -> None:
+    inbound = _body(result=_workitems())
+    inbound["tools"] = [
+        tool for tool in inbound["tools"] if tool.get("name") != "WaitForMcpServers"
+    ]
+    continuation_capture: dict[str, Any] = {}
+
+    class FakeCcr:
+        def has_ccr_tool_calls(self, response: dict[str, Any], provider: str) -> bool:
+            return True
+
+        async def handle_response(
+            self,
+            response: dict[str, Any],
+            messages: list[dict[str, Any]],
+            tools: Any,
+            api_call_fn: Any,
+            provider: str,
+        ) -> dict[str, Any]:
+            await api_call_fn(copy.deepcopy(messages), None)
+            return response
+
+        def residual_ccr_status(self, response: dict[str, Any], provider: str) -> None:
+            return None
+
+    class FakeHttpClient:
+        async def post(
+            self, url: str, *, content: bytes, headers: dict[str, str], timeout: Any
+        ) -> httpx.Response:
+            continuation_capture["body"] = json.loads(content)
+            return _response()
+
+        async def aclose(self) -> None:
+            return None
+
+    with _client() as client:
+        proxy = client.app.state.proxy
+        proxy.ccr_response_handler = FakeCcr()
+        proxy.http_client = FakeHttpClient()
+        _capture(client, inbound)
+
+    assert "WaitForMcpServers" not in json.dumps(continuation_capture["body"]["messages"])
 
 
 def test_memory_continuation_uses_locked_snapshot() -> None:
@@ -438,14 +543,21 @@ def test_response_hook_continuation_uses_locked_snapshot() -> None:
             call_model: Any,
         ) -> dict[str, Any]:
             ctx.tools = [{"name": "response-hook-replacement"}]
-            return await call_model([{"role": "user", "content": "reload"}])
+            replacement = copy.deepcopy(ctx.messages)
+            replacement[0]["content"][0]["input"]["pattern"] = "hook-mutated"
+            replacement[0]["content"][1]["content"]["tool_references"][0]["tool_name"] = (
+                "hook-mutated"
+            )
+            replacement.append({"role": "user", "content": "reload"})
+            return await call_model(replacement)
 
     register_turn_hook(ResponseHook())
     with _client() as client:
         outbound, _ = _capture(client, inbound)
 
     assert outbound["tools"] == inbound["tools"]
-    assert outbound["messages"] == [{"role": "user", "content": "reload"}]
+    assert outbound["messages"][0] == inbound["messages"][0]
+    assert outbound["messages"][-1] == {"role": "user", "content": "reload"}
 
 
 def test_active_route_description_compaction_leaves_tools_unchanged(

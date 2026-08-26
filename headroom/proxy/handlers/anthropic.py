@@ -1051,6 +1051,123 @@ class AnthropicHandlerMixin:
                     anthropic_beta=request.headers.get("anthropic-beta"),
                 )
             )
+            _provider_history_snapshot: tuple[
+                tuple[int, int, str | None, str | None, dict[str, Any]], ...
+            ] = ()
+
+            def _restore_provider_history(candidate: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                if not _claude_tool_search_active or not _provider_history_snapshot:
+                    return candidate
+                provider_types = {"server_tool_use", "tool_search_tool_result"}
+                protected_paths = {
+                    (message_index, content_index)
+                    for message_index, content_index, *_ in _provider_history_snapshot
+                }
+                for message_index, _, _, role, _ in sorted(
+                    _provider_history_snapshot,
+                    key=lambda entry: entry[0],
+                    reverse=True,
+                ):
+                    if message_index >= len(candidate):
+                        continue
+                    if isinstance(candidate[message_index].get("content"), list):
+                        continue
+                    candidate.insert(
+                        message_index,
+                        {"role": role or "assistant", "content": []},
+                    )
+                for (
+                    message_index,
+                    content_index,
+                    identity,
+                    role,
+                    frozen_block,
+                ) in _provider_history_snapshot:
+                    block = copy.deepcopy(frozen_block)
+                    found: tuple[int, int] | None = None
+                    if identity is not None:
+                        for current_message_index, message in enumerate(candidate):
+                            content = message.get("content")
+                            if not isinstance(content, list):
+                                continue
+                            for current_content_index, current_block in enumerate(content):
+                                current_identity = (
+                                    current_block.get("id") or current_block.get("tool_use_id")
+                                    if isinstance(current_block, dict)
+                                    else None
+                                )
+                                if (
+                                    isinstance(current_block, dict)
+                                    and current_block.get("type") == block.get("type")
+                                    and current_identity == identity
+                                ):
+                                    found = (current_message_index, current_content_index)
+                                    break
+                            if found is not None:
+                                break
+
+                    if found is not None and found != (message_index, content_index):
+                        found_content = candidate[found[0]]["content"]
+                        del found_content[found[1]]
+                        if found[0] == message_index and found[1] < content_index:
+                            content_index -= 1
+
+                    while len(candidate) <= message_index:
+                        candidate.append({"role": role or "assistant", "content": []})
+                    target_message = candidate[message_index]
+                    target_content = target_message.get("content")
+                    if not isinstance(target_content, list):
+                        candidate.insert(
+                            message_index,
+                            {"role": role or "assistant", "content": []},
+                        )
+                        target_content = candidate[message_index]["content"]
+                    if content_index < len(target_content):
+                        current_block = target_content[content_index]
+                        if (
+                            isinstance(current_block, dict)
+                            and current_block.get("type") in provider_types
+                        ):
+                            target_content[content_index] = block
+                        else:
+                            target_content.insert(content_index, block)
+                    else:
+                        target_content.insert(content_index, block)
+
+                for current_message_index, message in enumerate(candidate):
+                    content = message.get("content")
+                    if not isinstance(content, list):
+                        continue
+                    for current_content_index in range(len(content) - 1, -1, -1):
+                        current_block = content[current_content_index]
+                        if (
+                            isinstance(current_block, dict)
+                            and current_block.get("type") in provider_types
+                            and (current_message_index, current_content_index)
+                            not in protected_paths
+                        ):
+                            del content[current_content_index]
+                return candidate
+
+            for message_index, message in enumerate(messages):
+                content = message.get("content")
+                if not isinstance(content, list):
+                    continue
+                for content_index, block in enumerate(content):
+                    if not isinstance(block, dict) or block.get("type") not in {
+                        "server_tool_use",
+                        "tool_search_tool_result",
+                    }:
+                        continue
+                    _provider_history_snapshot += (
+                        (
+                            message_index,
+                            content_index,
+                            block.get("id") or block.get("tool_use_id"),
+                            message.get("role"),
+                            copy.deepcopy(block),
+                        ),
+                    )
             _locked_tools = copy.deepcopy(raw_tools) if _claude_tool_search_active else None
             pipeline_provider = provider_name
             pipeline_path = request.url.path if upstream_base_url else "/v1/messages"
@@ -1071,8 +1188,11 @@ class AnthropicHandlerMixin:
             )
             if input_event.messages is not None:
                 messages = input_event.messages
+                messages = _restore_provider_history(messages)
                 with stage_timer.measure("deep_copy"):
                     original_client_messages = copy.deepcopy(messages)
+            else:
+                messages = _restore_provider_history(messages)
             if input_event.tools is not None and not _claude_tool_search_active:
                 body["tools"] = input_event.tools
 
@@ -2185,6 +2305,7 @@ class AnthropicHandlerMixin:
                 if routed_event.messages is not None:
                     previous_optimized_messages = optimized_messages
                     optimized_messages = routed_event.messages
+                    optimized_messages = _restore_provider_history(optimized_messages)
                     if routed_event.messages is not previous_optimized_messages:
                         optimized_tokens = tokenizer.count_messages(optimized_messages)
                         tokens_saved = max(0, original_tokens - optimized_tokens)
@@ -2208,6 +2329,7 @@ class AnthropicHandlerMixin:
             if compressed_event.messages is not None:
                 previous_optimized_messages = optimized_messages
                 optimized_messages = compressed_event.messages
+                optimized_messages = _restore_provider_history(optimized_messages)
                 if compressed_event.messages is not previous_optimized_messages:
                     optimized_tokens = tokenizer.count_messages(optimized_messages)
                     tokens_saved = max(0, original_tokens - optimized_tokens)
@@ -2768,6 +2890,7 @@ class AnthropicHandlerMixin:
                 )
                 if remembered_event.messages is not None:
                     optimized_messages = remembered_event.messages
+                    optimized_messages = _restore_provider_history(optimized_messages)
                 if remembered_event.tools is not None and not _claude_tool_search_active:
                     tools = remembered_event.tools
                 if remembered_event.headers is not None:
@@ -2933,6 +3056,7 @@ class AnthropicHandlerMixin:
             previous_presend_messages = optimized_messages
             if presend_event.messages is not None:
                 optimized_messages = presend_event.messages
+                optimized_messages = _restore_provider_history(optimized_messages)
                 body["messages"] = optimized_messages
             if presend_event.tools is not None and not _claude_tool_search_active:
                 tools = self._tools_for_forwarding(
@@ -3063,6 +3187,7 @@ class AnthropicHandlerMixin:
                 run_request_hooks(_req_ctx, stream_safe_only=bool(stream))
                 if _req_ctx.messages is not optimized_messages:
                     optimized_messages = _req_ctx.messages
+                    optimized_messages = _restore_provider_history(optimized_messages)
                     body["messages"] = optimized_messages
                 if _req_ctx.tools is not body.get("tools") and not _claude_tool_search_active:
                     tools = _req_ctx.tools
@@ -3097,8 +3222,17 @@ class AnthropicHandlerMixin:
             # Nothing past this point mutates `body["tools"]` on the outbound path.
             from headroom.proxy.helpers import strip_unsupported_tool_search_blocks
 
+            def _active_continuation_messages(
+                candidate: list[dict[str, Any]],
+            ) -> list[dict[str, Any]]:
+                if not _claude_tool_search_active:
+                    return candidate
+                restored = _restore_provider_history(candidate)
+                repaired, _ = strip_unsupported_tool_search_blocks(restored, _locked_tools)
+                return repaired
+
             _ts_repaired, _ts_stripped = strip_unsupported_tool_search_blocks(
-                body.get("messages"), body.get("tools")
+                _restore_provider_history(body.get("messages")), body.get("tools")
             )
             if _ts_stripped:
                 body["messages"] = _ts_repaired
@@ -4064,6 +4198,7 @@ class AnthropicHandlerMixin:
                             async def api_call_fn(
                                 msgs: list[dict], tls: list[dict] | None
                             ) -> dict[str, Any]:
+                                msgs = _active_continuation_messages(msgs)
                                 continuation_body = {
                                     **body,
                                     "messages": msgs,
@@ -4245,10 +4380,13 @@ class AnthropicHandlerMixin:
                                         "content": tool_results,
                                     }
 
-                                    continuation_messages = optimized_messages + [
-                                        assistant_msg,
-                                        user_msg,
-                                    ]
+                                    continuation_messages = _active_continuation_messages(
+                                        optimized_messages
+                                        + [
+                                            assistant_msg,
+                                            user_msg,
+                                        ]
+                                    )
 
                                     # Make continuation API call
                                     continuation_body = {**body, "messages": continuation_messages}
@@ -4291,6 +4429,7 @@ class AnthropicHandlerMixin:
                             async def _turn_hook_call_model(
                                 hook_messages: list[dict[str, Any]],
                             ) -> dict[str, Any]:
+                                hook_messages = _active_continuation_messages(hook_messages)
                                 continuation_body = {**body, "messages": hook_messages}
                                 continuation_response = await self._retry_request(
                                     "POST",

@@ -113,6 +113,23 @@ def _headers_lower(send: _Send) -> dict[str, str]:
     return {k.lower(): v for k, v in send.headers.items()}
 
 
+def _emitted_providers(anthropic_api_url: str, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Provider labels on the outcomes this request emitted.
+
+    The relabel happens inside ``emit_request_outcome``, which runs in a task
+    created by ``asyncio.shield`` — so this also pins that the flag survives the
+    context copy into that task, which asserting on the flag alone would not.
+    """
+    import headroom.telemetry.session as telemetry_session
+
+    seen: list[str] = []
+    monkeypatch.setattr(
+        telemetry_session, "record_outcome", lambda outcome: seen.append(outcome.provider)
+    )
+    _post(anthropic_api_url, monkeypatch)
+    return seen
+
+
 # --- Copilot target ---------------------------------------------------------
 
 
@@ -144,6 +161,13 @@ def test_buffered_turn_to_copilot_is_flagged_for_attribution(
     assert send.routed_to_copilot is True
 
 
+def test_buffered_turn_to_copilot_is_labeled_copilot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """End of the chain: the outcome that reaches the dashboard says "copilot"."""
+    providers = contextvars.Context().run(lambda: _emitted_providers(COPILOT, monkeypatch))
+
+    assert providers == ["copilot"]
+
+
 # --- non-Copilot target (control) -------------------------------------------
 
 
@@ -157,3 +181,9 @@ def test_anthropic_target_is_left_alone(monkeypatch: pytest.MonkeyPatch) -> None
     # No Copilot credential or handshake headers invented for a non-Copilot host.
     assert headers.get("authorization") != f"Bearer {MINTED}"
     assert "copilot-integration-id" not in headers
+
+
+def test_anthropic_target_is_not_relabeled(monkeypatch: pytest.MonkeyPatch) -> None:
+    providers = contextvars.Context().run(lambda: _emitted_providers(ANTHROPIC, monkeypatch))
+
+    assert providers == ["anthropic"]

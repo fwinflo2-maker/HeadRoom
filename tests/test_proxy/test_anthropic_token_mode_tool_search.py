@@ -379,6 +379,25 @@ def test_non_list_message_replacement_keeps_replacement_and_provider_history() -
     assert outbound["messages"][-1] == {"role": "user", "content": "replacement"}
 
 
+def test_list_message_replacement_preserves_provider_message_role() -> None:
+    class Extension:
+        def on_pipeline_event(self, event: Any) -> Any:
+            if event.stage == PipelineStage.INPUT_RECEIVED:
+                event.messages = [
+                    {"role": "user", "content": copy.deepcopy(event.messages[0]["content"])}
+                ]
+            return event
+
+    inbound = _body(result=_workitems())
+    with _client() as client:
+        client.app.state.proxy.pipeline_extensions._extensions = [Extension()]
+        outbound, _ = _capture(client, inbound)
+
+    assert outbound["messages"][0]["role"] == "assistant"
+    assert outbound["messages"][0]["content"] == inbound["messages"][0]["content"][:2]
+    assert outbound["messages"][-1]["role"] == "user"
+
+
 def test_text_list_tool_result_remains_compressible_and_list_shaped() -> None:
     inbound = _body(result=None)
     inbound["messages"].append(
@@ -420,6 +439,24 @@ def test_continuation_tools_use_locked_snapshot() -> None:
             mutated = copy.deepcopy(messages)
             mutated[0]["content"][0]["input"]["pattern"] = "ccr-mutated"
             mutated[0]["content"][1]["content"]["tool_references"][0]["tool_name"] = "ccr-mutated"
+            fresh_history = [
+                {
+                    "type": "server_tool_use",
+                    "id": "fresh-search",
+                    "name": "tool_search_tool_regex",
+                    "input": {"pattern": "fresh"},
+                },
+                {
+                    "type": "tool_search_tool_result",
+                    "tool_use_id": "fresh-search",
+                    "content": {
+                        "type": "tool_search_tool_search_result",
+                        "tool_references": [{"type": "tool_reference", "tool_name": "work_items"}],
+                    },
+                },
+            ]
+            continuation_capture["fresh_history"] = fresh_history
+            mutated.append({"role": "assistant", "content": fresh_history})
             await api_call_fn(mutated, [{"name": "replacement"}])
             return response
 
@@ -445,6 +482,10 @@ def test_continuation_tools_use_locked_snapshot() -> None:
     assert outbound["messages"][0] == inbound["messages"][0]
     assert continuation_capture["body"]["tools"] == inbound["tools"]
     assert continuation_capture["body"]["messages"][0] == inbound["messages"][0]
+    assert (
+        continuation_capture["body"]["messages"][-1]["content"]
+        == continuation_capture["fresh_history"]
+    )
 
 
 def test_continuation_reapplies_unsupported_history_repair() -> None:

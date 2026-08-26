@@ -1055,7 +1055,11 @@ class AnthropicHandlerMixin:
                 tuple[int, int, str | None, str | None, dict[str, Any]], ...
             ] = ()
 
-            def _restore_provider_history(candidate: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            def _restore_provider_history(
+                candidate: list[dict[str, Any]],
+                *,
+                preserve_extra_provider_blocks: bool = False,
+            ) -> list[dict[str, Any]]:
                 if not _claude_tool_search_active or not _provider_history_snapshot:
                     return candidate
                 provider_types = {"server_tool_use", "tool_search_tool_result"}
@@ -1070,7 +1074,10 @@ class AnthropicHandlerMixin:
                 ):
                     if message_index >= len(candidate):
                         continue
-                    if isinstance(candidate[message_index].get("content"), list):
+                    if (
+                        isinstance(candidate[message_index].get("content"), list)
+                        and candidate[message_index].get("role") == role
+                    ):
                         continue
                     candidate.insert(
                         message_index,
@@ -1134,19 +1141,20 @@ class AnthropicHandlerMixin:
                     else:
                         target_content.insert(content_index, block)
 
-                for current_message_index, message in enumerate(candidate):
-                    content = message.get("content")
-                    if not isinstance(content, list):
-                        continue
-                    for current_content_index in range(len(content) - 1, -1, -1):
-                        current_block = content[current_content_index]
-                        if (
-                            isinstance(current_block, dict)
-                            and current_block.get("type") in provider_types
-                            and (current_message_index, current_content_index)
-                            not in protected_paths
-                        ):
-                            del content[current_content_index]
+                if not preserve_extra_provider_blocks:
+                    for current_message_index, message in enumerate(candidate):
+                        content = message.get("content")
+                        if not isinstance(content, list):
+                            continue
+                        for current_content_index in range(len(content) - 1, -1, -1):
+                            current_block = content[current_content_index]
+                            if (
+                                isinstance(current_block, dict)
+                                and current_block.get("type") in provider_types
+                                and (current_message_index, current_content_index)
+                                not in protected_paths
+                            ):
+                                del content[current_content_index]
                 return candidate
 
             for message_index, message in enumerate(messages):
@@ -3227,7 +3235,10 @@ class AnthropicHandlerMixin:
             ) -> list[dict[str, Any]]:
                 if not _claude_tool_search_active:
                     return candidate
-                restored = _restore_provider_history(candidate)
+                restored = _restore_provider_history(
+                    candidate,
+                    preserve_extra_provider_blocks=True,
+                )
                 repaired, _ = strip_unsupported_tool_search_blocks(restored, _locked_tools)
                 return repaired
 

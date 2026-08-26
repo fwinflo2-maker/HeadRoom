@@ -36,7 +36,47 @@ retrieved chunks, and anything else your agent transmits.
 
 Transport to the provider remains TLS. See
 [Governed knobs](#governed-knobs) for the one setting that relaxes certificate
-validation.
+validation. The trust store itself is configurable: `SSL_CERT_FILE` and
+`REQUESTS_CA_BUNDLE` have **replacement** semantics — set either and only those CAs are
+trusted — while `NODE_EXTRA_CA_CERTS` is **additive**, loading extra roots on top of the
+system store, matching Node.js. First match wins in that order.
+
+### The upstream is partly client-selectable
+
+"Upstream" is not purely operator-configured. The OpenAI-compatible handlers accept an
+`x-headroom-base-url` request header, so a client on the proxy port can choose the
+destination of a single request. That is deliberate — it is how BYOK gateways (LiteLLM,
+Azure, self-hosted vLLM) reach the dedicated handlers instead of generic passthrough —
+and two separate guards bound it.
+
+**Where it may point.** A client-supplied base URL is resolved and rejected if it lands
+on a private, loopback, link-local, or otherwise non-public address: the confused-deputy
+case where the proxy is used to reach cloud metadata (`169.254.169.254`) or RFC1918
+hosts the caller cannot reach directly. NAT64-embedded IPv4 is unwrapped before the
+check, so it cannot be smuggled through an IPv6 literal. A rejected override is
+**ignored rather than fatal** — the request proceeds to the configured upstream and a
+warning is logged. `HEADROOM_ALLOWED_BASE_URLS` (comma-separated hosts or URLs)
+re-permits specific internal endpoints as an explicit operator choice: a bare host
+permits every safe scheme and port on that host, a full URL permits only its exact
+normalized origin. DNS resolution is bounded by `HEADROOM_UPSTREAM_RESOLVE_TIMEOUT_S`
+(3 seconds by default).
+
+**What may ride along with it.** The operator's own `*_extra_headers` secrets — the two
+credential-shaped maps in [the settings store](#the-settings-store) — travel only to a
+host the operator designated. Designated means one of the resolved provider API targets
+(`ANTHROPIC_TARGET_API_URL`, `OPENAI_TARGET_API_URL`, and the Gemini/Vertex/Bedrock/Cloud
+Code equivalents), the default `api.anthropic.com` / `api.openai.com`, or a host listed
+in `HEADROOM_UPSTREAM_ALLOWED_HOSTS`. Matching is exact equality on the *parsed*
+hostname, never the URL string, so neither
+`https://api.anthropic.com@evil.example` nor `https://api.anthropic.com.evil.example`
+matches. An undesignated destination is still proxied — it simply does not receive those
+headers — and the drop is warned once per host rather than once per request.
+
+Read the pair for what it is: it stops a client redirecting the *operator's* stored
+credentials to a host of its choosing, and it stops the proxy being used as an SSRF
+pivot into the local network. Neither guard authenticates the caller. They constrain
+what a request can reach and what it carries, not who is allowed to make one — the same
+boundary described under [Local control surfaces](#local-control-surfaces).
 
 ## Data at rest
 
@@ -74,6 +114,11 @@ maps merged into forwarded requests — the field's own help text gives
 `{"Api-Key": "..."}` as the example. Anything you put there is written to disk in
 plaintext. The GUI masks them on read (`GET /settings` returns a sentinel, not the
 value), but that is a display control, not an at-rest one.
+
+Where these two are *sent* is separately constrained: they are merged only after the
+destination is known, and only for operator-designated hosts. See
+[The upstream is partly client-selectable](#the-upstream-is-partly-client-selectable).
+That bounds the blast radius of the values; it does not change how they are stored.
 
 Two further properties matter for policy:
 
@@ -131,12 +176,22 @@ Partitioning is then governed by `--memory-storage`, which defaults to `project`
 | Mode | Where memories land |
 |---|---|
 | `project` (default) | One DB per resolved workspace, under `<db_path_dir>/memories/projects/<basename>-<hash>/memory.db` |
-| `user` | One DB per `x-headroom-user-id` |
+| `user` | One DB per resolved identity — see the note on `x-headroom-user-id` below |
 | `global` | A single shared DB — the `--memory-db-path` file itself |
 
 `--memory-db-path` (env `HEADROOM_MEMORY_DB_PATH`) sets the `global`-mode file and seeds
 the storage root for `project` mode. Scoping can also be steered per-request with the
-`x-headroom-user-id`, `x-headroom-project-id`, and `x-headroom-cwd` headers.
+`x-headroom-project-id` and `x-headroom-cwd` headers.
+
+`x-headroom-user-id` is treated differently, and the distinction matters for anyone
+reasoning about who can read whose memories. It is a partition **hint, not an
+authenticated identity**, and `resolve_memory_identity` honors it only for loopback
+callers — the single-user local model. Any other caller is bound to a hash of
+`HEADROOM_PROXY_TOKEN`, or failing that the server's OS user, so a network client cannot
+select another user's partition by asserting a header. The check fails closed: a request
+whose peer metadata is missing is not treated as loopback, so unusual ASGI transports
+cannot opt into header trust. Multi-tenant deployments replace the default resolver
+through `set_identity_resolver`; the OSS proxy ships only the single-user default.
 
 For an inventory or a data-deletion procedure, enumerate project-local
 `.headroom/` directories as well as the workspace — memories are the store most likely

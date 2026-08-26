@@ -125,27 +125,63 @@ def test_second_turn_replays_first_turn_bytes() -> None:
         ]
         turn2 = _compress(client, turn2_history, session_id="conv-1")
         assert turn2["messages"][2]["content"] == t1_tool_content
-        assert turn2["messages"][0] == history[0]
+        # The WHOLE turn-1 prefix, not just the tool result: any drifted byte
+        # anywhere in the leading messages is a provider-cache bust.
+        assert turn2["messages"][: len(turn1["messages"])] == turn1["messages"]
         assert turn2["messages"][-1]["content"] == "Now sort them by score."
         assert turn2["session"]["id"] == "conv-1"
 
 
 def test_third_turn_still_byte_stable() -> None:
-    """Stability must hold across N turns, not just one hop."""
+    """The WHOLE returned prefix — every message, byte for byte — must be
+    stable across N turns. Checking only the tool result would let drift in
+    any other message (a mutated plain message, a moved marker) bust the
+    provider cache while the test stayed green.
+    """
     with _make_client() as client:
         history = _big_tool_history()
         turn1 = _compress(client, history, session_id="conv-multi")
-        t1_tool_content = turn1["messages"][2]["content"]
 
         history2 = history + [{"role": "user", "content": "next"}]
-        _compress(client, history2, session_id="conv-multi")
+        turn2 = _compress(client, history2, session_id="conv-multi")
+        # Turn 2's leading messages must be exactly turn 1's returned bytes.
+        assert turn2["messages"][: len(turn1["messages"])] == turn1["messages"]
 
         history3 = history2 + [
             {"role": "assistant", "content": "ok"},
             {"role": "user", "content": "and again"},
         ]
         turn3 = _compress(client, history3, session_id="conv-multi")
-        assert turn3["messages"][2]["content"] == t1_tool_content
+        # And turn 3's leading messages must be exactly turn 2's.
+        assert turn3["messages"][: len(turn2["messages"])] == turn2["messages"]
+
+
+def test_prefix_stable_even_after_tracker_state_loss() -> None:
+    """The overlay's tracker snapshots live shorter (600s session TTL) than
+    the compression cache (3900s). In that window the frozen+swap path is the
+    ONLY protection — this test kills the tracker between turns and demands
+    whole-prefix byte stability from frozen+swap alone.
+    """
+    with _make_client() as client:
+        history = _big_tool_history()
+        turn1 = _compress(client, history, session_id="conv-trackerloss")
+
+        proxy = client.app.state.proxy
+        # Simulate the tracker registry's TTL sweep reclaiming the session
+        # while the compression cache (longer TTL) survives.
+        store = proxy.session_tracker_store
+        removed = [k for k in list(store._trackers) if "conv-trackerloss" in k]
+        for k in removed:
+            del store._trackers[k]
+        assert removed, "tracker was never created for the session"
+        assert any("conv-trackerloss" in k for k in proxy._compression_caches)
+
+        turn2 = _compress(
+            client,
+            history + [{"role": "user", "content": "after tracker loss"}],
+            session_id="conv-trackerloss",
+        )
+        assert turn2["messages"][: len(turn1["messages"])] == turn1["messages"]
 
 
 def test_header_session_id_works() -> None:
@@ -184,11 +220,12 @@ def test_sessions_are_isolated() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# /v1/usage: relayed provider numbers make the freeze authoritative.           #
+# /v1/usage: telemetry relay for sidecar sessions. Deliberately NOT a freeze  #
+# input — freeze stays the locally-replayable bound (see handler docstring).  #
 # --------------------------------------------------------------------------- #
 
 
-def test_usage_feedback_advances_freeze() -> None:
+def test_usage_relay_is_recorded_and_freeze_stays_local() -> None:
     with _make_client() as client:
         history = _big_tool_history()
         _compress(client, history, session_id="conv-usage")
@@ -204,14 +241,42 @@ def test_usage_feedback_advances_freeze() -> None:
             },
         )
         assert resp.status_code == 200, resp.text
+        # The tracker recorded the provider-confirmed prefix (telemetry).
         assert resp.json()["frozen_message_count"] >= 1
 
+        # The next compress freezes from the LOCAL replayable bound, which
+        # covers the whole previously-returned prefix here.
         turn2 = _compress(
             client,
             history + [{"role": "user", "content": "next"}],
             session_id="conv-usage",
         )
         assert turn2["session"]["frozen_message_count"] >= 1
+
+        # An absurdly large confirmed count must never drag freezing past
+        # what local state can actually replay (that would forward raw bytes
+        # for evicted entries — the bust this design refuses).
+        resp2 = client.post(
+            "/v1/usage",
+            json={
+                "session_id": "conv-usage",
+                "usage": {"cache_read_input_tokens": 10_000_000},
+            },
+        )
+        assert resp2.status_code == 200
+        turn3 = _compress(
+            client,
+            history
+            + [
+                {"role": "user", "content": "next"},
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "more"},
+            ],
+            session_id="conv-usage",
+        )
+        # Freeze is capped by message count minus the trailing message — it
+        # can never exceed what exists, regardless of relayed numbers.
+        assert turn3["session"]["frozen_message_count"] < 6
 
 
 def test_usage_unknown_session_is_404() -> None:

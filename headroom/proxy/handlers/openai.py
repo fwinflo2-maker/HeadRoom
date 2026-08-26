@@ -9927,12 +9927,18 @@ class OpenAIHandlerMixin:
                          "cache_creation_input_tokens": N}}
 
         The session-aware ``/v1/compress`` never sees the provider's response
-        (the caller owns routing), so its freeze decisions default to the
-        conservative local bound. A caller that relays the usage numbers it
-        already holds closes that loop: ``update_from_response`` records the
-        provider-confirmed cached prefix — the same authoritative signal the
-        proxy path reads from the response itself. Optional: skipping this
-        call degrades freeze precision, never correctness.
+        (the caller owns routing). This relay feeds the provider-confirmed
+        numbers into the session's tracker — the same signal the proxy path
+        reads from the response itself — powering cache-hit/miss attribution,
+        idle-vs-prefix-change classification, and savings accounting for
+        sidecar sessions.
+
+        Deliberately NOT a freeze input: the compress path freezes exactly the
+        locally-replayable prefix (``compute_frozen_count``), and raising that
+        to a provider-confirmed count could freeze a message whose cache entry
+        was evicted — which would forward raw original bytes and bust the very
+        prefix the count vouched for. Optional: skipping this call costs
+        telemetry fidelity, never correctness.
         """
         from fastapi.responses import JSONResponse
 

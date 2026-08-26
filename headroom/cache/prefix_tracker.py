@@ -965,6 +965,26 @@ class PrefixCacheTracker:
     def get_last_forwarded_messages(self) -> list[dict[str, Any]]:
         return copy.deepcopy(self._last_forwarded_messages)
 
+    def record_returned(
+        self,
+        original_messages: list[dict[str, Any]],
+        returned_messages: list[dict[str, Any]],
+    ) -> None:
+        """Record the compressed form handed back to a compress-only caller.
+
+        Sidecar mode (session-aware ``/v1/compress``): Headroom does not
+        forward upstream, but whatever it RETURNS is what the caller forwards
+        — the same fact ``update_from_response`` records in proxy mode, just
+        captured at return time instead of send time. Only the transcript
+        snapshots and the activity clock move here; frozen-prefix counts are
+        left untouched because no provider response has confirmed anything
+        yet — they advance when the caller relays usage via ``/v1/usage``
+        (``update_from_response``), or stay at their conservative local value.
+        """
+        self._last_activity = time.time()
+        self._last_original_messages = copy.deepcopy(original_messages)
+        self._last_forwarded_messages = copy.deepcopy(returned_messages)
+
     def resolved_cache_ttl_seconds(self) -> int:
         """Effective prompt-cache lifetime for this session's provider."""
         if self.config.cache_ttl_seconds is not None:

@@ -76,13 +76,17 @@ def _compress(client: TestClient, messages: list[dict], **config) -> dict:
 # --------------------------------------------------------------------------- #
 
 
+# The NUL separator makes the namespace unspoofable from any HTTP header.
+SESSION_KEY_PREFIX = "compress\x00"
+
+
 def test_no_session_id_stays_stateless() -> None:
     with _make_client() as client:
         body = _compress(client, _big_tool_history())
         assert "session" not in body
         # And nothing session-shaped leaked into the registry.
         proxy = client.app.state.proxy
-        assert not any(k.startswith("compress:") for k in proxy._compression_caches)
+        assert not any(k.startswith(SESSION_KEY_PREFIX) for k in proxy._compression_caches)
 
 
 def test_invalid_session_id_is_rejected() -> None:
@@ -97,6 +101,36 @@ def test_invalid_session_id_is_rejected() -> None:
                 },
             )
             assert resp.status_code == 400, f"session_id {bad!r} was not rejected"
+
+
+def test_compress_user_messages_rejected_with_session() -> None:
+    """User-message rewrites are not content-addressed, so they cannot be
+    byte-replayed after tracker state expires — the combination is a latent
+    prefix-cache bust and must be refused up front."""
+    with _make_client() as client:
+        resp = client.post(
+            "/v1/compress",
+            json={
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hi"}],
+                "config": {"session_id": "conv-x", "compress_user_messages": True},
+            },
+        )
+        assert resp.status_code == 400
+        assert "compress_user_messages" in resp.json()["error"]["message"]
+
+
+def test_session_key_is_not_spoofable_via_string_prefix() -> None:
+    """A caller passing 'compress:...' (or similar) as its session id must
+    land on a key that no proxy-path header value can also produce."""
+    with _make_client() as client:
+        _compress(client, _big_tool_history(), session_id="compress:sneaky")
+        proxy = client.app.state.proxy
+        keys = [k for k in proxy._compression_caches if "sneaky" in k]
+        assert keys == [f"{SESSION_KEY_PREFIX}compress:sneaky"]
+        # NUL cannot appear in an HTTP header value, so no x-headroom-session-id
+        # on the proxy path can collide with this key.
+        assert all("\x00" in k for k in keys)
 
 
 # --------------------------------------------------------------------------- #
@@ -130,6 +164,11 @@ def test_second_turn_replays_first_turn_bytes() -> None:
         assert turn2["messages"][: len(turn1["messages"])] == turn1["messages"]
         assert turn2["messages"][-1]["content"] == "Now sort them by score."
         assert turn2["session"]["id"] == "conv-1"
+        # Savings must be reported against the RAW payload the caller sent —
+        # the warm turn still saved the caller ~everything turn 1 saved, even
+        # though the pipeline itself only saw the already-swapped input.
+        assert turn2["tokens_saved"] > 0
+        assert turn2["tokens_before"] > turn2["tokens_after"]
 
 
 def test_third_turn_still_byte_stable() -> None:
@@ -184,7 +223,22 @@ def test_prefix_stable_even_after_tracker_state_loss() -> None:
         assert turn2["messages"][: len(turn1["messages"])] == turn1["messages"]
 
 
-def test_header_session_id_works() -> None:
+def test_header_session_id_ignored_by_default() -> None:
+    """Deployments whose gateways stamp x-headroom-session-id on ALL traffic
+    must not silently flip stateless /v1/compress callers into session mode
+    (or blend conversations sharing one header value into one replay state)."""
+    with _make_client() as client:
+        resp = client.post(
+            "/v1/compress",
+            json={"model": "gpt-4o", "messages": _big_tool_history(), "config": {}},
+            headers={"x-headroom-session-id": "conv-header"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert "session" not in resp.json()
+
+
+def test_header_session_id_works_with_env_opt_in(monkeypatch) -> None:
+    monkeypatch.setenv("HEADROOM_COMPRESS_SESSION_FROM_HEADER", "1")
     with _make_client() as client:
         resp = client.post(
             "/v1/compress",
@@ -279,14 +333,38 @@ def test_usage_relay_is_recorded_and_freeze_stays_local() -> None:
         assert turn3["session"]["frozen_message_count"] < 6
 
 
-def test_usage_unknown_session_is_404() -> None:
+def test_usage_unknown_session_is_404_and_leaves_no_footprint() -> None:
     with _make_client() as client:
+        proxy = client.app.state.proxy
+        before = len(proxy.session_tracker_store._trackers)
+        for i in range(20):
+            resp = client.post(
+                "/v1/usage",
+                json={
+                    "session_id": f"never-seen-{i}",
+                    "usage": {"cache_read_input_tokens": 100},
+                },
+            )
+            assert resp.status_code == 404
+            assert resp.json()["error"]["type"] == "unknown_session"
+        # A flood of novel ids must not grow the tracker store (peek, never
+        # get_or_create): each ghost tracker would otherwise live a full TTL.
+        assert len(proxy.session_tracker_store._trackers) == before
+
+
+def test_usage_without_cache_fields_is_rejected_not_treated_as_cold() -> None:
+    """A usage block with NEITHER cache field (e.g. an OpenAI-style
+    {'prompt_tokens': N} relayed verbatim) carries no cache signal. Treating
+    the absent fields as 0 would tell the tracker 'provider confirmed fully
+    cold' and wipe its cached-prefix state on every signal-free relay."""
+    with _make_client() as client:
+        _compress(client, _big_tool_history(), session_id="conv-nosignal")
         resp = client.post(
             "/v1/usage",
-            json={"session_id": "never-seen", "usage": {"cache_read_input_tokens": 100}},
+            json={"session_id": "conv-nosignal", "usage": {"prompt_tokens": 12345}},
         )
-        assert resp.status_code == 404
-        assert resp.json()["error"]["type"] == "unknown_session"
+        assert resp.status_code == 400
+        assert "cache" in resp.json()["error"]["message"]
 
 
 def test_usage_validation() -> None:
@@ -315,14 +393,15 @@ def test_session_state_lives_in_registry_and_survives_eviction() -> None:
         history = _big_tool_history()
         turn1 = _compress(client, history, session_id="conv-ttl")
         proxy = client.app.state.proxy
-        assert "compress:conv-ttl" in proxy._compression_caches
+        _key = f"{SESSION_KEY_PREFIX}conv-ttl"
+        assert _key in proxy._compression_caches
 
         # Simulate the idle-TTL sweep reclaiming the session.
         now = _time.time()
-        proxy._compression_cache_last_seen["compress:conv-ttl"] = now - 999_999
+        proxy._compression_cache_last_seen[_key] = now - 999_999
         proxy._compression_caches_last_cleanup = now - 61
         proxy._get_compression_cache("unrelated")
-        assert "compress:conv-ttl" not in proxy._compression_caches
+        assert _key not in proxy._compression_caches
 
         # A post-eviction turn is fail-open: fresh state, valid response, and
         # the compressed form is reproducible (deterministic pipeline), even

@@ -1269,6 +1269,16 @@ class SessionTrackerStore:
         self._lineage_affinities: dict[str, str | None] = {}
         self._lineage_counter = itertools.count(1)
 
+    def peek(self, session_id: str) -> PrefixCacheTracker | None:
+        """Return the tracker for ``session_id`` if one exists, else None.
+
+        Never creates: lookup paths that must not leave a footprint (e.g. the
+        ``/v1/usage`` unknown-session check, where ``get_or_create`` would let
+        a flood of novel ids grow the store unboundedly within each TTL
+        window) use this instead of :meth:`get_or_create`.
+        """
+        return self._trackers.get(session_id)
+
     def get_or_create(self, session_id: str, provider: str) -> PrefixCacheTracker:
         """Get existing tracker or create a new one for this session."""
         self._maybe_cleanup()

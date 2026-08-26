@@ -187,6 +187,24 @@ def test_verifier_policy_does_not_count_as_an_implementation_reference(
     assert set(module.missing_variables(tmp_path)) == {"ACME_EXTERNAL_SETTING"}
 
 
+def test_verifier_tests_do_not_count_as_implementation_references(tmp_path: Path) -> None:
+    module = _load_module()
+    _write_minimal_project(
+        tmp_path,
+        docs="Set `ACME_TEST_ONLY_SETTING`.\n",
+        source="",
+    )
+    verifier_test = tmp_path / "scripts" / "tests" / "test_verify_documented_env_vars.py"
+    verifier_test.parent.mkdir(parents=True)
+    verifier_test.write_text(
+        'REPRESENTATIVE_VARIABLE = "ACME_TEST_ONLY_SETTING"\n',
+        encoding="utf-8",
+    )
+
+    assert "ACME_TEST_ONLY_SETTING" not in module.source_variables(tmp_path)
+    assert set(module.missing_variables(tmp_path)) == {"ACME_TEST_ONLY_SETTING"}
+
+
 def test_repository_docs_discover_representative_environment_variable_families() -> None:
     module = _load_module()
     repository_root = Path(__file__).resolve().parents[2]

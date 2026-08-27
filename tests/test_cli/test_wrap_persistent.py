@@ -17,6 +17,17 @@ def _no_attached_wrappers(monkeypatch: pytest.MonkeyPatch) -> None:
     flaky. Individual tests override this to simulate attached wrappers.
     """
     monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda *a, **kw: [])
+    for name in (
+        "ANTHROPIC_TARGET_API_URL",
+        "OPENAI_TARGET_API_URL",
+        "GEMINI_TARGET_API_URL",
+        "CLOUDCODE_TARGET_API_URL",
+        "VERTEX_TARGET_API_URL",
+        "AUGMENT_TARGET_API_URL",
+        "FACTORY_TARGET_API_URL",
+        "HEADROOM_BACKEND",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 class _Manifest:
@@ -66,6 +77,18 @@ def test_ensure_proxy_recovers_persistent_deployment_when_socket_is_bound(monkey
     )
     monkeypatch.setattr(
         "headroom.install.runtime.wait_ready", lambda manifest, timeout_seconds=45: True
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_query_proxy_health",
+        lambda port: {"version": wrap_cli._HEADROOM_VERSION, "config": {"backend": "anthropic"}},
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("matching recovered proxy should be reused")
+        ),
     )
 
     proc, actual_port = wrap_cli._ensure_proxy(8787, False)
@@ -410,8 +433,37 @@ def test_proxy_routing_mismatches_detects_backend_and_urls(monkeypatch) -> None:
         )
         == []
     )
+    # Captive provider paths are semantic; /v1 is not a removable transport
+    # convention for their REST catch-all routing.
+    assert check(
+        {"backend": "anthropic", "factory_api_url": "https://factory.example/v1"},
+        backend=None,
+        requested_api_urls={"factory_api_url": "https://factory.example"},
+    ) == ["factory_api_url"]
     # Missing backend key (older proxy): treated as unknown, not a mismatch.
     assert check({"openai_api_url": None}, backend=None) == []
+
+
+def test_effective_requested_proxy_routing_uses_startup_precedence(monkeypatch) -> None:
+    monkeypatch.setenv("HEADROOM_BACKEND", "anyllm")
+    monkeypatch.setenv("OPENAI_TARGET_API_URL", "https://env.openai.test")
+    monkeypatch.setenv("VERTEX_TARGET_API_URL", "https://env.vertex.test")
+    monkeypatch.setenv("AUGMENT_TARGET_API_URL", "https://env.augment.test/v1")
+    monkeypatch.setenv("FACTORY_TARGET_API_URL", "https://env.factory.test/v1")
+
+    backend, api_urls = wrap_cli._effective_requested_proxy_routing(
+        backend=None,
+        openai_api_url="https://explicit.openai.test",
+        anthropic_api_url=None,
+        vertex_api_url=None,
+        clear_vertex_api_url=True,
+    )
+
+    assert backend == "anyllm"
+    assert api_urls["openai_api_url"] == "https://explicit.openai.test"
+    assert api_urls["vertex_api_url"] is None
+    assert api_urls["augment_api_url"] == "https://env.augment.test/v1"
+    assert api_urls["factory_api_url"] == "https://env.factory.test/v1"
 
 
 def test_ensure_proxy_restarts_idle_proxy_for_routing_mismatch(monkeypatch) -> None:
@@ -719,6 +771,318 @@ def test_ensure_proxy_routing_mismatch_on_persistent_deployment_uses_dedicated_p
     assert calls[0] == ("find_port", 8787)
     assert calls[1][0] == "start"
     assert calls[1][1][0] == 8799
+
+
+def test_ensure_proxy_healthy_persistent_uses_config_fallback(monkeypatch) -> None:
+    config = {"pid": 12345, "backend": "anthropic"}
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
+    monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: True)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_query_proxy_health",
+        lambda port: {"version": wrap_cli._HEADROOM_VERSION},
+    )
+    monkeypatch.setattr(wrap_cli, "_query_proxy_config", lambda port: config)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("matching persistent proxy should be reused")
+        ),
+    )
+
+    assert wrap_cli._ensure_proxy(8787, False) == (None, 8787)
+
+
+def test_ensure_proxy_healthy_configless_persistent_uses_dedicated_port(monkeypatch) -> None:
+    calls: list[object] = []
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
+    monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: True)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_query_proxy_health",
+        lambda port: {"version": wrap_cli._HEADROOM_VERSION},
+    )
+    monkeypatch.setattr(wrap_cli, "_query_proxy_config", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: port == 8787)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_find_available_port",
+        lambda start_port, **kwargs: calls.append(("find_port", start_port)) or 8799,
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("configless persistent proxy must not be killed")
+        ),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
+    )
+
+    assert wrap_cli._ensure_proxy(8787, False) == (None, 8799)
+    assert calls[0] == ("find_port", 8787)
+    assert calls[1][0] == "start"
+
+
+@pytest.mark.parametrize(
+    ("env_name", "config_key"),
+    [
+        ("ANTHROPIC_TARGET_API_URL", "anthropic_api_url"),
+        ("OPENAI_TARGET_API_URL", "openai_api_url"),
+        ("GEMINI_TARGET_API_URL", "gemini_api_url"),
+        ("CLOUDCODE_TARGET_API_URL", "cloudcode_api_url"),
+        ("VERTEX_TARGET_API_URL", "vertex_api_url"),
+        ("AUGMENT_TARGET_API_URL", "augment_api_url"),
+        ("FACTORY_TARGET_API_URL", "factory_api_url"),
+    ],
+)
+def test_ensure_proxy_reuses_matching_inherited_routing_target(
+    monkeypatch,
+    env_name: str,
+    config_key: str,
+) -> None:
+    target = "https://tenant.example/api"
+    for name in (
+        "ANTHROPIC_TARGET_API_URL",
+        "OPENAI_TARGET_API_URL",
+        "GEMINI_TARGET_API_URL",
+        "CLOUDCODE_TARGET_API_URL",
+        "VERTEX_TARGET_API_URL",
+        "AUGMENT_TARGET_API_URL",
+        "FACTORY_TARGET_API_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(env_name, target)
+    health = {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {"pid": 12345, "backend": "anthropic", config_key: target},
+    }
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_find_available_port",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("matching inherited routing must reuse the proxy")
+        ),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("matching inherited routing must not kill the proxy")
+        ),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("matching inherited routing must not start another proxy")
+        ),
+    )
+
+    assert wrap_cli._ensure_proxy(8787, False) == (None, 8787)
+
+
+@pytest.mark.parametrize(
+    ("ensure_kwargs", "config_overrides", "env_override"),
+    [
+        (
+            {"anthropic_api_url": "https://expected.anthropic.test"},
+            {"anthropic_api_url": "https://running.anthropic.test"},
+            None,
+        ),
+        (
+            {"vertex_api_url": "https://expected.vertex.test"},
+            {"vertex_api_url": "https://running.vertex.test"},
+            None,
+        ),
+        (
+            {"backend": "anyllm"},
+            {"backend": "anthropic"},
+            None,
+        ),
+        (
+            {},
+            {"factory_api_url": "https://running.factory.test"},
+            ("FACTORY_TARGET_API_URL", "https://expected.factory.test"),
+        ),
+    ],
+)
+def test_ensure_proxy_recovered_routing_mismatch_uses_dedicated_port(
+    monkeypatch,
+    ensure_kwargs: dict[str, object],
+    config_overrides: dict[str, object],
+    env_override: tuple[str, str] | None,
+) -> None:
+    calls: list[object] = []
+    if env_override is not None:
+        monkeypatch.setenv(*env_override)
+    config = {"pid": 12345, "backend": "anthropic"}
+    config.update(config_overrides)
+    health = {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": config,
+    }
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
+    monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: False)
+    monkeypatch.setattr(wrap_cli, "_recover_persistent_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: port == 8787)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_find_available_port",
+        lambda start_port, **kwargs: calls.append(("find_port", start_port)) or 8799,
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_restart_persistent_proxy",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("routing mismatch must not restart the persistent proxy")
+        ),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("routing mismatch must not kill the persistent proxy")
+        ),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
+    )
+
+    assert wrap_cli._ensure_proxy(8787, False, **ensure_kwargs) == (None, 8799)
+    assert calls[0] == ("find_port", 8787)
+    assert calls[1][0] == "start"
+
+
+def test_ensure_proxy_stale_attached_persistent_routing_mismatch_uses_dedicated_port(
+    monkeypatch,
+) -> None:
+    calls: list[object] = []
+    health = _routing_mismatch_health({})
+    health["version"] = "0.0.1"
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
+    monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda *args, **kwargs: [999])
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: port == 8787)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_find_available_port",
+        lambda start_port, **kwargs: calls.append(("find_port", start_port)) or 8799,
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_restart_persistent_proxy",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("active persistent proxy must not restart")
+        ),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("active persistent proxy must not be killed")
+        ),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
+    )
+
+    assert wrap_cli._ensure_proxy(8787, False, memory=True) == (None, 8799)
+    assert calls[0] == ("find_port", 8787)
+    assert calls[1][0] == "start"
+
+
+def test_ensure_proxy_stale_attached_ephemeral_routing_mismatch_uses_dedicated_port(
+    monkeypatch,
+) -> None:
+    calls: list[object] = []
+    health = _routing_mismatch_health({})
+    health["version"] = "0.0.1"
+    health["runtime"]["websocket_sessions"]["active_sessions"] = 1
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_live_proxy_clients", lambda *args, **kwargs: [])
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: port == 8787)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_find_available_port",
+        lambda start_port, **kwargs: calls.append(("find_port", start_port)) or 8799,
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("active proxy must not be killed")
+        ),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
+    )
+
+    assert wrap_cli._ensure_proxy(8787, False, memory=True) == (None, 8799)
+    assert calls[0] == ("find_port", 8787)
+    assert calls[1][0] == "start"
+
+
+@pytest.mark.parametrize(
+    ("pid", "kill_result", "message"),
+    [
+        (None, True, "did not expose a PID"),
+        (12345, False, "Failed to stop stale proxy"),
+    ],
+)
+def test_ensure_proxy_stale_idle_restart_failures_are_actionable(
+    monkeypatch,
+    pid: int | None,
+    kill_result: bool,
+    message: str,
+) -> None:
+    config: dict[str, object] = {"backend": "anthropic"}
+    if pid is not None:
+        config["pid"] = pid
+    health = {
+        "version": "0.0.1",
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": config,
+    }
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_kill_proxy_by_pid", lambda found_pid, port: kill_result)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("failed stale restart must not start another proxy")
+        ),
+    )
+
+    with pytest.raises(click.ClickException, match=message):
+        wrap_cli._ensure_proxy(8787, False)
 
 
 def test_ensure_proxy_starts_isolated_ephemeral_proxy_for_copilot_subscription_seed(
@@ -1215,15 +1579,27 @@ def test_ensure_proxy_restarts_recovered_persistent_for_openai_api_url_mismatch(
     monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
     monkeypatch.setattr(
         wrap_cli,
+        "_find_available_port",
+        lambda start_port, **kwargs: calls.append(("find_port", start_port)) or 8799,
+    )
+    monkeypatch.setattr(
+        wrap_cli,
         "_restart_persistent_proxy",
-        lambda manifest, port: calls.append(("restart", manifest.profile, port)) or True,
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("routing mismatch must not restart the persistent proxy")
+        ),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("routing mismatch must not kill the persistent proxy")
+        ),
     )
     monkeypatch.setattr(
         wrap_cli,
         "_start_proxy",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("ephemeral proxy should not start")
-        ),
+        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
     )
 
     proc, actual_port = wrap_cli._ensure_proxy(
@@ -1233,8 +1609,9 @@ def test_ensure_proxy_restarts_recovered_persistent_for_openai_api_url_mismatch(
     )
 
     assert proc is None
-    assert actual_port == 8787
-    assert calls == [("restart", "default", 8787)]
+    assert actual_port == 8799
+    assert calls[0] == ("find_port", 8787)
+    assert calls[1][0] == "start"
 
 
 def test_ensure_proxy_restarts_recovered_persistent_when_config_unavailable(monkeypatch) -> None:
@@ -1248,15 +1625,27 @@ def test_ensure_proxy_restarts_recovered_persistent_when_config_unavailable(monk
     monkeypatch.setattr(wrap_cli, "_query_proxy_config", lambda port: None)
     monkeypatch.setattr(
         wrap_cli,
+        "_find_available_port",
+        lambda start_port, **kwargs: calls.append(("find_port", start_port)) or 8799,
+    )
+    monkeypatch.setattr(
+        wrap_cli,
         "_restart_persistent_proxy",
-        lambda manifest, port: calls.append(("restart", manifest.profile, port)) or True,
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("configless recovered proxy must not restart")
+        ),
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_kill_proxy_by_pid",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("configless recovered proxy must not be killed")
+        ),
     )
     monkeypatch.setattr(
         wrap_cli,
         "_start_proxy",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("ephemeral proxy should not start")
-        ),
+        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
     )
 
     proc, actual_port = wrap_cli._ensure_proxy(
@@ -1266,8 +1655,9 @@ def test_ensure_proxy_restarts_recovered_persistent_when_config_unavailable(monk
     )
 
     assert proc is None
-    assert actual_port == 8787
-    assert calls == [("restart", "default", 8787)]
+    assert actual_port == 8799
+    assert calls[0] == ("find_port", 8787)
+    assert calls[1][0] == "start"
 
 
 def test_ensure_proxy_reuses_persistent_deployment_when_features_match(monkeypatch) -> None:
@@ -1314,12 +1704,22 @@ def test_ensure_proxy_reuses_persistent_deployment_when_features_match(monkeypat
     assert actual_port == 8787
 
 
-def test_ensure_proxy_recovered_persistent_deployment_checks_feature_mismatch(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "ensure_kwargs",
+    [
+        {"memory": True},
+        {"learn": True},
+        {"code_graph": True},
+    ],
+)
+def test_ensure_proxy_recovered_persistent_deployment_checks_feature_mismatch(
+    monkeypatch,
+    ensure_kwargs: dict[str, bool],
+) -> None:
     """Recovered persistent deployments must still restart on feature mismatch.
 
-    Regression guard for the recover path: when wrap requests a different
-    openai_api_url (Copilot subscription), do not early-return right after
-    recover; run the shared mismatch checks and restart if needed.
+    Regression guard for the recover path: when wrap requests memory, do not
+    early-return right after recover; restart the deployment if needed.
     """
 
     calls: list[object] = []
@@ -1353,12 +1753,32 @@ def test_ensure_proxy_recovered_persistent_deployment_checks_feature_mismatch(mo
         ),
     )
 
-    proc, actual_port = wrap_cli._ensure_proxy(
-        8787,
-        False,
-        openai_api_url="https://api.githubcopilot.com",
-    )
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False, **ensure_kwargs)
 
     assert proc is None
     assert actual_port == 8787
     assert calls == [("restart", "default", 8787)]
+
+
+def test_ensure_proxy_recovered_feature_restart_failure_raises(monkeypatch) -> None:
+    health = {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "config": {"pid": 12345, "backend": "anthropic", "memory": False},
+    }
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
+    monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: False)
+    monkeypatch.setattr(wrap_cli, "_recover_persistent_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_restart_persistent_proxy", lambda manifest, port: False)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("failed persistent restart must not start an ephemeral proxy")
+        ),
+    )
+
+    with pytest.raises(click.ClickException, match="could not be restarted"):
+        wrap_cli._ensure_proxy(8787, False, memory=True)

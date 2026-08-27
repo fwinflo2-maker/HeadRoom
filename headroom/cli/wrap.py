@@ -3577,12 +3577,12 @@ def _proxy_active_session_count(payload: dict[str, Any] | None) -> int:
     return max(counts, default=0)
 
 
-def _normalize_proxy_api_url(url: object) -> str | None:
+def _normalize_proxy_api_url(url: object, *, strip_provider_v1: bool = True) -> str | None:
     """Normalize configured upstream URLs for running-proxy comparisons."""
     if not isinstance(url, str):
         return None
     normalized = url.strip().rstrip("/")
-    if normalized.endswith("/v1"):
+    if strip_provider_v1 and normalized.endswith("/v1"):
         normalized = normalized[:-3]
     return normalized or None
 
@@ -3654,11 +3654,48 @@ def _proxy_routing_mismatches(
         mismatches.append("backend")
     requested_api_urls = requested_api_urls or {}
     for key in _PROXY_ROUTING_URL_KEYS:
-        if _normalize_proxy_api_url(running_config.get(key)) != _normalize_proxy_api_url(
-            requested_api_urls.get(key)
+        strip_provider_v1 = key not in {"augment_api_url", "factory_api_url"}
+        if _normalize_proxy_api_url(
+            running_config.get(key),
+            strip_provider_v1=strip_provider_v1,
+        ) != _normalize_proxy_api_url(
+            requested_api_urls.get(key),
+            strip_provider_v1=strip_provider_v1,
         ):
             mismatches.append(key)
     return mismatches
+
+
+def _effective_requested_proxy_routing(
+    *,
+    backend: str | None,
+    openai_api_url: str | None,
+    anthropic_api_url: str | None,
+    vertex_api_url: str | None,
+    clear_vertex_api_url: bool,
+) -> tuple[str, dict[str, str | None]]:
+    """Resolve the routing a newly started proxy would inherit."""
+    from headroom.providers.registry import resolve_api_overrides
+
+    overrides = resolve_api_overrides(
+        anthropic_api_url=anthropic_api_url,
+        openai_api_url=openai_api_url,
+        gemini_api_url=None,
+        cloudcode_api_url=None,
+        vertex_api_url=vertex_api_url,
+    )
+    return (
+        backend or os.environ.get("HEADROOM_BACKEND") or "anthropic",
+        {
+            "anthropic_api_url": overrides.anthropic,
+            "openai_api_url": overrides.openai,
+            "gemini_api_url": overrides.gemini,
+            "cloudcode_api_url": overrides.cloudcode,
+            "vertex_api_url": None if clear_vertex_api_url else overrides.vertex,
+            "augment_api_url": os.environ.get("AUGMENT_TARGET_API_URL"),
+            "factory_api_url": os.environ.get("FACTORY_TARGET_API_URL"),
+        },
+    )
 
 
 def _detect_running_proxy_backend(port: int) -> str | None:
@@ -4122,6 +4159,13 @@ def _ensure_proxy_unlocked(
         or bool(copilot_refresh_oauth_token)
         or copilot_api_token_expires_at is not None
     )
+    requested_backend, requested_api_urls = helpers._effective_requested_proxy_routing(
+        backend=backend,
+        openai_api_url=openai_api_url,
+        anthropic_api_url=anthropic_api_url,
+        vertex_api_url=vertex_api_url,
+        clear_vertex_api_url=clear_vertex_api_url,
+    )
     # Set True when the proxy on the requested port belongs to a persistent
     # deployment whose routing config does not match this wrap: the deployment
     # owns the port and must not be reused, killed, or restarted from the
@@ -4149,7 +4193,34 @@ def _ensure_proxy_unlocked(
 
             if probe_ready(manifest.health_url):
                 health_payload = helpers._query_proxy_health(port)
-                if helpers._proxy_needs_version_restart(health_payload):
+                running_config = helpers._proxy_health_config(health_payload)
+                if running_config is None:
+                    running_config = helpers._query_proxy_config(port)
+                routing_mismatches = (
+                    None
+                    if running_config is None
+                    else helpers._proxy_routing_mismatches(
+                        running_config,
+                        backend=requested_backend,
+                        requested_api_urls=requested_api_urls,
+                    )
+                )
+                if running_config is None:
+                    click.echo(
+                        f"  Persistent deployment '{manifest.profile}' on port {port} "
+                        "did not expose routing config; starting a dedicated proxy "
+                        "on a different port instead."
+                    )
+                    persistent_routing_mismatch = True
+                elif routing_mismatches:
+                    keys_str = ", ".join(routing_mismatches)
+                    click.echo(
+                        f"  Persistent deployment '{manifest.profile}' on port {port} "
+                        f"has incompatible routing config ({keys_str}); "
+                        "starting a dedicated proxy on a different port instead."
+                    )
+                    persistent_routing_mismatch = True
+                elif helpers._proxy_needs_version_restart(health_payload):
                     running_version = helpers._proxy_version(health_payload) or "unknown"
                     active_sessions = helpers._proxy_active_session_count(health_payload)
                     other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
@@ -4174,14 +4245,8 @@ def _ensure_proxy_unlocked(
                         f"Persistent deployment '{manifest.profile}' on port {port} "
                         f"is running stale Headroom {running_version} and could not be restarted."
                     )
-                # Check if the running proxy has the features we need.
-                # Without this, a persistent deployment started for one use case
-                # (e.g. --backend anthropic) would be silently reused for another
-                # (e.g. --subscription --provider-type openai) causing auth failures.
-                running_config = helpers._proxy_health_config(health_payload)
-                if running_config is None:
-                    running_config = helpers._query_proxy_config(port)
-                if running_config is not None:
+                else:
+                    # Check if the running proxy has the features we need.
                     missing = []
                     if memory and not running_config.get("memory"):
                         missing.append("memory")
@@ -4189,38 +4254,7 @@ def _ensure_proxy_unlocked(
                         missing.append("learn")
                     if code_graph and not running_config.get("code_graph"):
                         missing.append("code_graph")
-                    if copilot_subscription_seed_requested:
-                        missing.append("copilot-subscription-auth")
-                    if openai_api_url:
-                        running_openai_url = _normalize_proxy_api_url(
-                            running_config.get("openai_api_url")
-                        )
-                        requested_openai_url = _normalize_proxy_api_url(openai_api_url)
-                        if running_openai_url != requested_openai_url:
-                            missing.append("openai-api-url")
-                    routing_mismatches = helpers._proxy_routing_mismatches(
-                        running_config,
-                        backend=backend,
-                        requested_api_urls={
-                            "openai_api_url": openai_api_url,
-                            "anthropic_api_url": anthropic_api_url,
-                            "vertex_api_url": (None if clear_vertex_api_url else vertex_api_url),
-                        },
-                    )
-                    if routing_mismatches:
-                        # A persistent deployment's routing comes from its
-                        # manifest; the shared ephemeral path must not kill it
-                        # (the manifest would point at a dead or hijacked
-                        # port). Start this wrap's proxy on a free port and
-                        # leave the deployment running.
-                        keys_str = ", ".join(routing_mismatches)
-                        click.echo(
-                            f"  Persistent deployment '{manifest.profile}' on port {port} "
-                            f"has incompatible routing config ({keys_str}); "
-                            "starting a dedicated proxy on a different port instead."
-                        )
-                        persistent_routing_mismatch = True
-                    elif not missing:
+                    if not missing:
                         click.echo(f"  Proxy already running on port {port}")
                         click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
                         return None, port
@@ -4229,29 +4263,9 @@ def _ensure_proxy_unlocked(
                 # mismatch skips that path entirely (see flag above).
             else:
                 if helpers._recover_persistent_proxy(port):
-                    # If the caller requested feature-sensitive config (e.g.
-                    # openai_api_url for Copilot subscription), continue into
-                    # the shared running-proxy checks below so mismatch-driven
-                    # restart logic can run. For plain recover-only calls,
-                    # preserve the historical fast return.
-                    if not any(
-                        (
-                            memory,
-                            learn,
-                            code_graph,
-                            openai_api_url,
-                            copilot_subscription_seed_requested,
-                        )
-                    ):
-                        return None, port
                     if not helpers._check_proxy(port):
                         return None, port
 
-                    # A freshly recovered persistent proxy may not expose
-                    # a full config payload yet. In feature-sensitive flows
-                    # (e.g. Copilot subscription), treat missing or mismatched
-                    # config as restart-required and refresh the persistent
-                    # deployment directly instead of silently reusing it.
                     health_payload = helpers._query_proxy_health(port)
                     running_config = helpers._proxy_health_config(health_payload)
                     if running_config is None:
@@ -4260,53 +4274,55 @@ def _ensure_proxy_unlocked(
                     if running_config is None:
                         click.echo(
                             f"  Recovered persistent deployment '{manifest.profile}' "
-                            "did not expose config; restarting with requested features..."
+                            "did not expose routing config; starting a dedicated proxy "
+                            "on a different port instead."
                         )
-                        if helpers._restart_persistent_proxy(manifest, port):
-                            return None, port
-                        raise click.ClickException(
-                            f"Persistent deployment '{manifest.profile}' on port {port} "
-                            "could not be restarted after recovery."
+                        persistent_routing_mismatch = True
+                    else:
+                        routing_mismatches = helpers._proxy_routing_mismatches(
+                            running_config,
+                            backend=requested_backend,
+                            requested_api_urls=requested_api_urls,
                         )
+                        if routing_mismatches:
+                            keys_str = ", ".join(routing_mismatches)
+                            click.echo(
+                                f"  Recovered persistent deployment '{manifest.profile}' "
+                                f"has incompatible routing config ({keys_str}); "
+                                "starting a dedicated proxy on a different port instead."
+                            )
+                            persistent_routing_mismatch = True
+                        else:
+                            missing = []
+                            if memory and not running_config.get("memory"):
+                                missing.append("memory")
+                            if learn and not running_config.get("learn"):
+                                missing.append("learn")
+                            if code_graph and not running_config.get("code_graph"):
+                                missing.append("code-graph")
 
-                    missing = []
-                    if memory and not running_config.get("memory"):
-                        missing.append("memory")
-                    if learn and not running_config.get("learn"):
-                        missing.append("learn")
-                    if code_graph and not running_config.get("code_graph"):
-                        missing.append("code-graph")
-                    if copilot_subscription_seed_requested:
-                        missing.append("copilot-subscription-auth")
-                    if openai_api_url:
-                        running_openai_url = _normalize_proxy_api_url(
-                            running_config.get("openai_api_url")
-                        )
-                        requested_openai_url = _normalize_proxy_api_url(openai_api_url)
-                        if running_openai_url != requested_openai_url:
-                            missing.append("openai-api-url")
-
-                    if missing:
-                        flags_str = ", ".join(f"--{f}" for f in missing)
-                        click.echo(
-                            f"  Recovered persistent deployment '{manifest.profile}' is missing: "
-                            f"{flags_str}; restarting..."
-                        )
-                        if helpers._restart_persistent_proxy(manifest, port):
-                            return None, port
-                        raise click.ClickException(
-                            f"Persistent deployment '{manifest.profile}' on port {port} "
-                            "could not be restarted with requested features."
-                        )
-                    return None, port
+                            if not missing:
+                                return None, port
+                            flags_str = ", ".join(f"--{f}" for f in missing)
+                            click.echo(
+                                f"  Recovered persistent deployment '{manifest.profile}' "
+                                f"is missing: {flags_str}; restarting..."
+                            )
+                            if helpers._restart_persistent_proxy(manifest, port):
+                                return None, port
+                            raise click.ClickException(
+                                f"Persistent deployment '{manifest.profile}' on port {port} "
+                                "could not be restarted with requested features."
+                            )
                 elif helpers._check_proxy(port):
                     raise click.ClickException(
                         f"Persistent deployment '{manifest.profile}' on port {port} is not healthy."
                     )
-            click.echo(
-                f"  Warning: persistent deployment '{manifest.profile}' on port {port} "
-                "is stale; starting a fresh proxy instead."
-            )
+            if not persistent_routing_mismatch:
+                click.echo(
+                    f"  Warning: persistent deployment '{manifest.profile}' on port {port} "
+                    "is stale; starting a fresh proxy instead."
+                )
 
         if (
             not isolated_copilot_subscription_proxy
@@ -4323,6 +4339,15 @@ def _ensure_proxy_unlocked(
             running_config = helpers._proxy_health_config(health_payload)
             if running_config is None:
                 running_config = helpers._query_proxy_config(port)
+            routing_mismatches = (
+                None
+                if running_config is None
+                else helpers._proxy_routing_mismatches(
+                    running_config,
+                    backend=requested_backend,
+                    requested_api_urls=requested_api_urls,
+                )
+            )
             if running_config is None and not helpers._proxy_needs_version_restart(health_payload):
                 # A proxy that exposes no config block cannot be checked for
                 # feature or routing compatibility, and without a reported PID
@@ -4355,28 +4380,37 @@ def _ensure_proxy_unlocked(
                         f"  Proxy on port {port} is running Headroom {running_version}; "
                         f"current CLI is {_HEADROOM_VERSION}."
                     )
-                    click.echo(
-                        f"  Leaving it running because {detail} "
-                        "are still attached; it will be restarted when idle."
-                    )
-                    return None, port
+                    if routing_mismatches or running_config is None:
+                        click.echo(
+                            f"  Not reusing it because its routing "
+                            f"{'cannot be verified' if running_config is None else 'is incompatible'}; "
+                            "starting a dedicated proxy on a different port instead."
+                        )
+                        reuse_running = False
+                    else:
+                        click.echo(
+                            f"  Leaving it running because {detail} "
+                            "are still attached; it will be restarted when idle."
+                        )
+                        return None, port
 
-                click.echo(
-                    f"  Proxy on port {port} is running Headroom {running_version}; "
-                    f"restarting with {_HEADROOM_VERSION}..."
-                )
-                proxy_pid = running_config.get("pid") if running_config is not None else None
-                if proxy_pid is None:
-                    raise click.ClickException(
-                        f"Proxy on port {port} is stale but did not expose a PID. "
-                        "Stop it manually and retry."
+                else:
+                    click.echo(
+                        f"  Proxy on port {port} is running Headroom {running_version}; "
+                        f"restarting with {_HEADROOM_VERSION}..."
                     )
-                if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
-                    raise click.ClickException(
-                        f"Failed to stop stale proxy (PID {proxy_pid}) on port {port}. "
-                        "Stop it manually and retry."
-                    )
-                needs_restart = True
+                    proxy_pid = running_config.get("pid") if running_config is not None else None
+                    if proxy_pid is None:
+                        raise click.ClickException(
+                            f"Proxy on port {port} is stale but did not expose a PID. "
+                            "Stop it manually and retry."
+                        )
+                    if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
+                        raise click.ClickException(
+                            f"Failed to stop stale proxy (PID {proxy_pid}) on port {port}. "
+                            "Stop it manually and retry."
+                        )
+                    needs_restart = True
 
             if running_config is not None:
                 missing = []
@@ -4386,30 +4420,14 @@ def _ensure_proxy_unlocked(
                     missing.append("learn")
                 if code_graph and not running_config.get("code_graph"):
                     missing.append("code_graph")
-                if copilot_subscription_seed_requested:
-                    missing.append("copilot-subscription-auth")
                 expected_savings_profile = helpers._wrap_agent_savings_profile(agent_type)
                 if (
                     expected_savings_profile is not None
                     and running_config.get("savings_profile") != expected_savings_profile
                 ):
                     missing.append("savings-profile")
-                if openai_api_url:
-                    running_openai_url = _normalize_proxy_api_url(
-                        running_config.get("openai_api_url")
-                    )
-                    requested_openai_url = _normalize_proxy_api_url(openai_api_url)
-                    if running_openai_url != requested_openai_url:
-                        missing.append("openai-api-url")
-                if vertex_api_url or clear_vertex_api_url:
-                    running_vertex_url = _normalize_proxy_api_url(
-                        running_config.get("vertex_api_url")
-                    )
-                    requested_vertex_url = _normalize_proxy_api_url(vertex_api_url)
-                    if running_vertex_url != requested_vertex_url:
-                        missing.append("vertex-api-url")
 
-                if missing:
+                if missing and not routing_mismatches:
                     flags_str = ", ".join(
                         f if f.startswith("--") else f"--{f.replace('_', '-')}" for f in missing
                     )
@@ -4460,19 +4478,7 @@ def _ensure_proxy_unlocked(
                 # request is broken, not degraded, so "reuse as-is" is never an
                 # option here (cf. the factory-api-url fail-loud precedent on
                 # the droid branch and the tenant check in wrap auggie).
-                routing_mismatches = (
-                    []
-                    if needs_restart
-                    else helpers._proxy_routing_mismatches(
-                        running_config,
-                        backend=backend,
-                        requested_api_urls={
-                            "openai_api_url": openai_api_url,
-                            "anthropic_api_url": anthropic_api_url,
-                            "vertex_api_url": None if clear_vertex_api_url else vertex_api_url,
-                        },
-                    )
-                )
+                routing_mismatches = [] if needs_restart else (routing_mismatches or [])
                 if routing_mismatches:
                     keys_str = ", ".join(routing_mismatches)
                     other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)

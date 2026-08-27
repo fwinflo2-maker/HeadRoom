@@ -163,6 +163,44 @@ def _invoke_copilot(monkeypatch: pytest.MonkeyPatch, args: list[str]):
     return result, captured
 
 
+def _invoke_native(
+    monkeypatch: pytest.MonkeyPatch,
+    extra: list[str] | None = None,
+    *,
+    support: bool | None = True,
+):
+    """Like `_invoke_copilot`, but resolves a tenant-pinned Business host.
+
+    Business / data-residency accounts advertise their own API host through the
+    token exchange (#610) rather than the generic ``api.githubcopilot.com``, and
+    both the OpenAI and Anthropic upstreams must follow it in --native mode.
+    """
+    import shutil
+
+    from click.testing import CliRunner
+
+    from headroom.cli import wrap as wrap_mod
+    from headroom.cli.main import main
+
+    captured: dict[str, object] = {}
+
+    class _Res:
+        token = "copilot-token"
+        api_url = "https://api.business.githubcopilot.com"
+        refresh_oauth_token = "refresh-token"
+        api_token_expires_at = 123.0
+
+    monkeypatch.setattr(shutil, "which", lambda _n: "/usr/bin/copilot")
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: False)
+    monkeypatch.setattr(wrap_mod, "_require_copilot_subscription_resolution", lambda: _Res())
+    monkeypatch.setattr(wrap_mod, "_native_api_url_supported", lambda **_k: support)
+    monkeypatch.setattr(wrap_mod, "_launch_tool", lambda **kwargs: captured.update(kwargs))
+    result = CliRunner().invoke(
+        main, ["wrap", "copilot", "--native", "--port", "8890", *(extra or [])]
+    )
+    return result, captured
+
+
 def test_native_flag_sets_the_override_and_no_byok_vars(monkeypatch: pytest.MonkeyPatch) -> None:
     result, captured = _invoke_copilot(monkeypatch, ["--native", "--port", "8890"])
     assert result.exit_code == 0, result.output
@@ -181,6 +219,24 @@ def test_native_points_the_anthropic_upstream_at_copilot(monkeypatch: pytest.Mon
     _result, captured = _invoke_copilot(monkeypatch, ["--native", "--port", "8890"])
     assert captured["anthropic_api_url"] == "https://api.githubcopilot.com"
     assert captured["openai_api_url"] == "https://api.githubcopilot.com"
+
+
+def test_native_cli_routes_both_protocols_to_tenant_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Business/data-residency accounts pin their own host; both wires must follow it.
+
+    A hardcoded ``api.githubcopilot.com`` assumption would silently route a
+    tenant's traffic to the wrong host — the same upstream-mismatch failure mode
+    ``test_native_points_the_anthropic_upstream_at_copilot`` pins for the generic
+    host.
+    """
+    result, captured = _invoke_native(monkeypatch)
+    assert result.exit_code == 0, result.output
+    assert captured["openai_api_url"] == "https://api.business.githubcopilot.com"
+    assert captured["anthropic_api_url"] == "https://api.business.githubcopilot.com"
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert COPILOT_NATIVE_API_URL_ENV in env
+    assert not any(variable in env for variable in COPILOT_BYOK_ENV_VARS)
 
 
 def test_byok_launch_leaves_the_anthropic_upstream_alone(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -208,6 +264,43 @@ def test_native_implies_subscription_so_no_model_is_required(
     assert result.exit_code == 0, result.output
     assert "requires a model" not in result.output
     assert COPILOT_NATIVE_API_URL_ENV in captured["env"]
+
+
+def test_implicit_oauth_uses_native_routing_without_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GitHub-OAuth users with no provider key get native routing without --native (#1910).
+
+    The old implicit-OAuth lane still configured Copilot as a one-model BYOK
+    client. Native aliases and runtime `/model` switches were then forwarded
+    literally and rejected by GitHub. Explicit `--subscription` keeps its
+    existing fixed-wire behavior; only the *implicit* GitHub-OAuth lane is
+    upgraded to native routing automatically.
+    """
+    from click.testing import CliRunner
+
+    from headroom.cli import wrap as wrap_mod
+    from headroom.cli.main import main
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(wrap_mod.shutil, "which", lambda _name: "/usr/bin/copilot")
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: False)
+    monkeypatch.setattr(wrap_mod, "has_oauth_auth", lambda: True)
+    monkeypatch.setattr(wrap_mod, "resolve_client_bearer_token", lambda: "oauth-token")
+    monkeypatch.setattr(
+        wrap_mod, "resolve_copilot_api_url", lambda _token: "https://api.githubcopilot.com"
+    )
+    monkeypatch.setattr(wrap_mod, "_native_api_url_supported", lambda **_kwargs: True)
+    monkeypatch.setattr(wrap_mod, "_launch_tool", lambda **kwargs: captured.update(kwargs))
+
+    result = CliRunner().invoke(
+        main,
+        ["wrap", "copilot", "--port", "8890", "--", "--model", "claude-sonnet-5"],
+    )
+
+    assert result.exit_code == 0, result.output
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert COPILOT_NATIVE_API_URL_ENV in env
+    assert not any(variable in env for variable in COPILOT_BYOK_ENV_VARS)
 
 
 def test_native_rejects_wire_api(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -262,6 +355,16 @@ def test_native_warns_when_cli_lacks_support(monkeypatch: pytest.MonkeyPatch) ->
     assert "COPILOT_API_URL" in result.output
     assert "silently get no compression" in result.output
     assert "without --native" in result.output
+
+
+def test_native_cli_reports_unknown_support_in_verbose_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The "could not verify" note only surfaces with --verbose, and never blocks launch."""
+    result, captured = _invoke_native(monkeypatch, ["--verbose"], support=None)
+    assert result.exit_code == 0, result.output
+    assert "could not verify" in result.output
+    assert captured
 
 
 def test_native_skips_the_model_list_injection(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -2662,11 +2662,14 @@ class WebSocketAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        headers = {
-            name.decode("latin-1").lower(): value.decode("latin-1")
-            for name, value in scope.get("headers", [])
-        }
-        provided = read_proxy_token(headers)
+        # Starlette's own Headers rather than a hand-built dict: on a repeated
+        # header it returns the FIRST occurrence, which is what the HTTP gate
+        # sees. Building a dict here instead took the LAST one, so the two
+        # transports disagreed about which `Authorization` counted — exactly the
+        # drift the shared reader below exists to prevent.
+        from starlette.datastructures import Headers
+
+        provided = read_proxy_token(Headers(scope=scope))
         if provided is not None and hmac.compare_digest(
             provided.encode("utf-8", "replace"), self.token_bytes
         ):

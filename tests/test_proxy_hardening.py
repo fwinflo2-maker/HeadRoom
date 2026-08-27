@@ -194,6 +194,30 @@ class TestWebSocketAuthMiddleware:
         assert downstream.called is True
         assert not _closed_with_policy_violation(sent)
 
+    async def test_repeated_header_resolves_like_the_http_gate(self):
+        """A duplicated Authorization must mean the same thing on both transports.
+
+        Starlette's Headers (what the HTTP gate reads) returns the FIRST
+        occurrence. A hand-built dict returns the last, which would let the two
+        paths disagree about which credential counted.
+        """
+        downstream = _SpyApp()
+        mw = WebSocketAuthMiddleware(downstream, proxy_token="s3cr3t-token")
+
+        sent = await _drive(
+            mw,
+            _ws_scope(
+                headers=[
+                    ("authorization", "Bearer s3cr3t-token"),
+                    ("authorization", "Bearer wrong"),
+                ]
+            ),
+        )
+
+        # First header wins → authenticated, same as the HTTP gate.
+        assert downstream.called is True
+        assert not _closed_with_policy_violation(sent)
+
     async def test_no_token_configured_is_a_passthrough(self):
         """Default deployment must gain no new challenge."""
         downstream = _SpyApp()

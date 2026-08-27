@@ -10530,7 +10530,12 @@ class OpenAIHandlerMixin:
             )
 
         # Remove compression headers since httpx already decompressed the response
-        response_headers = _sanitize_forwarded_response_headers(response.headers)
+        response_headers = _sanitize_forwarded_response_headers(
+            response.headers,
+            "etag",
+            "last-modified",
+            "cache-control",
+        )
         response_content = response.content
 
         if provider == "anthropic" and endpoint_name == "models":

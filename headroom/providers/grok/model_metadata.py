@@ -6,13 +6,18 @@ from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
+from headroom.providers.grok.runtime import DEFAULT_API_URL
+
+_XAI_API_HOST = urlsplit(DEFAULT_API_URL).hostname
+
 
 def is_xai_model_list_target(base_url: str) -> bool:
     """Return whether ``base_url`` is the exact xAI model-list target."""
     parsed = urlsplit(base_url)
     return (
         parsed.hostname is not None
-        and parsed.hostname.lower() == "api.x.ai"
+        and _XAI_API_HOST is not None
+        and parsed.hostname.lower() == _XAI_API_HOST.lower()
         and parsed.path.rstrip("/") in {"", "/v1"}
     )
 

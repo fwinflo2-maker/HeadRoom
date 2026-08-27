@@ -6,13 +6,14 @@ from headroom.providers.grok.model_metadata import (
     is_xai_model_list_target,
     normalize_xai_model_metadata,
 )
+from headroom.providers.grok.runtime import DEFAULT_API_URL
 
 
 @pytest.mark.parametrize(
     ("url", "expected"),
     [
-        ("https://api.x.ai", True),
-        ("https://API.X.AI/v1/", True),
+        (DEFAULT_API_URL, True),
+        (f"{DEFAULT_API_URL}/v1/", True),
         ("https://api.x.ai.evil.test", False),
         ("https://api.x.ai/v2", False),
         ("https://api.openai.com", False),

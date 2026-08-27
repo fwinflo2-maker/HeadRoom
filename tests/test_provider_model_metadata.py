@@ -154,6 +154,9 @@ def test_grok_response_preserves_status_and_safe_headers_without_stale_framing(m
                 headers={
                     "content-type": "application/json",
                     "x-upstream": "kept",
+                    "etag": '"stale"',
+                    "last-modified": "Thu, 01 Jan 1970 00:00:00 GMT",
+                    "cache-control": "max-age=60",
                     "content-length": "44",
                     "content-encoding": "gzip",
                     "transfer-encoding": "chunked",
@@ -177,6 +180,9 @@ def test_grok_response_preserves_status_and_safe_headers_without_stale_framing(m
 
     assert response.status_code == 206
     assert response.headers["x-upstream"] == "kept"
+    assert response.headers.get("etag") is None
+    assert response.headers.get("last-modified") is None
+    assert response.headers.get("cache-control") is None
     assert response.headers.get("content-encoding") is None
     assert response.headers.get("transfer-encoding") is None
     assert response.json()["data"][0]["context_window"] == 1

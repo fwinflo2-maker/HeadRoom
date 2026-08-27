@@ -1261,6 +1261,11 @@ def test_anthropic_model_metadata_strips_ansi_model_ids() -> None:
                         {"id": "claude-sonnet-4-5[1m]", "object": "model"},
                     ],
                 },
+                headers={
+                    "etag": '"stale"',
+                    "last-modified": "Thu, 01 Jan 1970 00:00:00 GMT",
+                    "cache-control": "max-age=60",
+                },
             )
 
         async def aclose(self) -> None:
@@ -1272,6 +1277,9 @@ def test_anthropic_model_metadata_strips_ansi_model_ids() -> None:
         response = client.get("/v1/models", headers={"x-api-key": "sk-ant-test"})
 
     assert response.status_code == 200
+    assert response.headers.get("etag") is None
+    assert response.headers.get("last-modified") is None
+    assert response.headers.get("cache-control") is None
     assert response.json()["data"] == [
         {"id": "claude-opus-4-8", "object": "model"},
         {"id": "claude-sonnet-4-5", "object": "model"},

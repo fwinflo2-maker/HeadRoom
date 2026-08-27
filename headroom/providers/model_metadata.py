@@ -75,7 +75,12 @@ async def handle_model_metadata_endpoint(
         except (TypeError, ValueError):
             normalized_payload = None
         if normalized_payload is not None:
-            headers = sanitize_forwarded_response_headers(response.headers)
+            headers = sanitize_forwarded_response_headers(
+                response.headers,
+                "etag",
+                "last-modified",
+                "cache-control",
+            )
             headers["content-type"] = "application/json"
             return Response(
                 content=json.dumps(

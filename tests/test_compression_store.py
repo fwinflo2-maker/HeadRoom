@@ -27,6 +27,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from headroom.cache.backends.memory import InMemoryBackend
+from headroom.cache.backends.sqlite import SQLiteBackend
 from headroom.cache.compression_store import (
     CCR_TTL_SECONDS_ENV,
     DEFAULT_CCR_TTL_SECONDS,
@@ -674,12 +675,53 @@ class TestCompressionStoreEviction:
                 return super().items()
 
         backend = _ItemsCountingBackend()
-        store = CompressionStore(backend=backend)
+        store = CompressionStore(max_entries=2, backend=backend)
 
-        for i in range(5):
+        for i in range(3):
             store.store(original=f"content_{i}", compressed=f"compressed_{i}")
 
         assert backend.items_calls == 0
+
+    def test_oversized_ttl_at_capacity_keeps_indexes_consistent(self):
+        """An oversized positive TTL is stored as a non-expiring heap entry."""
+        backend = InMemoryBackend()
+        store = CompressionStore(max_entries=1, enable_feedback=False, backend=backend)
+
+        with patch("headroom.cache.compression_store.time.time") as now:
+            now.return_value = 100.0
+            old_hash = store.store(original="old", compressed="old")
+            now.return_value = 101.0
+            oversized_hash = store.store(
+                original="oversized",
+                compressed="oversized",
+                ttl=10**1000,
+            )
+
+        entry = backend.get(oversized_hash)
+        assert entry is not None
+        assert not backend.exists(old_hash)
+        assert len(store._eviction_heap) - store._stale_heap_entries == backend.count() == 1
+        assert len(store._expiration_heap) - store._stale_expiration_heap_entries == backend.count()
+        assert (entry.created_at, oversized_hash) in store._eviction_heap
+        assert (float("inf"), entry.created_at, oversized_hash) in store._expiration_heap
+
+    def test_sqlite_ttl_purges_do_not_grow_eviction_indexes(self, tmp_path):
+        """SQLite TTL purges do not leave process-local heap tuples unbounded."""
+        backend = SQLiteBackend(tmp_path / "ccr.db")
+        store = CompressionStore(max_entries=1000, enable_feedback=False, backend=backend)
+
+        with patch("headroom.cache.compression_store.time.time") as now:
+            for i in range(5):
+                now.return_value = 100 + i * 61
+                store.store(
+                    original=f"content_{i}",
+                    compressed=f"compressed_{i}",
+                    ttl=1,
+                )
+
+        assert backend.count() == 1
+        assert len(store._eviction_heap) <= 2
+        assert len(store._expiration_heap) == 1
 
     def test_eviction_at_capacity(self, store_with_small_capacity: CompressionStore):
         """Oldest entries are evicted when at capacity."""
@@ -727,6 +769,24 @@ class TestCompressionStoreEviction:
         assert store_with_small_capacity.exists(hashes[2])
         assert store_with_small_capacity.exists(new_hash)
 
+    def test_mixed_ttl_pressure_evicts_oldest_created_live_entry(self):
+        """Live eviction remains creation-ordered across mixed TTLs."""
+        backend = InMemoryBackend()
+        store = CompressionStore(max_entries=2, enable_feedback=False, backend=backend)
+
+        with patch("headroom.cache.compression_store.time.time") as now:
+            now.return_value = 100
+            older_long_ttl = store.store(original="older", compressed="older", ttl=100)
+            now.return_value = 110
+            newer_short_ttl = store.store(original="newer", compressed="newer", ttl=20)
+            now.return_value = 120
+            new_hash = store.store(original="new", compressed="new", ttl=100)
+
+        assert not backend.exists(older_long_ttl)
+        assert backend.exists(newer_short_ttl)
+        assert backend.exists(new_hash)
+        assert backend.count() == 2
+
     def test_duplicate_store_at_capacity_does_not_evict(
         self, store_with_small_capacity: CompressionStore
     ):
@@ -755,25 +815,67 @@ class TestCompressionStoreEviction:
 
     def test_eviction_cleans_expired_first(self):
         """Eviction cleans expired entries before evicting valid ones."""
-        store = CompressionStore(max_entries=3, default_ttl=1)
+        backend = InMemoryBackend()
+        store = CompressionStore(max_entries=2, enable_feedback=True, backend=backend)
 
-        # Add 2 entries that will expire
-        hash1 = store.store(original="content_1", compressed="c1", ttl=1)
-        hash2 = store.store(original="content_2", compressed="c2", ttl=1)
+        with patch("headroom.cache.compression_store.time.time") as now:
+            now.return_value = 100
+            live_hash = store.store(original="live", compressed="live", ttl=100)
+            now.return_value = 110
+            expired_hash = store.store(
+                original="expired",
+                compressed="expired",
+                ttl=5,
+                tool_signature_hash="expired_signature",
+                compression_strategy="top_k",
+            )
+            now.return_value = 116
+            new_hash = store.store(original="new", compressed="new", ttl=100)
 
-        time.sleep(1.1)  # Wait for expiration
+        assert backend.exists(live_hash)
+        assert not backend.exists(expired_hash)
+        assert backend.exists(new_hash)
+        assert backend.count() == 2
+        assert store._pending_feedback_events == []
 
-        # Add 2 more entries (should clean expired first, not evict new)
-        hash3 = store.store(original="content_3", compressed="c3", ttl=300)
-        hash4 = store.store(original="content_4", compressed="c4", ttl=300)
+    def test_eviction_ignores_stale_expiration_after_replacement(self):
+        """A replaced entry survives its old expiration heap tuple."""
+        backend = InMemoryBackend()
+        store = CompressionStore(max_entries=2, enable_feedback=False, backend=backend)
 
-        # Expired entries should be gone
-        assert not store.exists(hash1)
-        assert not store.exists(hash2)
+        with patch("headroom.cache.compression_store.time.time") as now:
+            now.return_value = 90
+            oldest_hash = store.store(original="oldest", compressed="oldest", ttl=100)
+            now.return_value = 100
+            replacement_hash = store.store(original="replacement", compressed="v1", ttl=5)
+            now.return_value = 101
+            store.store(original="replacement", compressed="v2", ttl=100)
+            now.return_value = 110
+            new_hash = store.store(original="new", compressed="new", ttl=100)
 
-        # New entries should exist
-        assert store.exists(hash3)
-        assert store.exists(hash4)
+        assert not backend.exists(oldest_hash)
+        assert backend.exists(replacement_hash)
+        assert backend.exists(new_hash)
+
+    def test_eviction_ignores_stale_indexes_after_read_cleanup(self):
+        """Read-side expiry cleanup leaves both eviction indexes consistent."""
+        backend = InMemoryBackend()
+        store = CompressionStore(max_entries=2, enable_feedback=False, backend=backend)
+
+        with patch("headroom.cache.compression_store.time.time") as now:
+            now.return_value = 100
+            expired_hash = store.store(original="expired", compressed="expired", ttl=1)
+            now.return_value = 102
+            assert store.retrieve(expired_hash) is None
+            first_live = store.store(original="first", compressed="first", ttl=100)
+            now.return_value = 103
+            second_live = store.store(original="second", compressed="second", ttl=100)
+            now.return_value = 104
+            new_hash = store.store(original="new", compressed="new", ttl=100)
+
+        assert not backend.exists(first_live)
+        assert backend.exists(second_live)
+        assert backend.exists(new_hash)
 
     def test_heap_rebuild_on_stale_threshold(self):
         """Heap is rebuilt when stale entry ratio exceeds threshold."""
@@ -787,8 +889,10 @@ class TestCompressionStoreEviction:
         for i in range(5):
             store.store(original=f"content_{i}", compressed=f"updated_{i}")
 
-        # Stale ratio should be tracked
-        # The heap rebuild happens automatically when threshold is exceeded
+        assert len(store._eviction_heap) == 5
+        assert len(store._expiration_heap) == 5
+        assert store._stale_heap_entries == 0
+        assert store._stale_expiration_heap_entries == 0
 
 
 # =============================================================================
@@ -1020,6 +1124,10 @@ class TestCompressionStoreEdgeCases:
 
         stats = store.get_stats()
         assert stats["entry_count"] == 0
+        assert store._eviction_heap == []
+        assert store._expiration_heap == []
+        assert store._stale_heap_entries == 0
+        assert store._stale_expiration_heap_entries == 0
 
     def test_clear_removes_retrieval_events(self, store: CompressionStore):
         """clear() removes retrieval events."""
@@ -1229,7 +1337,7 @@ class TestCompressionStoreFeedback:
         store = CompressionStore(max_entries=2, enable_feedback=True)
 
         # Store entries with signature hash for eviction tracking
-        store.store(
+        first_hash = store.store(
             original="content_0",
             compressed="c0",
             tool_signature_hash="sig_0",
@@ -1256,6 +1364,9 @@ class TestCompressionStoreFeedback:
         # The evicted entry (content_0) was never retrieved,
         # so an eviction_success event should be queued
         # (tested via the pending_feedback mechanism)
+        assert len(store._pending_feedback_events) == 1
+        assert store._pending_feedback_events[0].hash == first_hash
+        assert store._pending_feedback_events[0].retrieval_type == "eviction_success"
 
 
 # =============================================================================

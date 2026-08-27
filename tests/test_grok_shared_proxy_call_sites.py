@@ -23,6 +23,24 @@ from tests.test_openai_codex_routing import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _allow_client_chosen_test_upstreams(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Allowlist the client-chosen upstreams these tests name.
+
+    ``x-headroom-base-url`` is validated by the SSRF guard before it is honored,
+    and in allowlist mode only these hosts pass. Naming them keeps the header
+    policy under test here rather than DNS: ``litellm.internal`` is deliberately
+    unresolvable, and the ``api.x.ai`` cases would otherwise depend on a live
+    lookup. The trailing-dot form is a distinct host to the guard, which matches
+    on the parsed hostname without normalizing it.
+
+    This is the SSRF allowlist, not the designated-upstream list that governs
+    which hosts may receive operator secrets, so the header assertions below
+    still exercise the real policy.
+    """
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "litellm.internal,api.x.ai,api.x.ai.")
+
+
 class _MinimalConfig(SimpleNamespace):
     """Treat unset optional chat features as disabled."""
 

@@ -83,6 +83,7 @@ def test_direct_handler_routes_model_endpoint_intent() -> None:
     assert OPENAI_HANDLER_ROUTES == (
         ProviderHandlerRoute("POST", "/v1/chat/completions", "handle_openai_chat"),
         ProviderHandlerRoute("POST", "/chat/completions", "handle_openai_chat"),
+        ProviderHandlerRoute("POST", "/inference/v1/chat/completions", "handle_openai_chat"),
     )
     assert GEMINI_HANDLER_ROUTES == (
         ProviderHandlerRoute(

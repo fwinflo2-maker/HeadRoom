@@ -10,6 +10,7 @@ Usage:
     headroom wrap openclaude                # Start proxy + OpenClaude
     headroom wrap vibe                      # Start proxy + Mistral Vibe
     headroom wrap grok                      # Start proxy + Grok CLI
+    headroom wrap bob                       # Start proxy + IBM Bob CLI
     headroom wrap cursor                    # Start proxy + print Cursor config instructions
     headroom wrap grok-build                # Start proxy + configure Grok Build
     headroom wrap openclaw                  # Install + configure OpenClaw plugin
@@ -73,6 +74,12 @@ from headroom.copilot_auth import (
     resolve_subscription_bearer_token_details,
 )
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
+from headroom.providers.bob import (
+    DEFAULT_API_URL as _BOB_DEFAULT_API_URL,
+)
+from headroom.providers.bob import (
+    build_launch_env as _build_bob_launch_env,
+)
 from headroom.providers.claude import (
     REMOTE_CONTROL_BASE_URL_ENV,
     TOOL_SEARCH_DEFAULT,
@@ -4982,6 +4989,7 @@ def wrap(ctx: click.Context) -> None:
         headroom wrap openclaude          # OpenClaude
         headroom wrap vibe                # Mistral Vibe
         headroom wrap grok                # Grok CLI (xAI)
+        headroom wrap bob                 # IBM Bob CLI
         headroom wrap cursor              # Cursor (prints config instructions)
         headroom wrap grok-build          # Grok Build (updates ~/.grok/config.toml)
         headroom wrap cline               # Cline (VS Code; prints config instructions)
@@ -6904,6 +6912,94 @@ def grok(
 
 
 # =============================================================================
+# IBM Bob
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@_retired_context_tool_option
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--backend",
+    default=None,
+    help="API backend for the proxy: 'anthropic' (default), 'litellm-openai', etc.",
+)
+@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
+@click.option("--region", default=None, help="Cloud region for Vertex/Bedrock backends")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("bob_args", nargs=-1, type=click.UNPROCESSED)
+def bob(
+    port: int,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    backend: str | None,
+    anyllm_provider: str | None,
+    region: str | None,
+    verbose: bool,
+    prepare_only: bool,
+    bob_args: tuple,
+) -> None:
+    """Launch IBM Bob CLI through Headroom proxy.
+
+    \b
+    Sets ``BOB_GATEWAY_URL`` so Bob routes inference traffic through Headroom
+    while keeping its own ``Authorization: apikey …`` credential and its
+    ~/.bob/settings files untouched. Bob speaks OpenAI-shaped chat completions
+    under an ``/inference/v1`` gateway prefix; its non-inference routes
+    (profile, metrics) pass through uncompressed.
+
+    \b
+    Mode matters more for Bob than for most agents. Its traffic is ~46% system
+    prompt and ~44% tool output, and the default cache mode protects every tool
+    result from compression. Replaying 285 requests of real Bob history measured
+    0.8% saved in cache mode versus 8.0% in token mode:
+        HEADROOM_MODE=token headroom wrap bob
+
+    \b
+    Examples:
+        headroom wrap bob                          # Start proxy + bob
+        headroom wrap bob -- run "fix the bug"     # Pass args to bob
+        headroom wrap bob --port 9999              # Custom proxy port
+    """
+    if prepare_only:
+        return
+
+    bob_bin = shutil.which("bob")
+    if not bob_bin:
+        click.echo("Error: 'bob' not found in PATH.")
+        click.echo("Install IBM Bob CLI: npm install -g bobshell")
+        raise SystemExit(1)
+
+    env, env_vars_display = _build_bob_launch_env(
+        port, os.environ, project=_project_name_from_cwd()
+    )
+
+    _launch_tool(
+        binary=bob_bin,
+        args=bob_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="BOB",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="bob",
+        backend=backend,
+        anyllm_provider=anyllm_provider,
+        region=region,
+        openai_api_url=_BOB_DEFAULT_API_URL,
+    )
+
+
+# =============================================================================
 # Cursor
 # =============================================================================
 
@@ -8356,6 +8452,40 @@ def unwrap_grok(port: int, no_stop_proxy: bool) -> None:
     click.echo("✓ Grok is no longer configured for Headroom MCP retrieval.")
     click.echo("  Start Grok without `headroom wrap grok` so API traffic skips the proxy.")
     if not no_stop_proxy and removed_any:
+        _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
+    click.echo()
+
+
+# =============================================================================
+# IBM Bob (unwrap)
+# =============================================================================
+
+
+@unwrap.command("bob")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
+@click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
+def unwrap_bob(port: int, no_stop_proxy: bool) -> None:
+    """Stop routing IBM Bob through Headroom.
+
+    Bob's inference routing is session-scoped via ``BOB_GATEWAY_URL`` and
+    ``wrap bob`` writes no Bob config, so there is nothing to restore --
+    this stops the local proxy. Start Bob without ``headroom wrap bob`` and
+    it returns to its default gateway.
+    """
+    click.echo()
+    click.echo("  ╔═══════════════════════════════════════════════╗")
+    click.echo("  ║            HEADROOM UNWRAP: BOB              ║")
+    click.echo("  ╚═══════════════════════════════════════════════╝")
+    click.echo()
+
+    click.echo("  Nothing to undo: `wrap bob` only sets BOB_GATEWAY_URL for the")
+    click.echo("  session it launches; ~/.bob/settings was never modified.")
+    click.echo()
+    click.echo("✓ IBM Bob is no longer routed through the Headroom proxy.")
+    click.echo("  Start Bob without `headroom wrap bob` so API traffic skips the proxy.")
+    if not no_stop_proxy:
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
     click.echo()
 

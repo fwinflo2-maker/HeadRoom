@@ -49,7 +49,7 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
 
 - **Library** — `compress(messages)` in Python or TypeScript, inline in any app
 - **Proxy** — `headroom proxy --port 8787`, zero code changes, any language
-- **Agent wrap** — `headroom wrap claude|codex|grok|copilot|cursor|aider|opencode|cline|continue|goose|openhands|openclaw|vibe|omp|zcode` in one command; undo with `headroom unwrap <tool>`
+- **Agent wrap** — `headroom wrap claude|codex|grok|bob|copilot|cursor|aider|opencode|cline|continue|goose|openhands|openclaw|vibe|omp|zcode` in one command; undo with `headroom unwrap <tool>`
 - **MCP server** — `headroom_compress`, `headroom_retrieve`, `headroom_stats` for any MCP client
 - **Cross-agent memory** — shared store across Claude, Codex, Gemini, Grok, auto-dedup
 - **`headroom learn`** — mines failed sessions, writes corrections to `CLAUDE.local.md` (default, gitignored) or `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` / `GROK.md`
@@ -230,6 +230,7 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 | Claude Code  | ✅              | `--memory` · `--code-graph` · `--1m` · `--tool-search` |
 | Codex        | ✅              | shares memory with Claude        |
 | Grok CLI     | ✅              | routes via `GROK_MODELS_BASE_URL` |
+| IBM Bob      | ✅              | routes via `BOB_GATEWAY_URL`; CLI only (not the VS Code GUI); use `HEADROOM_MODE=token` |
 | Cursor       | Manual setup    | starts proxy and prints base URLs for Cursor settings |
 | Aider        | ✅              | starts proxy + launches          |
 | Copilot CLI  | ✅              | starts proxy + launches          |

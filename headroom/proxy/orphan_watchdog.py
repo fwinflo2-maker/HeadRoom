@@ -73,38 +73,55 @@ def _marker_pid_recycled(marker: Path, pid: int) -> bool:
     return identity_mismatch(record.get("start_src"), record.get("start_time"), pid)
 
 
-def live_client_pids(clients_dir: Path) -> list[int]:
+def live_client_pids(clients_dir: Path) -> list[int] | None:
     """Live wrap-client PIDs for a clients dir, pruning stale markers as we go.
 
     Mirrors ``cli.wrap._live_proxy_clients`` without the self-exclusion; the
     proxy is never its own client.
     """
-    if not clients_dir.exists():
-        return []
-    live: list[int] = []
-    for marker in clients_dir.glob("*.json"):
-        try:
-            pid = int(marker.stem)
-        except ValueError:
-            continue
-        if not pid_alive(pid) or _marker_pid_recycled(marker, pid):
+    try:
+        if not clients_dir.exists():
+            return []
+        live: list[int] = []
+        for marker in clients_dir.glob("*.json"):
             try:
-                marker.unlink(missing_ok=True)
-            except OSError:
-                pass
-            continue
-        live.append(pid)
-    return live
+                pid = int(marker.stem)
+            except ValueError:
+                continue
+            if not pid_alive(pid) or _marker_pid_recycled(marker, pid):
+                try:
+                    marker.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                continue
+            live.append(pid)
+        return live
+    except OSError:
+        logger.warning(
+            "event=orphan_watchdog_client_scan_failed dir=%s", clients_dir, exc_info=True
+        )
+        return None
 
 
-def _active_session_count(proxy: Any) -> int:
+def _active_session_count(proxy: Any) -> int | None:
     registry = getattr(proxy, "ws_sessions", None)
     if registry is None:
         return 0
     try:
         return int(registry.active_count())
-    except Exception:  # defensive: never let telemetry kill the watchdog
-        return 0
+    except Exception:
+        logger.warning("event=orphan_watchdog_session_count_failed", exc_info=True)
+        return None
+
+
+def _active_http_request_count(proxy: Any) -> int | None:
+    """Return active HTTP request count, or None when it cannot be observed."""
+    try:
+        count = proxy.active_http_request_count
+    except Exception:
+        logger.warning("event=orphan_watchdog_http_count_failed", exc_info=True)
+        return None
+    return count if isinstance(count, int) and count >= 0 else None
 
 
 def _served_request_count(proxy: Any) -> int | None:
@@ -142,12 +159,10 @@ async def orphan_watchdog_loop(
 
     The grace window covers the boot race (the wrapper registers its marker
     just before spawning the proxy, and re-registers on port fallback) and
-    short client restarts. Active WebSocket relay sessions (e.g. a Codex
-    session whose wrapper was killed mid-stream) and any change to the
-    proxied-request counter (direct HTTP clients, SSH-forwarded clients)
-    suppress shutdown even with no live markers. Long idle HTTP streams are
-    covered by the grace period: they finish in minutes, the default grace is
-    15.
+    short client restarts. Active WebSocket relay sessions, in-flight HTTP
+    requests, and any change to the proxied-request counter suppress shutdown
+    even with no live markers. The idle clock runs only while every supported
+    activity signal is positively observable and idle.
     """
     port = proxy.config.port
     clients_dir = proxy_clients_dir(port)
@@ -156,18 +171,30 @@ async def orphan_watchdog_loop(
     while True:
         await asyncio.sleep(interval_seconds)
         clients = live_client_pids(clients_dir)
-        active = _active_session_count(proxy)
+        active_sessions = _active_session_count(proxy)
+        active_http_requests = _active_http_request_count(proxy)
         served = _served_request_count(proxy)
         served_changed = served is not None and last_served is not None and served != last_served
         if served is not None:
             last_served = served
-        if clients or active > 0 or served_changed:
+        activity_unknown = (
+            clients is None or active_sessions is None or active_http_requests is None
+        )
+        if (
+            activity_unknown
+            or clients
+            or (active_sessions is not None and active_sessions > 0)
+            or (active_http_requests is not None and active_http_requests > 0)
+            or served_changed
+        ):
             if idle_since is not None:
                 logger.info(
-                    "event=orphan_watchdog_reset port=%d live_clients=%s active_sessions=%d",
+                    "event=orphan_watchdog_reset port=%d live_clients=%s "
+                    "active_sessions=%s active_http_requests=%s",
                     port,
                     clients,
-                    active,
+                    active_sessions,
+                    active_http_requests,
                 )
             idle_since = None
             continue

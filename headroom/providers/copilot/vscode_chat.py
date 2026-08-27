@@ -229,13 +229,18 @@ def _provenance_path(path: Path) -> Path:
     return paths.workspace_dir() / "vscode_chat_models" / f"{digest}.json"
 
 
-def _record_provenance(path: Path, block: dict[str, Any]) -> None:
-    """Remember the exact block written, so a later run can prove ownership.
+def _require_provenance(path: Path, block: dict[str, Any]) -> None:
+    """Record a block's digest, or refuse to write it at all.
 
-    Ownership is deliberately **not** inferred from the file's contents. A user
-    may legitimately hand-edit or copy our provider entry, and a name match alone
-    would then license overwriting their edits. Recording a digest out of band
-    means only bytes Headroom actually wrote are ever replaced.
+    Called before ``path`` is touched, mirroring the settings-block writer's
+    ``_require_settings_provenance``: ownership is deliberately **not** inferred
+    from the file's contents (a user may legitimately hand-edit or copy our
+    provider entry, and a name match alone would then license overwriting their
+    edits), so the recorded digest is the only proof a later run ever accepts.
+    With no record, that later run can never prove this block is Headroom's,
+    which strands both refresh (``configure_chat_models`` raises "already has a
+    provider...") and removal (``remove_chat_models`` returns ``False``) until a
+    hand edit. Refusing here instead means nothing has touched the user's file.
     """
     try:
         record = _provenance_path(path)
@@ -244,9 +249,11 @@ def _record_provenance(path: Path, block: dict[str, Any]) -> None:
             record,
             json.dumps({"path": str(path), "sha256": _block_digest(block)}),
         )
-    except OSError:
-        # Losing the record only means the next run appends instead of replacing.
-        pass
+    except OSError as exc:
+        raise click.ClickException(
+            f"Could not create an ownership record for the Headroom provider entry "
+            f"bound for {path} ({exc}). The entry was not written."
+        ) from exc
 
 
 def _read_provenance(path: Path) -> str | None:
@@ -266,6 +273,19 @@ def _clear_provenance(path: Path) -> None:
 
 
 def _block_digest(block: dict[str, Any]) -> str:
+    # Hashes the whole block, including ``apiKey`` -- which is always the
+    # hardcoded ``PLACEHOLDER_API_KEY``, never a real secret, since the proxy
+    # substitutes the actual Copilot credential itself. A CodeQL scan flags this
+    # call as hashing password-like data because of that field's name; it is a
+    # false positive (this is a content-equality digest for ownership tracking,
+    # not a password hash, and SHA256 is entirely appropriate for that). Do NOT
+    # "fix" it by excluding the field: every provenance record already on a
+    # tester's disk was written against a digest that includes it, and doing so
+    # would make `configure_chat_models` unable to recognize its own past
+    # writes -- reintroducing, for every existing record, exactly the stuck
+    # state (refresh refuses, removal no-ops) this file's ownership scheme
+    # exists to prevent. The alert should be dismissed as a false positive
+    # instead.
     return hashlib.sha256(
         json.dumps(block, sort_keys=True, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
@@ -300,7 +320,9 @@ def configure_chat_models(path: Path, block: dict[str, Any]) -> str:
     """Write/refresh Headroom's provider entry, preserving every other provider.
 
     Returns ``"added"`` or ``"updated"``. Raises rather than clobbering a
-    same-named entry Headroom cannot prove it wrote.
+    same-named entry Headroom cannot prove it wrote, rather than leaving an
+    ownership record for a block that was never actually written, and rather
+    than leaving a stale record after a write that fails partway.
     """
     providers = _load_providers(path)
     expected = _read_provenance(path)
@@ -334,9 +356,32 @@ def configure_chat_models(path: Path, block: dict[str, Any]) -> str:
         providers.append(block)
         action = "added"
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fsutil.write_text(path, json.dumps(providers, indent=2, ensure_ascii=False) + "\n")
-    _record_provenance(path, block)
+    # Captured before the record below is overwritten, so a failed file write
+    # can restore it. The record is keyed on ``path`` alone (see
+    # ``_provenance_path``), not on the block's digest, so on a refresh this is
+    # the *previous* block's record -- if the write then fails, restoring it is
+    # what keeps that still-current-on-disk block provable.
+    record_path = _provenance_path(path)
+    try:
+        previous_record = fsutil.read_text(record_path)
+    except OSError:
+        previous_record = None
+
+    _require_provenance(path, block)
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fsutil.write_text(path, json.dumps(providers, indent=2, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        if previous_record is None:
+            _clear_provenance(path)
+        else:
+            try:
+                fsutil.write_text(record_path, previous_record)
+            except OSError:
+                pass
+        raise click.ClickException(f"Could not write {path} ({exc}). Nothing was changed.") from exc
+
     return action
 
 

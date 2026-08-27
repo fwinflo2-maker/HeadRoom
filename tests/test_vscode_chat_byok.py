@@ -279,6 +279,82 @@ def test_json_object_instead_of_array_is_refused(tmp_path: Path, payload: dict) 
         configure_chat_models(p, _block(payload))
 
 
+def test_initial_add_is_never_written_without_its_ownership_record(
+    tmp_path: Path, payload: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recording ownership happens before the file is written, not after.
+
+    With no record, a later run can never prove this entry is Headroom's:
+    ``configure_chat_models`` would see the same provider name without a digest
+    and raise the conflicting-provider error, and ``remove_chat_models`` would
+    report nothing to remove -- both refresh and unwrap stuck until a hand edit.
+    Refusing the write itself, before it happens, is the only thing that
+    prevents that stuck state from ever existing.
+    """
+    from headroom.providers.copilot import vscode_chat as vscode_chat_module
+
+    p = tmp_path / "chatLanguageModels.json"
+    mine = {"name": "My Ollama", "vendor": "customendpoint", "models": []}
+    original = json.dumps([mine])
+    p.write_text(original, encoding="utf-8")
+
+    # A file where the record's parent directory needs to be created makes
+    # `mkdir` raise, simulating an unwritable workspace directory.
+    blocker = tmp_path / "unwritable"
+    blocker.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setattr(
+        vscode_chat_module, "_provenance_path", lambda path: blocker / "record.json"
+    )
+
+    with pytest.raises(click.ClickException, match="Could not create an ownership record"):
+        configure_chat_models(p, _block(payload))
+
+    assert p.read_text(encoding="utf-8") == original, (
+        "chatLanguageModels.json was written even though its ownership record failed"
+    )
+    assert not (blocker / "record.json").exists(), "a record survived a failed write"
+
+
+def test_refresh_is_never_written_without_its_ownership_record(
+    tmp_path: Path, payload: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refresh that cannot re-prove ownership must leave the old entry provable.
+
+    The record is keyed on the file path alone, not on the block's digest, so a
+    refresh overwrites the *same* record the original add created. If the
+    refresh's write then fails, restoring that record -- not just clearing it --
+    is what keeps the still-current-on-disk (unrefreshed) entry removable and
+    refreshable on the next run.
+    """
+    from headroom import fsutil
+    from headroom.providers.copilot.vscode_chat import _read_provenance
+
+    p = tmp_path / "chatLanguageModels.json"
+    configure_chat_models(p, _block(payload, 2))
+    original = p.read_text(encoding="utf-8")
+    expected_before = _read_provenance(p)
+    assert expected_before is not None
+
+    real_write_text = fsutil.write_text
+
+    def _fail_on_config_write(path: Path, content: str) -> None:
+        if Path(path) == p:
+            raise OSError("synthetic disk-full on the config write")
+        real_write_text(path, content)
+
+    monkeypatch.setattr(fsutil, "write_text", _fail_on_config_write)
+
+    with pytest.raises(click.ClickException, match="Could not write"):
+        configure_chat_models(p, _block(payload, 3))
+
+    assert p.read_text(encoding="utf-8") == original, (
+        "chatLanguageModels.json changed even though the refresh write failed"
+    )
+    assert _read_provenance(p) == expected_before, (
+        "the ownership record no longer matches the entry actually on disk"
+    )
+
+
 # ---------------------------------------------------------------------------
 # settings.json: the 1.132 visibility gate
 # ---------------------------------------------------------------------------

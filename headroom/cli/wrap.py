@@ -6241,35 +6241,13 @@ def copilot(
             )
         effective_backend = running_backend or effective_backend
 
-    # --native replaces the BYOK interposition rather than layering on it, so it
-    # implies subscription-style resolution (Copilot's hosted API, the user's own
-    # GitHub auth) and is incompatible with a BYOK provider type or a translated
-    # backend. Validated up front so a bad combination fails clearly instead of
-    # producing a session that silently bypasses Headroom.
+    # --native implies subscription-style resolution (Copilot's hosted API, the
+    # user's own GitHub auth). Only the explicit flag forces this -- implicit
+    # native routing (detected below, from OAuth with no provider key) keeps
+    # `subscription` as the caller set it, since that path resolves its bearer
+    # token differently (see `_should_use_copilot_oauth` / #1910).
     if native:
         subscription = True
-        if provider_type == "anthropic":
-            raise click.ClickException(
-                "--native routes Copilot's own API through Headroom and does not use the "
-                "BYOK provider override; do not combine it with --provider-type anthropic."
-            )
-        if wire_api is not None:
-            raise click.ClickException(
-                "--wire-api pins one BYOK wire API for the whole session, which is exactly "
-                "what --native avoids: the wire is chosen per request from the model. "
-                "Drop --wire-api."
-            )
-        if no_proxy:
-            # Native mode needs BOTH proxy upstreams pointed at the Copilot host,
-            # and those are start-time parameters -- there is no runtime path to
-            # repoint a proxy that is already running. With --no-proxy the
-            # overrides are silently discarded and every request 401s against the
-            # wrong vendor, so fail loudly instead.
-            raise click.ClickException(
-                "--native cannot be combined with --no-proxy: it needs to start a proxy "
-                "whose Anthropic and OpenAI upstreams both point at the Copilot host, and "
-                "an already-running proxy cannot be repointed at runtime."
-            )
 
     effective_provider_type = _resolve_copilot_provider_type(effective_backend, provider_type)
     if subscription:
@@ -6315,6 +6293,37 @@ def copilot(
     # implicit GitHub OAuth uses Copilot's own routing automatically.
     if use_copilot_oauth and not explicit_subscription:
         native = True
+
+    # --native is incompatible with a BYOK provider type, a pinned wire API, or
+    # skipping proxy startup -- checked here, after implicit native-OAuth
+    # detection above, rather than only on the explicit flag. A session that
+    # qualifies for native routing without the flag must be held to the same
+    # guarantees as one that requests it explicitly: checked only against the
+    # explicit flag, --no-proxy would silently discard the upstream overrides
+    # native mode needs and every request would 401 against the wrong vendor.
+    if native:
+        if provider_type == "anthropic":
+            raise click.ClickException(
+                "--native routes Copilot's own API through Headroom and does not use the "
+                "BYOK provider override; do not combine it with --provider-type anthropic."
+            )
+        if wire_api is not None:
+            raise click.ClickException(
+                "--wire-api pins one BYOK wire API for the whole session, which is exactly "
+                "what --native avoids: the wire is chosen per request from the model. "
+                "Drop --wire-api."
+            )
+        if no_proxy:
+            # Native mode needs BOTH proxy upstreams pointed at the Copilot host,
+            # and those are start-time parameters -- there is no runtime path to
+            # repoint a proxy that is already running. With --no-proxy the
+            # overrides are silently discarded and every request 401s against the
+            # wrong vendor, so fail loudly instead.
+            raise click.ClickException(
+                "--native cannot be combined with --no-proxy: it needs to start a proxy "
+                "whose Anthropic and OpenAI upstreams both point at the Copilot host, and "
+                "an already-running proxy cannot be repointed at runtime."
+            )
 
     if use_copilot_oauth:
         if subscription:

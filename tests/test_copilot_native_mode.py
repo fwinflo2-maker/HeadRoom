@@ -50,6 +50,12 @@ def test_native_env_keeps_the_project_prefix() -> None:
     assert env[COPILOT_NATIVE_API_URL_ENV] == "http://127.0.0.1:8890/p/myproj"
 
 
+def test_native_env_url_encodes_the_project_name() -> None:
+    """A project directory name is not necessarily a valid URL path segment."""
+    env, _ = build_native_launch_env(port=8890, environ={}, project="repo name")
+    assert env[COPILOT_NATIVE_API_URL_ENV] == "http://127.0.0.1:8890/p/repo%20name"
+
+
 def test_native_env_preserves_unrelated_environment() -> None:
     env, _ = build_native_launch_env(
         port=8890, environ={"PATH": "/usr/bin", "MY_VAR": "keep"}, project=None
@@ -89,6 +95,48 @@ def test_native_support_probe_is_tri_state(tmp_path, monkeypatch: pytest.MonkeyP
             environ={"LOCALAPPDATA": str(tmp_path)}, home=str(tmp_path / "none")
         )
         is True
+    )
+
+
+def test_native_support_probe_is_unknown_when_a_bundle_cannot_be_fully_read(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bundle that opens but fails mid-read must not be reported as "unsupported".
+
+    Only a bundle whose content was actually inspected end to end may answer
+    False. One that opens and then fails to read (deleted or locked
+    concurrently, a transient I/O error) was never actually inspected, so the
+    honest answer is "unknown" -- reporting "unsupported" here would refuse a
+    native launch that could in fact work.
+    """
+    pkg = tmp_path / "copilot" / "pkg" / "win32-x64" / "1.0.0"
+    pkg.mkdir(parents=True)
+    bundle = pkg / "app.js"
+    bundle.write_text("var x = 1;\n", encoding="utf-8")
+
+    real_open = open
+
+    class _FlakyFile:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def read(self, *_args, **_kwargs):
+            raise OSError("synthetic mid-read failure")
+
+    def _fake_open(path, *args, **kwargs):
+        if str(path) == str(bundle):
+            return _FlakyFile()
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", _fake_open)
+    assert (
+        native_api_url_supported(
+            environ={"LOCALAPPDATA": str(tmp_path)}, home=str(tmp_path / "none")
+        )
+        is None
     )
 
 
@@ -301,6 +349,39 @@ def test_implicit_oauth_uses_native_routing_without_flag(monkeypatch: pytest.Mon
     assert isinstance(env, dict)
     assert COPILOT_NATIVE_API_URL_ENV in env
     assert not any(variable in env for variable in COPILOT_BYOK_ENV_VARS)
+
+
+def test_implicit_native_rejects_no_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The --no-proxy guard must fire for implicit native routing too, not just --native.
+
+    Checking only the explicit flag let an implicitly-native session (OAuth, no
+    provider key, no --subscription) through with --no-proxy: the already-running
+    proxy can't be repointed at the Copilot host, so the upstream overrides this
+    mode needs are silently discarded and every request 401s against the wrong
+    vendor -- the exact failure `--native --no-proxy` is refused for explicitly.
+    """
+    from click.testing import CliRunner
+
+    from headroom.cli import wrap as wrap_mod
+    from headroom.cli.main import main
+
+    monkeypatch.setattr(wrap_mod.shutil, "which", lambda _name: "/usr/bin/copilot")
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: False)
+    monkeypatch.setattr(wrap_mod, "has_oauth_auth", lambda: True)
+    monkeypatch.setattr(wrap_mod, "resolve_client_bearer_token", lambda: "oauth-token")
+    monkeypatch.setattr(
+        wrap_mod, "resolve_copilot_api_url", lambda _token: "https://api.githubcopilot.com"
+    )
+    monkeypatch.setattr(wrap_mod, "_native_api_url_supported", lambda **_kwargs: True)
+    monkeypatch.setattr(wrap_mod, "_launch_tool", lambda **_k: None)
+
+    result = CliRunner().invoke(
+        main,
+        ["wrap", "copilot", "--no-proxy", "--port", "8890", "--", "--model", "claude-sonnet-5"],
+    )
+
+    assert result.exit_code != 0
+    assert "--no-proxy" in result.output
 
 
 def test_native_rejects_wire_api(monkeypatch: pytest.MonkeyPatch) -> None:

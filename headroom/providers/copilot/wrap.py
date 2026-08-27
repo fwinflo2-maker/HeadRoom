@@ -289,11 +289,9 @@ def native_api_url_supported(
         return None  # nothing to inspect: unknown, not unsupported
 
     bundles.sort()
-    read_any = False
     for _key, path in reversed(bundles):
         try:
             with open(path, encoding="utf-8", errors="replace") as fh:
-                read_any = True
                 # Overlap successive reads so the needle cannot be missed by
                 # landing across a chunk boundary (it silently returned False for
                 # a supported CLI, which then hard-refused the launch).
@@ -307,7 +305,10 @@ def native_api_url_supported(
             continue
         # The newest readable bundle is authoritative; do not let older ones vote.
         return False
-    return False if read_any else None
+    # Every located bundle failed to open, or failed mid-read (e.g. deleted or
+    # locked concurrently) -- unknown, not confirmed unsupported, since no
+    # bundle's content was ever actually inspected.
+    return None
 
 
 def _version_key(path: str) -> tuple[int, ...]:

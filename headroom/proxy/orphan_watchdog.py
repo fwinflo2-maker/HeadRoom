@@ -80,27 +80,34 @@ def live_client_pids(clients_dir: Path) -> list[int] | None:
     proxy is never its own client.
     """
     try:
-        if not clients_dir.exists():
-            return []
-        live: list[int] = []
-        for marker in clients_dir.glob("*.json"):
-            try:
-                pid = int(marker.stem)
-            except ValueError:
-                continue
-            if not pid_alive(pid) or _marker_pid_recycled(marker, pid):
-                try:
-                    marker.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                continue
-            live.append(pid)
-        return live
+        with os.scandir(clients_dir) as entries:
+            markers = [
+                Path(entry.path)
+                for entry in entries
+                if entry.name.endswith(".json") and entry.is_file()
+            ]
+    except FileNotFoundError:
+        return []
     except OSError:
         logger.warning(
             "event=orphan_watchdog_client_scan_failed dir=%s", clients_dir, exc_info=True
         )
         return None
+
+    live: list[int] = []
+    for marker in markers:
+        try:
+            pid = int(marker.stem)
+        except ValueError:
+            continue
+        if not pid_alive(pid) or _marker_pid_recycled(marker, pid):
+            try:
+                marker.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        live.append(pid)
+    return live
 
 
 def _active_session_count(proxy: Any) -> int | None:
@@ -114,28 +121,24 @@ def _active_session_count(proxy: Any) -> int | None:
         return None
 
 
-def _active_http_request_count(proxy: Any) -> int | None:
-    """Return active HTTP request count, or None when it cannot be observed."""
+def _active_request_count(proxy: Any) -> int | None:
+    """Return active HTTP/WebSocket scope count, or None when unobservable."""
     try:
-        count = proxy.active_http_request_count
+        count = proxy.active_request_count
     except Exception:
-        logger.warning("event=orphan_watchdog_http_count_failed", exc_info=True)
+        logger.warning("event=orphan_watchdog_request_count_failed", exc_info=True)
         return None
     return count if isinstance(count, int) and count >= 0 else None
 
 
-def _served_request_count(proxy: Any) -> int | None:
-    """Best-effort count of proxied requests served so far, or None.
-
-    Covers clients the marker scheme cannot see: direct HTTP callers and
-    clients reaching the loopback listener through an SSH port-forward write
-    no wrap-client marker and may hold no WebSocket session. Any proxied LLM
-    call allocates a request id, so a changing counter means "in use".
-    """
-    counter = getattr(proxy, "_request_counter", None)
-    if isinstance(counter, int):
-        return counter
-    return None
+def _activity_generation(proxy: Any) -> int | None:
+    """Return the monotonic ASGI activity generation, or None."""
+    try:
+        generation = proxy.activity_generation
+    except Exception:
+        logger.warning("event=orphan_watchdog_activity_generation_failed", exc_info=True)
+        return None
+    return generation if isinstance(generation, int) and generation >= 0 else None
 
 
 def _default_stop() -> None:
@@ -160,41 +163,48 @@ async def orphan_watchdog_loop(
     The grace window covers the boot race (the wrapper registers its marker
     just before spawning the proxy, and re-registers on port fallback) and
     short client restarts. Active WebSocket relay sessions, in-flight HTTP
-    requests, and any change to the proxied-request counter suppress shutdown
+    requests, and any change to the ASGI activity generation suppress shutdown
     even with no live markers. The idle clock runs only while every supported
     activity signal is positively observable and idle.
     """
     port = proxy.config.port
     clients_dir = proxy_clients_dir(port)
     idle_since: float | None = None
-    last_served = _served_request_count(proxy)
+    last_activity_generation = _activity_generation(proxy)
     while True:
         await asyncio.sleep(interval_seconds)
         clients = live_client_pids(clients_dir)
         active_sessions = _active_session_count(proxy)
-        active_http_requests = _active_http_request_count(proxy)
-        served = _served_request_count(proxy)
-        served_changed = served is not None and last_served is not None and served != last_served
-        if served is not None:
-            last_served = served
+        active_requests = _active_request_count(proxy)
+        activity_generation = _activity_generation(proxy)
+        activity_changed = (
+            activity_generation is not None
+            and last_activity_generation is not None
+            and activity_generation != last_activity_generation
+        )
+        if activity_generation is not None:
+            last_activity_generation = activity_generation
         activity_unknown = (
-            clients is None or active_sessions is None or active_http_requests is None
+            clients is None
+            or active_sessions is None
+            or active_requests is None
+            or activity_generation is None
         )
         if (
             activity_unknown
             or clients
             or (active_sessions is not None and active_sessions > 0)
-            or (active_http_requests is not None and active_http_requests > 0)
-            or served_changed
+            or (active_requests is not None and active_requests > 0)
+            or activity_changed
         ):
             if idle_since is not None:
                 logger.info(
                     "event=orphan_watchdog_reset port=%d live_clients=%s "
-                    "active_sessions=%s active_http_requests=%s",
+                    "active_sessions=%s active_requests=%s",
                     port,
                     clients,
                     active_sessions,
-                    active_http_requests,
+                    active_requests,
                 )
             idle_since = None
             continue

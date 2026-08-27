@@ -32,12 +32,16 @@ class _Proxy:
     def __init__(self, *, port: int = 8787, active_sessions: int = 0) -> None:
         self.config = SimpleNamespace(port=port)
         self.ws_sessions = SimpleNamespace(active_count=lambda: active_sessions)
-        self._active_http_requests = 0
-        self._request_counter = 0
+        self._active_requests = 0
+        self._activity_generation = 0
 
     @property
-    def active_http_request_count(self) -> int:
-        return self._active_http_requests
+    def active_request_count(self) -> int:
+        return self._active_requests
+
+    @property
+    def activity_generation(self) -> int:
+        return self._activity_generation
 
 
 class TestEnvConfig:
@@ -88,14 +92,20 @@ class TestLiveClientPids:
         # Unparseable marker JSON is not proof of recycling: PID is alive, kept.
         assert ow.live_client_pids(tmp_path) == [os.getpid()]
 
+    def test_non_dict_marker_is_not_recycling_proof(self, tmp_path) -> None:
+        (tmp_path / f"{os.getpid()}.json").write_text("[]", encoding="utf-8")
+        assert ow.live_client_pids(tmp_path) == [os.getpid()]
+
     def test_missing_dir_is_empty(self, tmp_path) -> None:
         assert ow.live_client_pids(tmp_path / "nope") == []
 
     def test_client_scan_error_is_unknown(self, tmp_path, monkeypatch) -> None:
-        def fail_glob(self: Path, pattern: str):  # type: ignore[no-untyped-def]
-            raise OSError("scan unavailable")
+        tmp_path.mkdir(exist_ok=True)
 
-        monkeypatch.setattr(Path, "glob", fail_glob)
+        def fail_scandir(path: object):  # type: ignore[no-untyped-def]
+            raise PermissionError("scan unavailable")
+
+        monkeypatch.setattr(ow.os, "scandir", fail_scandir)
         assert ow.live_client_pids(tmp_path) is None
 
 
@@ -164,9 +174,9 @@ class TestWatchdogLoop:
 
         assert stopped == []
 
-    def test_no_stop_while_requests_are_served(self, tmp_path, monkeypatch) -> None:
+    def test_no_stop_while_request_activity_continues(self, tmp_path, monkeypatch) -> None:
         """Direct-HTTP / SSH-forwarded clients leave no marker and may hold no
-        WS session; served-request counter movement must still hold the exit."""
+        WS session; activity generation movement must still hold the exit."""
         monkeypatch.setattr(ow, "proxy_clients_dir", lambda port: tmp_path)
         counter = {"n": 0}
         proxy = self._proxy()
@@ -176,7 +186,7 @@ class TestWatchdogLoop:
             while True:
                 await asyncio.sleep(0.05)
                 counter["n"] += 1
-                proxy._request_counter = counter["n"]
+                proxy._activity_generation = counter["n"]
 
         async def run() -> None:
             traffic = asyncio.create_task(serve_traffic())
@@ -204,7 +214,7 @@ class TestWatchdogLoop:
         monkeypatch.setattr(ow, "proxy_clients_dir", lambda port: tmp_path)
         proxy = self._proxy()
         app = FastAPI()
-        app.add_middleware(server.ActiveHttpRequestMiddleware, proxy=proxy)
+        app.add_middleware(server.ActivityMiddleware, proxy=proxy)
         stream_started = asyncio.Event()
         release_stream = asyncio.Event()
         stopped: list[bool] = []
@@ -234,7 +244,7 @@ class TestWatchdogLoop:
                 await asyncio.wait_for(stream_started.wait(), timeout=1)
                 await asyncio.sleep(0.12)
                 assert stopped == []
-                assert proxy.active_http_request_count == 1
+                assert proxy.active_request_count == 1
 
                 release_stream.set()
                 await request
@@ -244,6 +254,85 @@ class TestWatchdogLoop:
 
         asyncio.run(run())
 
+        assert stopped == [True]
+
+    def test_short_http_pulse_restarts_full_grace(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(ow, "proxy_clients_dir", lambda port: tmp_path)
+        proxy = self._proxy()
+        app = FastAPI()
+        app.add_middleware(server.ActivityMiddleware, proxy=proxy)
+        stopped: list[bool] = []
+
+        @app.get("/pulse")
+        async def pulse() -> dict[str, bool]:
+            return {"ok": True}
+
+        async def run() -> None:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                watchdog = asyncio.create_task(
+                    ow.orphan_watchdog_loop(
+                        proxy,
+                        grace_seconds=0.08,
+                        interval_seconds=0.02,
+                        stop=lambda: stopped.append(True),
+                    )
+                )
+                await asyncio.sleep(0.05)
+                before = proxy.activity_generation
+                response = await client.get("/pulse")
+                assert response.status_code == 200
+                assert proxy.active_request_count == 0
+                assert proxy.activity_generation == before + 2
+
+                # The pre-pulse idle window would have expired by now. The
+                # observed generation change must start a full new window.
+                await asyncio.sleep(0.06)
+                assert stopped == []
+                await asyncio.wait_for(watchdog, timeout=0.2)
+
+        asyncio.run(run())
+
+        assert stopped == [True]
+
+    def test_activity_middleware_tracks_held_websocket_scope(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(ow, "proxy_clients_dir", lambda port: tmp_path)
+        proxy = self._proxy()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        stopped: list[bool] = []
+
+        async def held_app(scope, receive, send):  # type: ignore[no-untyped-def]
+            entered.set()
+            await release.wait()
+
+        async def unused():  # type: ignore[no-untyped-def]
+            return {}
+
+        async def run() -> None:
+            middleware = server.ActivityMiddleware(held_app, proxy=proxy)
+            watchdog = asyncio.create_task(
+                ow.orphan_watchdog_loop(
+                    proxy,
+                    grace_seconds=0.05,
+                    interval_seconds=0.01,
+                    stop=lambda: stopped.append(True),
+                )
+            )
+            task = asyncio.create_task(middleware({"type": "websocket"}, unused, unused))
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            assert proxy.active_request_count == 1
+            assert proxy.activity_generation == 1
+            await asyncio.sleep(0.08)
+            assert stopped == []
+
+            release.set()
+            await task
+            assert proxy.active_request_count == 0
+            assert proxy.activity_generation == 2
+            await asyncio.wait_for(watchdog, timeout=0.2)
+
+        asyncio.run(run())
         assert stopped == [True]
 
     def test_registry_failure_resets_grace_until_activity_is_observable(
@@ -283,22 +372,24 @@ class TestWatchdogLoop:
 
         assert stopped == [True]
 
-    @pytest.mark.parametrize("unknown_signal", ["clients", "http"])
+    @pytest.mark.parametrize("unknown_signal", ["clients", "activity", "generation"])
     def test_unknown_activity_signal_resets_grace_until_observable(
         self, unknown_signal, tmp_path, monkeypatch
     ) -> None:
         observable = False
         proxy = self._proxy()
         if unknown_signal == "clients":
-            del proxy._request_counter
             monkeypatch.setattr(
                 ow,
                 "live_client_pids",
                 lambda clients_dir: [] if observable else None,
             )
+        elif unknown_signal == "activity":
+            monkeypatch.setattr(ow, "proxy_clients_dir", lambda port: tmp_path)
+            proxy._active_requests = None
         else:
             monkeypatch.setattr(ow, "proxy_clients_dir", lambda port: tmp_path)
-            proxy._active_http_requests = None
+            proxy._activity_generation = None
         stopped: list[bool] = []
 
         async def run() -> None:
@@ -315,7 +406,8 @@ class TestWatchdogLoop:
             assert stopped == []
 
             observable = True
-            proxy._active_http_requests = 0
+            proxy._active_requests = 0
+            proxy._activity_generation = 0
             await asyncio.sleep(0.04)
             assert stopped == []
             await asyncio.wait_for(watchdog, timeout=0.2)
@@ -397,17 +489,17 @@ class TestDefensiveHelpers:
         proxy = SimpleNamespace(ws_sessions=SimpleNamespace(active_count=boom))
         assert ow._active_session_count(proxy) is None
 
-    def test_active_http_request_count_is_unknown_when_unavailable(self) -> None:
+    def test_active_request_count_is_unknown_when_unavailable(self) -> None:
         class BrokenProxy:
             @property
-            def active_http_request_count(self) -> int:
+            def active_request_count(self) -> int:
                 raise RuntimeError("counter unavailable")
 
-        assert ow._active_http_request_count(SimpleNamespace()) is None
-        assert ow._active_http_request_count(BrokenProxy()) is None
+        assert ow._active_request_count(SimpleNamespace()) is None
+        assert ow._active_request_count(BrokenProxy()) is None
 
-    def test_served_request_count_is_unknown_when_unavailable(self) -> None:
-        assert ow._served_request_count(SimpleNamespace()) is None
+    def test_activity_generation_is_unknown_when_unavailable(self) -> None:
+        assert ow._activity_generation(SimpleNamespace()) is None
 
     def test_default_stop_raises_sigterm(self, monkeypatch) -> None:
         sent: list[int] = []
@@ -447,10 +539,11 @@ class TestServerWiring:
         # Lifespan teardown cancelled it and cleared the state slot.
         assert app.state.orphan_watchdog_task is None
 
-    def test_http_activity_middleware_is_outermost(self) -> None:
+    def test_activity_middleware_is_outermost(self) -> None:
         app = server.create_app(self._config())
-        assert app.user_middleware[0].cls is server.ActiveHttpRequestMiddleware
-        assert app.state.proxy.active_http_request_count == 0
+        assert app.user_middleware[0].cls is server.ActivityMiddleware
+        assert app.state.proxy.active_request_count == 0
+        assert app.state.proxy.activity_generation == 0
 
     def test_skips_watchdog_for_multi_worker(self, monkeypatch) -> None:
         monkeypatch.setenv(ow.WRAP_OWNED_ENV, "1")

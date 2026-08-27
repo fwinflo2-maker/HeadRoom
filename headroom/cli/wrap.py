@@ -703,6 +703,10 @@ def _start_proxy(
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)
     proxy_env = os.environ.copy()
     _scrub_copilot_proxy_seed_env(proxy_env)
+    # A wrap-owned proxy must be a single authoritative process so its orphan
+    # watchdog can observe all activity before deciding to self-terminate.
+    proxy_env.pop("HEADROOM_WORKERS", None)
+    proxy_env.pop("HEADROOM_PROXY_CONFIG_JSON", None)
     proxy_env["PYTHONIOENCODING"] = "utf-8"
     # `python -m headroom.cli` prepends the launch cwd to sys.path, so running
     # `wrap` from a directory that contains a `headroom/` folder (most commonly a
@@ -4547,6 +4551,8 @@ def _marker_pid_reused(marker: Path, pid: int) -> bool:
         rec = json.loads(_read_text(marker))
     except (OSError, ValueError):
         return False
+    if not isinstance(rec, dict):
+        return False
     return _identity_mismatch(rec.get("start_src"), rec.get("start_time"), pid)
 
 
@@ -4577,61 +4583,21 @@ def _live_proxy_clients(port: int, *, exclude_self: bool = True) -> list[int]:
 
 
 def _make_cleanup(proxy_proc_holder: list, port: int | list[int] = 8787) -> Any:
-    """Create a cleanup function that terminates the proxy on exit.
-
-    Only kills the proxy when no other live headroom-wrapped clients remain,
-    tracked via per-PID marker files in ``paths.proxy_clients_dir(port)``.
+    """Create marker cleanup for a successfully launched wrap session.
 
     ``port`` can be an ``int`` or a ``list[int]``.  When a port fallback occurs
     (``_ensure_proxy`` ups the port because the requested one is busy), the
     caller can update ``port[0]`` in-place and the closure picks it up.
-    """
 
-    def _other_clients_exist() -> bool:
-        p = port[0] if isinstance(port, list) else port
-        return len(_live_proxy_clients(p, exclude_self=True)) > 0
+    Normal wrapper exit only unregisters its marker. The wrap-owned proxy's
+    watchdog owns final shutdown so active markerless HTTP or WebSocket traffic
+    receives a full grace period. Startup rollback and explicit stop commands
+    retain direct process termination.
+    """
 
     def cleanup(signum: int | None = None, frame: Any = None) -> None:
         p = port[0] if isinstance(port, list) else port
         _unregister_proxy_client(p)
-        proc = proxy_proc_holder[0] if proxy_proc_holder else None
-        if proc:
-            if _other_clients_exist():
-                # Other clients still using the proxy — leave it running.
-                return
-            # Snapshot the serving PID before terminating the launcher.  On
-            # Windows the detached serving child can briefly make /health
-            # unavailable while the launcher exits, causing the later safety
-            # probe to classify our own listener as "unidentified" and leave
-            # it orphaned.  We still verify it through Headroom's health
-            # payload before trusting the PID.
-            serving_pid: int | None = None
-            if sys.platform == "win32" and _check_proxy(p):
-                running_config = _query_proxy_config(p)
-                try:
-                    serving_pid = int(running_config["pid"]) if running_config else None
-                except (KeyError, TypeError, ValueError):
-                    serving_pid = None
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-            # On Windows the proxy launcher can exit while its detached
-            # serving child remains alive (the native runtime uses a child
-            # process).  The detachment is intentional so an ungraceful
-            # terminal close cannot disrupt other wrappers, but a graceful
-            # Ctrl+C from the last wrapper must still stop the listener.
-            if sys.platform == "win32" and _check_proxy(p):
-                stop_status = _stop_local_proxy_for_unwrap(p)
-                if stop_status == "unidentified" and serving_pid is not None:
-                    stop_status = "stopped" if _kill_proxy_by_pid(serving_pid, p) else "failed"
-                if stop_status not in {"stopped", "not_running"}:
-                    click.echo(
-                        f"  Warning: proxy on port {p} remained running "
-                        f"after shutdown ({stop_status})."
-                    )
 
     return cleanup
 

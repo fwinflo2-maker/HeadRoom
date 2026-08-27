@@ -1205,7 +1205,8 @@ class HeadroomProxy(
         # Request counter for IDs
         self._request_counter = 0
         self._request_counter_lock = asyncio.Lock()
-        self._active_http_requests = 0
+        self._active_requests = 0
+        self._activity_generation = 0
 
         # CCR tool injectors (one per provider)
         self.anthropic_tool_injector = CCRToolInjector(
@@ -2198,9 +2199,14 @@ class HeadroomProxy(
             return f"hr_{int(time.time())}_{self._request_counter:06d}"
 
     @property
-    def active_http_request_count(self) -> int:
-        """Number of HTTP requests whose full ASGI response is still active."""
-        return self._active_http_requests
+    def active_request_count(self) -> int:
+        """Number of active HTTP and WebSocket ASGI scopes."""
+        return self._active_requests
+
+    @property
+    def activity_generation(self) -> int:
+        """Monotonic generation advanced at request entry and completion."""
+        return self._activity_generation
 
     def _extract_tags(self, headers: dict) -> dict[str, str]:
         """Backwards-compat wrapper around :func:`extract_tags`.
@@ -2718,23 +2724,25 @@ class WebSocketProjectPrefixMiddleware:
         await self.app(scope, receive, send)
 
 
-class ActiveHttpRequestMiddleware:
-    """Track each HTTP request until its complete ASGI response finishes."""
+class ActivityMiddleware:
+    """Track HTTP and WebSocket scopes through their complete ASGI lifetime."""
 
     def __init__(self, app: Any, *, proxy: HeadroomProxy) -> None:
         self.app = app
         self.proxy = proxy
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        if scope["type"] != "http":
+        if scope["type"] not in {"http", "websocket"}:
             await self.app(scope, receive, send)
             return
 
-        self.proxy._active_http_requests += 1
+        self.proxy._active_requests += 1
+        self.proxy._activity_generation += 1
         try:
             await self.app(scope, receive, send)
         finally:
-            self.proxy._active_http_requests -= 1
+            self.proxy._active_requests -= 1
+            self.proxy._activity_generation += 1
 
 
 def create_app(config: ProxyConfig | None = None) -> FastAPI:
@@ -5435,7 +5443,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     register_provider_routes(app, proxy)
     # Register last so this raw ASGI middleware is outermost and covers the
     # complete response body, including responses produced by other middleware.
-    app.add_middleware(ActiveHttpRequestMiddleware, proxy=proxy)
+    app.add_middleware(ActivityMiddleware, proxy=proxy)
 
     return app
 

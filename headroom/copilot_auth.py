@@ -806,17 +806,16 @@ def iter_oauth_token_candidates(
                 )
             )
 
-    windows_copilot_token = _read_windows_copilot_cli_oauth_token()
-    if windows_copilot_token:
-        candidates.append(
-            CopilotTokenCandidate(
-                token=windows_copilot_token,
-                source="windows-credential-manager:copilot-cli",
-                confidence="high",
-            )
-        )
-
     if include_platform_secret_stores:
+        windows_copilot_token = _read_windows_copilot_cli_oauth_token()
+        if windows_copilot_token:
+            candidates.append(
+                CopilotTokenCandidate(
+                    token=windows_copilot_token,
+                    source="windows-credential-manager:copilot-cli",
+                    confidence="high",
+                )
+            )
         candidates.extend(_platform_secret_store_oauth_token_candidates())
 
     candidates.extend(_read_file_oauth_token_candidates())

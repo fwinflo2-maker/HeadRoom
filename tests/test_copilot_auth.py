@@ -195,7 +195,11 @@ def test_read_cached_oauth_token_prefers_copilot_cli_before_generic_github_token
     monkeypatch.delenv("GITHUB_COPILOT_TOKEN", raising=False)
     monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-generic")
-    monkeypatch.setattr(copilot_auth, "_read_windows_copilot_cli_oauth_token", lambda: None)
+    monkeypatch.setattr(
+        copilot_auth,
+        "_read_windows_copilot_cli_oauth_token",
+        lambda: None,
+    )
     monkeypatch.setattr(copilot_auth, "_read_macos_keychain_oauth_token", lambda: "gho-keychain")
     monkeypatch.setattr(copilot_auth, "_read_gh_cli_oauth_token", lambda: None)
 
@@ -1768,7 +1772,11 @@ def test_iter_oauth_token_candidates_skips_platform_secret_stores_when_disabled(
     monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GH_TOKEN", raising=False)
-    monkeypatch.setattr(copilot_auth, "_read_windows_copilot_cli_oauth_token", lambda: None)
+    monkeypatch.setattr(
+        copilot_auth,
+        "_read_windows_copilot_cli_oauth_token",
+        lambda: pytest.fail("Windows Credential Manager should not be read"),
+    )
     monkeypatch.setattr(
         copilot_auth,
         "_platform_secret_store_oauth_token_candidates",
@@ -1778,6 +1786,37 @@ def test_iter_oauth_token_candidates_skips_platform_secret_stores_when_disabled(
     monkeypatch.setattr(copilot_auth, "_read_gh_cli_oauth_token", lambda: None)
 
     assert copilot_auth.iter_oauth_token_candidates(include_platform_secret_stores=False) == []
+
+
+def test_iter_oauth_token_candidates_reads_windows_store_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for env_var in (
+        "GITHUB_COPILOT_GITHUB_TOKEN",
+        "GITHUB_COPILOT_TOKEN",
+        "COPILOT_GITHUB_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+    monkeypatch.setattr(
+        copilot_auth,
+        "_read_windows_copilot_cli_oauth_token",
+        lambda: "gho-windows",
+    )
+    monkeypatch.setattr(
+        copilot_auth,
+        "_platform_secret_store_oauth_token_candidates",
+        lambda: [],
+    )
+    monkeypatch.setattr(copilot_auth, "_read_file_oauth_token_candidates", lambda: [])
+    monkeypatch.setattr(copilot_auth, "_read_gh_cli_oauth_token", lambda: None)
+
+    candidates = copilot_auth.iter_oauth_token_candidates()
+
+    assert [(candidate.source, candidate.token) for candidate in candidates] == [
+        ("windows-credential-manager:copilot-cli", "gho-windows"),
+    ]
 
 
 def test_platform_secret_store_candidates_include_macos_keychain_token(

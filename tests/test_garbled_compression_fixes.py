@@ -61,14 +61,32 @@ def test_valid_json_array_is_still_typed_json_array() -> None:
     assert json.loads(array_section.content) == [{"id": i} for i in range(5)]
 
 
-def test_prose_around_failed_json_candidate_coalesces() -> None:
-    """A rejected bracket-line must not fragment the surrounding prose.
+def test_rejected_candidate_keeps_its_own_atomic_section() -> None:
+    """A balanced-but-invalid block stays standalone, never merged into prose.
 
-    Fragmented prose gets rejoined by the router's "\\n\\n" reassembly,
-    doubling the original single newlines. Contiguous PLAIN_TEXT
-    fragments are merged back with their original "\\n".
+    Standalone-ness is load-bearing: a 33-word banner meets the text
+    compressors' size floors on its own; merged into surrounding prose the
+    combined section clears the floor and the banner rides a lossy pass.
     """
     content = "Line one of prose.\n" + HARNESS_BANNER + "\nLine after the banner."
+    sections = split_into_sections(content)
+    assert [s.content for s in sections] == [
+        "Line one of prose.",
+        HARNESS_BANNER,
+        "Line after the banner.",
+    ]
+    assert all(s.content_type is ContentType.PLAIN_TEXT for s in sections)
+    assert [s.atomic for s in sections] == [False, True, False]
+
+
+def test_prose_around_unbalanced_candidate_coalesces() -> None:
+    """Prose fragmented by a never-balancing bracket line merges back.
+
+    Fragmented prose gets rejoined by the router's "\\n\\n" reassembly,
+    doubling the original single newlines; contiguous PLAIN_TEXT fragments
+    re-merge with their original "\\n" instead.
+    """
+    content = "Opening prose line.\n[unclosed bracket that never balances\nClosing prose line."
     sections = split_into_sections(content)
     assert len(sections) == 1, [(s.content_type, s.content[:40]) for s in sections]
     assert sections[0].content_type is ContentType.PLAIN_TEXT
@@ -195,6 +213,74 @@ def test_harness_banner_survives_router_compression_byte_intact() -> None:
 
     assert HARNESS_BANNER in result.compressed
     assert "\\u" not in result.compressed
+
+
+def test_banner_survives_with_live_kompress_model(monkeypatch) -> None:
+    """The screenshot scenario with the ML model actually LOADED.
+
+    Locally no Kompress model is installed, so text sections pass through
+    trivially and the other end-to-end tests can't prove the banner is safe
+    from a *live* lossy pass. Fake the model (keeps every other word — the
+    pattern from test_kompress_failsafe) and drive the full router: prose
+    must genuinely compress, while the banner — its own atomic section,
+    under the word floor — must come out byte-identical, and no CCR entry
+    may hold it.
+    """
+    import re
+
+    import headroom.transforms.kompress_compressor as kc
+    from headroom.cache.compression_store import get_compression_store
+    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+
+    class FakeEncoding:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def __getitem__(self, key):
+            if key == "input_ids":
+                return [[0] * len(r) for r in self._rows]
+            if key == "attention_mask":
+                return [[1] * len(r) for r in self._rows]
+            raise KeyError(key)
+
+        def word_ids(self, batch_index=0):
+            return list(range(len(self._rows[batch_index])))
+
+    class FakeTokenizer:
+        def __call__(self, words, **kwargs):
+            rows = words if words and isinstance(words[0], list) else [words]
+            return FakeEncoding(rows)
+
+    class FakeModel:
+        def get_keep_mask(self, input_ids, attention_mask):
+            return [[i % 2 == 0 for i in range(len(row))] for row in input_ids]
+
+        def get_scores(self, input_ids, attention_mask):
+            return [[1.0 if i % 2 == 0 else 0.0 for i in range(len(row))] for row in input_ids]
+
+    triple = (FakeModel(), FakeTokenizer(), "onnx")
+    model_id = kc.KompressConfig().model_id
+    monkeypatch.setattr(kc, "_kompress_cache", {model_id: triple})
+    monkeypatch.setattr(kc, "_load_kompress", lambda *a, **k: triple)
+
+    prose = "The reviewer walked every module and found the loader wired twice. " * 12
+    rows = json.dumps([{"id": i, "status": "ok"} for i in range(30)])
+    content = HARNESS_BANNER + "\n" + prose.strip() + "\nScan table:\n" + rows
+
+    router = ContentRouter(ContentRouterConfig())
+    result = router.compress(content, context="design review")
+
+    # The lossy model really ran on the prose...
+    assert "words compressed to" in result.compressed
+    assert "items compressed to" not in result.compressed
+    # ...but the banner is byte-identical, never word-dropped.
+    assert HARNESS_BANNER in result.compressed
+    # And no CCR entry stores the banner as retrievable "original content".
+    store = get_compression_store()
+    for hash_key in re.findall(r"hash=([0-9a-f]{12,64})", result.compressed):
+        entry = store.retrieve(hash_key)
+        if entry is not None:
+            assert HARNESS_BANNER not in entry.original_content
 
 
 # --------------------------------------------------------------------------- #

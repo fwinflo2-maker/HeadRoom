@@ -19,6 +19,13 @@ class ContentSection:
     start_line: int = 0
     end_line: int = 0
     is_code_fence: bool = False
+    # Never merged into a neighbor by the post-pass coalescer. Set on
+    # tag-protection placeholder lines (merging would drag prose into their
+    # compression exemption) and on bracket-balanced-but-invalid-JSON blocks
+    # (kept standalone so a short prose banner meets the compressors' size
+    # floors on its own instead of riding a larger merged section into a
+    # lossy pass).
+    atomic: bool = False
 
 
 _CODE_FENCE_PATTERN = re.compile(r"^```(\w*)\s*$", re.MULTILINE)
@@ -113,6 +120,7 @@ def split_into_sections(content: str, *, isolate: tuple[str, ...] = ()) -> list[
                     content_type=ContentType.PLAIN_TEXT,
                     start_line=i,
                     end_line=i,
+                    atomic=True,
                 )
             )
             i += 1
@@ -157,15 +165,25 @@ def split_into_sections(content: str, *, isolate: tuple[str, ...] = ()) -> list[
                 # always validated; the splitter must agree with it.
                 try:
                     json.loads(json_content)
+                    valid_json = True
                 except (TypeError, ValueError):
-                    json_content = None
-            if json_content is not None:
+                    valid_json = False
+                # Either way the block keeps its own section with the same
+                # line span the JSON_ARRAY typing always gave it. For the
+                # invalid case that standalone-ness is load-bearing: a short
+                # prose banner must meet the text compressors' size floors
+                # on its own, not merged into surrounding prose whose
+                # combined size clears them (atomic=True keeps the
+                # coalescer's hands off).
                 sections.append(
                     ContentSection(
                         content=json_content,
-                        content_type=ContentType.JSON_ARRAY,
+                        content_type=(
+                            ContentType.JSON_ARRAY if valid_json else ContentType.PLAIN_TEXT
+                        ),
                         start_line=i,
                         end_line=end_i,
+                        atomic=not valid_json,
                     )
                 )
                 i = end_i + 1
@@ -214,20 +232,22 @@ def split_into_sections(content: str, *, isolate: tuple[str, ...] = ()) -> list[
                 )
             )
 
-    return _coalesce_adjacent_plain_text(sections, isolate)
+    return _coalesce_adjacent_plain_text(sections)
 
 
-def _coalesce_adjacent_plain_text(
-    sections: list[ContentSection], isolate: tuple[str, ...] = ()
-) -> list[ContentSection]:
+def _coalesce_adjacent_plain_text(sections: list[ContentSection]) -> list[ContentSection]:
     """Merge line-contiguous PLAIN_TEXT neighbors back into one section.
 
     The text accumulator stops at every ``[``/``{``/search-shaped line so the
-    main loop can retry it as a candidate; when that candidate turns out not to
-    be JSON it becomes the start of a NEW text section. Left split, each
-    fragment would be rejoined by the router's ``"\\n\\n"`` reassembly, turning
-    the prose's original single newlines into doubles. Merging contiguous
-    fragments with ``"\\n"`` keeps the original bytes of uncompressed prose.
+    main loop can retry it as a candidate; when a candidate never balances it
+    becomes the start of a NEW text section. Left split, each fragment would
+    be rejoined by the router's ``"\\n\\n"`` reassembly, turning the prose's
+    original single newlines into doubles. Merging contiguous fragments with
+    ``"\\n"`` keeps the original bytes of uncompressed prose.
+
+    ``atomic`` sections (placeholder lines, balanced-but-invalid JSON blocks)
+    are never merged, in either direction — their standalone-ness carries
+    meaning (compression exemption, per-block size floors).
     """
     merged: list[ContentSection] = []
     for section in sections:
@@ -238,17 +258,9 @@ def _coalesce_adjacent_plain_text(
             and section.content_type is ContentType.PLAIN_TEXT
             and not prev.is_code_fence
             and not section.is_code_fence
+            and not prev.atomic
+            and not section.atomic
             and section.start_line == prev.end_line + 1
-            # Never merge across a protected placeholder: the router exempts
-            # placeholder-carrying sections from compression, and a merge
-            # would drag ordinary prose into that exemption.
-            and not (
-                isolate
-                and (
-                    any(m in prev.content for m in isolate)
-                    or any(m in section.content for m in isolate)
-                )
-            )
         ):
             prev.content = f"{prev.content}\n{section.content}"
             prev.end_line = section.end_line

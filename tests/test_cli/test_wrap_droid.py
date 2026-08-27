@@ -225,6 +225,87 @@ def test_wrap_droid_reuses_matching_factory_proxy(runner: CliRunner) -> None:
     assert captured["port"] == 8787
 
 
+@pytest.mark.parametrize(
+    ("proxy_running", "running_config", "factory_api_url"),
+    [
+        pytest.param(False, None, None, id="no-listener"),
+        pytest.param(False, {"factory_api_url": DEFAULT_FACTORY_API_URL}, None, id="non-headroom"),
+        pytest.param(True, None, None, id="configless"),
+        pytest.param(True, {}, None, id="non-factory"),
+        pytest.param(
+            True,
+            {"factory_api_url": "http://127.0.0.1:8787"},
+            "http://127.0.0.1:8787",
+            id="loopback-upstream",
+        ),
+        pytest.param(
+            True,
+            {"factory_api_url": "https://other.factory.example/v1/"},
+            "https://expected.factory.example",
+            id="mismatched-upstream",
+        ),
+        pytest.param(
+            True,
+            {"factory_api_url": "http://[invalid"},
+            None,
+            id="malformed-upstream",
+        ),
+    ],
+)
+def test_wrap_droid_no_proxy_rejects_unverified_factory_proxy(
+    runner: CliRunner,
+    proxy_running: bool,
+    running_config: dict[str, object] | None,
+    factory_api_url: str | None,
+) -> None:
+    args = ["wrap", "droid", "--no-proxy"]
+    if factory_api_url is not None:
+        args.extend(("--factory-api-url", factory_api_url))
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="droid"),
+        patch("headroom.cli.wrap._check_proxy", return_value=proxy_running),
+        patch("headroom.cli.wrap._query_proxy_config", return_value=running_config),
+        patch("headroom.cli.wrap._launch_tool") as launch_tool,
+    ):
+        result = runner.invoke(main, args)
+
+    assert result.exit_code == 1
+    assert "compatible Factory proxy" in result.output
+    launch_tool.assert_not_called()
+
+
+def test_wrap_droid_no_proxy_reuses_normalized_matching_factory_proxy(
+    runner: CliRunner,
+) -> None:
+    captured: dict[str, object] = {}
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="droid"),
+        patch("headroom.cli.wrap._check_proxy", return_value=True),
+        patch(
+            "headroom.cli.wrap._query_proxy_config",
+            return_value={"factory_api_url": " https://tenant.factory.example/ "},
+        ),
+        patch("headroom.cli.wrap._find_available_port") as find_available_port,
+        patch("headroom.cli.wrap._launch_tool", side_effect=lambda **kw: captured.update(kw)),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "droid",
+                "--no-proxy",
+                "--factory-api-url",
+                "https://tenant.factory.example/v1/",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert captured["port"] == 8787
+    assert captured["no_proxy"] is True
+    find_available_port.assert_not_called()
+
+
 def test_start_proxy_forwards_factory_api_url_to_subprocess(tmp_path: Path) -> None:
     """_start_proxy must pass --factory-api-url and FACTORY_TARGET_API_URL through
     to the actual proxy subprocess command/env when factory_api_url is set.

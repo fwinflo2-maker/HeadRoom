@@ -24,7 +24,8 @@ slim_container="headroom-bind-slim-$$"; network="headroom-bind-network-$$"
 tmp_dir="$(mktemp -d)"
 cleanup() {
   docker rm -f "$attacker_container" "$public_container" "$local_container" "$slim_container" "$head_container" "$base_container" "$mock_container" >/dev/null 2>&1 || true
-  docker image rm "$base_image" "$head_image" "${head_image}-runtime-slim" >/dev/null 2>&1 || true
+  # The CI workflow reuses the head image for installer, compose, and wrap checks.
+  docker image rm "$base_image" "${head_image}-runtime-slim" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
   rm -rf "$tmp_dir"
 }

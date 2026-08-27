@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -9,6 +10,11 @@ from fastapi import Request
 from fastapi.responses import Response
 
 from headroom.providers.codex.model_metadata import handle_chatgpt_model_metadata
+from headroom.providers.grok.model_metadata import (
+    is_xai_model_list_target,
+    normalize_xai_model_metadata,
+)
+from headroom.proxy.helpers import sanitize_forwarded_response_headers
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,7 +55,7 @@ async def handle_model_metadata_endpoint(
     if chatgpt_response is not None:
         return chatgpt_response
 
-    return cast(
+    response = cast(
         Response,
         await proxy.handle_passthrough(
             request,
@@ -58,3 +64,26 @@ async def handle_model_metadata_endpoint(
             provider_name,
         ),
     )
+    if (
+        endpoint == MODEL_METADATA_LIST_ENDPOINT
+        and 200 <= response.status_code < 300
+        and is_xai_model_list_target(provider_api_base_url)
+    ):
+        try:
+            payload = json.loads(response.body)
+            normalized_payload = normalize_xai_model_metadata(payload)
+        except (TypeError, ValueError):
+            normalized_payload = None
+        if normalized_payload is not None:
+            headers = sanitize_forwarded_response_headers(response.headers)
+            headers["content-type"] = "application/json"
+            return Response(
+                content=json.dumps(
+                    normalized_payload,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                status_code=response.status_code,
+                headers=headers,
+            )
+    return response

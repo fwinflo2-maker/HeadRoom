@@ -212,6 +212,11 @@ def test_grok_non_success_and_non_json_responses_are_unchanged(monkeypatch) -> N
             status_code=200,
             headers={"x-upstream": "surrogate"},
         ),
+        "/non-finite": Response(
+            content=b'{"data":[{"id":"grok","context_length":1}],"extra":NaN}',
+            status_code=200,
+            headers={"x-upstream": "non-finite"},
+        ),
     }
 
     class Proxy:
@@ -236,6 +241,7 @@ def test_grok_non_success_and_non_json_responses_are_unchanged(monkeypatch) -> N
         error = client.get("/error")
         non_json = client.get("/non-json")
         surrogate = client.get("/surrogate")
+        non_finite = client.get("/non-finite")
 
     assert error.status_code == 500
     assert error.content == b'{"data":[{"context_length":500000}]}'
@@ -245,6 +251,8 @@ def test_grok_non_success_and_non_json_responses_are_unchanged(monkeypatch) -> N
     assert non_json.headers["x-upstream"] == "text"
     assert surrogate.content == b'{"data":[{"id":"grok","context_length":1,"label":"\\ud800"}]}'
     assert surrogate.headers["x-upstream"] == "surrogate"
+    assert non_finite.content == b'{"data":[{"id":"grok","context_length":1}],"extra":NaN}'
+    assert non_finite.headers["x-upstream"] == "non-finite"
 
 
 def test_grok_response_unchanged_preserves_entity_validators(monkeypatch) -> None:

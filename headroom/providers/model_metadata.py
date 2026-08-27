@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 from fastapi import Request
 from fastapi.responses import Response
@@ -27,6 +27,10 @@ class ModelMetadataEndpoint:
 
 
 MODEL_METADATA_LIST_ENDPOINT = ModelMetadataEndpoint("/v1/models", "/backend-api/models")
+
+
+def _reject_non_standard_json_constant(value: str) -> NoReturn:
+    raise ValueError(f"non-standard JSON constant: {value}")
 
 
 def model_metadata_get_endpoint(model_id: str) -> ModelMetadataEndpoint:
@@ -71,7 +75,10 @@ async def handle_model_metadata_endpoint(
     ):
         normalized_content: bytes | None = None
         try:
-            payload = json.loads(response.body)
+            payload = json.loads(
+                response.body,
+                parse_constant=_reject_non_standard_json_constant,
+            )
             normalized_payload = normalize_xai_model_metadata(payload)
             if normalized_payload is not None:
                 normalized_content = json.dumps(

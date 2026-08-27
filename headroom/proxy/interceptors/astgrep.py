@@ -10,6 +10,7 @@ than three definitions to outline.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -25,7 +26,7 @@ from typing import Any
 from headroom import binaries
 from headroom._subprocess import run
 from headroom.proxy import runtime_env
-from headroom.proxy.project_context import get_current_cwd, is_current_request_trusted
+from headroom.proxy.project_context import get_registered_cwd
 
 from . import base
 
@@ -162,74 +163,112 @@ def _max_disk_verify_bytes() -> int:
         return 5_000_000
 
 
-def _resolve_read_path_in_workspace(file_path: str, resolved_root: Path) -> Path | None:
-    """Confine `file_path` (relative or absolute) strictly under `resolved_root`.
+def _dir_fd_walk_supported() -> bool:
+    # hasattr, not bare os.O_NOFOLLOW/os.O_DIRECTORY refs -- missing on
+    # Windows, would AttributeError at import time otherwise.
+    return (
+        hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY") and os.open in os.supports_dir_fd
+    )
 
-    Mirrors memory_handler._resolve_native_path's join/resolve/relative_to
-    pattern. `resolved_root` must already be canonicalized by the caller (a
-    single source of truth for "inside the workspace" across a call) --
-    this does not re-resolve it. `.resolve()` collapses symlinks, including
-    in intermediate path components, before the containment check runs, so
-    a symlink that points outside the workspace is rejected the same way a
-    `..` traversal is -- this is a path-segment containment check via
-    `relative_to()`, not a string-prefix check, so a sibling directory that
-    merely shares a string prefix with the root is correctly rejected too.
-    """
-    candidate = Path(file_path) if Path(file_path).is_absolute() else resolved_root / file_path
+
+def _on_event_loop_thread() -> bool:
+    """True only on a thread with a running asyncio loop (the request
+    coroutine) -- false on a plain ThreadPoolExecutor worker. Lets the
+    blocking read refuse itself if ever reached directly from the loop."""
     try:
-        resolved = candidate.resolve(strict=True)
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _open_regular_file_under_root(
+    file_path: str, resolved_root: Path, max_bytes: int
+) -> str | None:
+    """Race-safe read of `file_path` confined under `resolved_root`.
+
+    Walks from an fd opened on `resolved_root` using dir_fd-relative,
+    O_NOFOLLOW opens at every hop -- no full path is ever resolved then
+    reopened, so there's no TOCTOU window for a symlink swap to exploit.
+    Refuses if called on the event-loop thread or if this platform lacks
+    dir_fd support (notably Windows) -- no less-safe fallback either way.
+    """
+    if _on_event_loop_thread() or not _dir_fd_walk_supported():
+        return None
+
+    # Pure string math -- no I/O, can't itself be raced.
+    candidate = (
+        file_path if os.path.isabs(file_path) else os.path.join(str(resolved_root), file_path)
+    )
+    rel = os.path.relpath(os.path.normpath(candidate), str(resolved_root))
+    if rel == os.curdir:
+        return None  # the root itself, not a file within it
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep) or os.path.isabs(rel):
+        return None  # escapes resolved_root
+    segments = [s for s in rel.split(os.sep) if s]
+    if not segments or any(s in (os.curdir, os.pardir) for s in segments):
+        return None
+
+    try:
+        # resolved_root already went through resolve(strict=True) in the
+        # caller, so it's symlink-free at that instant -- O_NOFOLLOW here
+        # closes the residual window where the anchor itself gets swapped
+        # for a symlink between that resolve() and this open().
+        current_fd = os.open(str(resolved_root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError:
         return None
-    try:
-        resolved.relative_to(resolved_root)
-    except ValueError:
-        return None
-    return resolved
 
-
-def _read_disk_content_bounded(resolved: Path, max_bytes: int) -> str | None:
-    """Read `resolved` iff it's a regular file no larger than `max_bytes`.
-
-    Opens with O_NONBLOCK so a FIFO/special file with no writer returns
-    immediately instead of blocking the calling thread indefinitely --
-    O_NONBLOCK has no effect on reads once fstat confirms a regular file.
-    fstat runs on the already-open fd (not the path) so the type/size
-    check and the read happen on the same underlying file object, closing
-    the TOCTOU gap a separate path-based stat-then-open would leave.
-    """
+    file_fd = -1
     try:
-        fd = os.open(resolved, os.O_RDONLY | os.O_NONBLOCK)
-    except OSError:
-        return None
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+        for segment in segments[:-1]:
+            try:
+                next_fd = os.open(
+                    segment, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current_fd
+                )
+            except OSError:
+                return None
+            os.close(current_fd)
+            current_fd = next_fd
+
+        final = segments[-1]
+        try:
+            # O_NONBLOCK: a FIFO with no writer returns immediately instead
+            # of blocking -- no effect once fstat confirms a regular file.
+            file_fd = os.open(
+                final,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                dir_fd=current_fd,
+            )
+        except OSError:
             return None
-        with os.fdopen(fd, "r", encoding="utf-8") as f:
-            fd = -1  # ownership transferred to the file object
-            return f.read()
-    except (OSError, UnicodeDecodeError):
-        return None
+
+        try:
+            st = os.fstat(file_fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+                return None
+            with os.fdopen(file_fd, "r", encoding="utf-8") as f:
+                file_fd = -1  # ownership transferred to the file object
+                return f.read()
+        except (OSError, UnicodeDecodeError):
+            return None
     finally:
-        if fd >= 0:
-            os.close(fd)
+        if file_fd >= 0:
+            os.close(file_fd)
+        if current_fd >= 0:
+            os.close(current_fd)
 
 
 def _verify_read_against_disk(
     file_path: str | None,
     received_content: str,
-    cwd: str | None,
-    *,
-    trusted: bool,
+    registered_cwd: str | None,
 ) -> tuple[ReadVerificationResult, tuple[int, int] | None]:
     """Compare `received_content` against the real file at `file_path`.
 
-    `cwd` (the `x-headroom-cwd` header) is never authority on its own --
-    `trusted` (whether the request's peer is loopback, a server-observed
-    fact, not a header) must hold before `cwd` or `file_path` are even
-    inspected, let alone touch disk. Once trusted, every read must be a
-    regular file whose fully resolved path is beneath the canonically
-    resolved `cwd`; anything else is UNKNOWN, never a guess.
+    `registered_cwd` is `project_context.get_registered_cwd()`, not a raw
+    header -- non-None only when a session token matched a workspace root
+    `wrap` itself registered (see workspace_registry.py). Its presence is
+    the trust signal; there's no separate boolean to check.
 
     TRUNCATED requires an exact-prefix match with strictly more on disk —
     a weaker match means the file diverged since the client read it, not
@@ -237,22 +276,17 @@ def _verify_read_against_disk(
     total_lines)` alongside TRUNCATED so the header can cite real numbers
     without a second, potentially racy, read.
     """
-    if not trusted:
-        return ReadVerificationResult.UNKNOWN, None
     if not file_path:
         return ReadVerificationResult.UNKNOWN, None
-    if not cwd or not os.path.isabs(cwd):
+    if not registered_cwd or not os.path.isabs(registered_cwd):
         return ReadVerificationResult.UNKNOWN, None
     try:
-        resolved_root = Path(cwd).resolve(strict=True)
+        resolved_root = Path(registered_cwd).resolve(strict=True)
     except OSError:
         return ReadVerificationResult.UNKNOWN, None
     if not resolved_root.is_dir():
         return ReadVerificationResult.UNKNOWN, None
-    resolved = _resolve_read_path_in_workspace(file_path, resolved_root)
-    if resolved is None:
-        return ReadVerificationResult.UNKNOWN, None
-    disk_content = _read_disk_content_bounded(resolved, _max_disk_verify_bytes())
+    disk_content = _open_regular_file_under_root(file_path, resolved_root, _max_disk_verify_bytes())
     if disk_content is None:
         return ReadVerificationResult.UNKNOWN, None
     if disk_content == received_content:
@@ -312,8 +346,7 @@ class AstGrepReadOutline:
             verdict, disk_truncation = _verify_read_against_disk(
                 _path_from_input(tool_input),
                 tool_output,
-                get_current_cwd(),
-                trusted=is_current_request_trusted(),
+                get_registered_cwd(),
             )
             if verdict is ReadVerificationResult.TRUNCATED:
                 truncation = disk_truncation

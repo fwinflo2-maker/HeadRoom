@@ -27,6 +27,7 @@ import argparse
 import asyncio
 import concurrent.futures
 import contextlib
+import contextvars
 import hmac
 import ipaddress
 import json
@@ -160,9 +161,8 @@ from headroom.proxy.modes import (
 from headroom.proxy.probe_recorder import probe_recorder_from_env
 from headroom.proxy.project_context import (
     classify_project,
-    set_current_cwd,
     set_current_project,
-    set_current_request_trusted,
+    set_registered_cwd,
     strip_project_path_prefix,
 )
 from headroom.proxy.prometheus_metrics import PrometheusMetrics  # noqa: F401
@@ -173,6 +173,7 @@ from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
 from headroom.proxy.ssl_context import build_httpx_verify
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
 from headroom.proxy.warmup import WarmupRegistry
+from headroom.proxy.workspace_registry import resolve_registered_cwd
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 from headroom.subscription.base import get_quota_registry, reset_quota_registry
 from headroom.subscription.codex_rate_limits import get_codex_rate_limit_state
@@ -1555,7 +1556,12 @@ class HeadroomProxy(
                 if quarantine_cleared:
                     logger.info("Compression quarantine cleared after all timed-out workers exited")
 
-        future = loop.run_in_executor(self._compression_executor, _wrapped)
+        # run_in_executor doesn't copy contextvars into the worker thread
+        # (unlike asyncio.to_thread) -- without this, get_registered_cwd()
+        # etc. would silently see the ContextVar default, not what the
+        # request middleware bound.
+        ctx = contextvars.copy_context()
+        future = loop.run_in_executor(self._compression_executor, ctx.run, _wrapped)
         try:
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
@@ -1580,7 +1586,9 @@ class HeadroomProxy(
         Runs on the dedicated single-thread background executor.
         """
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._background_compression_executor, fn)
+        # Same context-propagation fix as _run_compression_in_executor above.
+        ctx = contextvars.copy_context()
+        return await loop.run_in_executor(self._background_compression_executor, ctx.run, fn)
 
     def _get_compression_cache(self, session_id: str) -> CompressionCache:
         """Get or create a CompressionCache for a session.
@@ -2521,7 +2529,6 @@ class WebSocketProjectPrefixMiddleware:
                 name.decode("latin-1"): value.decode("latin-1") for name, value in scope["headers"]
             }
             set_current_project(classify_project(headers) or prefix_project)
-            # No set_current_cwd() here -- HTTP-only for now, see project_context.py.
         await self.app(scope, receive, send)
 
 
@@ -3264,19 +3271,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         method = request.method
         query = request.url.query
         headers = dict(request.headers.items())
-        client = getattr(request, "client", None)
-        client_addr = ""
-        client_host = None
-        if client is not None:
-            client_host = getattr(client, "host", None)
-            client_port = getattr(client, "port", None)
-            client_addr = f"{client_host}:{client_port}" if client_port else str(client_host)
         set_current_project(classify_project(headers) or prefix_project)
-        set_current_cwd(headers.get("x-headroom-cwd"))
-        # Server-observed (not header-derived) trust signal for consumers that
-        # turn x-headroom-cwd into a filesystem read (e.g. astgrep disk
-        # verification) -- the header alone is never sufficient authority.
-        set_current_request_trusted(is_loopback_host(client_host))
+        # Non-None only if a live wrap session registered this exact token
+        # (workspace_registry.py) -- the caller-supplied x-headroom-cwd
+        # header is never itself sufficient authority.
+        set_registered_cwd(
+            resolve_registered_cwd(config.port, headers.get("x-headroom-session-token"))
+        )
         # Path-based Codex identification: stamp X-Client: codex on the
         # Responses endpoint for callers that don't otherwise classify (e.g.
         # Codex Desktop, whose User-Agent isn't a known codex UA). Without it
@@ -3286,6 +3287,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # makes every downstream classify_client(headers) read "codex".
         if should_stamp_codex_client(path, headers):
             request.scope["headers"].append((b"x-client", b"codex"))
+        client = getattr(request, "client", None)
+        client_addr = ""
+        if client is not None:
+            client_host = getattr(client, "host", None)
+            client_port = getattr(client, "port", None)
+            client_addr = f"{client_host}:{client_port}" if client_port else str(client_host)
         try:
             proxy.metrics.record_inbound_request(method=method, path=path)
         except Exception:

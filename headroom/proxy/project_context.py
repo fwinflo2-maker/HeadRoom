@@ -12,21 +12,12 @@ The value is sanitized (printable characters only, length-capped) before it
 is stored; an absent or unusable header simply leaves attribution off for
 that request, matching pre-feature behavior.
 
-The HTTP middleware also binds the raw ``x-headroom-cwd`` header into a
-second, unsanitized contextvar for consumers that need the literal
-filesystem path (e.g. verifying a Read tool_result against disk). Not
-(yet) bound at the WebSocket accept paths — an absent cwd there is already
-treated as "can't resolve, don't guess."
-
-A third contextvar, ``_current_request_trusted``, records whether the
-active request's peer is loopback — a fact the HTTP middleware observes
-from the TCP connection itself, not something a caller can assert via a
-header. Consumers that turn ``_current_cwd`` into a filesystem read (again,
-disk verification) must gate on this first: the cwd header alone is never
-sufficient authority for touching disk, only a signal to interpret once the
-peer is already known to be trusted. Defaults to ``False`` so any request
-path that never calls the setter (e.g. the WebSocket accept path) is safe
-by construction.
+A second contextvar, ``_current_registered_cwd``, is what disk verification
+trusts as a workspace root. It is never a raw header value — it's the
+result of ``workspace_registry.resolve_registered_cwd()``, which matches a
+session token against a workspace root ``headroom wrap`` itself registered
+over a trusted local channel (a 0700 marker file). A request can only
+*reference* a pre-established root this way, never assert an arbitrary one.
 """
 
 from __future__ import annotations
@@ -47,13 +38,9 @@ from headroom.proxy.savings_tracker import sanitize_project_name
 
 _current_project: ContextVar[str | None] = ContextVar("headroom_current_project", default=None)
 
-# Unsanitized, unlike _current_project — consumers join this against a
-# tool's file_path and read from disk, so it must stay the literal path.
-_current_cwd: ContextVar[str | None] = ContextVar("headroom_current_cwd", default=None)
-
-# Server-observed (not header-derived) loopback signal — see module docstring.
-_current_request_trusted: ContextVar[bool] = ContextVar(
-    "headroom_current_request_trusted", default=False
+# Server-verified, not header-derived -- see module docstring.
+_current_registered_cwd: ContextVar[str | None] = ContextVar(
+    "headroom_current_registered_cwd", default=None
 )
 
 
@@ -67,24 +54,14 @@ def get_current_project() -> str | None:
     return _current_project.get()
 
 
-def set_current_cwd(cwd: str | None) -> None:
-    """Bind the active request's ``x-headroom-cwd`` header value, unmodified."""
-    _current_cwd.set(cwd.strip() if isinstance(cwd, str) and cwd.strip() else None)
+def set_registered_cwd(cwd: str | None) -> None:
+    """Bind the server-verified workspace root resolved for this request."""
+    _current_registered_cwd.set(cwd)
 
 
-def get_current_cwd() -> str | None:
-    """Raw cwd header bound to the current request context, or ``None``."""
-    return _current_cwd.get()
-
-
-def set_current_request_trusted(trusted: bool) -> None:
-    """Bind whether the active request's peer is loopback."""
-    _current_request_trusted.set(trusted)
-
-
-def is_current_request_trusted() -> bool:
-    """Whether the active request's peer is loopback, or ``False`` if unset."""
-    return _current_request_trusted.get()
+def get_registered_cwd() -> str | None:
+    """Server-verified workspace root for the current request, or ``None``."""
+    return _current_registered_cwd.get()
 
 
 def strip_project_path_prefix(scope: MutableMapping[str, Any]) -> str | None:
@@ -103,12 +80,10 @@ __all__ = [
     "PROJECT_HEADER",
     "PROJECT_PATH_PREFIX",
     "classify_project",
-    "get_current_cwd",
     "get_current_project",
-    "is_current_request_trusted",
-    "set_current_cwd",
+    "get_registered_cwd",
     "set_current_project",
-    "set_current_request_trusted",
+    "set_registered_cwd",
     "split_project_path",
     "strip_project_path_prefix",
     "with_project_prefix",

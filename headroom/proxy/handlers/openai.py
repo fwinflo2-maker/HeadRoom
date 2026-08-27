@@ -3236,6 +3236,10 @@ class OpenAIHandlerMixin:
     async def handle_openai_chat(
         self,
         request: Request,
+        *,
+        trusted_upstream_base_url: str | None = None,
+        trusted_original_path: str | None = None,
+        trusted_provider_name: str | None = None,
     ) -> Response | StreamingResponse:
         """Handle OpenAI /v1/chat/completions endpoint."""
         if not hasattr(self, "pipeline_extensions"):
@@ -3298,22 +3302,28 @@ class OpenAIHandlerMixin:
         model = body.get("model", "unknown")
         messages = body.get("messages", [])
         original_client_messages = copy.deepcopy(messages)
-        custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
-        upstream_base_url = self._resolve_openai_upstream(request)
+        custom_upstream_base_url = trusted_upstream_base_url or _resolve_openai_upstream_base(
+            request.headers
+        )
+        upstream_base_url = custom_upstream_base_url or self.OPENAI_API_URL
         handler_path_suffix = _resolve_openai_chat_handler_path(
             upstream_base_url,
             model,
         )
-        handler_path = (
-            _resolve_openai_handler_path(request.headers, handler_path=handler_path_suffix)
-            if custom_upstream_base_url is not None
-            else f"/v1{handler_path_suffix}"
-        )
+        if trusted_original_path is not None:
+            handler_path = trusted_original_path
+        elif custom_upstream_base_url is not None:
+            handler_path = _resolve_openai_handler_path(
+                request.headers,
+                handler_path=handler_path_suffix,
+            )
+        else:
+            handler_path = f"/v1{handler_path_suffix}"
         input_event = self.pipeline_extensions.emit(
             PipelineStage.INPUT_RECEIVED,
             operation="proxy.request",
             request_id=request_id,
-            provider="openai",
+            provider=trusted_provider_name or "openai",
             model=model,
             messages=messages,
             tools=body.get("tools"),
@@ -3439,20 +3449,24 @@ class OpenAIHandlerMixin:
             stripped_count=_pre_strip_count_chat,
             request_id=request_id,
         )
-        upstream_base_url = _resolve_openai_upstream_base(request.headers)
-        handler_path = (
-            _resolve_openai_handler_path(
+        upstream_base_url = custom_upstream_base_url
+        if trusted_original_path is not None:
+            handler_path = trusted_original_path
+        elif upstream_base_url is not None:
+            handler_path = _resolve_openai_handler_path(
                 request.headers,
                 handler_path=_OPENAI_CHAT_COMPLETIONS_PATH,
             )
-            if upstream_base_url is not None
-            else "/v1/chat/completions"
-        )
-        _, custom_chat_provider = _custom_base_passthrough_telemetry(
-            request.method,
-            handler_path,
-            upstream_base_url or "",
-        )
+        else:
+            handler_path = "/v1/chat/completions"
+        if trusted_provider_name is not None:
+            custom_chat_provider = trusted_provider_name
+        else:
+            _, custom_chat_provider = _custom_base_passthrough_telemetry(
+                request.method,
+                handler_path,
+                upstream_base_url or "",
+            )
         openai_chat_outcome_provider = custom_chat_provider or "openai"
 
         # Memory: Get user ID when memory is enabled. Reads `request.headers`

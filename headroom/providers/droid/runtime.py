@@ -10,9 +10,59 @@ compressed on the user's Factory subscription with no ``customModels`` edits.
 
 from __future__ import annotations
 
+import ipaddress
 import os
+import socket
+from urllib.parse import urlsplit, urlunsplit
 
 DEFAULT_FACTORY_API_URL = "https://api.factory.ai"
+
+
+def _is_loopback_host(host: str) -> bool:
+    normalized = host.rstrip(".").lower()
+    if normalized == "localhost" or normalized.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        pass
+    try:
+        packed = socket.inet_aton(normalized)
+    except OSError:
+        return False
+    return ipaddress.ip_address(packed).is_loopback
+
+
+def canonical_factory_api_url(value: object) -> str | None:
+    """Return a strict Factory upstream URL, or None when unsafe or malformed."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = urlsplit(value.strip())
+        port = parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    host = parsed.hostname
+    if (
+        scheme not in {"http", "https"}
+        or host is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or _is_loopback_host(host)
+    ):
+        return None
+
+    host = host.lower()
+    rendered_host = f"[{host}]" if ":" in host else host
+    if port is not None and not (
+        (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    ):
+        rendered_host = f"{rendered_host}:{port}"
+    path = parsed.path.rstrip("/")
+    return urlunsplit((scheme, rendered_host, path, "", ""))
 
 
 def proxy_base_url(port: int) -> str:

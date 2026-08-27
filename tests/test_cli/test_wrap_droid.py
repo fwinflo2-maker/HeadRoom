@@ -12,15 +12,18 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import click
 import pytest
 from click.testing import CliRunner
 
+from headroom.cli import wrap as wrap_cli
 from headroom.cli.main import main
 from headroom.providers.droid import (
     DEFAULT_FACTORY_API_URL,
     proxy_base_url,
     resolve_factory_upstream,
 )
+from headroom.providers.droid import runtime as droid_runtime
 
 # Kept as module-level names rather than inline string literals in the `in`
 # checks below: CodeQL's incomplete-url-substring-sanitization query pattern
@@ -71,6 +74,30 @@ def test_resolve_factory_upstream_precedence(monkeypatch: pytest.MonkeyPatch) ->
     assert resolve_factory_upstream("https://custom.factory.test/") == "https://custom.factory.test"
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("HTTPS://API.FACTORY.AI:443/", "https://api.factory.ai"),
+        ("http://factory.example:80/path/", "http://factory.example/path"),
+        ("https://factory.example:8443/v1/", "https://factory.example:8443/v1"),
+        ("https://gateway.example/v1/", "https://gateway.example/v1"),
+        ("ftp://api.factory.ai", None),
+        ("https://user@api.factory.ai", None),
+        ("https://api.factory.ai?tenant=a", None),
+        ("https://api.factory.ai#fragment", None),
+        ("https://api.factory.ai:bad", None),
+        ("http://127.1:8787", None),
+        ("http://[::1]:8787", None),
+        ("http://factory.localhost:8787", None),
+    ],
+)
+def test_canonical_factory_api_url_is_strict(
+    value: str,
+    expected: str | None,
+) -> None:
+    assert droid_runtime.canonical_factory_api_url(value) == expected
+
+
 # ---------------------------------------------------------------------------
 # CLI wiring
 # ---------------------------------------------------------------------------
@@ -82,6 +109,16 @@ def test_wrap_droid_missing_binary_exits_with_install_hint(runner: CliRunner) ->
 
     assert result.exit_code == 1
     assert _FACTORY_DOCS_URL in result.output
+
+
+def test_wrap_droid_rejects_unsafe_factory_upstream(runner: CliRunner) -> None:
+    result = runner.invoke(
+        main,
+        ["wrap", "droid", "--factory-api-url", "http://localhost:8787"],
+    )
+
+    assert result.exit_code == 1
+    assert "Factory upstream must be an HTTP(S) URL" in result.output
 
 
 def test_wrap_droid_points_child_at_proxy_and_forwards_default_upstream(
@@ -225,56 +262,6 @@ def test_wrap_droid_reuses_matching_factory_proxy(runner: CliRunner) -> None:
     assert captured["port"] == 8787
 
 
-@pytest.mark.parametrize(
-    ("proxy_running", "running_config", "factory_api_url"),
-    [
-        pytest.param(False, None, None, id="no-listener"),
-        pytest.param(False, {"factory_api_url": DEFAULT_FACTORY_API_URL}, None, id="non-headroom"),
-        pytest.param(True, None, None, id="configless"),
-        pytest.param(True, {}, None, id="non-factory"),
-        pytest.param(
-            True,
-            {"factory_api_url": "http://127.0.0.1:8787"},
-            "http://127.0.0.1:8787",
-            id="loopback-upstream",
-        ),
-        pytest.param(
-            True,
-            {"factory_api_url": "https://other.factory.example/v1/"},
-            "https://expected.factory.example",
-            id="mismatched-upstream",
-        ),
-        pytest.param(
-            True,
-            {"factory_api_url": "http://[invalid"},
-            None,
-            id="malformed-upstream",
-        ),
-    ],
-)
-def test_wrap_droid_no_proxy_rejects_unverified_factory_proxy(
-    runner: CliRunner,
-    proxy_running: bool,
-    running_config: dict[str, object] | None,
-    factory_api_url: str | None,
-) -> None:
-    args = ["wrap", "droid", "--no-proxy"]
-    if factory_api_url is not None:
-        args.extend(("--factory-api-url", factory_api_url))
-
-    with (
-        patch("headroom.cli.wrap.shutil.which", return_value="droid"),
-        patch("headroom.cli.wrap._check_proxy", return_value=proxy_running),
-        patch("headroom.cli.wrap._query_proxy_config", return_value=running_config),
-        patch("headroom.cli.wrap._launch_tool") as launch_tool,
-    ):
-        result = runner.invoke(main, args)
-
-    assert result.exit_code == 1
-    assert "compatible Factory proxy" in result.output
-    launch_tool.assert_not_called()
-
-
 def test_wrap_droid_no_proxy_reuses_normalized_matching_factory_proxy(
     runner: CliRunner,
 ) -> None:
@@ -283,8 +270,11 @@ def test_wrap_droid_no_proxy_reuses_normalized_matching_factory_proxy(
         patch("headroom.cli.wrap.shutil.which", return_value="droid"),
         patch("headroom.cli.wrap._check_proxy", return_value=True),
         patch(
-            "headroom.cli.wrap._query_proxy_config",
-            return_value={"factory_api_url": " https://tenant.factory.example/ "},
+            "headroom.cli.wrap._query_proxy_health",
+            return_value={
+                "service": "headroom-proxy",
+                "config": {"factory_api_url": " HTTPS://TENANT.FACTORY.EXAMPLE:443/ "},
+            },
         ),
         patch("headroom.cli.wrap._find_available_port") as find_available_port,
         patch("headroom.cli.wrap._launch_tool", side_effect=lambda **kw: captured.update(kw)),
@@ -296,7 +286,7 @@ def test_wrap_droid_no_proxy_reuses_normalized_matching_factory_proxy(
                 "droid",
                 "--no-proxy",
                 "--factory-api-url",
-                "https://tenant.factory.example/v1/",
+                "https://tenant.factory.example/",
             ],
         )
 
@@ -306,10 +296,54 @@ def test_wrap_droid_no_proxy_reuses_normalized_matching_factory_proxy(
     find_available_port.assert_not_called()
 
 
-def test_start_proxy_forwards_factory_api_url_to_subprocess(tmp_path: Path) -> None:
-    """_start_proxy must pass --factory-api-url and FACTORY_TARGET_API_URL through
-    to the actual proxy subprocess command/env when factory_api_url is set.
-    """
+@pytest.mark.parametrize(
+    "health_payload",
+    [
+        None,
+        {"config": {"factory_api_url": DEFAULT_FACTORY_API_URL}},
+        {
+            "service": "other-service",
+            "config": {"factory_api_url": DEFAULT_FACTORY_API_URL},
+        },
+        {"service": "headroom-proxy", "config": None},
+    ],
+)
+def test_no_proxy_launch_path_rejects_unidentified_factory_listener(
+    health_payload: dict[str, object] | None,
+) -> None:
+    with (
+        patch("headroom.cli.wrap._check_proxy", return_value=True),
+        patch("headroom.cli.wrap._query_proxy_health", return_value=health_payload),
+        pytest.raises(click.ClickException, match="compatible Factory proxy"),
+    ):
+        wrap_cli._ensure_proxy_unlocked(
+            8787,
+            True,
+            factory_api_url=DEFAULT_FACTORY_API_URL,
+        )
+
+
+def test_no_proxy_launch_path_accepts_exact_factory_listener() -> None:
+    health_payload = {
+        "service": "headroom-proxy",
+        "config": {"factory_api_url": "HTTPS://API.FACTORY.AI:443/"},
+    }
+    with (
+        patch("headroom.cli.wrap._check_proxy", return_value=True),
+        patch("headroom.cli.wrap._query_proxy_health", return_value=health_payload),
+    ):
+        assert wrap_cli._ensure_proxy_unlocked(
+            8787,
+            True,
+            factory_api_url=DEFAULT_FACTORY_API_URL,
+        ) == (None, 8787)
+
+
+@pytest.mark.parametrize("factory_api_url", [None, "https://api.factory.ai"])
+def test_start_proxy_forwards_factory_api_url_to_subprocess(
+    tmp_path: Path,
+    factory_api_url: str | None,
+) -> None:
     import headroom.cli.wrap as wrap_module
 
     captured: dict[str, object] = {}
@@ -331,12 +365,22 @@ def test_start_proxy_forwards_factory_api_url_to_subprocess(tmp_path: Path) -> N
         patch("headroom.cli.wrap._get_log_path", return_value=tmp_path / "proxy.log"),
         patch("headroom.cli.wrap._get_proxy_stdio_log_path", return_value=tmp_path / "stdio.log"),
     ):
-        wrap_module._start_proxy(8899, factory_api_url="https://api.factory.ai")
+        wrap_module._start_proxy(8899, factory_api_url=factory_api_url)
 
-    assert "--factory-api-url" in captured["cmd"]
-    idx = captured["cmd"].index("--factory-api-url")
-    assert captured["cmd"][idx + 1] == "https://api.factory.ai"
-    assert captured["env"]["FACTORY_TARGET_API_URL"] == "https://api.factory.ai"
+    if factory_api_url is None:
+        assert "--factory-api-url" not in captured["cmd"]
+        assert "FACTORY_TARGET_API_URL" not in captured["env"]
+    else:
+        assert "--factory-api-url" in captured["cmd"]
+        idx = captured["cmd"].index("--factory-api-url")
+        assert captured["cmd"][idx + 1] == factory_api_url
+        assert captured["env"]["FACTORY_TARGET_API_URL"] == factory_api_url
+
+
+@pytest.mark.parametrize("proxy_running", [False, True])
+def test_no_proxy_without_factory_target_keeps_legacy_behavior(proxy_running: bool) -> None:
+    with patch("headroom.cli.wrap._check_proxy", return_value=proxy_running):
+        assert wrap_cli._ensure_proxy_unlocked(8787, True) == (None, 8787)
 
 
 def test_proxy_cli_banner_shows_factory_route_when_configured(runner: CliRunner) -> None:

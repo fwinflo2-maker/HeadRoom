@@ -22,22 +22,3 @@ def normalize_request_path(request: Request, path: str) -> None:
     normalize_scope_path(request.scope, path)
     if hasattr(request, "_url"):
         delattr(request, "_url")
-
-
-def set_scope_header(request: Request, name: str, value: str) -> None:
-    """Replace every existing occurrence of ``name`` in the ASGI scope with one
-    ``value``.
-
-    Drops all pairs whose (lower-cased) name matches, then appends the single
-    injected value. That matters for internal routing headers: Starlette's
-    ``Headers.get`` returns the *first* duplicate, so a client could otherwise
-    send its own ``x-headroom-base-url`` and shadow an internally injected one,
-    steering the request to a client-controlled upstream. Sanitizing first makes
-    the injected value authoritative.
-    """
-    lowered = name.lower().encode("latin-1")
-    headers = request.scope["headers"]
-    headers[:] = [(key, val) for (key, val) in headers if key.lower() != lowered]
-    headers.append((lowered, value.encode("latin-1")))
-    if hasattr(request, "_headers"):
-        delattr(request, "_headers")

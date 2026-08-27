@@ -66,15 +66,10 @@ from headroom.providers.vertex import (
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
-from headroom.proxy.request_scope import normalize_request_path, set_scope_header
+from headroom.proxy.request_scope import normalize_request_path
 from headroom.proxy.upstream_guard import is_safe_upstream_url_async
 
 logger = logging.getLogger("headroom.proxy.routes")
-
-# Internal routing headers consumed (and stripped before upstream) by the
-# OpenAI chat handler; kept in sync with ``headroom/proxy/handlers/openai.py``.
-_HEADROOM_BASE_URL_HEADER = "x-headroom-base-url"
-_HEADROOM_ORIGINAL_PATH_HEADER = "x-headroom-original-path"
 
 
 async def _handle_chatgpt_codex_alpha_search(request: Request, proxy: Any) -> Response | None:
@@ -323,23 +318,17 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
                 provider_name="factory",
             )
 
-        # The OpenAI chat handler resolves its upstream + upstream path from the
-        # `x-headroom-base-url` / `x-headroom-original-path` headers it already
-        # honors for OpenAI-compatible gateways (and strips them before
-        # forwarding). Injecting them here routes the request to
-        # `<factory>/api/llm/o/v1/chat/completions` and tags telemetry `factory`
-        # via `custom_base_passthrough_telemetry`, mirroring the `/a/` route
-        # without touching the handler.
+        # The Factory base is trusted server configuration, not a client routing
+        # override. Pass it through the handler's private seam so the client SSRF
+        # guard cannot reject it and fall back to the unrelated OpenAI target.
         @app.post("/api/llm/o/v1/chat/completions")
         async def factory_llm_chat(request: Request):
-            # `set_scope_header` replaces (not appends) so an inbound client
-            # cannot shadow the Factory routing controls: `handle_openai_chat`
-            # resolves the upstream via `request.headers.get(...)`, which returns
-            # the FIRST duplicate. A spoofed `x-headroom-base-url` would
-            # otherwise steer the request to a client-controlled upstream.
-            set_scope_header(request, _HEADROOM_BASE_URL_HEADER, _factory_base)
-            set_scope_header(request, _HEADROOM_ORIGINAL_PATH_HEADER, request.url.path)
-            return await proxy.handle_openai_chat(request)
+            return await proxy.handle_openai_chat(
+                request,
+                trusted_upstream_base_url=_factory_base,
+                trusted_original_path=request.url.path,
+                trusted_provider_name="factory",
+            )
 
     _register_openai_responses_routes(app, proxy)
 

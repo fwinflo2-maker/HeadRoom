@@ -4438,7 +4438,29 @@ def _ensure_proxy_unlocked(
             click.echo(f"  Error: {e}")
             raise SystemExit(1) from e
     else:
-        if not helpers._check_proxy(port):
+        if factory_api_url:
+            from headroom.providers.droid import canonical_factory_api_url
+
+            health_payload = (
+                helpers._query_proxy_health(port) if helpers._check_proxy(port) else None
+            )
+            running_config = (
+                helpers._proxy_health_config(health_payload)
+                if health_payload is not None and health_payload.get("service") == "headroom-proxy"
+                else None
+            )
+            running_factory = (
+                canonical_factory_api_url(running_config.get("factory_api_url"))
+                if running_config is not None
+                else None
+            )
+            requested_factory = canonical_factory_api_url(factory_api_url)
+            if requested_factory is None or running_factory != requested_factory:
+                raise click.ClickException(
+                    f"--no-proxy requires a compatible Factory proxy on port {port}. "
+                    "Start one for the requested Factory upstream or omit --no-proxy."
+                )
+        elif not helpers._check_proxy(port):
             click.echo(f"  Warning: No proxy detected on port {port}")
         elif vertex_api_url or clear_vertex_api_url:
             health_payload = helpers._query_proxy_health(port)
@@ -8357,9 +8379,18 @@ def droid(
         headroom wrap droid -- exec "say hi"    # Pass args to droid
         headroom wrap droid --port 9999         # Custom proxy port
     """
-    from headroom.providers.droid import proxy_base_url, resolve_factory_upstream
+    from headroom.providers.droid import (
+        canonical_factory_api_url,
+        proxy_base_url,
+        resolve_factory_upstream,
+    )
 
-    factory_upstream = resolve_factory_upstream(factory_api_url)
+    factory_upstream = canonical_factory_api_url(resolve_factory_upstream(factory_api_url))
+    if factory_upstream is None:
+        raise click.ClickException(
+            "Factory upstream must be an HTTP(S) URL with a non-loopback host and "
+            "no credentials, query, or fragment."
+        )
 
     if prepare_only:
         click.echo(f"FACTORY_API_BASE_URL={proxy_base_url(port)}")
@@ -8372,41 +8403,20 @@ def droid(
         click.echo("Install Factory Droid: https://docs.factory.ai")
         raise SystemExit(1)
 
-    expected_factory = _normalize_proxy_api_url(factory_upstream)
-    if no_proxy:
-        running_config = _query_proxy_config(port) if _check_proxy(port) else None
-        running_factory = (
-            _normalize_proxy_api_url(running_config.get("factory_api_url"))
-            if running_config
-            else None
-        )
-        try:
-            running_host = urllib.parse.urlparse(running_factory or "").hostname
-        except ValueError:
-            running_host = None
-        if (
-            running_host is None
-            or running_host.lower() in {"127.0.0.1", "localhost", "::1"}
-            or running_factory != expected_factory
-        ):
-            raise click.ClickException(
-                f"--no-proxy requires a compatible Factory proxy on port {port}. "
-                "Start one for the requested Factory upstream or omit --no-proxy."
-            )
     # Automatic port selection (no --port needed). Reuse a running Factory proxy
     # for the same upstream; otherwise a proxy on this port belongs to a
     # different session (a shared `wrap claude`, or a Factory proxy for another
     # upstream) whose routes would misroute Droid, so start a dedicated proxy on
     # the next free port instead of disrupting it or failing. `_launch_tool`
     # rewrites FACTORY_API_BASE_URL to the actual port, so Droid follows.
-    elif _check_proxy(port):
+    if not no_proxy and _check_proxy(port):
         running_config = _query_proxy_config(port)
         running_factory = (
-            _normalize_proxy_api_url(running_config.get("factory_api_url"))
+            canonical_factory_api_url(running_config.get("factory_api_url"))
             if running_config
             else None
         )
-        if running_factory != expected_factory:
+        if running_factory != factory_upstream:
             new_port = _find_available_port(port + 1)
             click.echo(
                 f"  Port {port} is serving a different session; using port "

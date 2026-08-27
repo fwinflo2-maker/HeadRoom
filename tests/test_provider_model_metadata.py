@@ -207,6 +207,11 @@ def test_grok_non_success_and_non_json_responses_are_unchanged(monkeypatch) -> N
             status_code=200,
             headers={"x-upstream": "text"},
         ),
+        "/surrogate": Response(
+            content=b'{"data":[{"id":"grok","context_length":1,"label":"\\ud800"}]}',
+            status_code=200,
+            headers={"x-upstream": "surrogate"},
+        ),
     }
 
     class Proxy:
@@ -230,6 +235,7 @@ def test_grok_non_success_and_non_json_responses_are_unchanged(monkeypatch) -> N
     with TestClient(app) as client:
         error = client.get("/error")
         non_json = client.get("/non-json")
+        surrogate = client.get("/surrogate")
 
     assert error.status_code == 500
     assert error.content == b'{"data":[{"context_length":500000}]}'
@@ -237,6 +243,52 @@ def test_grok_non_success_and_non_json_responses_are_unchanged(monkeypatch) -> N
     assert non_json.status_code == 200
     assert non_json.content == b"upstream text"
     assert non_json.headers["x-upstream"] == "text"
+    assert surrogate.content == b'{"data":[{"id":"grok","context_length":1,"label":"\\ud800"}]}'
+    assert surrogate.headers["x-upstream"] == "surrogate"
+
+
+def test_grok_response_unchanged_preserves_entity_validators(monkeypatch) -> None:
+    async def no_chatgpt_metadata(http_client, request: Request, upstream_path: str) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "headroom.providers.model_metadata.handle_chatgpt_model_metadata",
+        no_chatgpt_metadata,
+    )
+
+    class Proxy:
+        http_client = "h2"
+
+        async def handle_passthrough(self, request, base_url, sub_path="", provider_name=""):
+            return Response(
+                content=b'{"data":[{"id":"grok","context_length":1,"context_window":1}]}',
+                status_code=200,
+                headers={
+                    "content-type": "application/json",
+                    "etag": '"current"',
+                    "last-modified": "Thu, 01 Jan 1970 00:00:00 GMT",
+                    "cache-control": "max-age=60",
+                },
+            )
+
+    app = FastAPI()
+
+    @app.get("/probe")
+    async def probe(request: Request):
+        return await handle_model_metadata_endpoint(
+            Proxy(),
+            request,
+            endpoint=MODEL_METADATA_LIST_ENDPOINT,
+            provider_api_base_url="https://api.x.ai",
+            provider_name="openai",
+        )
+
+    with TestClient(app) as client:
+        response = client.get("/probe")
+
+    assert response.headers["etag"] == '"current"'
+    assert response.headers["last-modified"] == "Thu, 01 Jan 1970 00:00:00 GMT"
+    assert response.headers["cache-control"] == "max-age=60"
 
 
 def test_grok_negative_space_bypasses_non_xai_detail_and_aliases(monkeypatch) -> None:

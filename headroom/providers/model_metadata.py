@@ -69,12 +69,19 @@ async def handle_model_metadata_endpoint(
         and 200 <= response.status_code < 300
         and is_xai_model_list_target(provider_api_base_url)
     ):
+        normalized_content: bytes | None = None
         try:
             payload = json.loads(response.body)
             normalized_payload = normalize_xai_model_metadata(payload)
-        except (TypeError, ValueError):
+            if normalized_payload is not None:
+                normalized_content = json.dumps(
+                    normalized_payload,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+        except (TypeError, UnicodeError, ValueError):
             normalized_payload = None
-        if normalized_payload is not None:
+        if normalized_payload is not None and normalized_content is not None:
             headers = sanitize_forwarded_response_headers(
                 response.headers,
                 "etag",
@@ -83,11 +90,7 @@ async def handle_model_metadata_endpoint(
             )
             headers["content-type"] = "application/json"
             return Response(
-                content=json.dumps(
-                    normalized_payload,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                ).encode("utf-8"),
+                content=normalized_content,
                 status_code=response.status_code,
                 headers=headers,
             )

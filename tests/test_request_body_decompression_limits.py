@@ -215,6 +215,56 @@ def test_multi_member_gzip_is_still_concatenated() -> None:
     )
 
 
+def test_gzip_trailing_nul_padding_is_tolerated() -> None:
+    """Real clients pad gzip bodies with NULs and `gzip.decompress` accepts it.
+
+    A member-restart loop that treats the padding as a fresh member rejects
+    bodies the one-shot call happily decoded — a silent compatibility break
+    that no bomb test would have caught.
+    """
+    padded = gzip.compress(PAYLOAD) + b"\x00" * 16
+
+    assert gzip.decompress(padded) == PAYLOAD  # the behavior being matched
+    assert (
+        _helpers()._inflate_bounded(
+            padded, wbits=16 + zlib.MAX_WBITS, label="gzip", multi_member=True
+        )
+        == PAYLOAD
+    )
+
+
+def test_gzip_padding_between_members_is_skipped() -> None:
+    stream = gzip.compress(b'{"a":1}') + b"\x00" * 8 + gzip.compress(b'{"b":2}')
+
+    assert (
+        _helpers()._inflate_bounded(
+            stream, wbits=16 + zlib.MAX_WBITS, label="gzip", multi_member=True
+        )
+        == b'{"a":1}{"b":2}'
+    )
+
+
+def test_empty_gzip_body_matches_the_one_shot_call() -> None:
+    """`gzip.decompress(b"")` returns b""; refusing it would be a new rejection."""
+    assert gzip.decompress(b"") == b""
+    assert (
+        _helpers()._inflate_bounded(b"", wbits=16 + zlib.MAX_WBITS, label="gzip", multi_member=True)
+        == b""
+    )
+
+
+def test_gzip_body_of_only_padding_is_still_rejected() -> None:
+    """Tolerating padding must not turn a bodyless run of NULs into success."""
+    with pytest.raises(gzip.BadGzipFile):
+        gzip.decompress(b"\x00" * 8)
+    # zlib.error, not ValueError: only `_read_request_body_bytes` wraps the
+    # codec's own error, and it turns this into the same 400 as before.
+    with pytest.raises(zlib.error):
+        _helpers()._inflate_bounded(
+            b"\x00" * 8, wbits=16 + zlib.MAX_WBITS, label="gzip", multi_member=True
+        )
+
+
 def test_truncated_gzip_still_errors() -> None:
     """Losing the one-shot call must not turn a corrupt body into a silent empty one."""
     truncated = gzip.compress(PAYLOAD)[:-5]

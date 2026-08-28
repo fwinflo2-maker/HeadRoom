@@ -2571,7 +2571,21 @@ def _inflate_bounded(raw: bytes, *, wbits: int, label: str, multi_member: bool =
 
     out = bytearray()
     pending = raw
+    first_member = True
     while True:
+        if multi_member and not first_member:
+            # gzip is a *sequence* of members and CPython's reader skips NUL
+            # padding between and after them — real clients emit it, and
+            # `gzip.decompress(member + b"\x00" * 16)` returns the payload
+            # rather than raising. Parsing that padding as a fresh member
+            # would reject bodies the one-shot call accepted.
+            pending = pending.lstrip(b"\x00")
+        if multi_member and not pending:
+            # Either an empty body (`gzip.decompress(b"")` == b"") or a clean
+            # end after the last member. A body that is *only* padding never
+            # reaches here: `first_member` is still True, so it falls through
+            # to the header parse below and fails there, as CPython does.
+            break
         decompressor = zlib.decompressobj(wbits)
         while True:
             chunk = decompressor.decompress(pending, _DECOMPRESS_CHUNK_SIZE)
@@ -2599,7 +2613,8 @@ def _inflate_bounded(raw: bytes, *, wbits: int, label: str, multi_member: bool =
         # gzip streams may carry several members; `gzip.decompress` concatenates
         # them, so restart on the trailer to keep that behavior.
         pending = decompressor.unused_data
-        if not (multi_member and pending):
+        first_member = False
+        if not multi_member:
             break
     return bytes(out)
 

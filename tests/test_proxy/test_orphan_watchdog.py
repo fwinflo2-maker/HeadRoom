@@ -92,6 +92,12 @@ class TestLiveClientPids:
         # Unparseable marker JSON is not proof of recycling: PID is alive, kept.
         assert ow.live_client_pids(tmp_path) == [os.getpid()]
 
+    def test_oversized_numeric_marker_is_pruned(self, tmp_path) -> None:
+        marker = _write_marker(tmp_path, int("9" * 100))
+
+        assert ow.live_client_pids(tmp_path) == []
+        assert not marker.exists()
+
     def test_non_dict_marker_is_not_recycling_proof(self, tmp_path) -> None:
         (tmp_path / f"{os.getpid()}.json").write_text("[]", encoding="utf-8")
         assert ow.live_client_pids(tmp_path) == [os.getpid()]

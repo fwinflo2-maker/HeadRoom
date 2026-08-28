@@ -654,7 +654,16 @@ def _start_proxy(
     (see ``_find_available_port``).
     """
 
-    cmd = [sys.executable, "-m", "headroom.cli", "proxy", "--port", str(port)]
+    cmd = [
+        sys.executable,
+        "-m",
+        "headroom.cli",
+        "proxy",
+        "--port",
+        str(port),
+        "--workers",
+        "1",
+    ]
 
     # Forward HEADROOM_MODE env var so the proxy respects the user's mode choice
     headroom_mode = os.environ.get("HEADROOM_MODE")
@@ -7782,6 +7791,7 @@ def opencode(
         ),
     )
 
+    launch_started = False
     try:
         # If the proxy fell back to a different port, move our marker so
         # cleanup tracking stays accurate and update MCP config.
@@ -7810,6 +7820,7 @@ def opencode(
 
         # Proxy already started by _ensure_proxy above; tell _launch_tool to
         # skip duplicate startup.
+        launch_started = True
         _launch_tool(
             binary=opencode_bin,
             args=opencode_args,
@@ -7827,7 +7838,7 @@ def opencode(
             region=region,
         )
     finally:
-        if _opencode_proxy and _opencode_proxy.poll() is None:
+        if not launch_started and _opencode_proxy and _opencode_proxy.poll() is None:
             _other = _live_proxy_clients(actual_port, exclude_self=True)
             if not _other:
                 _opencode_proxy.terminate()

@@ -539,6 +539,7 @@ def test_start_proxy_strips_ambient_worker_configuration(
 ) -> None:
     monkeypatch.setenv("HEADROOM_WORKERS", "4")
     monkeypatch.setenv("HEADROOM_PROXY_CONFIG_JSON", '{"port": 9999}')
+    monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
     captured: dict[str, object] = {}
     proc = _FakeProxyProc()
 
@@ -562,6 +563,8 @@ def test_start_proxy_strips_ambient_worker_configuration(
     assert isinstance(env, dict)
     assert "HEADROOM_WORKERS" not in env
     assert "HEADROOM_PROXY_CONFIG_JSON" not in env
+    assert env["HEADROOM_HTTP2"] == "false"
+    assert captured["command"][-2:] == ["--workers", "1"]
 
 
 def test_start_proxy_timeout_kills_failed_new_process(
@@ -716,6 +719,23 @@ class TestProxyClientRefCounting:
 
         assert dead_pid not in live
         assert not marker.exists()
+
+    def test_dead_client_marker_unlink_failure_is_tolerated(
+        self,
+        clients_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        dead_pid = 358784
+        marker = self._write_marker(clients_dir, dead_pid)
+        monkeypatch.setattr(wrap_mod, "_pid_alive", lambda pid: pid != dead_pid)
+
+        def fail_unlink(*args: object, **kwargs: object) -> None:
+            raise OSError("read-only")
+
+        monkeypatch.setattr(Path, "unlink", fail_unlink)
+
+        assert wrap_mod._live_proxy_clients(self.PORT, exclude_self=True) == []
+        assert marker.exists()
 
     def test_reused_pid_with_mismatched_identity_is_pruned(
         self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch

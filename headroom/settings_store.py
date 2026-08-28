@@ -570,10 +570,10 @@ SETTINGS: tuple[SettingField, ...] = (
         default=None,
         minimum=1,
         help=(
-            "Seconds an upstream may stop accepting request data before the send is "
-            "abandoned. Default: 60. Applied per write, so a large body over a slow "
-            "link is unaffected. Lower it to fail over a dead pooled connection "
-            "faster; the connect timeout only guards a fresh connect."
+            "Seconds the upstream send may take before it is abandoned. Default: 150. "
+            "On HTTP/1.1 this bounds the whole request body, so raise it if you push "
+            "large bodies over a slow link. Lower it to fail over a dead pooled "
+            "connection faster; the connect timeout only guards a fresh connect."
         ),
         tier="advanced",
     ),

@@ -377,10 +377,17 @@ class ProxyConfig:
     # (~180-220s on macOS), which is *under* 300s, so no timeout ever fired and
     # the proxy hung, retried, and hung again (#3259).
     #
-    # httpx applies this per write operation, not to the whole body, so a large
-    # upload over a slow link keeps resetting it and is unaffected; it only
-    # expires when the peer stops accepting data for this many seconds straight.
-    write_timeout_seconds: int = 60
+    # This bounds the WHOLE body send, not one chunk of it. httpx hands a bytes
+    # body to the transport as a single write, so on HTTP/1.1 the entire upload
+    # runs inside one timer -- measured: a 16MB body against a peer draining
+    # steadily at ~1MB/s raises WriteTimeout at exactly the configured bound,
+    # healthy peer or not. On HTTP/2 the body is split by flow control and the
+    # waiting-for-window part is charged to `read`, so only real socket writes
+    # count against it. The default has to clear the slower of those two while
+    # staying under the OS retransmit ceiling that made the inherited 300s
+    # unreachable: 150s carries a 15MB body -- the largest #3259 reports -- over
+    # a ~1 Mbps uplink, and still fires well before the OS gives up at ~180s.
+    write_timeout_seconds: int = 150
     # Anthropic buffered reads can legitimately run longer than the generic
     # proxy request cap. Keep the generic timeout unchanged elsewhere.
     anthropic_buffered_request_timeout_seconds: int = 600

@@ -57,8 +57,8 @@ def _assert_buffered_timeout(timeout: httpx.Timeout | None) -> None:
     assert timeout.connect == 3.0
     assert timeout.read == 19.0
     # `write` is no longer request_timeout_seconds (7): sending the request is a
-    # separate operation from waiting for the answer, so it has its own bound
-    # (#3259). The fixture leaves write_timeout_seconds at its default.
+    # separate operation from waiting for the answer, so it has its own bound --
+    # the fixture's write_timeout_seconds, not the read budget (#3259).
     assert timeout.write == 11.0
     assert timeout.pool == 3.0
 
@@ -469,5 +469,5 @@ def test_generic_proxy_timeout_defaults_stay_unchanged():
     # `write` deliberately no longer tracks read. Inheriting 300s put the send
     # bound above the ~180-220s point where the OS abandons retransmission, so
     # it could never fire against a dead peer (#3259).
-    assert timeout.write == 60.0
+    assert timeout.write == 150.0
     assert timeout.write < timeout.read

@@ -5446,7 +5446,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         ),
         write_timeout_seconds=_get_env_int(
             "HEADROOM_WRITE_TIMEOUT_SECONDS",
-            60,
+            150,
             min_value=1,
         ),
         buffered_ccr_grace_seconds=_get_env_float(
@@ -6199,11 +6199,11 @@ if __name__ == "__main__":
             args.anthropic_buffered_request_timeout_seconds,
             min_value=1,
         ),
-        # getattr: this builder is fed namespaces from several callers, not all
-        # of which carry the newer flags.
+        # Env-only here, like connect/request: this parser exposes no timeout
+        # flag but the buffered one.
         write_timeout_seconds=_get_env_int(
             "HEADROOM_WRITE_TIMEOUT_SECONDS",
-            getattr(args, "write_timeout_seconds", None) or 60,
+            150,
             min_value=1,
         ),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),

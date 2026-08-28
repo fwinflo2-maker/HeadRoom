@@ -42,6 +42,23 @@ def test_write_timeout_defaults_below_the_os_retransmit_ceiling() -> None:
     assert ProxyConfig().write_timeout_seconds < 180
 
 
+def test_write_timeout_default_can_carry_a_large_body() -> None:
+    """The bound covers the whole upload, so it has to fit a real request.
+
+    httpx hands a bytes body to the transport as one write, so on HTTP/1.1 the
+    entire body is sent inside a single timer -- this is NOT a per-chunk budget.
+    Measured against a peer draining a 16MB body at ~1MB/s, WriteTimeout fires
+    at exactly the configured bound even though the peer is healthy. #3259's
+    reporter sends 7-15MB bodies, so a default that cannot carry 15MB over a
+    modest uplink would turn this fix into an outage for them.
+    """
+    budget = ProxyConfig().write_timeout_seconds
+    largest_reported_body_bytes = 15 * 1024 * 1024
+    slow_uplink_bytes_per_second = 125 * 1024  # ~1 Mbps
+
+    assert largest_reported_body_bytes / slow_uplink_bytes_per_second <= budget
+
+
 def test_write_timeout_is_configurable() -> None:
     timeout = _timeout(ProxyConfig(write_timeout_seconds=15))
 

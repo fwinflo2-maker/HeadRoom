@@ -520,10 +520,10 @@ def dashboard(port: int, no_open: bool) -> None:
     default=None,
     envvar="HEADROOM_WRITE_TIMEOUT_SECONDS",
     help=(
-        "Seconds an upstream may stop accepting request data before the send is "
-        "abandoned (default: 60). Applied per write, so a large body over a slow "
-        "link is unaffected. Lower it to fail over a dead pooled connection "
-        "faster; --connect-timeout-seconds only guards a fresh connect. "
+        "Seconds the upstream send may take before it is abandoned (default: 150). "
+        "On HTTP/1.1 this bounds the whole request body, so raise it if you push "
+        "large bodies over a slow link. Lower it to fail over a dead pooled "
+        "connection faster; --connect-timeout-seconds only guards a fresh connect. "
         "Env: HEADROOM_WRITE_TIMEOUT_SECONDS."
     ),
 )
@@ -1390,9 +1390,7 @@ def proxy(
         connect_timeout_seconds=connect_timeout_seconds
         if connect_timeout_seconds is not None
         else 10,
-        write_timeout_seconds=write_timeout_seconds
-        if write_timeout_seconds is not None and write_timeout_seconds > 0
-        else 60,
+        write_timeout_seconds=write_timeout_seconds if write_timeout_seconds is not None else 150,
         anthropic_buffered_request_timeout_seconds=(
             anthropic_buffered_request_timeout_seconds
             if anthropic_buffered_request_timeout_seconds is not None

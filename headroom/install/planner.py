@@ -9,6 +9,7 @@ from collections.abc import Iterable
 import click
 
 from headroom import paths as _paths
+from headroom.providers.bob.runtime import DEFAULT_API_URL as _BOB_DEFAULT_API_URL
 from headroom.providers.grok.runtime import DEFAULT_API_URL as _GROK_DEFAULT_API_URL
 from headroom.providers.install_registry import build_install_target_envs
 from headroom.rollout import RolloutChannel
@@ -34,6 +35,7 @@ SUPPORTED_TARGETS = [
     ToolTarget.GROK,
     ToolTarget.OPENCLAW,
     ToolTarget.OPENCODE,
+    ToolTarget.BOB,
 ]
 PROVIDER_SCOPE_TARGETS = [
     ToolTarget.CLAUDE,
@@ -178,19 +180,44 @@ def build_manifest(
     base_env["HEADROOM_TELEMETRY"] = "on" if telemetry_enabled else "off"
     if memory_enabled:
         base_env["HEADROOM_MEMORY_ENABLED"] = "1"
-    # Grok / Grok Build need proxy upstream = xAI. Only auto-set when no other
-    # OpenAI-compatible tools share this proxy (those may need api.openai.com /
-    # Copilot). Explicit OPENAI_TARGET_API_URL in extra_env still wins below.
+    # Some tools speak the OpenAI wire format but against their own gateway:
+    # Grok/Grok Build need xAI, Bob needs the IBM gateway. A proxy has a single
+    # `--openai-api-url` slot, so a default is only derived when exactly one
+    # such family is installed and no OpenAI-native tool shares this proxy
+    # (those may need api.openai.com / Copilot). With two competing families
+    # neither may silently win — leaving it unset keeps the default rather than
+    # pointing one tool's credential at the other's host. Explicit
+    # OPENAI_TARGET_API_URL in extra_env still wins below.
     _openai_native = {
         ToolTarget.CODEX.value,
         ToolTarget.COPILOT.value,
         ToolTarget.AIDER.value,
         ToolTarget.OPENCODE.value,
     }
-    _grok_targets = {ToolTarget.GROK.value, ToolTarget.GROK_BUILD.value}
+    _exclusive_openai_gateways = (
+        ("grok", {ToolTarget.GROK.value, ToolTarget.GROK_BUILD.value}, _GROK_DEFAULT_API_URL),
+        ("bob", {ToolTarget.BOB.value}, _BOB_DEFAULT_API_URL),
+    )
     target_set = set(resolved_targets)
-    if target_set & _grok_targets and not (target_set & _openai_native):
-        base_env.setdefault("OPENAI_TARGET_API_URL", _GROK_DEFAULT_API_URL)
+    explicit_upstream = (extra_env or {}).get("OPENAI_TARGET_API_URL")
+    if not (target_set & _openai_native) and not explicit_upstream:
+        claimed = [
+            (name, url) for name, family, url in _exclusive_openai_gateways if target_set & family
+        ]
+        if len(claimed) == 1:
+            base_env.setdefault("OPENAI_TARGET_API_URL", claimed[0][1])
+        elif len(claimed) > 1:
+            # Refusing beats both alternatives. Leaving it unset sends every
+            # one of these tools to api.openai.com, and picking a winner
+            # breaks the loser — either way the user learns about it as an
+            # upstream 401 with nothing pointing at this decision.
+            names = ", ".join(sorted(name for name, _ in claimed))
+            raise click.ClickException(
+                f"Targets {names} each need a different OpenAI-compatible upstream, "
+                "and a proxy has only one. Install them on separate ports/profiles, "
+                "or choose the upstream explicitly with "
+                "`--env OPENAI_TARGET_API_URL=<url>`."
+            )
     # Applied last so explicit --env overrides win over the auto-derived
     # defaults above (e.g. a custom HEADROOM_WORKSPACE_DIR).
     if extra_env:

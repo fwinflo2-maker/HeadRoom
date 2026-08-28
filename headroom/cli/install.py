@@ -23,7 +23,7 @@ from headroom.install.models import (
     RuntimeKind,
     SupervisorKind,
 )
-from headroom.install.planner import build_manifest
+from headroom.install.planner import SUPPORTED_TARGETS, build_manifest
 from headroom.install.providers import apply_mutations, revert_mutations
 from headroom.install.runtime import (
     acquire_runtime_start_lock,
@@ -60,6 +60,13 @@ class TurnkeyPlan:
     supervisor_kind: str | None
     reason: str
     base_env: dict[str, str] | None = None
+
+
+# Derived, not restated: two hand-maintained copies of this list had already
+# drifted from the planner (one missing `grok`, the other `grok` and
+# `grok_build`), and a target the planner supports but the CLI rejects is
+# simply unreachable.
+_TARGET_CHOICES = [target.value for target in SUPPORTED_TARGETS]
 
 
 @main.group()
@@ -495,9 +502,7 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
     "--target",
     "targets",
     multiple=True,
-    type=click.Choice(
-        ["claude", "copilot", "codex", "aider", "cursor", "grok_build", "openclaw", "opencode"]
-    ),
+    type=click.Choice(_TARGET_CHOICES),
     help="Tool target to configure when --providers manual is used.",
 )
 @click.option("--profile", default="default", show_default=True, help="Deployment profile name.")
@@ -729,7 +734,7 @@ def install_apply(
     "--target",
     "targets",
     multiple=True,
-    type=click.Choice(["claude", "copilot", "codex", "aider", "cursor", "openclaw", "opencode"]),
+    type=click.Choice(_TARGET_CHOICES),
     help="Tool target to configure when --providers manual is used.",
 )
 @click.option("--memory", is_flag=True, help="Enable persistent memory in the proxy runtime.")

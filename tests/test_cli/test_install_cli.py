@@ -1344,3 +1344,27 @@ def test_install_agent_ensure_propagates_start_deployment_failure(monkeypatch) -
     result = runner.invoke(main, ["install", "agent", "ensure"])
     assert result.exit_code != 0, f"expected non-zero exit, got {result.exit_code}: {result.output}"
     assert "simulated start failure" in result.output
+
+
+def test_install_target_choices_track_supported_targets() -> None:
+    """`--target` must offer exactly the targets the planner accepts.
+
+    Both choice lists were maintained by hand and had already drifted: `apply`
+    was missing `grok`, `deploy` was missing `grok` and `grok_build`. A target
+    the planner supports but the CLI rejects is unreachable, which is how
+    `bob` stayed unusable even after its env builder was registered.
+    """
+    import click
+
+    from headroom.cli.install import deploy as deploy_cmd
+    from headroom.cli.install import install_apply
+    from headroom.install.planner import SUPPORTED_TARGETS
+
+    expected = {target.value for target in SUPPORTED_TARGETS}
+
+    for command in (install_apply, deploy_cmd):
+        param = next(p for p in command.params if p.name == "targets")
+        assert isinstance(param.type, click.Choice)
+        assert set(param.type.choices) == expected, (
+            f"{command.name} --target choices drifted from SUPPORTED_TARGETS"
+        )

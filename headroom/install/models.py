@@ -59,6 +59,7 @@ class ToolTarget(str, Enum):
     GROK = "grok"
     OPENCLAW = "openclaw"
     OPENCODE = "opencode"
+    BOB = "bob"
 
 
 def iso_utc_now() -> str:

@@ -365,3 +365,105 @@ def test_build_manifest_extra_env_wins_over_grok_xai_default() -> None:
     assert manifest.base_env["OPENAI_TARGET_API_URL"] == "https://gateway.example/v1"
     idx = manifest.proxy_args.index("--openai-api-url")
     assert manifest.proxy_args[idx + 1] == "https://gateway.example/v1"
+
+
+def test_resolve_targets_manual_accepts_bob() -> None:
+    """`--target bob` must survive resolution.
+
+    Without ToolTarget.BOB the value was filtered out of `normalized` here, so
+    the Bob env builder registered in install_registry was never reached and the
+    generated manifest carried no IBM gateway upstream.
+    """
+    targets = resolve_targets(ProviderSelectionMode.MANUAL.value, ["bob"])
+
+    assert targets == [ToolTarget.BOB.value]
+
+
+def test_build_manifest_bob_only_sets_ibm_gateway_upstream() -> None:
+    """A persistent install for Bob alone must point the OpenAI upstream at IBM.
+
+    This is the flag whose absence sent Bob's `Authorization: apikey ...` to
+    api.openai.com and 401'd every request.
+    """
+    from headroom.providers.bob import DEFAULT_API_URL
+
+    manifest = build_manifest(**_base_manifest_kwargs(targets=["bob"], backend="openai"))
+
+    assert manifest.base_env.get("OPENAI_TARGET_API_URL") == DEFAULT_API_URL
+    idx = manifest.proxy_args.index("--openai-api-url")
+    assert manifest.proxy_args[idx + 1] == DEFAULT_API_URL
+
+
+def test_build_manifest_bob_with_codex_does_not_force_ibm_gateway() -> None:
+    """Do not hijack the OpenAI upstream when OpenAI-native tools share the proxy."""
+    manifest = build_manifest(**_base_manifest_kwargs(targets=["bob", "codex"], backend="openai"))
+
+    assert "OPENAI_TARGET_API_URL" not in manifest.base_env
+    assert "--openai-api-url" not in manifest.proxy_args
+
+
+def test_build_manifest_rejects_two_competing_openai_gateways() -> None:
+    """Bob and Grok cannot share one proxy, and the conflict must be loud.
+
+    A proxy has a single `--openai-api-url`. Silently leaving it unset sends
+    *both* tools to api.openai.com, where neither credential is valid — the
+    same silent-misroute failure as an upstream pointed at the wrong provider.
+    Picking a winner is no better: it breaks the loser just as quietly.
+    """
+    with pytest.raises(click.ClickException) as excinfo:
+        build_manifest(**_base_manifest_kwargs(targets=["bob", "grok"], backend="openai"))
+
+    message = str(excinfo.value)
+    assert "bob" in message and "grok" in message
+    assert "OPENAI_TARGET_API_URL" in message
+
+
+def test_build_manifest_explicit_upstream_resolves_gateway_conflict() -> None:
+    """An explicit override is the documented escape hatch, so it must not raise."""
+    manifest = build_manifest(
+        **_base_manifest_kwargs(
+            targets=["bob", "grok"],
+            backend="openai",
+            extra_env={"OPENAI_TARGET_API_URL": "https://gateway.example/v1"},
+        )
+    )
+
+    assert manifest.base_env["OPENAI_TARGET_API_URL"] == "https://gateway.example/v1"
+
+
+def test_build_manifest_openai_native_target_defuses_gateway_conflict() -> None:
+    """With an OpenAI-native tool present nothing is auto-derived, so no conflict.
+
+    This is the common `--providers auto` shape on a developer machine (codex
+    or copilot installed alongside everything else) and must keep working
+    exactly as it did before Bob became a valid target.
+    """
+    manifest = build_manifest(
+        **_base_manifest_kwargs(targets=["bob", "grok", "codex"], backend="openai")
+    )
+
+    assert "OPENAI_TARGET_API_URL" not in manifest.base_env
+    assert "--openai-api-url" not in manifest.proxy_args
+
+
+def test_build_manifest_extra_env_wins_over_bob_gateway_default() -> None:
+    manifest = build_manifest(
+        **_base_manifest_kwargs(
+            targets=["bob"],
+            backend="openai",
+            extra_env={"OPENAI_TARGET_API_URL": "https://gateway.example/v1"},
+        )
+    )
+
+    assert manifest.base_env["OPENAI_TARGET_API_URL"] == "https://gateway.example/v1"
+    idx = manifest.proxy_args.index("--openai-api-url")
+    assert manifest.proxy_args[idx + 1] == "https://gateway.example/v1"
+
+
+def test_build_manifest_bob_tool_env_wires_gateway_url() -> None:
+    """The manifest must hand Bob its BOB_GATEWAY_URL, not just configure upstream."""
+    from headroom.providers.bob import PROXY_ENV_KEY
+
+    manifest = build_manifest(**_base_manifest_kwargs(targets=["bob"], backend="openai"))
+
+    assert manifest.tool_envs["bob"][PROXY_ENV_KEY] == "http://127.0.0.1:8787"

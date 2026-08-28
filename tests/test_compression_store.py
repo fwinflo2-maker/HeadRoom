@@ -682,7 +682,36 @@ class TestCompressionStoreEviction:
 
         assert backend.items_calls == 0
 
-    def test_oversized_ttl_at_capacity_keeps_indexes_consistent(self):
+    def test_expired_cleanup_below_capacity_is_bounded(self):
+        """A new key cleans at most one expired entry while capacity is available."""
+        backend = InMemoryBackend()
+        store = CompressionStore(max_entries=10, enable_feedback=False, backend=backend)
+
+        with (
+            patch("headroom.cache.compression_store.time.time") as now,
+            patch.object(backend, "get", wraps=backend.get) as get,
+            patch.object(backend, "delete", wraps=backend.delete) as delete,
+            patch.object(backend, "items", wraps=backend.items) as items,
+            patch.object(backend, "count", wraps=backend.count) as count,
+        ):
+            operations = (get, delete, items, count)
+            now.return_value = 100
+            for i in range(4):
+                store.store(original=f"expired_{i}", compressed="expired", ttl=1)
+
+            for operation in operations:
+                operation.reset_mock()
+            now.return_value = 200
+            store.store(original="new_1", compressed="new", ttl=100)
+            assert tuple(operation.call_count for operation in operations) == (2, 1, 0, 1)
+
+            for operation in operations:
+                operation.reset_mock()
+            now.return_value = 201
+            store.store(original="new_2", compressed="new", ttl=100)
+            assert (items.call_count, count.call_count) == (0, 1)
+
+    def test_in_memory_oversized_ttl_at_capacity_keeps_indexes_consistent(self):
         """An oversized positive TTL is stored as a non-expiring heap entry."""
         backend = InMemoryBackend()
         store = CompressionStore(max_entries=1, enable_feedback=False, backend=backend)
@@ -705,23 +734,53 @@ class TestCompressionStoreEviction:
         assert (entry.created_at, oversized_hash) in store._eviction_heap
         assert (float("inf"), entry.created_at, oversized_hash) in store._expiration_heap
 
-    def test_sqlite_ttl_purges_do_not_grow_eviction_indexes(self, tmp_path):
-        """SQLite TTL purges do not leave process-local heap tuples unbounded."""
-        backend = SQLiteBackend(tmp_path / "ccr.db")
-        store = CompressionStore(max_entries=1000, enable_feedback=False, backend=backend)
+    @pytest.mark.parametrize("mode", ["count", "revision", "revision_error", "stale_revision"])
+    def test_shared_sqlite_pressure_reconciles_sibling_entries(self, tmp_path, mode: str):
+        """Capacity reconciliation covers sibling count and identity changes."""
+
+        class _RevisionFailureSQLiteBackend(SQLiteBackend):
+            fail_revision = False
+
+            def external_revision(self) -> int | None:
+                if self.fail_revision:
+                    raise RuntimeError("revision unavailable")
+                return super().external_revision()
+
+        db_path = tmp_path / "ccr.db"
+        backend = _RevisionFailureSQLiteBackend(db_path)
+        sibling_backend = SQLiteBackend(db_path)
+        store = CompressionStore(max_entries=2, enable_feedback=True, backend=backend)
+        sibling_store = CompressionStore(enable_feedback=False, backend=sibling_backend)
 
         with patch("headroom.cache.compression_store.time.time") as now:
-            for i in range(5):
-                now.return_value = 100 + i * 61
-                store.store(
-                    original=f"content_{i}",
-                    compressed=f"compressed_{i}",
-                    ttl=1,
+            now.return_value = 90
+            removed_hash = None
+            if mode != "count":
+                removed_hash = store.store(
+                    original="removed",
+                    compressed="removed",
+                    ttl=1 if mode == "stale_revision" else 100,
                 )
+            now.return_value = 100
+            live_hash = store.store(
+                original="live",
+                compressed="live",
+                ttl=100,
+                tool_signature_hash="live_signature",
+                compression_strategy="top_k",
+            )
+            if removed_hash is not None and mode != "stale_revision":
+                sibling_backend.delete(removed_hash)
+            now.return_value = 110
+            sibling_store.store(original="expired", compressed="expired", ttl=5)
+            backend.fail_revision = mode == "revision_error"
+            now.return_value = 116
+            with patch.object(backend, "items", wraps=backend.items) as items:
+                new_hash = store.store(original="new", compressed="new", ttl=100)
 
-        assert backend.count() == 1
-        assert len(store._eviction_heap) <= 2
-        assert len(store._expiration_heap) == 1
+        assert set(backend.keys()) == {live_hash, new_hash}
+        assert items.call_count == 1
+        assert store._pending_feedback_events == []
 
     def test_eviction_at_capacity(self, store_with_small_capacity: CompressionStore):
         """Oldest entries are evicted when at capacity."""
@@ -836,6 +895,48 @@ class TestCompressionStoreEviction:
         assert not backend.exists(expired_hash)
         assert backend.exists(new_hash)
         assert backend.count() == 2
+        assert store._pending_feedback_events == []
+
+    @pytest.mark.parametrize("misses", [1, 2])
+    def test_expiration_cleanup_handles_transient_backend_misses(self, misses: int):
+        """Expiry lookup misses retry once, then fail open without live eviction."""
+
+        class _TransientMissBackend(InMemoryBackend):
+            miss_key: str | None = None
+            misses_remaining = 0
+
+            def get(self, hash_key: str) -> CompressionEntry | None:
+                if hash_key == self.miss_key and self.misses_remaining:
+                    self.misses_remaining -= 1
+                    return None
+                return super().get(hash_key)
+
+        backend = _TransientMissBackend()
+        store = CompressionStore(max_entries=2, enable_feedback=True, backend=backend)
+
+        with patch("headroom.cache.compression_store.time.time") as now:
+            if misses == 1:
+                now.return_value = 80
+                store.store(original="stale", compressed="stale", ttl=100)
+            now.return_value = 90
+            live_hash = store.store(
+                original="live",
+                compressed="live",
+                ttl=100,
+                tool_signature_hash="live_signature",
+                compression_strategy="top_k",
+            )
+            now.return_value = 91
+            expired_hash = store.store(original="expired", compressed="expired", ttl=5)
+            backend.miss_key = expired_hash
+            backend.misses_remaining = misses
+            now.return_value = 97
+            new_hash = store.store(original="new", compressed="new", ttl=100)
+
+        expected_keys = {live_hash, new_hash}
+        if misses == 2:
+            expected_keys.add(expired_hash)
+        assert set(backend.keys()) == expected_keys
         assert store._pending_feedback_events == []
 
     def test_eviction_ignores_stale_expiration_after_replacement(self):

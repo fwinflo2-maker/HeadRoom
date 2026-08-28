@@ -265,6 +265,9 @@ class CompressionStore:
         self._stale_expiration_heap_entries = 0
         # Threshold for triggering heap rebuild (when 50% are stale)
         self._heap_rebuild_threshold = 0.5
+        external_revision = getattr(self._backend, "external_revision", None)
+        self._backend_revision_reader = external_revision if callable(external_revision) else None
+        self._backend_revision = self._read_backend_revision()
 
     @property
     def default_ttl_seconds(self) -> int:
@@ -742,16 +745,35 @@ class CompressionStore:
         # Avoid the old full backend items() scan per new-key store().
         # The expiration heap keeps cleanup proportional to expired roots.
 
-        self._rebuild_heap_if_needed()
+        backend_count = self._backend.count()
+        indexed_count = max(0, len(self._eviction_heap) - self._stale_heap_entries)
+        at_capacity = backend_count >= self._max_entries
+        if at_capacity:
+            backend_revision = self._read_backend_revision()
+            backend_changed = self._backend_revision_reader is not None and (
+                backend_revision is None or backend_revision != self._backend_revision
+            )
+            if indexed_count != backend_count or backend_changed:
+                self._rebuild_heap()
+            else:
+                self._rebuild_heap_if_needed()
+            if backend_revision is not None:
+                self._backend_revision = backend_revision
+        else:
+            self._rebuild_heap_if_needed()
 
         # Remove expired entries first without reporting successful compression.
         while self._expiration_heap:
             expires_at, created_at, hash_key = self._expiration_heap[0]
             if expires_at >= time.time():
                 break
-            heapq.heappop(self._expiration_heap)
 
             entry = self._backend.get(hash_key)
+            if entry is None and at_capacity:
+                entry = self._backend.get(hash_key)
+                if entry is None:
+                    return
+            heapq.heappop(self._expiration_heap)
             if (
                 entry is not None
                 and entry.created_at == created_at
@@ -764,6 +786,12 @@ class CompressionStore:
             else:
                 # Backend-side TTL purges leave the matching eviction tuple stale.
                 self._stale_heap_entries += 1
+
+            if not at_capacity or self._backend.count() < self._max_entries:
+                return
+
+        if not at_capacity:
+            return
 
         # If still at capacity, remove oldest entries using heap
         while self._backend.count() >= self._max_entries and self._eviction_heap:
@@ -796,6 +824,17 @@ class CompressionStore:
             return entry.created_at + float(entry.ttl)
         except OverflowError:
             return float("inf") if entry.ttl > 0 else float("-inf")
+
+    def _read_backend_revision(self) -> object | None:
+        """Read optional backend revision metadata without breaking stores."""
+        if self._backend_revision_reader is None:
+            return None
+        try:
+            revision: object | None = self._backend_revision_reader()
+            return revision
+        except Exception:
+            logger.debug("CCR backend revision lookup failed", exc_info=True)
+            return None
 
     def _rebuild_heap_if_needed(self) -> None:
         """Rebuild both indexes when either stale ratio reaches the threshold."""

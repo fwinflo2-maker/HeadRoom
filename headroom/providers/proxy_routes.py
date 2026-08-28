@@ -299,10 +299,12 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     # Factory Droid inference passthrough. Registered ONLY when an upstream is
     # configured (`--factory-api-url` / FACTORY_TARGET_API_URL). Factory exposes
-    # two inference shapes and Droid picks per model: Anthropic Messages at
+    # three inference shapes and Droid picks per model: Anthropic Messages at
     # `/api/llm/a/v1/messages` (e.g. Bedrock-backed models) and OpenAI Chat
     # Completions at `/api/llm/o/v1/chat/completions` (e.g. Fireworks-backed
-    # Droid Core / Kimi). Both are compressed by reusing the matching pipeline;
+    # Droid Core / Kimi), plus OpenAI Responses at
+    # `/api/llm/o/v1/responses` (e.g. GPT-5.6). All are compressed by reusing
+    # the matching pipeline;
     # auth (`Authorization: Bearer fk-...`) passes through untouched and all
     # other Factory REST paths fall through to the catch-all, which
     # `select_passthrough_base_url` points at the same upstream.
@@ -324,6 +326,15 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         @app.post("/api/llm/o/v1/chat/completions")
         async def factory_llm_chat(request: Request):
             return await proxy.handle_openai_chat(
+                request,
+                trusted_upstream_base_url=_factory_base,
+                trusted_original_path=request.url.path,
+                trusted_provider_name="factory",
+            )
+
+        @app.post("/api/llm/o/v1/responses")
+        async def factory_llm_responses(request: Request):
+            return await proxy.handle_openai_responses(
                 request,
                 trusted_upstream_base_url=_factory_base,
                 trusted_original_path=request.url.path,

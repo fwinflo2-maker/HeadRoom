@@ -1594,3 +1594,77 @@ def test_factory_openai_chat_route_absent_without_factory_upstream(monkeypatch) 
         ).json()
 
     assert payload["handler"] == "handle_passthrough"
+
+
+def test_factory_openai_responses_route_uses_trusted_factory_state(monkeypatch) -> None:
+    seen: list[tuple[str, str | None, dict[str, object]]] = []
+
+    async def fake_openai_responses(self, request, **kwargs):  # type: ignore[no-untyped-def]
+        seen.append(
+            (
+                request.url.path,
+                request.headers.get("x-headroom-base-url"),
+                kwargs,
+            )
+        )
+        return JSONResponse({"handler": "handle_openai_responses"})
+
+    monkeypatch.setattr(
+        HeadroomProxy,
+        "handle_openai_responses",
+        fake_openai_responses,
+    )
+
+    with TestClient(_factory_app()) as client:
+        payload = client.post(
+            "/api/llm/o/v1/responses?trace=test",
+            headers={
+                "authorization": "Bearer fk-test",
+                "x-headroom-base-url": "https://evil.example",
+            },
+            json={"model": "gpt-5.6-luna", "input": "hello"},
+        ).json()
+
+    assert payload == {"handler": "handle_openai_responses"}
+    assert seen == [
+        (
+            "/api/llm/o/v1/responses",
+            "https://evil.example",
+            {
+                "trusted_upstream_base_url": "https://api.factory.ai",
+                "trusted_original_path": "/api/llm/o/v1/responses",
+                "trusted_provider_name": "factory",
+            },
+        )
+    ]
+
+
+def test_factory_openai_responses_route_absent_without_factory_upstream(
+    monkeypatch,
+) -> None:
+    async def fake_openai_responses(self, request, **kwargs):  # type: ignore[no-untyped-def]
+        return JSONResponse({"handler": "handle_openai_responses"})
+
+    async def fake_passthrough(
+        self,
+        request,
+        base_url,
+        sub_path="",
+        provider_name="",
+    ):  # type: ignore[no-untyped-def]
+        return JSONResponse({"handler": "handle_passthrough"})
+
+    monkeypatch.setattr(
+        HeadroomProxy,
+        "handle_openai_responses",
+        fake_openai_responses,
+    )
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    with TestClient(_app()) as client:
+        payload = client.post(
+            "/api/llm/o/v1/responses",
+            json={"model": "gpt-5.6-luna", "input": "hello"},
+        ).json()
+
+    assert payload == {"handler": "handle_passthrough"}

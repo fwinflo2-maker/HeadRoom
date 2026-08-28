@@ -834,24 +834,33 @@ def test_ensure_proxy_restarts_persistent_deployment_for_memory_mismatch(monkeyp
 def test_ensure_proxy_restarts_recovered_persistent_for_openai_api_url_mismatch(
     monkeypatch,
 ) -> None:
+    """A manifest that already carries the right upstream is fixed by a restart.
+
+    The stale proxy predates the manifest's ``--openai-api-url``, so restarting
+    it picks the flag up and the post-restart verification passes.
+    """
     calls: list[object] = []
-    health = {
-        "version": wrap_cli._HEADROOM_VERSION,
-        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
-        "config": {
-            "pid": 12345,
-            "memory": False,
-            "learn": False,
-            "code_graph": False,
-            "openai_api_url": None,
-        },
-    }
+    requested = "https://api.business.githubcopilot.com"
+
+    def _health(port: int) -> dict:
+        restarted = bool(calls)
+        return {
+            "version": wrap_cli._HEADROOM_VERSION,
+            "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+            "config": {
+                "pid": 12345,
+                "memory": False,
+                "learn": False,
+                "code_graph": False,
+                "openai_api_url": requested if restarted else None,
+            },
+        }
 
     monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
     monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: False)
     monkeypatch.setattr(wrap_cli, "_recover_persistent_proxy", lambda port: True)
     monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
-    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", _health)
     monkeypatch.setattr(
         wrap_cli,
         "_restart_persistent_proxy",
@@ -865,11 +874,7 @@ def test_ensure_proxy_restarts_recovered_persistent_for_openai_api_url_mismatch(
         ),
     )
 
-    proc, actual_port = wrap_cli._ensure_proxy(
-        8787,
-        False,
-        openai_api_url="https://api.business.githubcopilot.com",
-    )
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False, openai_api_url=requested)
 
     assert proc is None
     assert actual_port == 8787
@@ -877,14 +882,24 @@ def test_ensure_proxy_restarts_recovered_persistent_for_openai_api_url_mismatch(
 
 
 def test_ensure_proxy_restarts_recovered_persistent_when_config_unavailable(monkeypatch) -> None:
+    """A recovered deployment that exposes no config is restarted, then verified.
+
+    The restart makes the config readable; because the manifest carries the
+    requested upstream, verification passes and the port is reused.
+    """
     calls: list[object] = []
+    requested = "https://api.business.githubcopilot.com"
 
     monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
     monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: False)
     monkeypatch.setattr(wrap_cli, "_recover_persistent_proxy", lambda port: True)
     monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
     monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: {"version": "x"})
-    monkeypatch.setattr(wrap_cli, "_query_proxy_config", lambda port: None)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_query_proxy_config",
+        lambda port: {"openai_api_url": requested} if calls else None,
+    )
     monkeypatch.setattr(
         wrap_cli,
         "_restart_persistent_proxy",
@@ -898,11 +913,7 @@ def test_ensure_proxy_restarts_recovered_persistent_when_config_unavailable(monk
         ),
     )
 
-    proc, actual_port = wrap_cli._ensure_proxy(
-        8787,
-        False,
-        openai_api_url="https://api.business.githubcopilot.com",
-    )
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False, openai_api_url=requested)
 
     assert proc is None
     assert actual_port == 8787
@@ -962,14 +973,70 @@ def test_ensure_proxy_recovered_persistent_deployment_checks_feature_mismatch(mo
     """
 
     calls: list[object] = []
+    requested = "https://api.githubcopilot.com"
+
+    def _health(port: int) -> dict:
+        restarted = bool(calls)
+        return {
+            "version": wrap_cli._HEADROOM_VERSION,
+            "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+            "config": {
+                "pid": "12345",
+                "memory": False,
+                "learn": False,
+                "code_graph": False,
+                "openai_api_url": requested if restarted else None,
+            },
+        }
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
+    monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: False)
+    monkeypatch.setattr(wrap_cli, "_recover_persistent_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", _health)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_restart_persistent_proxy",
+        lambda manifest, port: calls.append(("restart", manifest.profile, port)) or True,
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("ephemeral proxy should not start")
+        ),
+    )
+
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False, openai_api_url=requested)
+
+    assert proc is None
+    assert actual_port == 8787
+    assert calls == [("restart", "default", 8787)]
+
+
+def test_ensure_proxy_raises_when_persistent_restart_cannot_apply_openai_api_url(
+    monkeypatch,
+) -> None:
+    """A manifest restart that leaves the upstream wrong must not report success.
+
+    ``_restart_persistent_proxy`` replays ``manifest.proxy_args`` verbatim, so it
+    can fix a stale *version* but never a missing ``--openai-api-url``. The old
+    code called it for an upstream mismatch and returned the port as success,
+    handing the agent a proxy pointed at the wrong provider: Bob's IBM
+    ``Authorization: apikey ...`` reached api.openai.com and every
+    ``/inference/v1/chat/completions`` 401'd.
+    """
+    calls: list[object] = []
     health = {
         "version": wrap_cli._HEADROOM_VERSION,
         "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
         "config": {
-            "pid": "12345",
+            "pid": 12345,
             "memory": False,
             "learn": False,
             "code_graph": False,
+            # The manifest has no --openai-api-url, so this stays None across
+            # the restart.
             "openai_api_url": None,
         },
     }
@@ -992,12 +1059,76 @@ def test_ensure_proxy_recovered_persistent_deployment_checks_feature_mismatch(mo
         ),
     )
 
+    with pytest.raises(click.ClickException) as excinfo:
+        wrap_cli._ensure_proxy(
+            8787,
+            False,
+            agent_type="bob",
+            openai_api_url="https://api.us-east.bob.ibm.com/inference/v1",
+        )
+
+    message = str(excinfo.value)
+    assert "default" in message
+    assert "api.us-east.bob.ibm.com" in message
+    # The remedy must name the actual tool, not a placeholder.
+    assert "headroom install apply --profile default --target bob" in message
+    assert "headroom wrap bob --port 8788" in message
+    # The restart was attempted before giving up — this is a verification
+    # failure, not a refusal to try.
+    assert calls == [("restart", "default", 8787)]
+
+
+def test_ensure_proxy_warns_when_no_proxy_reuses_mismatched_upstream(monkeypatch, capsys) -> None:
+    """``--no-proxy`` must not silently hand an agent the wrong upstream.
+
+    The whole config-validation block lives under ``if not no_proxy:``, so
+    ``headroom wrap bob --no-proxy`` against a proxy installed for another
+    provider reused it with no check at all and every request 401'd upstream.
+    ``--no-proxy`` means "use what is already there", so this warns rather than
+    failing, but it must not stay silent.
+    """
+    health = {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {"pid": 12345, "openai_api_url": None},
+    }
+
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("--no-proxy must not start a proxy")
+        ),
+    )
+
     proc, actual_port = wrap_cli._ensure_proxy(
         8787,
-        False,
-        openai_api_url="https://api.githubcopilot.com",
+        True,
+        agent_type="bob",
+        openai_api_url="https://api.us-east.bob.ibm.com/inference/v1",
     )
 
     assert proc is None
     assert actual_port == 8787
-    assert calls == [("restart", "default", 8787)]
+    out = capsys.readouterr().out
+    assert "api.us-east.bob.ibm.com" in out
+    assert "--no-proxy" in out
+
+
+def test_ensure_proxy_no_proxy_is_quiet_when_upstream_matches(monkeypatch, capsys) -> None:
+    """Control: a matching upstream under --no-proxy produces no warning."""
+    requested = "https://api.us-east.bob.ibm.com/inference/v1"
+    health = {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {"pid": 12345, "openai_api_url": requested},
+    }
+
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+
+    wrap_cli._ensure_proxy(8787, True, agent_type="bob", openai_api_url=requested)
+
+    assert "api.us-east.bob.ibm.com" not in capsys.readouterr().out

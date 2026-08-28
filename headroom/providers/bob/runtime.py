@@ -47,9 +47,16 @@ def build_launch_env(
 
     Bob routes inference traffic through ``BOB_GATEWAY_URL`` when set. The
     proxy forwards OpenAI-compatible chat requests upstream to IBM while Bob
-    keeps its own ``Authorization: apikey …`` credential and its non-inference
-    routes (``/admin/v1/profile``, ``/metrics-forwarder/…``) pass through
-    untouched.
+    keeps its own ``Authorization: apikey …`` credential.
+
+    Caveat: setting this env var reroutes *every* Bob gateway call, not just
+    inference. Only ``/inference/v1/chat/completions`` has a matching proxy
+    route; Bob's other gateway routes (``/admin/v1/profile``,
+    ``/metrics-forwarder/…``) land on the catch-all passthrough, whose upstream
+    base is the same ``…/inference`` target, so they are forwarded to
+    ``…/inference/admin/v1/profile`` instead of the path IBM serves. Fixing
+    that needs a per-provider upstream-path mapping the proxy does not have
+    yet.
 
     ``project`` (the wrap launch directory) is encoded as a ``/p/<name>``
     base-URL prefix because Bob sends no custom attribution headers; the proxy

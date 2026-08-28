@@ -3956,6 +3956,46 @@ def _restart_persistent_proxy(manifest: Any, port: int) -> bool:
     return False
 
 
+def _verify_persistent_openai_upstream(
+    manifest: Any,
+    port: int,
+    requested_openai_api_url: str,
+    *,
+    agent_type: str = "unknown",
+) -> None:
+    """Raise when a restarted persistent deployment still has the wrong upstream.
+
+    ``_restart_persistent_proxy`` replays ``manifest.proxy_args`` verbatim, so it
+    can resolve a stale *version* but never a missing ``--openai-api-url``. The
+    callers below used to treat its ``True`` as "mismatch resolved" and return
+    the port as success, which handed the agent a proxy pointed at the wrong
+    provider: a ``headroom wrap bob`` session against a dashboard deployment
+    installed without ``--target bob`` sent Bob's IBM ``Authorization: apikey …``
+    to api.openai.com and 401'd every request.
+
+    Verifying after the restart keeps the legitimate case working — a manifest
+    that already carries the right flag comes back matching — while turning the
+    unfixable case into an actionable error instead of silent misrouting.
+    """
+    running_config = _proxy_health_config(_query_proxy_health(port)) or _query_proxy_config(port)
+    running_raw = running_config.get("openai_api_url") if running_config else None
+    if _normalize_proxy_api_url(running_raw) == _normalize_proxy_api_url(requested_openai_api_url):
+        return
+
+    running_display = running_raw or "the default OpenAI upstream (https://api.openai.com)"
+    target_hint = agent_type if agent_type and agent_type != "unknown" else "<tool>"
+    raise click.ClickException(
+        f"Persistent deployment '{manifest.profile}' on port {port} forwards "
+        f"OpenAI-compatible traffic to {running_display}, but this session needs "
+        f"{requested_openai_api_url}. Restarting the deployment replays its stored "
+        "proxy args, so it cannot pick up a different upstream. Either reinstall it "
+        f"with this tool as a target:\n"
+        f"    headroom install apply --profile {manifest.profile} --target {target_hint}\n"
+        "or give this session its own port:\n"
+        f"    headroom wrap {target_hint} --port {port + 1}"
+    )
+
+
 def _copilot_model_configured(copilot_args: tuple[str, ...], env: dict[str, str]) -> bool:
     """Return True when Copilot BYOK model selection is configured."""
     return _copilot_model_configured_impl(copilot_args, env)
@@ -4084,6 +4124,27 @@ def _ensure_proxy_unlocked(
             "  Warning: --backend/--region/--anyllm-provider have no effect with --no-proxy "
             "(reusing the existing proxy)."
         )
+    if no_proxy and openai_api_url and helpers._check_proxy(port):
+        # Every config check below lives under `if not no_proxy:`, so this flag
+        # used to reuse whatever was listening with no validation at all. For a
+        # provider with its own gateway that means the agent's credential is
+        # forwarded to the wrong host and every request fails upstream.
+        # `--no-proxy` is an explicit "use what is already there", so warn
+        # rather than fail — but do not stay silent about it.
+        running_config = helpers._proxy_health_config(
+            helpers._query_proxy_health(port)
+        ) or helpers._query_proxy_config(port)
+        running_raw = running_config.get("openai_api_url") if running_config else None
+        if _normalize_proxy_api_url(running_raw) != _normalize_proxy_api_url(openai_api_url):
+            running_display = running_raw or "the default OpenAI upstream (https://api.openai.com)"
+            click.echo(
+                f"  Warning: the proxy on port {port} forwards OpenAI-compatible traffic to "
+                f"{running_display}, but this session expects {openai_api_url}."
+            )
+            click.echo(
+                "  --no-proxy reuses it as-is; requests will likely fail upstream. "
+                "Drop --no-proxy to let Headroom start a correctly configured proxy."
+            )
     if not no_proxy:
         manifest = helpers._find_persistent_manifest(port)
         isolated_copilot_subscription_proxy = copilot_subscription_seed_requested and (
@@ -4190,6 +4251,10 @@ def _ensure_proxy_unlocked(
                             "did not expose config; restarting with requested features..."
                         )
                         if helpers._restart_persistent_proxy(manifest, port):
+                            if openai_api_url:
+                                helpers._verify_persistent_openai_upstream(
+                                    manifest, port, openai_api_url, agent_type=agent_type
+                                )
                             return None, port
                         raise click.ClickException(
                             f"Persistent deployment '{manifest.profile}' on port {port} "
@@ -4220,6 +4285,10 @@ def _ensure_proxy_unlocked(
                             f"{flags_str}; restarting..."
                         )
                         if helpers._restart_persistent_proxy(manifest, port):
+                            if openai_api_url:
+                                helpers._verify_persistent_openai_upstream(
+                                    manifest, port, openai_api_url, agent_type=agent_type
+                                )
                             return None, port
                         raise click.ClickException(
                             f"Persistent deployment '{manifest.profile}' on port {port} "
@@ -6952,8 +7021,15 @@ def bob(
     Sets ``BOB_GATEWAY_URL`` so Bob routes inference traffic through Headroom
     while keeping its own ``Authorization: apikey …`` credential and its
     ~/.bob/settings files untouched. Bob speaks OpenAI-shaped chat completions
-    under an ``/inference/v1`` gateway prefix; its non-inference routes
-    (profile, metrics) pass through uncompressed.
+    under an ``/inference/v1`` gateway prefix, which is the traffic Headroom
+    compresses.
+
+    \b
+    Known limitation: only ``/inference/v1/chat/completions`` is routed
+    correctly. Bob's other gateway routes (``/admin/v1/profile``,
+    ``/metrics-forwarder/…``) reach the catch-all passthrough, which resolves
+    its upstream from the same ``…/inference`` base and so forwards them to
+    ``…/inference/admin/v1/profile`` rather than the path IBM serves.
 
     \b
     Mode matters more for Bob than for most agents. Its traffic is ~46% system
@@ -8476,7 +8552,7 @@ def unwrap_bob(port: int, no_stop_proxy: bool) -> None:
     """
     click.echo()
     click.echo("  ╔═══════════════════════════════════════════════╗")
-    click.echo("  ║            HEADROOM UNWRAP: BOB              ║")
+    click.echo("  ║            HEADROOM UNWRAP: BOB               ║")
     click.echo("  ╚═══════════════════════════════════════════════╝")
     click.echo()
 

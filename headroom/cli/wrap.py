@@ -7821,22 +7821,32 @@ def opencode(
         # Proxy already started by _ensure_proxy above; tell _launch_tool to
         # skip duplicate startup.
         launch_started = True
-        _launch_tool(
-            binary=opencode_bin,
-            args=opencode_args,
-            env=env,
-            port=actual_port,
-            no_proxy=True,
-            tool_label="OPENCODE",
-            env_vars_display=env_vars_display,
-            learn=learn,
-            memory=memory,
-            agent_type="opencode",
-            code_graph=code_graph,
-            backend=backend,
-            anyllm_provider=anyllm_provider,
-            region=region,
-        )
+        try:
+            _launch_tool(
+                binary=opencode_bin,
+                args=opencode_args,
+                env=env,
+                port=actual_port,
+                no_proxy=True,
+                tool_label="OPENCODE",
+                env_vars_display=env_vars_display,
+                learn=learn,
+                memory=memory,
+                agent_type="opencode",
+                code_graph=code_graph,
+                backend=backend,
+                anyllm_provider=anyllm_provider,
+                region=region,
+            )
+        except SystemExit as exc:
+            # _launch_tool raises plain SystemExit after a child exits, but
+            # chains pre-launch failures as the cause.
+            if exc.__cause__ is not None:
+                launch_started = False
+            raise
+        except BaseException:
+            launch_started = False
+            raise
     finally:
         if not launch_started and _opencode_proxy and _opencode_proxy.poll() is None:
             _other = _live_proxy_clients(actual_port, exclude_self=True)

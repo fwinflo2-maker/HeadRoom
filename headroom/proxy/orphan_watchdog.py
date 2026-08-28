@@ -100,10 +100,7 @@ def live_client_pids(clients_dir: Path) -> list[int] | None:
             pid = int(marker.stem)
         except ValueError:
             continue
-        try:
-            alive = pid_alive(pid)
-        except (OverflowError, ValueError):
-            alive = False
+        alive = pid_alive(pid)
         if not alive or _marker_pid_recycled(marker, pid):
             try:
                 marker.unlink(missing_ok=True)

@@ -104,3 +104,66 @@ def test_unwrap_bob_reports_nothing_to_restore(monkeypatch) -> None:
     assert result.exit_code == 0, result.output
     assert "BOB_GATEWAY_URL" in result.output
     assert "no longer routed" in result.output
+
+
+def test_wrap_bob_hands_ibm_gateway_upstream_to_the_proxy(monkeypatch) -> None:
+    """`wrap bob` must tell the proxy which upstream Bob needs.
+
+    This is the contract the proxy-reuse checks depend on: without
+    ``openai_api_url`` the mismatch detection has nothing to compare, and a
+    proxy configured for another provider is reused silently. In production
+    that sent Bob's IBM ``Authorization: apikey ...`` to api.openai.com and
+    401'd every ``/inference/v1/chat/completions``.
+    """
+    import headroom.cli.wrap as wrap_mod
+
+    captured: dict[str, object] = {}
+
+    class _Completed:
+        returncode = 0
+
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.setattr(wrap_mod.shutil, "which", lambda binary: f"/usr/local/bin/{binary}")
+    monkeypatch.setattr(
+        wrap_mod,
+        "_ensure_proxy",
+        lambda port, no_proxy, **kwargs: captured.update(kwargs) or (None, port),
+    )
+    monkeypatch.setattr(wrap_mod.subprocess, "run", lambda *a, **kw: _Completed())
+
+    result = CliRunner().invoke(main, ["wrap", "bob"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["openai_api_url"] == DEFAULT_API_URL
+    # agent_type drives the remedy text in the upstream-mismatch error.
+    assert captured["agent_type"] == "bob"
+
+
+def test_wrap_bob_points_bob_at_the_actual_proxy_port(monkeypatch) -> None:
+    """When the requested port is taken, BOB_GATEWAY_URL must follow the fallback.
+
+    ``_launch_tool`` rewrites ``127.0.0.1:<requested>`` in the launch env after
+    ``_ensure_proxy`` reports the port it really bound. If that rewrite missed
+    Bob's variable, Bob would keep talking to whatever else owns the original
+    port.
+    """
+    import headroom.cli.wrap as wrap_mod
+
+    launched_env: dict[str, str] = {}
+
+    class _Completed:
+        returncode = 0
+
+    def _run(cmd, env=None, **kwargs):
+        launched_env.update(env or {})
+        return _Completed()
+
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.setattr(wrap_mod.shutil, "which", lambda binary: f"/usr/local/bin/{binary}")
+    monkeypatch.setattr(wrap_mod, "_ensure_proxy", lambda port, no_proxy, **kwargs: (None, 8788))
+    monkeypatch.setattr(wrap_mod.subprocess, "run", _run)
+
+    result = CliRunner().invoke(main, ["wrap", "bob", "--port", "8787"])
+
+    assert result.exit_code == 0, result.output
+    assert launched_env[PROXY_ENV_KEY].startswith("http://127.0.0.1:8788")

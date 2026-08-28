@@ -53,7 +53,10 @@ class BobTurn:
     seq: int
     model: str
     messages: list[dict[str, Any]]
-    observed_context_tokens: int = 0
+    # Memoized raw token count. The payload is identical in every mode, so
+    # counting it once instead of once per mode removes two full tokenizer
+    # passes over every turn.
+    raw_token_cache: int | None = None
 
 
 @dataclass
@@ -114,9 +117,6 @@ def load_turns(
     if not db_path.exists():
         raise SystemExit(f"bob db not found: {db_path}")
 
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    con.row_factory = sqlite3.Row
-
     q = "select id, costs, created_at from tasks"
     where: list[str] = []
     params: list[str | int] = []
@@ -124,12 +124,25 @@ def load_turns(
         where.append("id like ?")
         params.append(task_prefix + "%")
     if since:
+        # Parse before opening the database so a bad --since fails fast without
+        # leaving a connection behind.
         try:
-            cutoff = datetime.fromisoformat(since).replace(tzinfo=timezone.utc)
+            cutoff = datetime.fromisoformat(since)
         except ValueError as exc:
             raise SystemExit(f"--since must be ISO date (YYYY-MM-DD), got {since!r}") from exc
+        # A bare date is naive and means UTC; an explicit offset is the caller's
+        # deliberate choice, so convert rather than overwrite it.
+        cutoff = (
+            cutoff.replace(tzinfo=timezone.utc)
+            if cutoff.tzinfo is None
+            else cutoff.astimezone(timezone.utc)
+        )
         where.append("created_at > ?")
         params.append(int(cutoff.timestamp() * 1000))
+
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+
     if where:
         q += " where " + " and ".join(where)
     q += " order by created_at"
@@ -171,8 +184,12 @@ def load_turns(
                         task_id=t["id"],
                         seq=seq,
                         model=costs.get("model") or "gpt-4o",
-                        messages=copy.deepcopy(convo[:-1]),
-                        observed_context_tokens=costs.get("contextTokens", 0),
+                        # A shallow copy of the prefix, not a deep one: `replay`
+                        # deep-copies again before handing the payload to the
+                        # pipeline, and nothing here mutates a message in place.
+                        # Deep-copying per turn made the whole load quadratic in
+                        # conversation length.
+                        messages=list(convo[:-1]),
                     )
                 )
     con.close()
@@ -191,16 +208,7 @@ def build_proxy(mode: str, disable_kompress: bool = False) -> Any:
     from headroom.proxy.models import ProxyConfig
     from headroom.proxy.server import HeadroomProxy
 
-    cfg_kwargs: dict[str, Any] = {"disable_kompress": disable_kompress}
-    try:
-        cfg = ProxyConfig(mode=mode, **cfg_kwargs)
-    except TypeError:
-        # Older/newer ProxyConfig signatures: fall back to the default and set
-        # the attributes directly rather than guessing at keyword names.
-        cfg = ProxyConfig()
-        cfg.mode = mode
-        cfg.disable_kompress = disable_kompress
-    return HeadroomProxy(cfg)
+    return HeadroomProxy(ProxyConfig(mode=mode, disable_kompress=disable_kompress))
 
 
 def count_tokens(tokenizer: Any, messages: list[dict[str, Any]]) -> int:
@@ -211,6 +219,13 @@ def count_tokens(tokenizer: Any, messages: list[dict[str, Any]]) -> int:
         # The estimate only has to be consistent between arms; a tokenizer
         # that refuses one payload must not abort the whole run.
         return len(text) // 4
+
+
+def raw_tokens(tokenizer: Any, turn: BobTurn) -> int:
+    """Token count of a turn's untouched payload, computed once per turn."""
+    if turn.raw_token_cache is None:
+        turn.raw_token_cache = count_tokens(tokenizer, turn.messages)
+    return turn.raw_token_cache
 
 
 def replay(
@@ -224,7 +239,7 @@ def replay(
 
     if mode == "baseline":
         for t in turns:
-            n = count_tokens(tokenizer, t.messages)
+            n = raw_tokens(tokenizer, t)
             summary.turns.append(TurnResult(t.task_id, t.seq, n, n))
         return summary
 
@@ -240,8 +255,9 @@ def replay(
     if effective != mode:
         raise SystemExit(f"mode not applied: asked for {mode!r}, proxy reports {effective!r}")
 
+    failures = 0
     for t in turns:
-        raw = count_tokens(tokenizer, t.messages)
+        raw = raw_tokens(tokenizer, t)
         try:
             limit = provider.get_context_limit(t.model)
         except Exception:
@@ -263,10 +279,22 @@ def replay(
             )
             forwarded = count_tokens(tokenizer, result.messages)
         except Exception as exc:  # noqa: BLE001 - one bad turn must not kill the run
+            # Counting a failed turn as "forwarded everything" is the honest
+            # floor, but it is indistinguishable from a turn that genuinely
+            # compressed to nothing. A payload shape the pipeline rejects would
+            # otherwise report 0% savings for the whole mode with no signal, so
+            # the count is always surfaced, not just under -v.
+            failures += 1
             if verbose:
                 print(f"  ! {t.task_id[:8]}#{t.seq} {mode}: {exc}", file=sys.stderr)
             forwarded = raw
         summary.turns.append(TurnResult(t.task_id, t.seq, raw, forwarded))
+    if failures:
+        print(
+            f"  ! {mode}: {failures}/{len(turns)} turns failed to compress and were "
+            "counted as fully forwarded (rerun with -v for the errors)",
+            file=sys.stderr,
+        )
     return summary
 
 
@@ -311,7 +339,17 @@ def report(summaries: dict[str, ModeSummary], turns: list[BobTurn]) -> None:
         if not s:
             continue
         delta = base.cost_usd - s.cost_usd
-        vs_base = f"-${delta:.2f}" if delta > 0 else "—"
+        # A mode that costs MORE than baseline is the result most worth seeing,
+        # so show the sign rather than collapsing it into the same dash used
+        # for "no difference".
+        if mode == "baseline":
+            vs_base = "—"
+        elif delta > 0:
+            vs_base = f"-${delta:.2f}"
+        elif delta < 0:
+            vs_base = f"+${-delta:.2f}"
+        else:
+            vs_base = "$0.00"
         print(
             f"{mode:<10}{s.forwarded:>15,}{s.saved:>12,}{s.saved_pct:>9.2f}%"
             f"{s.cost_usd:>10.2f}{vs_base:>10}"

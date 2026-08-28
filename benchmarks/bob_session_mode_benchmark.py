@@ -179,19 +179,27 @@ def load_turns(
     return turns
 
 
-def build_proxy(mode: str) -> Any:
-    """A proxy instance configured for one mode, with no network listener."""
+def build_proxy(mode: str, disable_kompress: bool = False) -> Any:
+    """A proxy instance configured for one mode, with no network listener.
+
+    HEADROOM_* env vars are parsed by the proxy's CLI factory, not by
+    ProxyConfig itself, so constructing the config directly ignores them. A
+    first attempt to measure Kompress by exporting HEADROOM_DISABLE_KOMPRESS=1
+    produced byte-identical results in both arms for exactly this reason —
+    every toggle this harness varies has to be passed as a keyword.
+    """
     from headroom.proxy.models import ProxyConfig
     from headroom.proxy.server import HeadroomProxy
 
-    cfg_kwargs: dict[str, Any] = {}
+    cfg_kwargs: dict[str, Any] = {"disable_kompress": disable_kompress}
     try:
         cfg = ProxyConfig(mode=mode, **cfg_kwargs)
     except TypeError:
         # Older/newer ProxyConfig signatures: fall back to the default and set
-        # the attribute directly rather than guessing at keyword names.
+        # the attributes directly rather than guessing at keyword names.
         cfg = ProxyConfig()
         cfg.mode = mode
+        cfg.disable_kompress = disable_kompress
     return HeadroomProxy(cfg)
 
 
@@ -205,7 +213,9 @@ def count_tokens(tokenizer: Any, messages: list[dict[str, Any]]) -> int:
         return len(text) // 4
 
 
-def replay(turns: list[BobTurn], mode: str, verbose: bool = False) -> ModeSummary:
+def replay(
+    turns: list[BobTurn], mode: str, verbose: bool = False, disable_kompress: bool = False
+) -> ModeSummary:
     from headroom.tokenizers import get_tokenizer
     from headroom.utils import extract_user_query
 
@@ -218,7 +228,7 @@ def replay(turns: list[BobTurn], mode: str, verbose: bool = False) -> ModeSummar
             summary.turns.append(TurnResult(t.task_id, t.seq, n, n))
         return summary
 
-    proxy = build_proxy(mode)
+    proxy = build_proxy(mode, disable_kompress=disable_kompress)
     pipeline = proxy.openai_pipeline
     provider = proxy.openai_provider
 
@@ -340,6 +350,11 @@ def main() -> int:
     ap.add_argument("--max-tasks", type=int, help="keep only the N most recent")
     ap.add_argument("--modes", default=",".join(MODES))
     ap.add_argument("--json", type=Path, help="write full per-turn results here")
+    ap.add_argument(
+        "--disable-kompress",
+        action="store_true",
+        help="turn off the ModernBERT token compressor to isolate its contribution",
+    )
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -356,7 +371,9 @@ def main() -> int:
     for mode in modes:
         if args.verbose:
             print(f"replaying {len(turns)} turns in {mode} mode…", file=sys.stderr)
-        summaries[mode] = replay(turns, mode, verbose=args.verbose)
+        summaries[mode] = replay(
+            turns, mode, verbose=args.verbose, disable_kompress=args.disable_kompress
+        )
 
     report(summaries, turns)
 

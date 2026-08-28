@@ -562,6 +562,22 @@ SETTINGS: tuple[SettingField, ...] = (
         tier="advanced",
     ),
     SettingField(
+        "HEADROOM_WRITE_TIMEOUT_SECONDS",
+        "write_timeout_seconds",
+        "Write timeout (s)",
+        "Timeouts",
+        "int",
+        default=None,
+        minimum=1,
+        help=(
+            "Seconds an upstream may stop accepting request data before the send is "
+            "abandoned. Default: 60. Applied per write, so a large body over a slow "
+            "link is unaffected. Lower it to fail over a dead pooled connection "
+            "faster; the connect timeout only guards a fresh connect."
+        ),
+        tier="advanced",
+    ),
+    SettingField(
         "HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS",
         "anthropic_buffered_request_timeout_seconds",
         "Anthropic buffered timeout (s)",

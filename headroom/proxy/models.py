@@ -368,6 +368,19 @@ class ProxyConfig:
     # Timeouts
     request_timeout_seconds: int = 300
     connect_timeout_seconds: int = 10
+    # Sending the request is a different operation from waiting for the model to
+    # answer, but `write` used to inherit `request_timeout_seconds`, so pushing
+    # bytes got the same 300s budget as a model thinking. That left the write
+    # phase effectively unbounded in practice: when an upstream stops draining —
+    # a pooled socket whose peer went away over a laptop sleep, a network change,
+    # a NAT timeout — the send blocks until the OS gives up retransmitting
+    # (~180-220s on macOS), which is *under* 300s, so no timeout ever fired and
+    # the proxy hung, retried, and hung again (#3259).
+    #
+    # httpx applies this per write operation, not to the whole body, so a large
+    # upload over a slow link keeps resetting it and is unaffected; it only
+    # expires when the peer stops accepting data for this many seconds straight.
+    write_timeout_seconds: int = 60
     # Anthropic buffered reads can legitimately run longer than the generic
     # proxy request cap. Keep the generic timeout unchanged elsewhere.
     anthropic_buffered_request_timeout_seconds: int = 600

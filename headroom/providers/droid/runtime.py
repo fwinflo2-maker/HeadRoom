@@ -12,10 +12,25 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 import socket
 from urllib.parse import urlsplit, urlunsplit
 
 DEFAULT_FACTORY_API_URL = "https://api.factory.ai"
+_DNS_HOST_RE = re.compile(
+    r"(?=.{1,253}\.?$)"
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?"
+)
+
+
+def _is_valid_host(host: str) -> bool:
+    """Return whether `host` is an IP literal or a syntactically valid DNS name."""
+    try:
+        ipaddress.ip_address(host.rstrip("."))
+    except ValueError:
+        return _DNS_HOST_RE.fullmatch(host) is not None
+    return True
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -47,6 +62,7 @@ def canonical_factory_api_url(value: object) -> str | None:
     if (
         scheme not in {"http", "https"}
         or host is None
+        or not _is_valid_host(host)
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query

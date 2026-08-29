@@ -218,27 +218,21 @@ def test_proxy_throughput_in_stats_endpoint(monkeypatch: pytest.MonkeyPatch) -> 
     `from headroom.perf.analyzer import ...` on every call, so we patch the
     names directly on the `headroom.perf.analyzer` module so the local import
     inside the closure picks up our fakes.
-
-    Skipped locally when headroom._core (Rust extension) is not compiled.
     """
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
 
     import headroom.perf.analyzer as _analyzer_mod
+    from headroom.proxy.loopback_guard import require_loopback
+    from headroom.proxy.server import ProxyConfig, create_app
 
-    try:
-        from headroom.proxy.server import (
-            _throughput_cache,
-            create_app,
-            require_loopback,
-        )
-    except (ImportError, ModuleNotFoundError) as exc:
-        pytest.skip(f"headroom._core not available (Rust extension not compiled): {exc}")
-
-    from headroom.config import ProxyConfig
-
-    # Reset the module-level cache so CI doesn't reuse a stale value
-    _throughput_cache.update({"expires_at": 0.0, "value": None})
+    # No cache reset needed: `_throughput_cache` is a local of `create_app`
+    # captured by the route closures, so each app built below starts with its
+    # own empty cache. It was previously imported here and reset as a
+    # "module-level cache" — an import that cannot succeed, whose ImportError
+    # was caught and reported as a missing Rust extension. That skipped this
+    # test unconditionally, on every machine, including ones where the
+    # extension is compiled.
 
     # Patch at the module level so the local import inside _compute_throughput
     # picks up our stubs instead of the real implementations.

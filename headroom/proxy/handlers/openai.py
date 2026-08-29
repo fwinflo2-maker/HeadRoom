@@ -5500,8 +5500,7 @@ class OpenAIHandlerMixin:
             headers,
             self.config.openai_extra_headers,
             upstream_url=(
-                trusted_upstream_base_url
-                or _resolve_openai_upstream_base(request.headers)
+                trusted_upstream_base_url or _resolve_openai_upstream_base(request.headers)
             ),
             config=self.config,
         )
@@ -5591,9 +5590,7 @@ class OpenAIHandlerMixin:
             rate_key = headers.get("authorization", "default")[:20]
             allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
             if not allowed:
-                await self.metrics.record_rate_limited(
-                    provider=responses_outcome_provider
-                )
+                await self.metrics.record_rate_limited(provider=responses_outcome_provider)
                 raise HTTPException(
                     status_code=429,
                     detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
@@ -5803,9 +5800,8 @@ class OpenAIHandlerMixin:
         if is_chatgpt_auth and trusted_upstream_base_url is None:
             url = codex_responses_http_url()
         else:
-            upstream_base_url = (
-                trusted_upstream_base_url
-                or _resolve_openai_upstream_base(request.headers)
+            upstream_base_url = trusted_upstream_base_url or _resolve_openai_upstream_base(
+                request.headers
             )
             if trusted_upstream_base_url is not None:
                 handler_path = trusted_original_path or request.url.path
@@ -6617,9 +6613,7 @@ class OpenAIHandlerMixin:
                 # Same wrapper as the Anthropic twin; only the error wire format
                 # differs. See headroom/proxy/buffered_ccr_response.py (#3079).
                 async def _record_buffered_responses_failure(**_kwargs: Any) -> None:
-                    await self.metrics.record_failed(
-                        provider=responses_outcome_provider
-                    )
+                    await self.metrics.record_failed(provider=responses_outcome_provider)
 
                 _buffered_call = buffered_ccr_asgi_call(
                     operation=operation,

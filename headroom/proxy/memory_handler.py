@@ -1285,8 +1285,7 @@ your responses, not to drive new actions."""
             )
 
         logger.info(
-            "event=memory_save user=%s scope=%s agent=%s provider=%s similar=%d",
-            effective_user_id,
+            "event=memory_save scope=%s agent=%s provider=%s similar=%d",
             scope.display_name if scope else "<legacy>",
             self.agent_type,
             provider,
@@ -1389,8 +1388,9 @@ your responses, not to drive new actions."""
                 user_id=effective_user_id,
             )
             logger.info(
-                f"Memory: Updated {memory_id} by {self.agent_type} "
-                f"(provider={provider}, reason={reason})"
+                "event=memory_update agent=%s provider=%s",
+                self.agent_type,
+                provider,
             )
             return json.dumps({"status": "updated", "memory_id": memory.id})
         else:

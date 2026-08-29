@@ -743,9 +743,7 @@ def test_handle_openai_responses_routes_trusted_factory_request(monkeypatch):
     assert handler.captured_request is not None
     method, url, _headers, body = handler.captured_request
     assert method == "POST"
-    assert url == (
-        "http://127.0.0.1:9999/private/api/llm/o/v1/responses?trace=test"
-    )
+    assert url == ("http://127.0.0.1:9999/private/api/llm/o/v1/responses?trace=test")
     assert body["input"] == "hello"
     assert [outcome.provider for outcome in outcomes] == ["factory"]
 

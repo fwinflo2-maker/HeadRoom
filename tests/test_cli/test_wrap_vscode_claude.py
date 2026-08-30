@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from click.testing import CliRunner
 
 from headroom.cli.main import main
@@ -115,7 +116,41 @@ def test_wrap_vscode_claude_no_configure_1m_is_write_free(tmp_path: Path) -> Non
 
     assert result.exit_code == 0, result.output
     assert '"model": "claude-opus-5[1m]"' in result.output
+    assert (
+        '  "ENABLE_TOOL_SEARCH": "true"\n'
+        f"  Add this top-level setting to {path}:\n"
+        '  "model": "claude-opus-5[1m]"'
+    ) in result.output
     assert path.read_text(encoding="utf-8") == original
+    assert state_path.read_text(encoding="utf-8") == '{"sentinel":true}'
+
+
+@pytest.mark.parametrize("contents", ["{broken", '{"model":{"name":"opus"}}'])
+def test_wrap_vscode_claude_no_configure_1m_falls_back_for_invalid_settings(
+    tmp_path: Path, contents: str
+) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text(contents, encoding="utf-8")
+    state_path = tmp_path / ".headroom-vscode-claude.json"
+    state_path.write_text('{"sentinel":true}', encoding="utf-8")
+
+    def fake_watcher(**kwargs):  # noqa: ANN003, ANN202
+        kwargs["print_setup_lines"](8787)
+
+    with patch("headroom.cli.wrap._run_proxy_only_watcher", side_effect=fake_watcher):
+        result = CliRunner().invoke(
+            main,
+            ["wrap", "vscode-claude", "--no-configure", "--1m", "--settings-file", str(path)],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert (
+        '  "ENABLE_TOOL_SEARCH": "true"\n'
+        f"  Add this top-level setting to {path}:\n"
+        '  "model": "claude-opus-5[1m]"'
+    ) in result.output
+    assert '  "ENABLE_TOOL_SEARCH": "true",\n' not in result.output
+    assert path.read_text(encoding="utf-8") == contents
     assert state_path.read_text(encoding="utf-8") == '{"sentinel":true}'
 
 

@@ -14,6 +14,7 @@ from headroom.providers.claude.vscode import (
     configure_vscode_claude_settings,
     remove_vscode_claude_settings,
     resolve_vscode_claude_model,
+    resolve_vscode_claude_model_for_instructions,
     vscode_claude_proxy_url,
 )
 
@@ -222,6 +223,22 @@ def test_resolve_vscode_claude_model_is_read_only(tmp_path: Path) -> None:
     assert not (tmp_path / ".headroom-vscode-claude.json").exists()
 
 
+def test_resolve_vscode_claude_model_for_instructions_falls_back_for_non_string(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "settings.json"
+    original = '{"model":{"name":"opus"}}'
+    path.write_text(original, encoding="utf-8")
+    monkeypatch.setenv("HEADROOM_1M_MODEL", "claude-opus-9")
+
+    with pytest.raises(click.ClickException, match="non-string"):
+        resolve_vscode_claude_model(path)
+
+    assert resolve_vscode_claude_model_for_instructions(path) == "claude-opus-9[1m]"
+    assert path.read_text(encoding="utf-8") == original
+    assert not (tmp_path / ".headroom-vscode-claude.json").exists()
+
+
 def test_remove_deletes_settings_created_only_for_headroom(tmp_path: Path) -> None:
     path = tmp_path / "settings.json"
     configure_vscode_claude_settings(path, "http://127.0.0.1:8787/p/demo")
@@ -234,7 +251,7 @@ def test_configure_refuses_malformed_settings(tmp_path: Path) -> None:
     path = tmp_path / "settings.json"
     path.write_text("{broken", encoding="utf-8")
     with pytest.raises(click.ClickException, match="not valid JSON"):
-        configure_vscode_claude_settings(path, "http://127.0.0.1:8787")
+        configure_vscode_claude_settings(path, "http://127.0.0.1:8787", context_1m=True)
     assert path.read_text(encoding="utf-8") == "{broken"
 
 
@@ -275,6 +292,47 @@ def test_remove_without_headroom_state_is_noop(tmp_path: Path) -> None:
         ({"version": 2}, "unsupported or incomplete"),
         ({"managed": None}, "has no managed values"),
         ({"previous": {"ANTHROPIC_BASE_URL": None}}, "is incomplete"),
+        ({"model": None}, "incomplete model record"),
+        (
+            {"model": {"previous": None, "managed": "claude-opus-5[1m]"}},
+            "incomplete model record",
+        ),
+        (
+            {
+                "model": {
+                    "previous": {"present": True},
+                    "managed": "claude-opus-5[1m]",
+                }
+            },
+            "incomplete model record",
+        ),
+        (
+            {
+                "model": {
+                    "previous": {"present": False, "value": "unexpected"},
+                    "managed": "claude-opus-5[1m]",
+                }
+            },
+            "incomplete model record",
+        ),
+        (
+            {
+                "model": {
+                    "previous": {"present": True, "value": 5},
+                    "managed": "claude-opus-5[1m]",
+                }
+            },
+            "incomplete model record",
+        ),
+        (
+            {
+                "model": {
+                    "previous": {"present": False, "value": None},
+                    "managed": None,
+                }
+            },
+            "incomplete model record",
+        ),
     ],
 )
 def test_remove_refuses_incomplete_state(

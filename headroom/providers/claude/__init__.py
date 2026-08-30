@@ -29,6 +29,7 @@ from .vscode import (
     configure_vscode_claude_settings,
     remove_vscode_claude_settings,
     resolve_vscode_claude_model,
+    resolve_vscode_claude_model_for_instructions,
     vscode_claude_proxy_url,
 )
 
@@ -39,6 +40,7 @@ __all__ = [
     "configure_vscode_claude_settings",
     "remove_vscode_claude_settings",
     "resolve_vscode_claude_model",
+    "resolve_vscode_claude_model_for_instructions",
     "vscode_claude_proxy_url",
     "DEFAULT_API_URL",
     "DEFAULT_1M_MODEL",

@@ -92,6 +92,7 @@ from headroom.providers.claude import (
     remove_vscode_claude_settings,
     resolve_1m_model,
     resolve_vscode_claude_model,
+    resolve_vscode_claude_model_for_instructions,
     vscode_claude_proxy_url,
 )
 from headroom.providers.claude import (
@@ -6096,9 +6097,11 @@ def vscode_claude(
         click.echo(f"  Add these values under 'env' in {target_settings}:")
         click.echo(f'  "ANTHROPIC_BASE_URL": "{proxy_url}",')
         if context_1m:
-            click.echo(f'  "{_TOOL_SEARCH_ENV}": "{_TOOL_SEARCH_DEFAULT}",')
+            click.echo(f'  "{_TOOL_SEARCH_ENV}": "{_TOOL_SEARCH_DEFAULT}"')
             click.echo(f"  Add this top-level setting to {target_settings}:")
-            click.echo(f'  "model": "{resolve_vscode_claude_model(target_settings)}"')
+            click.echo(
+                f'  "model": "{resolve_vscode_claude_model_for_instructions(target_settings)}"'
+            )
         else:
             click.echo(f'  "{_TOOL_SEARCH_ENV}": "{_TOOL_SEARCH_DEFAULT}"')
 

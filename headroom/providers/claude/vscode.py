@@ -98,6 +98,14 @@ def resolve_vscode_claude_model(path: Path) -> str:
     return resolve_1m_model(_model_value(payload, path))
 
 
+def resolve_vscode_claude_model_for_instructions(path: Path) -> str:
+    """Resolve a model for manual setup instructions, tolerating bad settings."""
+    try:
+        return resolve_vscode_claude_model(path)
+    except click.ClickException:
+        return resolve_1m_model(None)
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fsutil.write_text(path, json.dumps(payload, indent=2) + "\n")

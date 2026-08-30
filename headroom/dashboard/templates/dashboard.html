@@ -823,29 +823,38 @@
                         <div class="bg-surface rounded-lg border border-border overflow-hidden lg:col-span-2">
                             <div class="px-4 py-3 border-b border-border flex justify-between items-center">
                                 <span class="text-sm font-medium text-gray-300">Per-Model Token Savings</span>
-                                <span class="text-xs text-gray-500">Exact tokens saved per model</span>
+                                <span class="text-xs text-gray-500">Exact tokens saved per model — grouped by upstream provider</span>
                             </div>
                             <div class="overflow-x-auto">
                                 <table class="w-full text-sm" style="table-layout:fixed">
                                     <colgroup>
-                                        <col style="width:40%">
-                                        <col style="width:12%">
-                                        <col style="width:18%">
-                                        <col style="width:18%">
-                                        <col style="width:12%">
+                                        <col style="width:14%">
+                                        <col style="width:30%">
+                                        <col style="width:9%">
+                                        <col style="width:13%">
+                                        <col style="width:13%">
+                                        <col style="width:11%">
+                                        <col style="width:10%">
                                     </colgroup>
                                     <thead>
                                         <tr class="text-xs text-gray-500 uppercase tracking-wide">
+                                            <th class="px-4 py-3 font-medium text-left">Provider</th>
                                             <th class="px-4 py-3 font-medium text-left">Model</th>
                                             <th class="px-4 py-3 font-medium text-right">Requests</th>
                                             <th class="px-4 py-3 font-medium text-right">Tokens Saved</th>
                                             <th class="px-4 py-3 font-medium text-right">Tokens Sent</th>
                                             <th class="px-4 py-3 font-medium text-right">Reduction</th>
+                                            <th class="px-4 py-3 font-medium text-right">Cost (USD)</th>
                                         </tr>
                                     </thead>
                                     <tbody class="divide-y divide-border">
                                         <template x-for="[model, info] in Object.entries(stats.cost?.per_model || {})" :key="model">
                                             <tr class="hover:bg-border/30 transition-colors">
+                                                <td class="px-4 py-3 text-left">
+                                                    <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-mono"
+                                                          :class="providerChipClass(providerFor(model))"
+                                                          x-text="providerFor(model)"></span>
+                                                </td>
                                                 <td class="px-4 py-3 text-left">
                                                     <span class="px-2 py-0.5 bg-border rounded text-xs" x-text="truncateModel(model)"></span>
                                                 </td>
@@ -855,6 +864,7 @@
                                                 <td class="px-4 py-3 text-right">
                                                     <span class="text-accent font-mono tabular-nums" x-text="info.reduction_pct.toFixed(1) + '%'"></span>
                                                 </td>
+                                                <td class="px-4 py-3 text-right font-mono tabular-nums" x-text="info.input_cost_usd != null ? '$' + formatCurrency(info.input_cost_usd) : '—'"></td>
                                             </tr>
                                         </template>
                                     </tbody>
@@ -2651,6 +2661,33 @@
                 getProviderPercent(count) {
                     const total = this.stats.requests?.total || 1;
                     return Math.min((count / total) * 100, 100);
+                },
+
+                providerFor(model) {
+                    if (!model) return 'other';
+                    const m = model.toLowerCase();
+                    if (/^(us|eu|apac|ap|ca|sa)\.anthropic\./.test(m) || m.startsWith('anthropic.')) return 'bedrock';
+                    if (m.startsWith('claude-') || m.includes('/claude-')) return 'anthropic';
+                    if (m.startsWith('gpt-') || m.startsWith('o1-') || m.startsWith('o3-') || m.startsWith('o4-') || m.startsWith('chatgpt-')) return 'openai';
+                    if (m.startsWith('gemini-') || m.includes('/gemini')) return 'gemini';
+                    if (m.startsWith('minimax-m') || m.includes('minimax-m') || m.includes('minimax/')) return 'minimax';
+                    if (m.startsWith('mistral') || m.startsWith('mixtral') || m.includes('codestral')) return 'mistral';
+                    if (m.startsWith('deepseek-')) return 'deepseek';
+                    return 'other';
+                },
+
+                providerChipClass(provider) {
+                    const map = {
+                        anthropic: 'bg-orange-500/20 text-orange-200 border border-orange-500/50',
+                        openai: 'bg-emerald-500/20 text-emerald-200 border border-emerald-500/50',
+                        gemini: 'bg-blue-500/20 text-blue-200 border border-blue-500/50',
+                        bedrock: 'bg-purple-500/20 text-purple-200 border border-purple-500/50',
+                        minimax: 'bg-cyan-500/20 text-cyan-100 border border-cyan-400/60',
+                        mistral: 'bg-amber-500/20 text-amber-200 border border-amber-500/50',
+                        deepseek: 'bg-pink-500/20 text-pink-200 border border-pink-500/50',
+                        other: 'bg-gray-700/40 text-gray-300 border border-gray-500/50',
+                    };
+                    return map[provider] || map.other;
                 },
 
                 getSparkline(data) {

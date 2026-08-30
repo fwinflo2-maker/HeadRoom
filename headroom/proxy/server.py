@@ -285,6 +285,8 @@ def _classify_agent_from_log(entry: dict[str, Any]) -> tuple[str, str, str]:
     model = str(entry.get("model") or "").lower()
     if "codex" in model:
         return "codex", _agent_label("codex"), "model"
+    if "minimax" in model or "m2.7" in model or "m3" == model[-2:] or "m2" == model[-2:]:
+        return "minimax", _agent_label("minimax"), "model"
     if "claude" in model:
         return "claude-code", _agent_label("claude-code"), "model"
     if "gemini" in model:
@@ -608,6 +610,7 @@ from headroom.proxy.handlers import (  # noqa: E402
     BatchHandlerMixin,
     BedrockHandlerMixin,
     GeminiHandlerMixin,
+    MiniMaxHandlerMixin,
     OpenAIHandlerMixin,
     StreamingMixin,
 )
@@ -760,6 +763,7 @@ def _external_compressor_selection(compressors: set[str] | None) -> list[str] | 
 class HeadroomProxy(
     StreamingMixin,
     AnthropicHandlerMixin,
+    MiniMaxHandlerMixin,
     OpenAIHandlerMixin,
     GeminiHandlerMixin,
     BatchHandlerMixin,
@@ -803,6 +807,16 @@ class HeadroomProxy(
         HeadroomProxy.GEMINI_API_URL = api_targets.gemini
         HeadroomProxy.CLOUDCODE_API_URL = api_targets.cloudcode
         HeadroomProxy.VERTEX_API_URL = api_targets.vertex
+
+        # Safety guardrail: if the env signals we're running in a MiniMax
+        # profile (MINIMAX_SESSION_TOKEN set) but the resolved Anthropic
+        # upstream points somewhere else, log a loud warning so a
+        # misconfigured LaunchAgent never silently burns Anthropic quota.
+        # This catches the failure mode where someone runs the MiniMax plist
+        # but ANTHROPIC_TARGET_API_URL has been clobbered (or omitted) and
+        # the proxy silently falls back to the literal api.anthropic.com
+        # default.
+        self._check_minimax_upstream_guardrail()
         self.anthropic_provider = self.provider_runtime.pipeline_provider("anthropic")
         self.openai_provider = self.provider_runtime.pipeline_provider("openai")
 
@@ -1196,6 +1210,8 @@ class HeadroomProxy(
             openai_api_url=config.openai_api_url,
             anyllm_backend_cls=AnyLLMBackend,
             litellm_backend_cls=LiteLLMBackend,
+            minimax_api_key=config.minimax_api_key,
+            minimax_api_url=config.minimax_api_url,
         )
 
         # Request counter for IDs
@@ -1384,6 +1400,103 @@ class HeadroomProxy(
                 "backend": self.config.backend,
                 "memory_enabled": self.config.memory_enabled,
             },
+        )
+
+    @staticmethod
+    def _is_minimax_gateway_url(url: str) -> bool:
+        """True when `url` points at the Mavis Code gateway, not the direct
+        MiniMax Anthropic-compatible API.
+
+        Mavis Code gateway: agent.minimax.io/mavis/api/v1/llm/v1
+        Direct MiniMax API: api.minimaxi.com/anthropic
+        """
+        from urllib.parse import urlparse
+
+        try:
+            host = (urlparse(url).hostname or "").lower()
+        except ValueError:
+            return False
+        return host in {"agent.minimax.io", "minimax.io"}
+
+    @staticmethod
+    def _is_minimax_upstream(url: str) -> bool:
+        """True when `url` is ANY MiniMax endpoint (gateway OR direct API).
+
+        Used by the safety guardrail: if the proxy is running in a "MiniMax
+        profile" (signalled by ``ANTHROPIC_TARGET_API_URL`` pointing at a
+        MiniMax host or by ``MINIMAX_SESSION_TOKEN`` being set), and
+        ANTHROPIC_API_URL has drifted to something that isn't a MiniMax
+        host (e.g. the literal api.anthropic.com default), we want to log
+        a loud warning at startup so a misconfigured LaunchAgent never
+        silently starts burning Claude Code quota.
+        """
+        from urllib.parse import urlparse
+
+        try:
+            host = (urlparse(url).hostname or "").lower()
+        except ValueError:
+            return False
+        return host in {"agent.minimax.io", "minimax.io", "api.minimaxi.com"}
+
+    def _is_minimax_upstream_for_self(self, url: str) -> bool:
+        """Instance-method wrapper around _is_minimax_upstream().
+
+        Needed because ``self._is_minimax_upstream(url)`` on a static
+        method passes ``self`` implicitly as the first positional argument,
+        which breaks the URL-host parsing. Callers from instance methods
+        (e.g. ``_check_minimax_upstream_guardrail``) should use this
+        helper instead.
+        """
+        return self._is_minimax_upstream(url)
+
+    def _check_minimax_upstream_guardrail(self) -> None:
+        """Log a loud WARN if the proxy is in a MiniMax profile but the
+        resolved Anthropic upstream isn't a MiniMax host.
+
+        Profile detection: ``ANTHROPIC_TARGET_API_URL`` env var is set AND
+        points at a MiniMax host. That's the marker of a MiniMax-profile
+        plist (e.g. ``com.headroom.minimax-enable``). The fallback marker
+        is ``MINIMAX_SESSION_TOKEN`` for headroom configurations that pass
+        the JWT via env instead of the per-request ``Token:`` header.
+
+        Behaviour:
+          - MiniMax profile + MiniMax upstream  → no log (happy path).
+          - MiniMax profile + non-MiniMax upstream → ERROR-level log
+            with the offending URL. The proxy keeps running so the user
+            can see the warning in logs and fix the plist, but every
+            outbound /v1/messages call will fail with 502 because the
+            wrong upstream returns 401 on the MiniMax JWT.
+          - No MiniMax profile → no log (regular Anthropic-mode proxy).
+        """
+        env_target = os.environ.get("ANTHROPIC_TARGET_API_URL") or ""
+        env_session = os.environ.get("MINIMAX_SESSION_TOKEN") or ""
+        cfg_session = getattr(self.config, "minimax_session_token", None)
+
+        is_minimax_profile = False
+        if env_target and self._is_minimax_upstream_for_self(env_target):
+            is_minimax_profile = True
+        elif env_session or cfg_session:
+            is_minimax_profile = True
+
+        if not is_minimax_profile:
+            return  # regular Anthropic profile — nothing to guard
+
+        upstream = HeadroomProxy.ANTHROPIC_API_URL
+        if self._is_minimax_upstream_for_self(upstream):
+            logger.info(
+                "minimax_guardrail: upstream=%s — MiniMax profile OK",
+                upstream,
+            )
+            return
+
+        logger.error(
+            "minimax_guardrail: ANTHROPIC_API_URL=%s is NOT a MiniMax host, "
+            "but ANTHROPIC_TARGET_API_URL=%s signals a MiniMax profile. "
+            "Check ANTHROPIC_TARGET_API_URL in the LaunchAgent plist — "
+            "it must be agent.minimax.io or api.minimaxi.com. "
+            "Outbound /v1/messages calls will fail with 401/502 until fixed.",
+            upstream,
+            env_target,
         )
 
     async def _run_compression_in_executor(
@@ -2275,6 +2388,41 @@ class HeadroomProxy(
         )
         outbound_bytes, source = outbound.content, outbound.source
         outbound_headers = {**headers, "content-type": "application/json"}
+
+        # MiniMax upstream auth shim.
+        #
+        # Headroom can be routed at two distinct MiniMax surfaces:
+        #   1. Direct Anthropic-compatible API: api.minimaxi.com/anthropic
+        #      Auth: static API key from `sk-cp-…` (subscription).
+        #   2. Mavis Code gateway: agent.minimax.io/mavis/api/v1/llm/v1
+        #      Auth: per-session JWT (`eyJ…`) stored in the local
+        #      Codex/Mavis Agent localStorage (`_token` key).
+        #
+        # When the upstream is the gateway, we must REPLACE the client's
+        # `Authorization: Bearer <whatever>` with the real session JWT,
+        # otherwise the gateway returns 401 `auth failed`. The proxy
+        # reads the JWT from `MINIMAX_SESSION_TOKEN` (env) or
+        # `self.config.minimax_session_token` (ProxyConfig field).
+        #
+        # When the upstream is api.minimaxi.com, we instead inject
+        # `x-api-key: <key>` so the client Bearer can coexist.
+        if self._is_minimax_gateway_url(url):
+            session_token = os.environ.get("MINIMAX_SESSION_TOKEN") or getattr(
+                self.config, "minimax_session_token", None
+            )
+            if session_token:
+                outbound_headers["authorization"] = f"Bearer {session_token}"
+                # The gateway doesn't expect x-api-key — only Authorization.
+                outbound_headers.pop("x-api-key", None)
+        elif self._is_minimax_upstream(url):
+            # Direct MiniMax API (api.minimaxi.com): inject subscription key.
+            # Use getattr with default so SimpleNamespace test doubles don't
+            # blow up when they only model a subset of ProxyConfig fields.
+            minimax_api_key = os.environ.get("MINIMAX_API_KEY") or getattr(
+                self.config, "minimax_api_key", None
+            )
+            if minimax_api_key:
+                outbound_headers["x-api-key"] = minimax_api_key
 
         log_outbound_request(
             forwarder=forwarder_name,
@@ -5466,6 +5614,8 @@ def _proxy_config_from_env() -> ProxyConfig:
         bedrock_profile=os.environ.get("AWS_PROFILE"),
         bedrock_api_url=os.environ.get("BEDROCK_TARGET_API_URL"),
         anyllm_provider=_get_env_str("HEADROOM_ANYLLM_PROVIDER", "openai"),
+        minimax_api_key=os.environ.get("MINIMAX_API_KEY"),
+        minimax_api_url=os.environ.get("MINIMAX_TARGET_API_URL"),
         disable_kompress=_get_env_bool("HEADROOM_DISABLE_KOMPRESS", False),
         disable_kompress_fallback=_get_env_bool("HEADROOM_DISABLE_KOMPRESS_FALLBACK", False),
         disable_kompress_anthropic=_get_env_optional_bool("HEADROOM_DISABLE_KOMPRESS_ANTHROPIC"),
@@ -6214,6 +6364,9 @@ if __name__ == "__main__":
             min_value=1,
         ),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),
+        minimax_api_key=os.environ.get("MINIMAX_API_KEY") or getattr(args, "minimax_api_key", None),
+        minimax_api_url=os.environ.get("MINIMAX_TARGET_API_URL")
+        or getattr(args, "minimax_api_url", None),
         # Backend settings
         backend=_get_env_str("HEADROOM_BACKEND", args.backend),  # type: ignore[arg-type]
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", args.bedrock_region),

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -63,6 +64,7 @@ from headroom.providers.vertex import (
     vertex_anthropic_target,
     vertex_publisher_provider_name,
 )
+from headroom.proxy.handlers.minimax import MiniMaxHandlerMixin
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
@@ -261,10 +263,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.post("/v1/messages")
     async def anthropic_messages(request: Request):
-        # Honor the per-request upstream override so clients that speak the
-        # Anthropic Messages wire format but authenticate against a
-        # non-Anthropic gateway route correctly, consistent with the
-        # OpenAI-compatible and generic passthrough routes.
+        # Explicit per-request upstream overrides remain authoritative.
         custom_base = request.headers.get("x-headroom-base-url", "").strip()
         if custom_base:
             if not await is_safe_upstream_url_async(custom_base):
@@ -273,6 +272,19 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             return await proxy.handle_anthropic_messages(
                 request, upstream_base_url=custom_base.rstrip("/")
             )
+
+        # MiniMax traffic uses the Anthropic wire format but is bucketed
+        # under provider="minimax" for cost tracking and dashboard
+        # breakdown. Detect by model name in the request body.
+        try:
+            body_bytes = await request.body()
+            parsed = json.loads(body_bytes or b"{}")
+            model = parsed.get("model", "") if isinstance(parsed, dict) else ""
+        except (json.JSONDecodeError, ValueError):
+            model = ""
+
+        if isinstance(proxy, MiniMaxHandlerMixin) and MiniMaxHandlerMixin._is_minimax_model(model):
+            return await proxy.handle_minimax_messages(request)
         return await proxy.handle_anthropic_messages(request)
 
     @app.post("/anthropic/v1/messages")

@@ -151,6 +151,12 @@ class ProxyConfig:
     gemini_api_url: str | None = None  # Custom Gemini API URL override
     cloudcode_api_url: str | None = None  # Custom Cloud Code Assist API URL override
     vertex_api_url: str | None = None  # Custom Vertex AI regional API URL override
+    # MiniMax provider (M3 / M2.x Anthropic-compatible). When set,
+    # `MiniMaxProvider` is registered with this API key + URL and the
+    # proxy routes MiniMax-M* traffic through it.
+    minimax_api_url: str | None = None
+    minimax_api_key: str | None = None
+    minimax_session_token: str | None = None  # JWT for the Mavis Code gateway
     # Extra headers merged into (and overriding) forwarded Anthropic/OpenAI requests.
     # JSON-object config knobs; see settings_store's anthropic_extra_headers/
     # openai_extra_headers and providers.registry.resolve_extra_headers.

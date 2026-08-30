@@ -243,6 +243,47 @@ def _resolve_litellm_model(model: str) -> str:
     return model
 
 
+def _get_minimax_cost_per_token(model: str) -> dict[str, float] | None:
+    """Return a LiteLLM-compatible cost dict for MiniMax models, or None.
+
+    LiteLLM doesn't ship pricing for MiniMax M3/M2.7/M2.5/M2.1/M2 in its
+    default registry, so any cost query for these models returns an empty
+    dict and the dashboard reports $0.00 spend. The MiniMaxProvider class
+    in ``headroom/providers/minimax.py`` already declares INPUT/OUTPUT
+    cost per million tokens for each model; we re-use that data here so
+    the savings tracker reports real dollars for MiniMax traffic.
+
+    Returned dict shape mirrors ``litellm.model_cost`` entries so it can
+    be merged into the resolved lookup result without further conversion::
+
+        {
+            "input_cost_per_token": <float>,
+            "output_cost_per_token": <float>,
+        }
+    """
+    if not model:
+        return None
+    # MiniMaxProvider exposes helpers via classmethods already.
+    from headroom.providers.minimax import (
+        MODEL_INPUT_COST,
+        MODEL_OUTPUT_COST,
+    )
+
+    # Normalise: strip "minimax/" prefix if present (route-style prefix).
+    normalised = model.split("/")[-1]
+    if normalised not in MODEL_INPUT_COST:
+        return None
+
+    # Pricing in MiniMaxProvider is dollars per 1M tokens; LiteLLM uses
+    # dollars per single token.
+    input_per_token = MODEL_INPUT_COST[normalised] / 1_000_000
+    output_per_token = MODEL_OUTPUT_COST[normalised] / 1_000_000
+    return {
+        "input_cost_per_token": input_per_token,
+        "output_cost_per_token": output_per_token,
+    }
+
+
 def _estimate_compression_savings_usd(model: str, tokens_saved: int) -> float:
     """Estimate compression savings in USD from saved input tokens."""
     litellm = _get_litellm_module()
@@ -315,8 +356,13 @@ def _estimate_cache_savings_usd(model: str, cache_read_tokens: int) -> float:
         return float(cache_read_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
     try:
-        resolved = _resolve_litellm_model(model)
-        info = litellm.model_cost.get(resolved, {})
+        info = _get_minimax_cost_per_token(model) or {}
+        if not info:
+            litellm = _get_litellm_module()
+            if litellm is None:
+                return 0.0
+            resolved = _resolve_litellm_model(model)
+            info = litellm.model_cost.get(resolved, {})
         input_cost_per_token = info.get("input_cost_per_token")
         if not input_cost_per_token:
             return 0.0
@@ -395,8 +441,18 @@ def _estimate_input_cost_usd(
         return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
     try:
-        resolved = _resolve_litellm_model(model)
-        info = litellm.model_cost.get(resolved, {})
+        # MiniMax has no entry in litellm.model_cost; use the
+        # MiniMaxProvider's declared pricing. This path doesn't require
+        # litellm, so it works on Python 3.14 where litellm is
+        # skipped (it pins requires-python<3.14).
+        info = _get_minimax_cost_per_token(model) or {}
+        if not info:
+            # Anthropic / OpenAI / Gemini: litellm is required.
+            litellm = _get_litellm_module()
+            if litellm is None:
+                return 0.0
+            resolved = _resolve_litellm_model(model)
+            info = litellm.model_cost.get(resolved, {})
         input_cost_per_token = info.get("input_cost_per_token")
         # A missing key means the model is unknown → fall back to a blended rate.
         # A present 0.0 means the model is free and must cost $0, not the fallback.

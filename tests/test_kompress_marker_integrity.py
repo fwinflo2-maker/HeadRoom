@@ -4,7 +4,9 @@ import headroom.transforms.kompress_compressor as kc
 from headroom.transforms.kompress_compressor import KompressCompressor, KompressConfig
 
 _HASH = "abcdefabcdefabcdefabcdef"
-_CONTENT = " ".join(["ordinary"] * 40)
+# Stay above the current production minimum so the test exercises compression
+# and marker emission rather than the small-input passthrough.
+_CONTENT = " ".join(["ordinary"] * 80)
 
 
 class _FakeEncoding:

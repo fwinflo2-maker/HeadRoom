@@ -60,7 +60,7 @@ import httpx
 from .kompress_compressor import (
     KompressConfig,
     KompressResult,
-    _format_ccr_retrieval_marker,
+    ccr_retrieval_marker,
     store_kompress_in_ccr,
 )
 
@@ -205,7 +205,11 @@ class RemoteKompressCompressor:
         whole deployment while the proxy kept reporting success.
         """
         n_words = len(content.split())
-        if n_words < _MIN_WORDS:
+        # Same floor contract as the in-process compressor: lossy
+        # word-dropping below config.min_input_words is a net loss (the
+        # retrieval marker alone is ~20 words) and garbles short
+        # instruction-like blocks. _MIN_WORDS stays the hard clamp.
+        if n_words < max(_MIN_WORDS, self.config.min_input_words):
             return self._passthrough(content, n_words)
 
         try:
@@ -257,11 +261,8 @@ class RemoteKompressCompressor:
                 result.cache_key = cache_key
                 # Report the source line span so a reader can tell content was
                 # compressed away rather than absent (#2586).
-                result.compressed += _format_ccr_retrieval_marker(
-                    result.original_tokens,
-                    result.compressed_tokens,
-                    ccr_source.count("\n") + 1,
-                    cache_key,
+                result.compressed += ccr_retrieval_marker(
+                    result.original_tokens, result.compressed_tokens, ccr_source, cache_key
                 )
 
         return result

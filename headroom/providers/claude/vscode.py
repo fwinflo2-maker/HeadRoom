@@ -191,7 +191,7 @@ def configure_vscode_claude_settings(
     if state_path.exists():
         state = _read_object(state_path, label="Headroom state")
         model_state = _validate_state(state, state_path)
-        old_managed = state.get("managed")
+        old_managed = state["managed"]
         if any(env.get(key) != old_managed[key] for key in _MANAGED_KEYS):
             raise click.ClickException(
                 "Claude settings changed one of Headroom's managed values. Run "
@@ -248,8 +248,8 @@ def remove_vscode_claude_settings(path: Path) -> bool:
     if not state_path.exists():
         return False
     state = _read_object(state_path, label="Headroom state")
-    previous = state.get("previous")
-    managed = state.get("managed")
+    previous = state["previous"]
+    managed = state["managed"]
     model_state = _validate_state(state, state_path)
 
     payload = _read_settings(path)

@@ -5,7 +5,15 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin, _is_deepseek_request
+
+
+@pytest.fixture(autouse=True)
+def _allow_test_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep routing-precedence tests independent of DNS and SSRF policy."""
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "gateway.example")
 
 
 def _headers(*pairs: tuple[str, str]) -> dict[str, str]:

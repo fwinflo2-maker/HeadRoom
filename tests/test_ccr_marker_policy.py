@@ -100,7 +100,7 @@ def test_remote_kompress_compressor_emits_original_content_preserved(monkeypatch
     c._client = _FakeClient()
     c.config.enable_ccr = True
 
-    result = c.compress("line one\nline two\nline three " * 10)
+    result = c.compress("line one\nline two\nline three " * 20)
     assert (
         "Original content preserved. Retrieve more: hash=cafebabecafebabecafebabe"
         in result.compressed
@@ -122,7 +122,7 @@ def test_kompress_compressor_emits_original_content_preserved(monkeypatch) -> No
         lambda *a, **k: (_FakeModel(), _FakeTokenizer(), "onnx"),
     )
 
-    result = compressor.compress("line one\nline two\nline three " * 10)
+    result = compressor.compress("line one\nline two\nline three " * 20)
     assert (
         "Original content preserved. Retrieve more: hash=cafebabecafebabecafebabe"
         in result.compressed
@@ -145,7 +145,7 @@ def test_kompress_compressor_batch_emits_original_content_preserved(monkeypatch)
         lambda *a, **k: (_FakeModel(), _FakeTokenizer(), "onnx"),
     )
 
-    results = compressor.compress_batch(["line one\nline two\nline three " * 10])
+    results = compressor.compress_batch(["line one\nline two\nline three " * 20])
     assert len(results) == 1
     assert (
         "Original content preserved. Retrieve more: hash=cafebabecafebabecafebabe"

@@ -7,10 +7,28 @@ import json
 from typing import Any
 
 
+def _is_cache_annotation(value: Any) -> bool:
+    """Return whether ``value`` is an Anthropic prompt-cache annotation."""
+    return (
+        isinstance(value, dict)
+        and value.get("type") == "ephemeral"
+        and set(value) <= {"type", "ttl"}
+    )
+
+
 def strip_cache_control(obj: Any) -> Any:
-    """Recursively drop ``cache_control`` annotations before hashing."""
+    """Recursively drop prompt-cache annotations before hashing.
+
+    ``cache_control`` is also a valid user-defined JSON Schema property name.
+    Only remove values with Anthropic's annotation shape; stripping every key
+    with that spelling collapses semantically different tool contracts.
+    """
     if isinstance(obj, dict):
-        return {k: strip_cache_control(v) for k, v in obj.items() if k != "cache_control"}
+        return {
+            k: strip_cache_control(v)
+            for k, v in obj.items()
+            if k != "cache_control" or not _is_cache_annotation(v)
+        }
     if isinstance(obj, list):
         return [strip_cache_control(item) for item in obj]
     return obj

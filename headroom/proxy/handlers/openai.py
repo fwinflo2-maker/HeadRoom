@@ -116,6 +116,17 @@ _CCR_HASH_RE = re.compile(
 _BARE_CCR_HASH_RE = re.compile(r"[a-fA-F0-9]{12,24}")
 
 
+def _openai_rate_limit_key(headers: dict[str, str]) -> str:
+    """Return the credential identity used by the OpenAI rate limiter.
+
+    OpenAI-compatible gateways may authenticate with either a bearer token or
+    an ``api-key`` header. Requests without either retain the existing shared
+    fallback bucket.
+    """
+    credential = headers.get("authorization") or headers.get("api-key") or "default"
+    return credential[:20]
+
+
 def _response_ccr_hashes(messages: list[dict[str, Any]], markers: list[str]) -> list[str]:
     """Return the distinct retrievable CCR hashes exposed by a response.
 
@@ -3520,7 +3531,7 @@ class OpenAIHandlerMixin:
 
         # Rate limiting
         if self.rate_limiter:
-            rate_key = headers.get("authorization", "default")[:20]
+            rate_key = _openai_rate_limit_key(headers)
             allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
             if not allowed:
                 await self.metrics.record_rate_limited(provider=openai_chat_outcome_provider)
@@ -5588,7 +5599,7 @@ class OpenAIHandlerMixin:
 
         # Rate limiting
         if self.rate_limiter:
-            rate_key = headers.get("authorization", "default")[:20]
+            rate_key = _openai_rate_limit_key(headers)
             allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
             if not allowed:
                 await self.metrics.record_rate_limited(provider="openai")

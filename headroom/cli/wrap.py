@@ -7336,7 +7336,11 @@ def opencode(
     # Register our proxy client marker BEFORE _ensure_proxy so that another
     # wrapper's cleanup sees us as an active client and doesn't terminate a
     # shared proxy during the startup gap.
-    _register_proxy_client(port)
+    #
+    # Mirrors claude()'s token minting; only reaches OpenCode when the
+    # plugin layer is loaded (see build_launch_env).
+    _session_token = secrets.token_urlsafe(32)
+    _register_proxy_client(port, session_token=_session_token)
 
     # Resolve port before config injection so the provider block and MCP
     # URL both point at the port the proxy will actually be on.
@@ -7365,7 +7369,7 @@ def opencode(
         # cleanup tracking stays accurate and update MCP config.
         if actual_port != port:
             _unregister_proxy_client(port)
-            _register_proxy_client(actual_port)
+            _register_proxy_client(actual_port, session_token=_session_token)
             if not no_mcp:
                 from headroom.mcp_registry import OpencodeRegistrar
 
@@ -7375,7 +7379,11 @@ def opencode(
         if subscription_resolution is not None:
             _scrub_copilot_subscription_launch_env(launch_environ)
         env, env_vars_display = _build_opencode_launch_env(
-            actual_port, launch_environ, project=_project_name_from_cwd(), include_mcp=not no_mcp
+            actual_port,
+            launch_environ,
+            project=_project_name_from_cwd(),
+            include_mcp=not no_mcp,
+            session_token=_session_token,
         )
 
         # Inject Headroom provider into OpenCode config so traffic routes through proxy.

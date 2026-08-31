@@ -69,6 +69,28 @@ def test_valid_session_token_resolves_registered_cwd(tmp_path, monkeypatch):
     assert resp.json() == {"registered_cwd": str(project_dir)}
 
 
+def test_opencode_registration_marker_resolves_through_real_middleware(tmp_path, monkeypatch):
+    """Closes the seam the reviewer flagged: proves there's no schema drift
+    between what opencode()'s wrap command actually writes
+    (wrap._register_proxy_client -- the same function claude() calls, not
+    a hand-rolled test marker) and what resolve_registered_cwd() reads,
+    using the lowercase header casing the OpenCode transport plugin sends
+    (vs. claude's title-case) over the real HTTP middleware."""
+    from headroom.cli import wrap as wrap_mod
+
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+    project_dir = tmp_path / "opencode-project"
+    project_dir.mkdir()
+    monkeypatch.chdir(project_dir)
+    wrap_mod._register_proxy_client(_TEST_PORT, session_token="tok-opencode")
+
+    client = TestClient(_app_with_registered_cwd_probe())
+    resp = client.get(
+        "/__test/registered-cwd", headers={"x-headroom-session-token": "tok-opencode"}
+    )
+    assert resp.json() == {"registered_cwd": str(project_dir)}
+
+
 def test_missing_or_wrong_token_resolves_to_none(tmp_path, monkeypatch):
     monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
     project_dir = tmp_path / "project"

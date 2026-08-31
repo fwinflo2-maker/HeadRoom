@@ -565,6 +565,32 @@ jobs:
       - name: Run native installer wrapper tests
         run: pytest tests/test_install/test_native_installers.py -q
 
+  # Runtime coverage for pure-Python proxy logic on Windows, kept separate
+  # from windows-native-wrapper (above), which is deliberately
+  # dependency-minimal and gated on native-installer changes only. Installs
+  # the latest published wheel from PyPI (real precompiled _core.pyd, no
+  # cargo/maturin build needed) so this branch's local ./headroom source
+  # tree can shadow it -- same shadowing the Linux `test` job relies on,
+  # just without needing our own freshly-built wheel, since the covered
+  # test file never imports headroom._core.
+  windows-tool-result-interceptors:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - name: Install headroom-ai[dev] (published wheel; local source shadows it)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install "headroom-ai[dev]"
+      - name: Run tool-result interceptor tests
+        run: pytest tests/test_tool_result_interceptors.py -q
+
   macos-native-wrapper:
     needs: changes
     if: needs.changes.outputs.native == 'true'

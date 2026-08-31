@@ -398,6 +398,11 @@ class TestVerifyReadAgainstDisk:
         assert verdict is ReadVerificationResult.UNKNOWN
         assert info is None
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="dir_fd disk verification unavailable on Windows; falls back to UNKNOWN"
+        " (see test_open_regular_file_under_root_falls_back_unknown_when_dir_fd_unsupported)",
+    )
     def test_exact_match_is_complete(self, tmp_path):
         f = tmp_path / "payments.py"
         f.write_text(_PY_FIXTURE, encoding="utf-8")
@@ -405,6 +410,11 @@ class TestVerifyReadAgainstDisk:
         assert verdict is ReadVerificationResult.COMPLETE
         assert info is None
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="dir_fd disk verification unavailable on Windows; falls back to UNKNOWN"
+        " (see test_open_regular_file_under_root_falls_back_unknown_when_dir_fd_unsupported)",
+    )
     def test_strict_prefix_is_truncated(self, tmp_path):
         f = tmp_path / "payments.py"
         f.write_text(_PY_FIXTURE, encoding="utf-8")
@@ -413,6 +423,11 @@ class TestVerifyReadAgainstDisk:
         assert verdict is ReadVerificationResult.TRUNCATED
         assert info == (len(partial.splitlines()), len(_PY_FIXTURE.splitlines()))
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="dir_fd disk verification unavailable on Windows; falls back to UNKNOWN"
+        " (see test_open_regular_file_under_root_falls_back_unknown_when_dir_fd_unsupported)",
+    )
     def test_relative_path_resolves_against_registered_cwd(self, tmp_path):
         f = tmp_path / "payments.py"
         f.write_text(_PY_FIXTURE, encoding="utf-8")
@@ -542,6 +557,11 @@ def test_open_regular_file_under_root_refuses_on_event_loop_thread(tmp_path):
     assert asyncio.run(_call_from_loop()) is None
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="dir_fd disk verification unavailable on Windows; falls back to UNKNOWN"
+    " (see test_open_regular_file_under_root_falls_back_unknown_when_dir_fd_unsupported)",
+)
 def test_open_regular_file_under_root_proceeds_from_plain_sync_context(tmp_path):
     """Sanity check: with no running loop, the read must still succeed."""
     f = tmp_path / "x.py"
@@ -582,6 +602,31 @@ def test_open_regular_file_under_root_rejects_fifo_without_hanging(tmp_path):
 # -------- End-to-end: apply_to_messages, real registered_cwd --------- #
 
 
+def _disk_verification_messages(partial: str) -> list[dict]:
+    return [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "abc",
+                    "name": "Read",
+                    "input": {"file_path": "payments.py"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "abc", "content": partial}],
+        },
+    ]
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="dir_fd disk verification unavailable on Windows; falls back to UNKNOWN"
+    " (see test_astgrep_disk_verification_stays_unknown_when_dir_fd_unsupported)",
+)
 def test_astgrep_disk_verification_flags_truncation_when_no_banner(
     tokenizer, tmp_path, monkeypatch
 ):
@@ -597,24 +642,7 @@ def test_astgrep_disk_verification_flags_truncation_when_no_banner(
 
     set_registered_cwd(str(tmp_path))
     try:
-        messages = [
-            {
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "id": "abc",
-                        "name": "Read",
-                        "input": {"file_path": "payments.py"},
-                    }
-                ],
-            },
-            {
-                "role": "user",
-                "content": [{"type": "tool_result", "tool_use_id": "abc", "content": partial}],
-            },
-        ]
-        result = apply_to_messages(messages, tokenizer)
+        result = apply_to_messages(_disk_verification_messages(partial), tokenizer)
     finally:
         set_registered_cwd(None)
 
@@ -627,6 +655,35 @@ def test_astgrep_disk_verification_flags_truncation_when_no_banner(
     assert "def compute_subtotal" in new_content
     assert "def apply_promo" in new_content
     assert "def format_receipt" not in new_content
+
+
+def test_astgrep_disk_verification_stays_unknown_when_dir_fd_unsupported(
+    tokenizer, tmp_path, monkeypatch
+):
+    """Fail-closed contract, simulated cross-platform: dir_fd unsupported ->
+    UNKNOWN -> no false "truncated upstream" claim. Stands in for the real
+    Windows behavior the skipif'd tests above can't exercise here."""
+    import headroom.proxy.interceptors.astgrep as astgrep_module
+
+    monkeypatch.setattr(astgrep_module, "_dir_fd_walk_supported", lambda: False)
+    monkeypatch.setenv("HEADROOM_VERIFY_TRUNCATION_ON_DISK", "1")
+    monkeypatch.setenv("HEADROOM_INTERCEPT_READ_MIN_CHARS", "50")
+    f = tmp_path / "payments.py"
+    f.write_text(_PY_FIXTURE, encoding="utf-8")
+    marker = "\n\ndef format_receipt"
+    partial = _PY_FIXTURE[: _PY_FIXTURE.index(marker)]  # no banner text anywhere
+    assert "truncated" not in partial.lower()
+
+    set_registered_cwd(str(tmp_path))
+    try:
+        result = apply_to_messages(_disk_verification_messages(partial), tokenizer)
+    finally:
+        set_registered_cwd(None)
+
+    # The outline rewrite is independent of the disk-verify verdict.
+    assert len(result.spans) == 1
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "truncated upstream" not in new_content
 
 
 def test_astgrep_disk_verification_skips_when_no_root_registered(tokenizer, tmp_path, monkeypatch):

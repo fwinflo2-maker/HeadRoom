@@ -78,7 +78,8 @@ RUNTIME_ENV_KNOBS: tuple[Knob, ...] = (
     Knob(
         "HEADROOM_VERIFY_TRUNCATION_ON_DISK",
         "bool",
-        "Verify ast-grep Read truncation against disk when no client banner is found.",
+        "Verify ast-grep Read truncation against disk when no client banner is found. "
+        "Always UNKNOWN on Windows (no dir_fd/O_NOFOLLOW support).",
     ),
     Knob(
         "HEADROOM_VERIFY_TRUNCATION_MAX_BYTES",

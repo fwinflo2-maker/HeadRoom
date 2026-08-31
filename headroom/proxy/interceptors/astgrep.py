@@ -135,7 +135,10 @@ def _detect_truncation(source: str) -> tuple[int, int] | None:
 class ReadVerificationResult(Enum):
     """Client-independent fallback for `_detect_truncation`'s banner regex:
     compares tool_output against the real file on disk instead of parsing
-    client-specific prose. Only used when the banner regex finds nothing."""
+    client-specific prose. Only used when the banner regex finds nothing.
+
+    Always UNKNOWN on Windows (no O_NOFOLLOW/dir_fd) -- never falls back to
+    a less-safe read."""
 
     COMPLETE = "complete"
     TRUNCATED = "truncated"

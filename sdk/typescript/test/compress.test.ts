@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { compress } from "../src/compress.js";
+import { HeadroomClient } from "../src/client.js";
 import type { OpenAIMessage } from "../src/types.js";
 
 const mockFetch = vi.fn();
@@ -114,5 +115,25 @@ describe("compress()", () => {
     // Verify all messages were sent to proxy
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     expect(body.messages).toHaveLength(5);
+  });
+
+  it("forwards a per-call config, overriding a provided client's config", async () => {
+    mockFetch.mockResolvedValueOnce(okResponse());
+    // A provided client with its own client-level config; the per-call config
+    // must win. Pre-fix, `config` fell into clientOptions and was dropped when
+    // a `client` was supplied — so the provided client's "cache" was sent.
+    const client = new HeadroomClient({
+      baseUrl: "http://localhost:8787",
+      config: { defaultMode: "cache" },
+    });
+
+    await compress([{ role: "user", content: "hello" }], {
+      client,
+      config: { defaultMode: "token" },
+    });
+
+    const [, opts] = mockFetch.mock.calls[0];
+    const body = JSON.parse(opts.body);
+    expect(body.config.default_mode).toBe("token");
   });
 });

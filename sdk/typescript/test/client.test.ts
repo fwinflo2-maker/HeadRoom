@@ -263,4 +263,47 @@ describe("HeadroomClient", () => {
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     expect(body.model).toBe("gpt-4o");
   });
+
+  it("sends a per-call config (snake_cased) in the request body", async () => {
+    mockFetch.mockResolvedValueOnce(okResponse(sampleProxyResponse));
+    const client = new HeadroomClient({ baseUrl: "http://localhost:8787" });
+
+    await client.compress(sampleMessages, {
+      model: "gpt-4o",
+      config: { defaultMode: "token", contentRouterEnabled: false },
+    });
+
+    const [, opts] = mockFetch.mock.calls[0];
+    const body = JSON.parse(opts.body);
+    expect(body.config.default_mode).toBe("token");
+    expect(body.config.content_router_enabled).toBe(false);
+  });
+
+  it("per-call config overrides client-level config", async () => {
+    mockFetch.mockResolvedValueOnce(okResponse(sampleProxyResponse));
+    const client = new HeadroomClient({
+      baseUrl: "http://localhost:8787",
+      config: { defaultMode: "cache" },
+    });
+
+    await client.compress(sampleMessages, {
+      model: "gpt-4o",
+      config: { defaultMode: "token" },
+    });
+
+    const [, opts] = mockFetch.mock.calls[0];
+    const body = JSON.parse(opts.body);
+    expect(body.config.default_mode).toBe("token");
+  });
+
+  it("omits the config key when neither client nor call sets config", async () => {
+    mockFetch.mockResolvedValueOnce(okResponse(sampleProxyResponse));
+    const client = new HeadroomClient({ baseUrl: "http://localhost:8787" });
+
+    await client.compress(sampleMessages, { model: "gpt-4o" });
+
+    const [, opts] = mockFetch.mock.calls[0];
+    const body = JSON.parse(opts.body);
+    expect(body.config).toBeUndefined();
+  });
 });

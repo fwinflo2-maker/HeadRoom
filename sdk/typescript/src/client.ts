@@ -234,7 +234,7 @@ export class HeadroomClient implements HeadroomClientInterface {
 
   async compress(
     messages: OpenAIMessage[],
-    options: { model?: string; tokenBudget?: number } = {},
+    options: { model?: string; tokenBudget?: number; config?: HeadroomConfig } = {},
   ): Promise<CompressResult> {
     const model = options.model ?? "gpt-4o";
 
@@ -243,7 +243,7 @@ export class HeadroomClient implements HeadroomClientInterface {
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
-        return await this._doCompress(messages, model, options.tokenBudget);
+        return await this._doCompress(messages, model, options.tokenBudget, options.config);
       } catch (error) {
         lastError = error;
         if (error instanceof HeadroomAuthError) throw error;
@@ -602,13 +602,15 @@ export class HeadroomClient implements HeadroomClientInterface {
     messages: OpenAIMessage[],
     model: string,
     tokenBudget?: number,
+    config?: HeadroomConfig,
   ): Promise<CompressResult> {
     const body: Record<string, unknown> = { messages, model };
     if (tokenBudget) {
       body.token_budget = tokenBudget;
     }
-    if (this.config) {
-      body.config = deepSnakeCase(this.config);
+    const mergedConfig = { ...this.config, ...config };
+    if (Object.keys(mergedConfig).length > 0) {
+      body.config = deepSnakeCase(mergedConfig);
     }
 
     const response = await this._fetch("/v1/compress", {

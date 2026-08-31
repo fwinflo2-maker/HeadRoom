@@ -35,6 +35,7 @@ from headroom.memory.backends import cognee as cognee_backend_module
 from headroom.memory.backends.cognee import (
     CogneeBackend,
     CogneeConfig,
+    CogneeDeletionUnverifiedError,
     _resolve_metadata_db_path,
 )
 from headroom.memory.cognee_env import (
@@ -840,9 +841,15 @@ def _attach_fake_datasets_api(
     data_items: list[SimpleNamespace],
     delete_error: Exception | None = None,
 ) -> SimpleNamespace:
-    """Attach a fake ``cognee.datasets`` namespace; returns a call recorder."""
+    """Attach a fake ``cognee.datasets`` namespace; returns a call recorder.
+
+    ``delete_data`` really removes the item from ``data_items`` (like
+    cognee's API), so the backend's post-delete verification pass sees an
+    honest picture.
+    """
     calls = SimpleNamespace(deleted=[])
     dataset = SimpleNamespace(name=dataset_name, id="dataset-uuid")
+    live_items = list(data_items)
 
     class _Datasets:
         @staticmethod
@@ -852,13 +859,14 @@ def _attach_fake_datasets_api(
         @staticmethod
         async def list_data(dataset_id):
             assert dataset_id == "dataset-uuid"
-            return list(data_items)
+            return list(live_items)
 
         @staticmethod
         async def delete_data(dataset_id=None, data_id=None):
             if delete_error is not None:
                 raise delete_error
             calls.deleted.append({"dataset_id": dataset_id, "data_id": data_id})
+            live_items[:] = [item for item in live_items if item.id != data_id]
 
     module.datasets = _Datasets
     return calls
@@ -918,20 +926,140 @@ class TestBestEffortHardDelete:
         assert await backend.delete_memory(memory.id) is True
         assert calls.deleted == []
 
-    async def test_hard_delete_survives_unavailable_cognee(
+    async def test_unavailable_cognee_is_unproven_but_chunks_delete_succeeds(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """If cognee cannot initialize, the hard delete is skipped silently."""
+        """No cognee => removal unproven; CHUNKS deletes still succeed via tombstones."""
         module, _ = _make_fake_cognee()
         monkeypatch.setitem(sys.modules, "cognee", module)
         backend = CogneeBackend(CogneeConfig(dataset_name="ds"))
+        memory = await backend.save_memory(content="doomed fact", user_id="alice", importance=0.5)
 
         async def broken_init() -> None:
             raise RuntimeError("cognee is down")
 
         monkeypatch.setattr(backend, "_ensure_initialized", broken_init)
-        # Must not raise: durable tombstones remain the enforcement layer.
-        await backend._try_hard_delete(["doomed fact"])
+        assert await backend._try_hard_delete(["doomed fact"]) is False
+        # Under CHUNKS the tombstone is authoritative, so the public delete
+        # still succeeds — and its results filter provably excludes the text.
+        assert await backend.delete_memory(memory.id) is True
+
+    async def test_unmatched_content_is_unproven(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """'Nothing matched' is not proof of removal (chunk-registered rows)."""
+        module, _ = _make_fake_cognee()
+        _attach_fake_datasets_api(module, "ds", data_items=[])
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds"))
+        assert await backend._try_hard_delete(["never stored verbatim"]) is False
+
+    async def test_matched_and_verified_is_proven(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        module, _ = _make_fake_cognee()
+        data_items = [
+            SimpleNamespace(id="data-1", content_hash=_md5("doomed"), raw_content_hash=None),
+        ]
+        _attach_fake_datasets_api(module, "ds", data_items)
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds"))
+        assert await backend._try_hard_delete(["doomed"]) is True
+
+
+# =============================================================================
+# Deletion contract under synthesized search types (fail closed)
+# =============================================================================
+
+
+class TestSynthesizedModeDeletionContract:
+    """The public API must never both report a successful delete and later
+    surface information derived from the deleted memory.
+
+    Under non-``CHUNKS`` search types cognee synthesizes result text, so a
+    text-matched tombstone cannot enforce deletion; success there requires
+    the underlying hard delete to be proven, otherwise the operation raises.
+    """
+
+    async def test_unverified_delete_fails_closed_instead_of_resurfacing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Hard delete fails + a synthesized derivation exists => no success report."""
+        original = "Vasilije prefers uv over poetry for Python projects"
+        # Graph-synthesized text derived from the memory, sharing no verbatim
+        # substring with it — exactly what tombstones cannot catch.
+        synthesized = "The user is known to favor uv-style tooling."
+        module, _ = _make_fake_cognee(search_results=[_fake_hit([synthesized])])
+        _attach_fake_datasets_api(
+            module,
+            "ds",
+            [SimpleNamespace(id="data-1", content_hash=_md5(original), raw_content_hash=None)],
+            delete_error=RuntimeError("delete_data is down"),
+        )
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds", search_type="GRAPH_COMPLETION"))
+        memory = await backend.save_memory(content=original, user_id="alice", importance=0.5)
+
+        with pytest.raises(CogneeDeletionUnverifiedError):
+            await backend.delete_memory(memory.id)
+
+        # The synthesized derivation may still surface — but deletion was
+        # never reported as successful, and the memory remains accounted for
+        # in the registry so the delete can be retried.
+        results = await backend.search_memories(query="tooling preference", user_id="alice")
+        assert [r.memory.content for r in results] == [synthesized]
+        assert await backend.get_memory(memory.id) is not None
+
+    async def test_verified_delete_succeeds_in_synthesized_mode(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        module, _ = _make_fake_cognee(search_results=[])
+        _attach_fake_datasets_api(
+            module,
+            "ds",
+            [SimpleNamespace(id="data-1", content_hash=_md5("doomed"), raw_content_hash=None)],
+        )
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds", search_type="GRAPH_COMPLETION"))
+        memory = await backend.save_memory(content="doomed", user_id="alice", importance=0.5)
+        assert await backend.delete_memory(memory.id) is True
+        assert await backend.get_memory(memory.id) is None
+
+    async def test_unverified_update_raises_without_mutation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        module, calls = _make_fake_cognee()
+        _attach_fake_datasets_api(module, "ds", data_items=[])  # nothing matches: unproven
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds", search_type="GRAPH_COMPLETION"))
+        memory = await backend.save_memory(content="original", user_id="alice", importance=0.5)
+        adds_before = len(calls.add)
+
+        with pytest.raises(CogneeDeletionUnverifiedError):
+            await backend.update_memory(memory.id, "new content", user_id="alice")
+
+        assert len(calls.add) == adds_before  # no new content was added
+        fetched = await backend.get_memory(memory.id)
+        assert fetched is not None
+        assert fetched.content == "original"
+
+    async def test_chunks_mode_unverified_delete_succeeds_and_filters_fragments(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Counterpart: under CHUNKS the tombstone is authoritative, so an
+        unproven hard delete still succeeds — and even a chunk FRAGMENT of
+        the deleted content is provably filtered from results."""
+        content = "Vasilije prefers uv over poetry for Python projects"
+        fragment = "prefers uv over poetry"  # verbatim chunk of the content
+        module, _ = _make_fake_cognee(search_results=[_fake_hit([fragment])])
+        _attach_fake_datasets_api(module, "ds", data_items=[], delete_error=RuntimeError("down"))
+        monkeypatch.setitem(sys.modules, "cognee", module)
+
+        backend = CogneeBackend(CogneeConfig(dataset_name="ds"))  # CHUNKS default
+        memory = await backend.save_memory(content=content, user_id="alice", importance=0.5)
+        assert await backend.delete_memory(memory.id) is True
+        assert await backend.search_memories(query="q", user_id="alice") == []
 
 
 # =============================================================================

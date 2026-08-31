@@ -45,23 +45,30 @@ Usage:
         {"content": "User prefers Python", "importance": 0.8},
     )
 
+Deletion contract (split by search type):
+    - Under ``CHUNKS`` (the default), results are verbatim stored text and
+      tombstones are authoritative: ``delete_memory`` removes the registry
+      row, tombstones the content (and pre-extracted facts), and additionally
+      runs a hard delete against cognee's dataset API to reclaim storage.
+      Tombstones are scoped per user and matched by exact equality or
+      substring containment in BOTH directions, so a chunk that is a piece of
+      deleted content is filtered too — nothing derived from tombstoned text
+      can pass the read path. The delete succeeds even when the hard delete
+      cannot be proven.
+    - Under every other search type, results may be graph-synthesized text
+      that no longer contains the deleted source, which text-matched
+      tombstones cannot enforce. There ``delete_memory``/``update_memory``
+      succeed only when the hard delete is PROVEN (every content matched a
+      stored data item, all matches were deleted, and a verification re-list
+      finds none left); otherwise they raise
+      ``CogneeDeletionUnverifiedError`` — delete tombstones the content and
+      keeps the registry row for retry; update refuses before mutating
+      anything. This backend never reports a deletion it cannot stand behind.
+
 Known limitations (cognee v1.x):
     - cognee has no per-item update API. ``update_memory`` updates the durable
       registry row in place (same ID, new content), adds the new content to
       cognee, and tombstones the old content so it stops surfacing in search.
-    - ``delete_memory`` removes the registry row and tombstones the content.
-      In addition, a best-effort hard delete runs against cognee's dataset API
-      (``cognee.datasets.list_data`` / ``delete_data``, matched by content
-      hash); when it fails or the data cannot be matched, the underlying
-      cognee data persists and the durable tombstones are the enforcement
-      layer that keeps it out of results.
-    - Tombstones are scoped per user and matched against search-result text
-      by exact equality or substring containment (a chunk that is a piece of
-      the deleted content is filtered). The filter applies to every search
-      type this backend can be configured with, but it is text-based:
-      non-CHUNKS, graph-synthesized search results (or text cognee rewrote
-      during cognify) may still reflect deleted content when the emitted text
-      no longer matches the tombstoned original.
     - Memory IDs are stable content-derived UUIDs (``uuid5(user_id, content)``)
       resolved through the durable registry, so IDs returned by
       ``search_memories`` remain valid inputs to ``update_memory`` /
@@ -99,6 +106,20 @@ from headroom.memory.ports import MemorySearchResult
 logger = logging.getLogger(__name__)
 
 _IMPORT_ERROR_MSG = 'cognee package not installed. Install with: pip install "headroom-ai[cognee]"'
+
+
+class CogneeDeletionUnverifiedError(RuntimeError):
+    """Raised when a delete/update cannot prove cognee removed the underlying data.
+
+    Only raised for search types whose results tombstones cannot fully
+    enforce (anything but ``CHUNKS``): graph-synthesized text derived from a
+    deleted memory need not contain the original text, so a text-matched
+    tombstone is not authoritative there. Rather than reporting a deletion
+    that could still resurface, the operation fails closed. The content is
+    still tombstoned (suppressing every text-matched result) and the memory
+    stays in the registry so the operation can be retried.
+    """
+
 
 # Filename used for the default metadata DB location (under data_root,
 # system_root, or the headroom workspace dir, in that order).
@@ -531,6 +552,24 @@ class _CogneeMetadataStore:
 
     # -- tombstones ----------------------------------------------------------
 
+    def add_tombstones(self, user_id: str, tombstone_contents: list[str]) -> None:
+        """Tombstone contents WITHOUT deleting any registry row.
+
+        Used when a fail-closed delete cannot prove cognee removed the
+        underlying data: the content is suppressed from every text-matched
+        result while the memory stays in the registry for a retry.
+        """
+        now_iso = _utcnow().isoformat()
+        conn = self._connect()
+        try:
+            conn.executemany(
+                "INSERT OR IGNORE INTO tombstones (user_id, content, created_at) VALUES (?, ?, ?)",
+                [(user_id, content, now_iso) for content in tombstone_contents],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def get_tombstones(self, user_id: str) -> set[str]:
         """Return all tombstoned contents for a user."""
         conn = self._connect()
@@ -938,35 +977,79 @@ class CogneeBackend:
             return str(item)
         return str(item) if item is not None else ""
 
-    async def _try_hard_delete(self, contents: list[str]) -> None:
-        """Best-effort hard delete of data items from cognee's stores.
+    def _tombstones_fully_enforce(self) -> bool:
+        """Whether tombstones are authoritative for the configured search type.
+
+        ``CHUNKS`` returns stored text verbatim (whole contents or fragments
+        of them), and ``_is_tombstoned`` matches both directions — so nothing
+        derived from a tombstoned memory can pass the filter. Every other
+        search type may synthesize text that no longer contains the deleted
+        source, which a text-matched tombstone cannot catch.
+        """
+        return self._config.search_type.strip().upper() == "CHUNKS"
+
+    async def _try_hard_delete(self, contents: list[str]) -> bool:
+        """Hard-delete data items from cognee's stores; report whether proven.
 
         cognee identifies text data items by an MD5 content hash. This maps
         each content to its hash and removes matching items via
         ``cognee.datasets.list_datasets`` / ``list_data`` / ``delete_data``
-        (which also removes related graph nodes/edges). Every failure is
-        swallowed and logged: the durable tombstones are the enforcement
-        layer, this only reclaims the underlying storage when possible.
+        (which also removes related graph nodes/edges).
+
+        Returns True only when removal is PROVEN: every content matched at
+        least one stored data item, every matching item was deleted, and a
+        verification re-list finds no matching item left. "Nothing matched"
+        is NOT proof — content registered from a search result (a chunk, or
+        text cognee normalized) hashes differently from its source item, so
+        absence of a match cannot distinguish "already removed" from "stored
+        under different text". Failures are logged, never raised; callers
+        decide whether an unproven removal is acceptable (``CHUNKS``
+        tombstone enforcement) or must fail closed (synthesized modes).
         """
         try:
             await self._ensure_initialized()
         except Exception:
             logger.debug(
-                "cognee unavailable for best-effort hard delete; "
-                "durable tombstones still filter the content",
+                "cognee unavailable for hard delete; durable tombstones still filter the content",
                 exc_info=True,
             )
-            return
+            return False
 
         datasets_api = getattr(self._cognee, "datasets", None)
         if datasets_api is None or not hasattr(datasets_api, "list_datasets"):
-            return
+            return False
 
         try:
             hashes = {
                 hashlib.md5(content.encode("utf-8"), usedforsecurity=False).hexdigest()
                 for content in contents
             }
+            matched: set[str] = set()
+            for dataset in await datasets_api.list_datasets() or []:
+                if getattr(dataset, "name", None) != self._config.dataset_name:
+                    continue
+                for data_item in await datasets_api.list_data(dataset.id) or []:
+                    item_hashes = {
+                        getattr(data_item, "content_hash", None),
+                        getattr(data_item, "raw_content_hash", None),
+                    }
+                    overlap = {h for h in hashes if h in item_hashes}
+                    if overlap:
+                        await datasets_api.delete_data(dataset_id=dataset.id, data_id=data_item.id)
+                        matched |= overlap
+                        logger.info(
+                            "Hard-deleted cognee data item %s from dataset %s",
+                            data_item.id,
+                            self._config.dataset_name,
+                        )
+            if matched != hashes:
+                logger.info(
+                    "Hard delete unproven: %d of %d contents had no matching cognee data item",
+                    len(hashes - matched),
+                    len(hashes),
+                )
+                return False
+            # Verification pass: nothing matching may remain.
             for dataset in await datasets_api.list_datasets() or []:
                 if getattr(dataset, "name", None) != self._config.dataset_name:
                     continue
@@ -976,18 +1059,18 @@ class CogneeBackend:
                         getattr(data_item, "raw_content_hash", None),
                     }
                     if item_hashes & hashes:
-                        await datasets_api.delete_data(dataset_id=dataset.id, data_id=data_item.id)
-                        logger.info(
-                            "Hard-deleted cognee data item %s from dataset %s",
+                        logger.warning(
+                            "Hard delete unproven: data item %s still matches after deletion",
                             data_item.id,
-                            self._config.dataset_name,
                         )
+                        return False
+            return True
         except Exception:
             logger.warning(
-                "Best-effort cognee hard delete failed; "
-                "durable tombstones still filter the content",
+                "cognee hard delete failed; durable tombstones still filter the content",
                 exc_info=True,
             )
+            return False
 
     async def update_memory(
         self,
@@ -1004,8 +1087,14 @@ class CogneeBackend:
         this user), and adds the new content as a fresh cognee data item with
         the same scoping tags. Because search resolves canonical IDs by
         ``(user_id, content)``, the next search returns this same memory ID
-        for the new content. A best-effort hard delete of the old cognee data
-        runs afterwards (see ``_try_hard_delete``).
+        for the new content.
+
+        The old data's removal follows the same contract as
+        ``delete_memory``: under ``CHUNKS`` the tombstone is authoritative and
+        the hard delete of the old cognee data is best-effort; under any
+        other search type the old data's removal must be PROVEN first, and an
+        unproven removal raises ``CogneeDeletionUnverifiedError`` BEFORE
+        anything is mutated (no new content is added, the row is unchanged).
 
         Args:
             memory_id: ID of the memory to update. Must exist in the durable
@@ -1020,6 +1109,8 @@ class CogneeBackend:
 
         Raises:
             ValueError: If the memory is not found or belongs to another user.
+            CogneeDeletionUnverifiedError: Non-``CHUNKS`` search type and the
+                old data's removal could not be proven.
         """
         await self._ensure_initialized()
 
@@ -1037,6 +1128,15 @@ class CogneeBackend:
         for fact in existing.metadata.get("_cognee_facts") or []:
             if isinstance(fact, str) and fact:
                 old_contents.append(fact)
+
+        if not self._tombstones_fully_enforce() and not await self._try_hard_delete(old_contents):
+            raise CogneeDeletionUnverifiedError(
+                f"Cannot verify cognee removed the old data behind memory "
+                f"{memory_id}; refusing to update under search type "
+                f"{self._config.search_type!r}, whose synthesized results "
+                "tombstones cannot fully enforce. Nothing was changed; "
+                "use search_type=CHUNKS for tombstone-enforceable updates."
+            )
 
         node_set = list(existing.metadata.get("_cognee_node_set") or []) or self._build_node_set(
             existing.user_id, existing.session_id, existing.entity_refs
@@ -1074,7 +1174,10 @@ class CogneeBackend:
         # Row rewritten in place (same id) + old content tombstoned, in one
         # transaction against the shared durable store.
         await asyncio.to_thread(self._store.apply_update, updated, old_contents)
-        await self._try_hard_delete(old_contents)
+        if self._tombstones_fully_enforce():
+            # Best-effort reclaim; under non-CHUNKS the old data was already
+            # verifiably removed before any mutation.
+            await self._try_hard_delete(old_contents)
         logger.info("Updated memory %s in place (old content tombstoned)", memory_id)
         return updated
 
@@ -1084,15 +1187,25 @@ class CogneeBackend:
         reason: str | None = None,
         user_id: str | None = None,
     ) -> bool:
-        """Delete a memory (durable tombstone + best-effort hard delete).
+        """Delete a memory. The success contract depends on the search type.
 
-        Removes the memory from the durable registry and tombstones its
-        content (and pre-extracted facts) so it is excluded from future
-        search results for this user — across restarts and across every
-        backend instance sharing this metadata store. A best-effort hard
-        delete against cognee's dataset API then tries to remove the
-        underlying data items; when that fails, already-cognified data
-        remains in cognee's stores and the tombstones keep filtering it.
+        Under ``CHUNKS`` (the default), results are verbatim stored text, so
+        the durable tombstone IS the enforcement layer: the memory is removed
+        from the registry, its content (and pre-extracted facts) is
+        tombstoned — surviving restarts, visible to every instance sharing
+        this metadata store — and a hard delete against cognee's dataset API
+        additionally reclaims the underlying data when possible. Returns True
+        even when the hard delete cannot be proven, because no result derived
+        from the tombstoned text can pass the read-path filter.
+
+        Under every other search type, results may be graph-synthesized text
+        that no longer contains the deleted source, which tombstones cannot
+        enforce. There, success requires the hard delete to be PROVEN
+        (matched, deleted, and verified gone — see ``_try_hard_delete``).
+        When it cannot be proven, the content is still tombstoned as defense
+        in depth, the memory stays in the registry for a retry, and
+        ``CogneeDeletionUnverifiedError`` is raised: this backend never
+        reports a deletion it cannot stand behind.
 
         Args:
             memory_id: ID of the memory to delete. Must exist in the durable
@@ -1102,6 +1215,10 @@ class CogneeBackend:
 
         Returns:
             True if deleted, False if not found or owned by another user.
+
+        Raises:
+            CogneeDeletionUnverifiedError: Non-``CHUNKS`` search type and the
+                underlying removal could not be proven.
         """
         existing = await asyncio.to_thread(self._store.get_memory, memory_id)
         if existing is None:
@@ -1113,6 +1230,30 @@ class CogneeBackend:
         for fact in existing.metadata.get("_cognee_facts") or []:
             if isinstance(fact, str) and fact:
                 contents.append(fact)
+
+        if not self._tombstones_fully_enforce():
+            if not await self._try_hard_delete(contents):
+                # Defense in depth: suppress text-matched surfacing, keep the
+                # registry row so the caller can retry, and refuse to report
+                # a deletion that synthesized results could contradict.
+                await asyncio.to_thread(self._store.add_tombstones, existing.user_id, contents)
+                raise CogneeDeletionUnverifiedError(
+                    f"Cannot verify cognee removed the data behind memory "
+                    f"{memory_id}: search type {self._config.search_type!r} "
+                    "returns synthesized text that tombstones cannot fully "
+                    "enforce, so the deletion is not reported as successful. "
+                    "The content is tombstoned and the memory kept for retry; "
+                    "use search_type=CHUNKS for tombstone-enforceable deletes."
+                )
+            await asyncio.to_thread(
+                self._store.delete_and_tombstone, memory_id, existing.user_id, contents
+            )
+            logger.info(
+                "Deleted memory %s (reason: %s); hard delete verified",
+                memory_id,
+                reason or "unspecified",
+            )
+            return True
 
         await asyncio.to_thread(
             self._store.delete_and_tombstone, memory_id, existing.user_id, contents

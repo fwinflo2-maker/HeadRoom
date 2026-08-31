@@ -120,11 +120,20 @@ def _openai_rate_limit_key(headers: dict[str, str]) -> str:
     """Return the credential identity used by the OpenAI rate limiter.
 
     OpenAI-compatible gateways may authenticate with either a bearer token or
-    an ``api-key`` header. Requests without either retain the existing shared
-    fallback bucket.
+    an ``api-key`` header. Hash the complete value so common credential prefixes
+    do not merge buckets and raw credential material is not retained in memory.
+    Requests without either retain the existing shared fallback bucket.
     """
-    credential = headers.get("authorization") or headers.get("api-key") or "default"
-    return credential[:20]
+    authorization = headers.get("authorization")
+    api_key = headers.get("api-key")
+    if authorization:
+        kind, credential = "authorization", authorization
+    elif api_key:
+        kind, credential = "api-key", api_key
+    else:
+        return "default"
+    digest = hashlib.sha256(f"{kind}:{credential}".encode()).hexdigest()
+    return f"{kind}:{digest}"
 
 
 def _response_ccr_hashes(messages: list[dict[str, Any]], markers: list[str]) -> list[str]:

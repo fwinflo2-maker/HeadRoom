@@ -21,9 +21,18 @@ def test_openai_rate_limit_key_accepts_api_key_header() -> None:
     )
 
 
+def test_openai_rate_limit_key_uses_complete_credential() -> None:
+    shared_prefix = "a" * 20
+    assert _openai_rate_limit_key({"api-key": f"{shared_prefix}-A"}) != _openai_rate_limit_key(
+        {"api-key": f"{shared_prefix}-B"}
+    )
+
+
 def test_openai_rate_limit_key_prefers_authorization() -> None:
     headers = {"authorization": "Bearer primary", "api-key": "secondary"}
-    assert _openai_rate_limit_key(headers) == "Bearer primary"
+    assert _openai_rate_limit_key(headers) == _openai_rate_limit_key(
+        {"authorization": "Bearer primary"}
+    )
 
 
 @pytest.mark.parametrize("endpoint", ["chat", "responses"])

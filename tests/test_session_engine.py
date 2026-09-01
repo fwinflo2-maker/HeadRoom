@@ -196,7 +196,7 @@ def test_finalize_declines_inflating_replay_by_default() -> None:
     assert turn.messages == recompressed
 
 
-def test_finalize_enforce_non_inflation_false_replays_cached_bytes() -> None:
+def test_finalize_confirmed_floor_replays_confirmed_bytes() -> None:
     prev_original, prev_returned = _prev_pair()
     current = prev_original + [{"role": "user", "content": "next"}]
     recompressed = [
@@ -205,7 +205,7 @@ def test_finalize_enforce_non_inflation_false_replays_cached_bytes() -> None:
         {"role": "user", "content": "next"},
     ]
     turn = finalize_turn(
-        recompressed, current, prev_original, prev_returned, enforce_non_inflation=False
+        recompressed, current, prev_original, prev_returned, confirmed_frozen_count=2
     )
     assert turn.replayed
     assert turn.messages[0]["content"] == "[returned-form]"

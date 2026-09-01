@@ -449,7 +449,7 @@ def overlay_cached_prefix(
     previous_original_messages: list[dict[str, Any]] | None,
     previous_forwarded_messages: list[dict[str, Any]] | None,
     *,
-    enforce_non_inflation: bool = True,
+    confirmed_frozen_count: int | None = None,
 ) -> list[dict[str, Any]]:
     """Replay a positional, non-inflating cached prefix when it is safe.
 
@@ -474,16 +474,19 @@ def overlay_cached_prefix(
     candidate. These bounds prefer a cache miss to corrupting or inflating a
     client's live history.
 
-    ``enforce_non_inflation`` gates only the compact-JSON size bound, never the
-    alignment/append-only guards. The proxy's confirmed-clamp path passes
-    False: its snapshots are refreshed from every provider response, so the
-    replayed prefix is exactly what the provider has cached, and re-forwarding
-    a freshly recompressed (smaller) history instead busts the cache from the
-    first changed byte - a full prefix re-write at the full input rate to save
-    bytes that would have billed at the ~0.1x cache-read rate. Growth stays
-    bounded with the bound off: the replay source is always last turn's
-    forwarded bytes, so the prefix is byte-stable turn over turn rather than
-    compounding.
+    ``confirmed_frozen_count`` bounds UNCONDITIONAL replay. Leading positions
+    the provider has already confirmed cached (a message count derived from
+    ``cache_read_input_tokens``) are always replayed byte-identical: the
+    replay source there is exactly what the provider hashed, so changing
+    those bytes can only bust the cache. Beyond the floor the size bound
+    still arbitrates each turn: a shrinking replay (the pipeline emitted
+    original bytes for a frozen message) is repaired, while an inflating one
+    (fresh compression improved on the forwarded form) is declined so the
+    improvement reaches the wire. When the provider count collapses (cold
+    cache, TTL lapse) the floor collapses with it and every accumulated
+    improvement lands at once - the natural re-baselining that keeps
+    long-session growth bounded (#3026). Callers with no provider-confirmed
+    count pass None and keep the fully size-bounded behavior.
     """
     prev_orig = previous_original_messages
     prev_fwd = previous_forwarded_messages
@@ -561,7 +564,7 @@ def overlay_cached_prefix(
                     + [merged]
                     + list(optimized_messages[message_index + 1 :])
                 )
-                if enforce_non_inflation:
+                if message_index >= max(confirmed_frozen_count or 0, 0):
                     replayed_bytes = _compact_json_bytes(replayed)
                     optimized_bytes = _compact_json_bytes(optimized_messages)
                     if (
@@ -618,16 +621,31 @@ def overlay_cached_prefix(
     # Replay the cached (compressed) prefix byte-identical up to the first
     # divergence; keep this turn's freshly-produced output for the rest.
     replayed = list(prev_fwd[:k]) + list(optimized_messages[k:])
-    if enforce_non_inflation:
-        replayed_bytes = _compact_json_bytes(replayed)
-        optimized_bytes = _compact_json_bytes(optimized_messages)
-        if (
-            replayed_bytes is None
-            or optimized_bytes is None
-            or len(replayed_bytes) > len(optimized_bytes)
-        ):
+    replayed_bytes = _compact_json_bytes(replayed)
+    optimized_bytes = _compact_json_bytes(optimized_messages)
+    if (
+        replayed_bytes is None
+        or optimized_bytes is None
+        or len(replayed_bytes) > len(optimized_bytes)
+    ):
+        # Something in the replay is byte-larger than this turn's fresh form:
+        # fresh compression improved on already-forwarded bytes. Landing the
+        # improvement is only safe OUTSIDE the provider-confirmed prefix -
+        # inside it, the improvement would change bytes the provider has
+        # already cached and bust the whole suffix. Split at the confirmed
+        # floor: replay the confirmed region unconditionally, forward
+        # everything beyond it fresh so the improvement reaches the wire.
+        floor = min(k, max(confirmed_frozen_count or 0, 0))
+        if floor <= 0:
             logger.debug("overlay: replay inflated compact JSON — skipping cached-prefix replay")
             return optimized_messages
+        logger.debug(
+            "overlay: replay inflated beyond the confirmed floor — replaying %d/%d "
+            "confirmed messages, forwarding the rest fresh",
+            floor,
+            k,
+        )
+        return list(prev_fwd[:floor]) + list(optimized_messages[floor:])
     return replayed
 
 

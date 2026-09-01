@@ -138,3 +138,60 @@ def test_cache_create_stays_bounded_to_the_delta_with_overlay():
     # with conversation length. Assert the last turn creates no more than the
     # first (which had no cache to reuse).
     assert creates[-1] <= creates[0] + 1
+
+
+def test_background_improvement_never_busts_warm_cache_and_lands_on_cold():
+    """The #3379 regression and its fix, end to end: a background improvement
+    to an already-forwarded message must NOT change warm-cache bytes (the
+    confirmed floor overrides it), and must land the moment the provider
+    count collapses (cold cache re-baseline) - so long-session growth is
+    bounded by the TTL-lapse cadence instead of unbounded pinning."""
+    tracker = PrefixCacheTracker("anthropic", PrefixFreezeConfig(min_cached_tokens=0))
+    convo: list[dict] = []
+    prev_forwarded: list[dict] | None = None
+    improved_from_turn = 4
+
+    def pipeline(original, frozen, turn):
+        out = _apply_freeze(original, frozen)
+        if turn >= improved_from_turn:
+            # Background compression later found a much better form for the
+            # very first message (this PR's stated trigger).
+            out = [{**out[0], "content": str(out[0]["content"])[:4]}] + out[1:]
+        return out
+
+    for t in range(1, 9):
+        convo = convo + [{"role": "user", "content": f"tool-output-turn-{t}:" + "X" * 400}]
+        frozen = tracker.get_frozen_message_count()
+        forwarded = overlay_cached_prefix(
+            pipeline(convo, frozen, t),
+            convo,
+            tracker.get_last_original_messages(),
+            tracker.get_last_forwarded_messages(),
+            confirmed_frozen_count=frozen,
+        )
+        expected = sum(_toklen(m) for m in prev_forwarded) if prev_forwarded else 0
+        actual = _provider_cache_read(forwarded, prev_forwarded)
+        assert actual >= expected, f"turn {t}: warm-cache bust ({actual} < {expected})"
+        counts = [_toklen(m) for m in forwarded]
+        tracker.update_from_response(
+            actual,
+            sum(counts) - actual,
+            forwarded,
+            message_token_counts=counts,
+            original_messages=convo,
+        )
+        prev_forwarded = forwarded
+
+    # Cold cache: the provider count collapses, the floor collapses with it,
+    # and the accumulated improvement finally reaches the wire.
+    convo = convo + [{"role": "user", "content": "tool-output-turn-9:" + "X" * 400}]
+    cold = overlay_cached_prefix(
+        pipeline(convo, 0, 9),
+        convo,
+        tracker.get_last_original_messages(),
+        tracker.get_last_forwarded_messages(),
+        confirmed_frozen_count=0,
+    )
+    assert len(str(cold[0]["content"])) < len(str(prev_forwarded[0]["content"])), (
+        "cold-cache turn must re-baseline: the background improvement lands"
+    )

@@ -24,6 +24,12 @@ headroom proxy \
 
 Telemetry is **local-only and off by default**. `HEADROOM_TELEMETRY=on` (or `--telemetry`) turns on in-process usage stats that power your own `/stats`, `/metrics`, and dashboard — **nothing is sent to Headroom Labs**. (The anonymous aggregate beacon that older versions shipped has been removed from the code.)
 
+For read-only, container, CI, serverless, or load-balanced deployments, use [Detached Mode](/docs/detached-mode) to make local-state degradation explicit:
+
+```bash
+headroom proxy --stateless --detached-profile lenient
+```
+
 ## CLI options
 
 ### Core
@@ -53,6 +59,7 @@ Telemetry is **local-only and off by default**. `HEADROOM_TELEMETRY=on` (or `--t
 | `--telemetry` | `false` | Enable local, in-process usage stats (for your own `/stats` and dashboard; nothing leaves the machine) |
 | `--no-telemetry` | `false` | Force local telemetry off (already the default) |
 | `--stateless` | `false` | Disable filesystem writes and keep runtime state in memory |
+| `--detached-profile` | `lenient` | Capability policy for detached/stateless deployments: `strict`, `lenient`, or `silent` |
 
 Use `--http-proxy` or `HEADROOM_HTTP_PROXY` when only provider API traffic should go through a proxy:
 
@@ -338,6 +345,14 @@ Live session statistics plus durable `persistent_savings` totals. Stored at `~/.
 
 ```bash
 curl http://localhost:8787/stats
+```
+
+### `GET /capabilities`
+
+Resolved detached-mode capability matrix for operators and deployment automation.
+
+```bash
+curl http://localhost:8787/capabilities
 ```
 
 ### `GET /stats-history`

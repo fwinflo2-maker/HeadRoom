@@ -318,12 +318,23 @@ from the project you plan to open in VS Code:
 ```bash
 pip install "headroom-ai[proxy]"
 headroom wrap vscode-claude
+# Optional: persist Claude Code's client-owned 1M model selector
+headroom wrap vscode-claude --1m
 ```
 
 On the first run, reload the VS Code window. Keep the wrapper terminal running
 while you use the Claude Code panel; inspect the dashboard or proxy log printed
 at startup to see requests and savings.
-Headroom preserves your Anthropic authentication and selected model.
+Headroom preserves your Anthropic authentication and selected model. With
+`--1m`, it writes the resolved `[1m]` model selector to Claude Code's top-level
+user setting and restores the exact prior model on `headroom unwrap vscode-claude`
+or when setup runs again without `--1m`. Use
+`headroom wrap vscode-claude --no-configure --1m` to print the setting without
+writing files.
+
+Claude Code and Anthropic own 1M model support and account eligibility. Local
+tests prove persisted settings and restoration, not a live entitled VS Code
+session or the resulting context window.
 
 Press `Ctrl+C` to stop the proxy. Restart the same command before using Claude
 Code again, or completely restore the settings that existed before setup:

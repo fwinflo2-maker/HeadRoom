@@ -145,6 +145,60 @@ def test_block_append_overlay_never_inflates_forwarded_payload():
     assert overlay_cached_prefix(optimized, current, previous, forwarded) == optimized
 
 
+def test_enforce_non_inflation_false_replays_recompressed_prefix():
+    # Background recompression produced a SMALLER form of already-forwarded
+    # history. With the size bound enforced, the replay is declined and the
+    # forwarded bytes change mid-history - busting the provider cache the
+    # moment compression improves. The confirmed-clamp proxy path passes
+    # enforce_non_inflation=False so the cached bytes keep flowing.
+    recompressed = [
+        M("user", "READ foo.py:\n<tiny>"),
+        M("assistant", "ok"),
+        M("user", "grep result:\n<compressed>"),
+    ]
+    out = overlay_cached_prefix(
+        recompressed, CUR_ORIG, PREV_ORIG, PREV_FWD, enforce_non_inflation=False
+    )
+    assert out[:2] == PREV_FWD  # cached bytes win over the smaller fresh form
+    assert out[2] == recompressed[2]  # this turn's tail is preserved
+    # Default posture is unchanged: the same replay is declined as inflating.
+    assert overlay_cached_prefix(recompressed, CUR_ORIG, PREV_ORIG, PREV_FWD) == recompressed
+
+
+def test_enforce_non_inflation_false_keeps_alignment_guards():
+    # The flag relaxes ONLY the size bound; every alignment guard still bails.
+    changed = [M("user", "TOTALLY DIFFERENT"), PREV_ORIG[1], M("user", "x")]
+    assert (
+        overlay_cached_prefix(
+            OPTIMIZED_BUGGY, changed, PREV_ORIG, PREV_FWD, enforce_non_inflation=False
+        )
+        == OPTIMIZED_BUGGY
+    )
+    assert (
+        overlay_cached_prefix(
+            OPTIMIZED_BUGGY, CUR_ORIG, PREV_ORIG, PREV_FWD[:1], enforce_non_inflation=False
+        )
+        == OPTIMIZED_BUGGY
+    )
+
+
+def test_block_append_enforce_non_inflation_false_replays_forwarded_blocks():
+    previous = [{"role": "user", "content": [{"type": "text", "text": "stable"}]}]
+    forwarded = [{"role": "user", "content": [{"type": "text", "text": "x" * 500}]}]
+    current = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "stable"}, {"type": "text", "text": "new"}],
+        }
+    ]
+    optimized = copy.deepcopy(current)
+    out = overlay_cached_prefix(
+        optimized, current, previous, forwarded, enforce_non_inflation=False
+    )
+    assert out[0]["content"][0]["text"] == "x" * 500
+    assert out[0]["content"][1]["text"] == "new"
+
+
 def test_cache_hit_property_prefix_matches_last_forward():
     # The invariant that guarantees a cache hit: forwarded[:n] this turn ==
     # forwarded[:n] last turn (== what the provider cached).

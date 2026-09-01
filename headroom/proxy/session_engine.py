@@ -152,6 +152,7 @@ def finalize_turn(
     prev_returned: list[dict[str, Any]] | None,
     *,
     count_tokens: Callable[[list[dict[str, Any]]], int] | None = None,
+    enforce_non_inflation: bool = True,
 ) -> TurnFinal:
     """Replay last turn's exact forwarded/returned prefix over pipeline drift.
 
@@ -159,11 +160,24 @@ def finalize_turn(
     shape, non-inflation), so calling this is always safe: when replay is not
     provably correct it returns the pipeline's own output unchanged.
 
+    ``enforce_non_inflation`` is forwarded to ``overlay_cached_prefix``: it
+    relaxes only the size bound, never the alignment guards. Pass False only
+    when the snapshot pair is refreshed from every provider response (the
+    proxy's confirmed-clamp path), where the replayed bytes are exactly what
+    the provider has cached and a byte-larger replay is still the cheaper
+    request.
+
     ``count_tokens`` is invoked only when the overlay actually replaced
     bytes — the pipeline's own token count is still accurate otherwise. A
     failing hook falls back to "no recount" rather than failing the turn.
     """
-    final = overlay_cached_prefix(result_messages, original_messages, prev_original, prev_returned)
+    final = overlay_cached_prefix(
+        result_messages,
+        original_messages,
+        prev_original,
+        prev_returned,
+        enforce_non_inflation=enforce_non_inflation,
+    )
     replayed = final != result_messages
     tokens: int | None = None
     if replayed and count_tokens is not None:

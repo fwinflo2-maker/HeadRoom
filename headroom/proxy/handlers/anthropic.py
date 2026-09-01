@@ -2150,6 +2150,16 @@ class AnthropicHandlerMixin:
                         previous_original_messages,
                         previous_forwarded_messages,
                         count_tokens=tokenizer.count_messages,
+                        # This path's snapshots refresh from every provider
+                        # response, so prev_fwd is exactly what the provider
+                        # cached. Declining a byte-larger replay here would
+                        # re-forward freshly recompressed history at the full
+                        # input rate and bust the prompt cache from the first
+                        # changed byte every time background compression
+                        # improves on an already-forwarded message; the size
+                        # bound stays on for callers without refreshed
+                        # snapshots.
+                        enforce_non_inflation=False,
                     )
                     _overlay_replayed = _final.replayed
                     if _overlay_replayed:

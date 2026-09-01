@@ -448,6 +448,8 @@ def overlay_cached_prefix(
     current_original_messages: list[dict[str, Any]],
     previous_original_messages: list[dict[str, Any]] | None,
     previous_forwarded_messages: list[dict[str, Any]] | None,
+    *,
+    enforce_non_inflation: bool = True,
 ) -> list[dict[str, Any]]:
     """Replay a positional, non-inflating cached prefix when it is safe.
 
@@ -471,6 +473,17 @@ def overlay_cached_prefix(
     compact UTF-8 JSON for the replayed result must not exceed the optimized
     candidate. These bounds prefer a cache miss to corrupting or inflating a
     client's live history.
+
+    ``enforce_non_inflation`` gates only the compact-JSON size bound, never the
+    alignment/append-only guards. The proxy's confirmed-clamp path passes
+    False: its snapshots are refreshed from every provider response, so the
+    replayed prefix is exactly what the provider has cached, and re-forwarding
+    a freshly recompressed (smaller) history instead busts the cache from the
+    first changed byte - a full prefix re-write at the full input rate to save
+    bytes that would have billed at the ~0.1x cache-read rate. Growth stays
+    bounded with the bound off: the replay source is always last turn's
+    forwarded bytes, so the prefix is byte-stable turn over turn rather than
+    compounding.
     """
     prev_orig = previous_original_messages
     prev_fwd = previous_forwarded_messages
@@ -548,15 +561,16 @@ def overlay_cached_prefix(
                     + [merged]
                     + list(optimized_messages[message_index + 1 :])
                 )
-                replayed_bytes = _compact_json_bytes(replayed)
-                optimized_bytes = _compact_json_bytes(optimized_messages)
-                if (
-                    replayed_bytes is None
-                    or optimized_bytes is None
-                    or len(replayed_bytes) > len(optimized_bytes)
-                ):
-                    logger.debug("overlay: block replay inflated compact JSON — skipping")
-                    return optimized_messages
+                if enforce_non_inflation:
+                    replayed_bytes = _compact_json_bytes(replayed)
+                    optimized_bytes = _compact_json_bytes(optimized_messages)
+                    if (
+                        replayed_bytes is None
+                        or optimized_bytes is None
+                        or len(replayed_bytes) > len(optimized_bytes)
+                    ):
+                        logger.debug("overlay: block replay inflated compact JSON — skipping")
+                        return optimized_messages
                 return replayed
     # Append-only guard on CONTENT ONLY, message-by-message. Replay the
     # previously-forwarded (cached, compressed) bytes for the longest LEADING
@@ -604,15 +618,16 @@ def overlay_cached_prefix(
     # Replay the cached (compressed) prefix byte-identical up to the first
     # divergence; keep this turn's freshly-produced output for the rest.
     replayed = list(prev_fwd[:k]) + list(optimized_messages[k:])
-    replayed_bytes = _compact_json_bytes(replayed)
-    optimized_bytes = _compact_json_bytes(optimized_messages)
-    if (
-        replayed_bytes is None
-        or optimized_bytes is None
-        or len(replayed_bytes) > len(optimized_bytes)
-    ):
-        logger.debug("overlay: replay inflated compact JSON — skipping cached-prefix replay")
-        return optimized_messages
+    if enforce_non_inflation:
+        replayed_bytes = _compact_json_bytes(replayed)
+        optimized_bytes = _compact_json_bytes(optimized_messages)
+        if (
+            replayed_bytes is None
+            or optimized_bytes is None
+            or len(replayed_bytes) > len(optimized_bytes)
+        ):
+            logger.debug("overlay: replay inflated compact JSON — skipping cached-prefix replay")
+            return optimized_messages
     return replayed
 
 

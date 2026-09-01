@@ -263,6 +263,7 @@ def test_unwrap_claude_restores_all_base_url_modes(runner: CliRunner) -> None:
             "vertex_mode": True,
             "bedrock_mode": False,
             "settings_path": settings_path,
+            "force": True,
         },
         {
             "previous": None,

@@ -251,6 +251,11 @@ class SavingsEstimate:
         return asdict(self)
 
 
+# Emitted by ``output_shaper.shape_request`` only when it actually changed the
+# request, so its presence is the per-request proof that shaping happened.
+_SHAPED_LABEL_PREFIX = "output_shaper:verbosity:"
+
+
 @dataclass
 class SavingsLedger:
     """Accumulates shaped (treatment) and unshaped (control) observations and
@@ -425,6 +430,10 @@ class SavingsLedger:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            # Marks arms accumulated under the shaped-only recording rule (see
+            # ``record_from_labels``). Absent = written before that rule, so the
+            # arms may hold unshaped observations.
+            "shaped_only": True,
             "baseline": self.baseline.to_dict(),
             "treatment": {k: a.to_dict() for k, a in self.treatment.items()},
             "control": {k: a.to_dict() for k, a in self.control.items()},
@@ -433,6 +442,21 @@ class SavingsLedger:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> SavingsLedger:
         ledger = cls(baseline=BaselineModel.from_dict(d.get("baseline") or {}))
+        if not d.get("shaped_only"):
+            # Pre-rule arms cannot be told apart from shaped ones entry by
+            # entry, and republishing them is the reported bug. Drop them and
+            # re-accumulate from live traffic (hours, not weeks). The offline
+            # baseline is kept: it is learned from pre-shaper history, costs a
+            # `learn --verbosity` run to rebuild, and was never the poisoned part.
+            if d.get("treatment") or d.get("control"):
+                logger.warning(
+                    "output-savings ledger predates shaped-only recording; "
+                    "dropping %d treatment and %d control strata and "
+                    "re-accumulating (baseline kept)",
+                    len(d.get("treatment") or {}),
+                    len(d.get("control") or {}),
+                )
+            return ledger
         for k, a in (d.get("treatment") or {}).items():
             ledger.treatment[k] = _Accum.from_dict(a)
         for k, a in (d.get("control") or {}).items():
@@ -495,12 +519,26 @@ class SavingsRecorder:
 
     def record_from_labels(self, labels: Any, output_tokens: int) -> bool:
         """Record one outcome given its transforms_applied labels. Returns True
-        if a shaping label was found and recorded."""
-        for label in labels or ():
-            parsed = parse_stratum_label(str(label))
+        if a shaping label was found and recorded.
+
+        A treatment observation is only recorded when the request was ACTUALLY
+        shaped, evidenced by the shaper's own ``output_shaper:verbosity:``
+        label on the same channel. The stratum label is attached whenever the
+        shaper is configured on, but the shaping itself can still be a no-op
+        (level resolves to none, the body offers nothing to steer), and a
+        treatment arm holding unshaped output is exactly what produces a
+        "measured" reduction the deployment never performed. Control is
+        unshaped by definition, so it records unconditionally.
+        """
+        label_strings = tuple(str(label) for label in labels or ())
+        shaped = any(label.startswith(_SHAPED_LABEL_PREFIX) for label in label_strings)
+        for label in label_strings:
+            parsed = parse_stratum_label(label)
             if parsed is None:
                 continue
             arm, key = parsed
+            if arm == "treatment" and not shaped:
+                return False
             with self._lock:
                 self._ledger.record(arm, key, output_tokens)
                 self._since_flush += 1

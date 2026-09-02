@@ -3232,12 +3232,18 @@ class AnthropicHandlerMixin:
                         model=model,
                         has_tools=bool(body.get("tools")),
                     )
-                    # Carry (arm, stratum) on the existing label channel so the
-                    # outcome funnel can feed the savings ledger from any path.
-                    transforms_applied.append(stratum_label(_arm, _stratum))
+                    # Carry (arm, stratum, level) on the existing label channel
+                    # so the outcome funnel can feed the savings ledger from any
+                    # path. The level is resolved for BOTH arms because it is
+                    # what tells the ledger the shaper was live when this
+                    # observation landed — level 0 (cache mode, or a learned/env
+                    # 0) shapes nothing while both arms keep filling, and an
+                    # observation the ledger cannot attribute to shaping is
+                    # excluded from the estimate rather than credited to it.
+                    _level, _src = resolve_verbosity_level(_shaper_settings)
+                    transforms_applied.append(stratum_label(_arm, _stratum, verbosity_level=_level))
 
                     if _arm == "treatment":
-                        _level, _src = resolve_verbosity_level(_shaper_settings)
                         shape_result = shape_request(body, _shaper_settings, level_override=_level)
                         if shape_result.changed:
                             body_mutation_tracker.mark_mutated("output_shaper")

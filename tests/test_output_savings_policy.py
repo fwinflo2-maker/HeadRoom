@@ -52,9 +52,36 @@ def test_conversation_key_uses_response_create_payload() -> None:
     assert conversation_key_from_body(http_body) == conversation_key_from_body(ws_body)
 
 
-def test_stratum_label_round_trips_arm_and_key() -> None:
+def test_stratum_label_round_trips_arm_key_and_level() -> None:
     key = "opus|code|m|tools"
 
-    assert parse_stratum_label(stratum_label("treatment", key)) == ("treatment", key)
-    assert parse_stratum_label(stratum_label("control", key)) == ("control", key)
+    assert parse_stratum_label(stratum_label("treatment", key, verbosity_level=3)) == (
+        "treatment",
+        key,
+        3,
+    )
+    assert parse_stratum_label(stratum_label("control", key, verbosity_level=0)) == (
+        "control",
+        key,
+        0,
+    )
     assert parse_stratum_label("unrelated") is None
+
+
+def test_untagged_stratum_label_round_trips_with_no_level() -> None:
+    # The pre-#3395 label shape. It still decodes — the ledger needs the arm and
+    # stratum to file it — but with no level, which is what makes it excluded
+    # from the estimate rather than credited to shaping.
+    key = "opus|code|m|tools"
+
+    assert parse_stratum_label(stratum_label("treatment", key)) == ("treatment", key, None)
+    assert parse_stratum_label(stratum_label("control", key)) == ("control", key, None)
+
+
+def test_level_tag_does_not_disturb_prefix_matching() -> None:
+    # Downstream matchers (and the WS lifecycle tests) match on the label prefix
+    # plus stratum key; the level rides as a tail so those keep working.
+    label = stratum_label("treatment", "gpt|new_user_ask|s|tools", verbosity_level=2)
+
+    assert label.startswith("output_shaper:stratum:gpt|new_user_ask|s|")
+    assert label.endswith(":L2")

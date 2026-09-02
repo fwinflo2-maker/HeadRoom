@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from headroom.proxy.output_savings import (
+    LEDGER_SCHEMA_VERSION,
     BaselineModel,
     SavingsLedger,
     SavingsRecorder,
@@ -235,7 +236,7 @@ class TestEstimateFromBaseline:
     def test_positive_savings_when_treatment_below_baseline(self):
         ledger = self._ledger_with_baseline(1000.0)
         for _ in range(20):
-            ledger.record("treatment", "opus|new_user_ask|s|tools", 700)
+            ledger.record("treatment", "opus|new_user_ask|s|tools", 700, shaper_active=True)
         est = ledger.estimate_from_baseline()
         assert est.kind == "estimated"
         assert est.n_requests == 20
@@ -247,15 +248,15 @@ class TestEstimateFromBaseline:
         # A treatment request LARGER than baseline must reduce the total, not
         # be clamped to zero (clamping would bias the estimate upward).
         ledger = self._ledger_with_baseline(1000.0)
-        ledger.record("treatment", "opus|new_user_ask|s|tools", 700)
-        ledger.record("treatment", "opus|new_user_ask|s|tools", 1400)
+        ledger.record("treatment", "opus|new_user_ask|s|tools", 700, shaper_active=True)
+        ledger.record("treatment", "opus|new_user_ask|s|tools", 1400, shaper_active=True)
         est = ledger.estimate_from_baseline()
         # (1000-700) + (1000-1400) = 300 - 400 = -100
         assert abs(est.tokens_saved - (-100)) < 1e-6
 
     def test_zero_baseline_samples_yields_zero(self):
         ledger = SavingsLedger()
-        ledger.record("treatment", "opus|x|s|tools", 500)
+        ledger.record("treatment", "opus|x|s|tools", 500, shaper_active=True)
         est = ledger.estimate_from_baseline()
         # No baseline at all -> global is empty -> nothing contributes.
         assert est.n_requests == 0
@@ -268,7 +269,7 @@ class TestEstimateFromBaseline:
                 ledger.baseline.observe("opus|new_user_ask|s|tools", v)
         for v in (600, 700, 800):
             for _ in range(20):
-                ledger.record("treatment", "opus|new_user_ask|s|tools", v)
+                ledger.record("treatment", "opus|new_user_ask|s|tools", v, shaper_active=True)
         est = ledger.estimate_from_baseline()
         assert est.ci_low_pct <= est.pct <= est.ci_high_pct
         assert est.ci_low_pct < est.ci_high_pct  # nonzero band given spread
@@ -282,14 +283,14 @@ class TestEstimateFromBaseline:
 class TestEstimateFromHoldout:
     def test_none_without_control_data(self):
         ledger = SavingsLedger()
-        ledger.record("treatment", "opus|x|s|tools", 500)
+        ledger.record("treatment", "opus|x|s|tools", 500, shaper_active=True)
         assert ledger.estimate_from_holdout() is None
 
     def test_measured_difference_of_means(self):
         ledger = SavingsLedger()
         for _ in range(30):
-            ledger.record("control", "opus|new_user_ask|s|tools", 1000)
-            ledger.record("treatment", "opus|new_user_ask|s|tools", 750)
+            ledger.record("control", "opus|new_user_ask|s|tools", 1000, shaper_active=True)
+            ledger.record("treatment", "opus|new_user_ask|s|tools", 750, shaper_active=True)
         est = ledger.estimate_from_holdout()
         assert est is not None
         assert est.kind == "measured"
@@ -300,10 +301,10 @@ class TestEstimateFromHoldout:
     def test_only_strata_present_in_both_arms_contribute(self):
         ledger = SavingsLedger()
         for _ in range(10):
-            ledger.record("control", "opus|a|s|tools", 1000)
-            ledger.record("treatment", "opus|a|s|tools", 800)
+            ledger.record("control", "opus|a|s|tools", 1000, shaper_active=True)
+            ledger.record("treatment", "opus|a|s|tools", 800, shaper_active=True)
         # Treatment-only stratum must not contribute (no control to compare).
-        ledger.record("treatment", "opus|b|m|notools", 50)
+        ledger.record("treatment", "opus|b|m|notools", 50, shaper_active=True)
         est = ledger.estimate_from_holdout()
         assert est is not None
         assert est.n_requests == 10
@@ -312,15 +313,15 @@ class TestEstimateFromHoldout:
         ledger = SavingsLedger()
         for _ in range(10):
             ledger.baseline.observe("opus|a|s|tools", 1000)
-            ledger.record("control", "opus|a|s|tools", 1000)
-            ledger.record("treatment", "opus|a|s|tools", 900)
+            ledger.record("control", "opus|a|s|tools", 1000, shaper_active=True)
+            ledger.record("treatment", "opus|a|s|tools", 900, shaper_active=True)
         assert ledger.best_estimate().kind == "measured"
 
     def test_best_estimate_falls_back_to_estimated(self):
         ledger = SavingsLedger()
         for _ in range(10):
             ledger.baseline.observe("opus|a|s|tools", 1000)
-            ledger.record("treatment", "opus|a|s|tools", 900)
+            ledger.record("treatment", "opus|a|s|tools", 900, shaper_active=True)
         assert ledger.best_estimate().kind == "estimated"
 
 
@@ -333,8 +334,8 @@ class TestLedgerPersistence:
     def test_roundtrip(self, tmp_path):
         ledger = SavingsLedger()
         ledger.baseline.observe("opus|a|s|tools", 1000)
-        ledger.record("treatment", "opus|a|s|tools", 800)
-        ledger.record("control", "opus|a|s|tools", 1000)
+        ledger.record("treatment", "opus|a|s|tools", 800, shaper_active=True)
+        ledger.record("control", "opus|a|s|tools", 1000, shaper_active=True)
         path = tmp_path / "savings.json"
         ledger.save(path)
         loaded = SavingsLedger.load(path)
@@ -352,6 +353,229 @@ class TestLedgerPersistence:
         p.write_text("{not json")
         ledger = SavingsLedger.load(p)
         assert ledger.baseline.total_samples == 0
+
+
+# ---------------------------------------------------------------------------
+# shaper-active tagging (#3395)
+#
+# The arms fill whenever the shaper is *configured* on, but shaping is inert at
+# level 0 (cache mode forces it; a learned or env level selects it). Untagged
+# observations are the same problem one upgrade earlier. Neither may reach an
+# estimate: differencing two unshaped arms is how a rollout-blocked install
+# published a "measured" -147.9% reduction over 19,644 requests.
+# ---------------------------------------------------------------------------
+
+
+class TestShaperActiveTagging:
+    KEY = "opus|new_user_ask|s|tools"
+
+    def _seeded(self) -> SavingsLedger:
+        ledger = SavingsLedger()
+        for _ in range(10):
+            ledger.baseline.observe(self.KEY, 1000)
+        return ledger
+
+    def test_active_observations_are_counted(self):
+        ledger = self._seeded()
+        for _ in range(4):
+            ledger.record("treatment", self.KEY, 700, shaper_active=True)
+
+        est = ledger.estimate_from_baseline()
+        assert est.n_requests == 4
+        assert est.tokens_saved == pytest.approx(4 * 300)
+
+    def test_inactive_observations_reach_no_estimate(self):
+        ledger = self._seeded()
+        for _ in range(4):
+            ledger.record("treatment", self.KEY, 700, shaper_active=False)
+            ledger.record("control", self.KEY, 1000, shaper_active=False)
+
+        assert ledger.estimate_from_baseline().n_requests == 0
+        assert ledger.estimate_from_holdout() is None
+        assert ledger.best_estimate().n_requests == 0
+        # Kept, but only as diagnostics — this is the number that explains a
+        # small n to an operator instead of history appearing to vanish.
+        assert ledger.inactive_requests == 8
+
+    def test_inactive_arm_cannot_pair_with_an_active_one(self):
+        # The era-mixing case: control accumulated while the shaper was inert,
+        # treatment after it was switched on. Pairing them measures the traffic
+        # drift between the two periods and calls it shaping.
+        ledger = self._seeded()
+        for _ in range(6):
+            ledger.record("control", self.KEY, 2000, shaper_active=False)
+        for _ in range(6):
+            ledger.record("treatment", self.KEY, 800, shaper_active=True)
+
+        assert ledger.estimate_from_holdout() is None
+        # The synthetic-control tier still works off the shaped arm alone.
+        assert ledger.estimate_from_baseline().n_requests == 6
+
+    def test_measured_number_uses_active_arms_only(self):
+        ledger = self._seeded()
+        for _ in range(5):
+            ledger.record("control", self.KEY, 1000, shaper_active=True)
+            ledger.record("treatment", self.KEY, 750, shaper_active=True)
+            # Inactive-period traffic in both arms, wildly off, must not move it.
+            ledger.record("control", self.KEY, 10, shaper_active=False)
+            ledger.record("treatment", self.KEY, 9000, shaper_active=False)
+
+        est = ledger.estimate_from_holdout()
+        assert est is not None
+        assert est.kind == "measured"
+        assert est.n_requests == 5
+        assert est.pct == pytest.approx(25.0)
+
+    def test_modelled_tier_ignores_inactive_traffic(self):
+        # The weakest tier multiplies observed treatment output by a benchmark
+        # factor; unshaped output there invents savings out of a constant.
+        ledger = SavingsLedger()
+        for _ in range(3):
+            ledger.record("treatment", self.KEY, 1000, shaper_active=False)
+
+        assert ledger.estimate_from_model(3) is None
+
+
+class TestRecorderTagsFromTheLabel:
+    KEY = "opus|new_user_ask|s|tools"
+
+    def _recorder(self, tmp_path) -> SavingsRecorder:
+        rec = SavingsRecorder(tmp_path / "savings.json", flush_every=1000)
+        for _ in range(10):
+            rec._ledger.baseline.observe(self.KEY, 1000)
+        return rec
+
+    def test_a_shaped_level_records_into_the_active_arm(self, tmp_path):
+        rec = self._recorder(tmp_path)
+        assert (
+            rec.record_from_labels([stratum_label("treatment", self.KEY, verbosity_level=3)], 700)
+            is True
+        )
+
+        assert rec._ledger.treatment[self.KEY].n == 1
+        assert rec.estimate().n_requests == 1
+
+    def test_level_zero_records_into_the_inactive_arm(self, tmp_path):
+        # Level 0 is the documented "no steering" value — what cache mode
+        # forces. The request happened; the shaping did not.
+        rec = self._recorder(tmp_path)
+        assert (
+            rec.record_from_labels([stratum_label("treatment", self.KEY, verbosity_level=0)], 700)
+            is True
+        )
+
+        assert self.KEY not in rec._ledger.treatment
+        assert rec._ledger.inactive_treatment[self.KEY].n == 1
+        assert rec.estimate().n_requests == 0
+
+    def test_an_untagged_label_is_treated_as_inactive(self, tmp_path):
+        # A label with no level carries no evidence that shaping ran, and
+        # unprovable activity must never be able to inflate a claim.
+        rec = self._recorder(tmp_path)
+        assert rec.record_from_labels([stratum_label("treatment", self.KEY)], 700) is True
+
+        assert self.KEY not in rec._ledger.treatment
+        assert rec._ledger.inactive_treatment[self.KEY].n == 1
+        assert rec.estimate().n_requests == 0
+
+    def test_control_is_tagged_the_same_way(self, tmp_path):
+        # Symmetry matters: filtering only the treatment arm would leave the
+        # arms holding different populations and bias the difference of means.
+        rec = self._recorder(tmp_path)
+        rec.record_from_labels([stratum_label("control", self.KEY, verbosity_level=0)], 1000)
+        rec.record_from_labels([stratum_label("control", self.KEY, verbosity_level=3)], 1000)
+
+        assert rec._ledger.control[self.KEY].n == 1
+        assert rec._ledger.inactive_control[self.KEY].n == 1
+
+
+class TestLedgerSchemaMigration:
+    KEY = "opus|new_user_ask|s|tools"
+
+    def _legacy_file(self, tmp_path, *, with_arms: bool = True):
+        """A ledger file in the pre-tag on-disk shape (no ``schema_version``)."""
+        import json
+
+        payload = {
+            "baseline": {
+                "strata": {self.KEY: {"n": 10, "sum": 10_000.0, "sumsq": 10_000_000.0}},
+                "glob": {"n": 10, "sum": 10_000.0, "sumsq": 10_000_000.0},
+            },
+        }
+        if with_arms:
+            payload["treatment"] = {self.KEY: {"n": 19_644, "sum": 12_000_000.0, "sumsq": 1e13}}
+            payload["control"] = {self.KEY: {"n": 500, "sum": 250_000.0, "sumsq": 1e11}}
+        p = tmp_path / "savings.json"
+        p.write_text(json.dumps(payload))
+        return p
+
+    def test_legacy_file_loads_without_error_and_drops_its_arms(self, tmp_path):
+        ledger = SavingsLedger.load(self._legacy_file(tmp_path))
+
+        assert ledger.treatment == {}
+        assert ledger.control == {}
+        assert ledger.estimate_from_holdout() is None
+        assert ledger.best_estimate().n_requests == 0
+
+    def test_legacy_baseline_survives_the_drop(self, tmp_path):
+        # The baseline is learned offline from pre-shaper history — unshaped by
+        # definition, never the poisoned part, and costly to rebuild.
+        ledger = SavingsLedger.load(self._legacy_file(tmp_path))
+
+        assert ledger.baseline.total_samples == 10
+        assert ledger.baseline.lookup(self.KEY)[0] == 1000.0
+
+    def test_dropping_legacy_arms_is_reported(self, tmp_path, caplog, monkeypatch):
+        # Silently discarding accumulated history is exactly the failure mode
+        # #18 fixed for corrupt files; say it out loud.
+        monkeypatch.setattr("headroom.proxy.output_savings._legacy_arms_warned", False)
+        with caplog.at_level("WARNING"):
+            SavingsLedger.load(self._legacy_file(tmp_path))
+
+        assert any("predates the shaper-active tag" in r.message for r in caplog.records)
+
+    def test_a_baseline_only_legacy_file_is_not_warned_about(self, tmp_path, caplog, monkeypatch):
+        # `learn --verbosity --apply` before any traffic writes exactly this.
+        monkeypatch.setattr("headroom.proxy.output_savings._legacy_arms_warned", False)
+        with caplog.at_level("WARNING"):
+            ledger = SavingsLedger.load(self._legacy_file(tmp_path, with_arms=False))
+
+        assert ledger.baseline.total_samples == 10
+        assert caplog.records == []
+
+    def test_upgraded_install_re_accumulates_from_live_traffic(self, tmp_path):
+        # The upgrade contract: a smaller n, not an inherited claim.
+        path = self._legacy_file(tmp_path)
+        rec = SavingsRecorder(path, flush_every=1)
+        rec.record_from_labels([stratum_label("treatment", self.KEY, verbosity_level=3)], 700)
+
+        est = rec.estimate()
+        assert est.n_requests == 1
+        assert est.tokens_saved == pytest.approx(300.0)
+
+    def test_current_schema_round_trips_both_arm_pairs(self, tmp_path):
+        ledger = SavingsLedger()
+        ledger.baseline.observe(self.KEY, 1000)
+        ledger.record("treatment", self.KEY, 800, shaper_active=True)
+        ledger.record("control", self.KEY, 1000, shaper_active=True)
+        ledger.record("treatment", self.KEY, 4000, shaper_active=False)
+        ledger.record("control", self.KEY, 4000, shaper_active=False)
+        path = tmp_path / "savings.json"
+        ledger.save(path)
+
+        loaded = SavingsLedger.load(path)
+        assert loaded.treatment[self.KEY].n == 1
+        assert loaded.control[self.KEY].n == 1
+        assert loaded.inactive_requests == 2
+        assert loaded.estimate_from_holdout().pct == pytest.approx(20.0)
+
+    def test_saved_file_declares_the_schema_version(self, tmp_path):
+        import json
+
+        path = tmp_path / "savings.json"
+        SavingsLedger().save(path)
+
+        assert json.loads(path.read_text())["schema_version"] == LEDGER_SCHEMA_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +623,9 @@ class TestRecorderBaselineReload:
 
         recorder = SavingsRecorder(path, flush_every=1)
         for output_tokens in (200, 210, 190):
-            recorder.record_from_labels([stratum_label("treatment", key)], output_tokens)
+            recorder.record_from_labels(
+                [stratum_label("treatment", key, verbosity_level=3)], output_tokens
+            )
 
         # No baseline to compare against yet, so there is nothing to estimate.
         assert recorder.estimate().n_requests == 0
@@ -430,7 +656,7 @@ class TestRecorderBaselineReload:
         learned.save(path)
         assert SavingsLedger.load(path).baseline.total_samples == 4
 
-        recorder.record_from_labels([stratum_label("treatment", key)], 200)
+        recorder.record_from_labels([stratum_label("treatment", key, verbosity_level=3)], 200)
         recorder.flush()
 
         # The flush must keep the learned baseline rather than writing the empty
@@ -459,7 +685,9 @@ class TestRecorderBaselineReload:
 
         recorder = SavingsRecorder(path, flush_every=1)
         for output_tokens in (200, 210, 190):
-            recorder.record_from_labels([stratum_label("treatment", key)], output_tokens)
+            recorder.record_from_labels(
+                [stratum_label("treatment", key, verbosity_level=3)], output_tokens
+            )
 
         # First learn writes a baseline; the recorder adopts it.
         first = SavingsLedger.load(path)
@@ -502,7 +730,7 @@ class TestFlushDurability:
         key = SAMPLE_KEY
 
         recorder = SavingsRecorder(path, flush_every=1)
-        recorder.record_from_labels([stratum_label("treatment", key)], 200)
+        recorder.record_from_labels([stratum_label("treatment", key, verbosity_level=3)], 200)
         recorder.flush()
         assert SavingsLedger.load(path).treatment[key].n == 1
 
@@ -510,7 +738,7 @@ class TestFlushDurability:
             raise OSError(5, "simulated crash before rename")
 
         monkeypatch.setattr(headroom.fsutil.os, "replace", _die_before_rename)
-        recorder.record_from_labels([stratum_label("treatment", key)], 210)
+        recorder.record_from_labels([stratum_label("treatment", key, verbosity_level=3)], 210)
         recorder.flush()  # OSError swallowed by the recorder — fail-open by design
 
         # The pre-crash sample must survive and no temp residue may be left
@@ -568,7 +796,7 @@ class TestFlushDurability:
             output_tokens=50,
             tokens_saved=20,
             attempted_input_tokens=100,
-            transforms_applied=(stratum_label("treatment", SAMPLE_KEY),),
+            transforms_applied=(stratum_label("treatment", SAMPLE_KEY, verbosity_level=3),),
         )
         asyncio.run(emit_request_outcome(_Handler(), outcome))
 
@@ -614,7 +842,7 @@ class TestModelledTier:
             turn_kind="new_user_ask", input_tokens=1000, model="claude-sonnet-5", has_tools=False
         )
         for _ in range(n):
-            ledger.record("treatment", key, observed_total // n)
+            ledger.record("treatment", key, observed_total // n, shaper_active=True)
         return ledger
 
     def test_ships_empty_so_an_unmeasured_deployment_claims_nothing(self):
@@ -702,7 +930,7 @@ class TestModelledTier:
             baseline.observe(key, 2000)
         ledger = SavingsLedger(baseline=baseline)
         for _ in range(10):
-            ledger.record("treatment", key, 1000)
+            ledger.record("treatment", key, 1000, shaper_active=True)
         assert ledger.best_estimate(3).kind == "estimated"
 
     def test_without_a_level_behaviour_is_unchanged(self):

@@ -746,12 +746,15 @@ def _shape_openai_responses_payload(
             model=model or str(payload.get("model", "")),
             has_tools=bool(payload.get("tools")),
         )
-        labels = [stratum_label(arm, stratum)]
+        # Resolved for both arms: the level tags the ledger entry with whether
+        # the shaper was live (level 0 = inert), and an untagged observation is
+        # excluded from the estimate rather than credited to shaping.
+        level, src = resolve_verbosity_level(settings)
+        labels = [stratum_label(arm, stratum, verbosity_level=level)]
 
         if arm != "treatment":
             return labels, False
 
-        level, src = resolve_verbosity_level(settings)
         shape_result = shape_responses_request(payload, settings, level_override=level)
         if shape_result.changed:
             labels.extend(shape_result.labels or [])
@@ -1459,11 +1462,14 @@ def _shape_openai_responses_for_output(
         model=model or str(payload.get("model") or ""),
         has_tools=bool(payload.get("tools")),
     )
-    result.labels.append(stratum_label(arm, stratum))
+    # Resolve the level BEFORE the arm branch: it tags the ledger entry for
+    # both arms with whether the shaper was live (level 0 = inert), and an
+    # observation the ledger cannot attribute is excluded from the estimate.
+    level, _source = resolve_verbosity_level(settings)
+    result.labels.append(stratum_label(arm, stratum, verbosity_level=level))
     if arm == "control":
         return result
 
-    level, _source = resolve_verbosity_level(settings)
     shaped = shape_openai_responses_request(
         payload,
         settings=settings,
@@ -4522,11 +4528,15 @@ class OpenAIHandlerMixin:
                     model=model,
                     has_tools=bool(body.get("tools")),
                 )
-                # Carry (arm, stratum) on the transforms channel so the outcome
-                # funnel feeds the output-savings ledger from the chat path too.
-                transforms_applied.append(stratum_label(_arm, _stratum))
+                # Carry (arm, stratum, level) on the transforms channel so the
+                # outcome funnel feeds the output-savings ledger from the chat
+                # path too. The level is resolved for BOTH arms: it is the
+                # ledger's record of whether the shaper was live when the
+                # observation landed (level 0 = inert, e.g. cache mode), and an
+                # unattributable observation is excluded from the estimate.
+                _level, _src = resolve_verbosity_level(_shaper_settings)
+                transforms_applied.append(stratum_label(_arm, _stratum, verbosity_level=_level))
                 if _arm == "treatment":
-                    _level, _src = resolve_verbosity_level(_shaper_settings)
                     _shape_result = shape_openai_chat_request(
                         body, _shaper_settings, level_override=_level
                     )

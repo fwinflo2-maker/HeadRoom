@@ -12,6 +12,13 @@ _INPUT_BUCKETS = (2_000, 8_000, 32_000, 128_000)
 _STRATUM_LABEL = "output_shaper:stratum:"
 _CONTROL_LABEL = "output_shaper:control:"
 
+# Optional ``:L<n>`` tail on a stratum label carrying the verbosity level the
+# shaper resolved for that request. A stratum key is built from a fixed
+# vocabulary joined with "|" (see :func:`stratum_key`) and can never contain a
+# colon, so the tail is unambiguous: the text after the last colon is the tag
+# if and only if it looks like ``L<digits>``.
+_LEVEL_TAG_PREFIX = "L"
+
 
 def input_bucket(input_tokens: int) -> str:
     """Map an input-token count to a coarse bucket label."""
@@ -165,16 +172,47 @@ def assign_arm(conversation_key: str, holdout_fraction: float) -> str:
     return "control" if frac < holdout_fraction else "treatment"
 
 
-def stratum_label(arm: str, key: str) -> str:
-    """Encode (arm, stratum) as a transforms_applied label."""
+def stratum_label(arm: str, key: str, *, verbosity_level: int | None = None) -> str:
+    """Encode (arm, stratum, shaper level) as a transforms_applied label.
+
+    ``verbosity_level`` is the level :func:`output_shaper.resolve_verbosity_level`
+    returned for THIS request, and it is what tells the ledger whether the
+    shaper was actually live when the observation was recorded. The stratum
+    label is attached whenever the shaper is *configured* on, but shaping can
+    still be inert — level 0 means no steering at all (cache mode forces it, and
+    a learned or env level of 0 selects it), so both arms fill with unshaped
+    traffic that a naive estimator reads as a shaping effect.
+
+    The level rides as a ``:L<n>`` tail rather than a separate label so nothing
+    downstream sees a new transform (``telemetry.session`` counts one entry per
+    label, keyed on the text before the first colon) and existing
+    ``startswith(prefix + key)`` matches keep working.
+
+    Omitting ``verbosity_level`` produces the historical untagged label, which
+    the ledger records as "shaper inactive". That direction is deliberate:
+    activity we cannot prove must never be able to inflate a savings claim.
+    """
     prefix = _STRATUM_LABEL if arm == "treatment" else _CONTROL_LABEL
-    return prefix + key
+    if verbosity_level is None:
+        return prefix + key
+    return f"{prefix}{key}:{_LEVEL_TAG_PREFIX}{int(verbosity_level)}"
 
 
-def parse_stratum_label(label: str) -> tuple[str, str] | None:
-    """Decode a label into ``(arm, stratum)``, or None if not one of ours."""
+def parse_stratum_label(label: str) -> tuple[str, str, int | None] | None:
+    """Decode a label into ``(arm, stratum, verbosity_level)``, or None.
+
+    ``verbosity_level`` is ``None`` for an untagged label — one written before
+    the level tag existed, or by a caller that did not supply it.
+    """
     if label.startswith(_STRATUM_LABEL):
-        return "treatment", label[len(_STRATUM_LABEL) :]
-    if label.startswith(_CONTROL_LABEL):
-        return "control", label[len(_CONTROL_LABEL) :]
-    return None
+        arm, rest = "treatment", label[len(_STRATUM_LABEL) :]
+    elif label.startswith(_CONTROL_LABEL):
+        arm, rest = "control", label[len(_CONTROL_LABEL) :]
+    else:
+        return None
+    key, sep, tail = rest.rpartition(":")
+    if sep and tail.startswith(_LEVEL_TAG_PREFIX):
+        digits = tail[len(_LEVEL_TAG_PREFIX) :]
+        if digits.isdigit():
+            return arm, key, int(digits)
+    return arm, rest, None

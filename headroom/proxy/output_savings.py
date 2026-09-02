@@ -30,6 +30,18 @@ This module makes the estimate honest by separating three tiers:
    measurable with no counterfactual. "32% of output restated existing context"
    is an honest standalone fact and the shaper's target. See ``echo_ratio``.
 
+Both live tiers rest on a precondition that used to go unchecked: the shaper
+was actually running when the observation was recorded. The stratum label is
+attached whenever the shaper is *configured* on, but the shaping itself can be
+inert — level 0 means no steering at all, which cache mode forces and a learned
+or env level of 0 selects — and traffic still lands in both arms while nothing
+is being shaped. Differencing those arms measures noise and reports it as a
+shaping effect: a rollout-blocked install published a "measured" -147.9%
+reduction over 19,644 requests exactly that way (#3395). So every observation
+carries the shaper's resolved level at record time, only shaper-active
+observations reach ``treatment``/``control``, and the rest accumulate in
+``inactive_treatment``/``inactive_control`` where no estimator can see them.
+
 Stratification uses only features observable at request time (never the output):
 turn kind, input-token bucket, model family, whether tools are present.
 
@@ -251,6 +263,22 @@ class SavingsEstimate:
         return asdict(self)
 
 
+# On-disk schema version for the persisted ledger.
+#
+# 1 (or absent): arms carry no shaper-active tag. Entries from a period when
+#    the shaper was inert are indistinguishable from shaped ones, so the arms
+#    are dropped on load — see :meth:`SavingsLedger.from_dict`.
+# 2: ``treatment``/``control`` hold shaper-active observations only; inactive
+#    ones live in ``inactive_treatment``/``inactive_control``.
+LEDGER_SCHEMA_VERSION = 2
+
+# Warn once per process when legacy arms are dropped. The recorder re-reads the
+# file on every flush and on every ``estimate`` (to pick up a freshly learned
+# baseline), so an un-upgraded file with no traffic to rewrite it would
+# otherwise log the same warning on every /stats poll.
+_legacy_arms_warned = False
+
+
 @dataclass
 class SavingsLedger:
     """Accumulates shaped (treatment) and unshaped (control) observations and
@@ -260,22 +288,63 @@ class SavingsLedger:
     are live per-stratum accumulators of observed output tokens, used both for
     the A/B "measured" number (when a holdout exists) and to keep the ledger
     self-describing.
+
+    **Arm invariant:** ``treatment`` and ``control`` hold only observations
+    recorded while the shaper was active. Observations recorded while it was
+    inert go to ``inactive_treatment``/``inactive_control``, which no estimator
+    reads. Every estimator therefore gets the filtering for free, and a future
+    one cannot silently reintroduce the bug by forgetting to filter — the
+    poisoned data is not in the dicts it reads.
+
+    The inactive arms are kept rather than discarded so an operator can be told
+    *why* ``n`` is small ("19,644 requests recorded while the shaper was
+    inactive") instead of seeing history vanish. They are diagnostic only.
     """
 
     baseline: BaselineModel = field(default_factory=BaselineModel)
     treatment: dict[str, _Accum] = field(default_factory=dict)
     control: dict[str, _Accum] = field(default_factory=dict)
+    inactive_treatment: dict[str, _Accum] = field(default_factory=dict)
+    inactive_control: dict[str, _Accum] = field(default_factory=dict)
 
     # ---- recording -------------------------------------------------------
 
-    def record(self, arm: str, key: str, output_tokens: int) -> None:
-        target = self.treatment if arm == "treatment" else self.control
+    def record(self, arm: str, key: str, output_tokens: int, *, shaper_active: bool) -> None:
+        """File one observation into the arm for *arm* and the shaper's state.
+
+        ``shaper_active`` is required, with no default, on purpose: this is
+        statistical accounting, and a default would let a new call site pick a
+        tag by accident. Tagging is symmetric across arms — it describes the
+        deployment's state at record time, not what the shaper did to this
+        particular body — because filtering one arm on a per-request outcome
+        (say, "the steering block actually got appended") conditions treatment
+        on a post-assignment variable while control keeps every request, which
+        makes the two arms different populations and biases the difference of
+        means. Filtering both arms on the same request-time state is a time
+        restriction, and leaves the comparison causal within what remains.
+        """
+        if shaper_active:
+            target = self.treatment if arm == "treatment" else self.control
+        else:
+            target = self.inactive_treatment if arm == "treatment" else self.inactive_control
         target.setdefault(key, _Accum()).add(output_tokens)
+
+    @property
+    def inactive_requests(self) -> int:
+        """Observations excluded from every estimate as shaper-inactive."""
+        return sum(a.n for a in self.inactive_treatment.values()) + sum(
+            a.n for a in self.inactive_control.values()
+        )
 
     # ---- estimation ------------------------------------------------------
 
     def estimate_from_baseline(self) -> SavingsEstimate:
         """Synthetic-control estimate: treatment output vs. offline baseline.
+
+        Reads ``treatment``, so it sees shaper-active observations only (see
+        the class docstring's arm invariant). An unshaped treatment observation
+        differenced against a pre-shaper baseline is pure traffic drift wearing
+        a savings label.
 
         Aggregate signed delta ``Σ_s n_s·(μ_s − ȳ_s)`` where μ_s is the
         baseline mean and ȳ_s the observed treatment mean. Variance propagates
@@ -308,6 +377,11 @@ class SavingsLedger:
         Only strata with data in BOTH arms contribute. Returns ``None`` if no
         such stratum exists (no holdout traffic yet). Weighted by treatment
         volume; this is the unbiased causal number.
+
+        Both arms are read from the shaper-active dicts, so a stratum whose
+        control samples came from an inactive period cannot pair with treatment
+        samples from an active one. That pairing is what made a blocked install
+        difference two unshaped arms and call the result measured (#3395).
         """
         total_saved = 0.0
         total_baseline = 0.0
@@ -425,18 +499,60 @@ class SavingsLedger:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "schema_version": LEDGER_SCHEMA_VERSION,
             "baseline": self.baseline.to_dict(),
             "treatment": {k: a.to_dict() for k, a in self.treatment.items()},
             "control": {k: a.to_dict() for k, a in self.control.items()},
+            "inactive_treatment": {k: a.to_dict() for k, a in self.inactive_treatment.items()},
+            "inactive_control": {k: a.to_dict() for k, a in self.inactive_control.items()},
         }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> SavingsLedger:
+        """Rebuild a ledger, dropping arms written before the shaper tag.
+
+        A schema-1 file (no ``schema_version``) is a real, common case: the
+        ledger persists across restarts, so the first run after an upgrade
+        finds one. Its arms cannot be split into shaped and unshaped entry by
+        entry — the tag they would need is exactly what is missing — so they
+        are excluded rather than adopted. An upgraded install therefore starts
+        from a smaller ``n`` and re-accumulates from live traffic (hours, not
+        weeks) instead of inheriting a claim nobody can attribute. That is the
+        conservative direction: the failure mode we are fixing is a claim that
+        was never earned, and keeping the arms would preserve precisely it.
+
+        The baseline survives. It is learned offline by ``learn --verbosity``
+        from pre-shaper history, it costs a re-run to rebuild, and it was never
+        the poisoned part — it is unshaped by definition.
+        """
+        global _legacy_arms_warned
         ledger = cls(baseline=BaselineModel.from_dict(d.get("baseline") or {}))
+        try:
+            version = int(d.get("schema_version") or 1)
+        except (TypeError, ValueError):
+            version = 1
+        if version < LEDGER_SCHEMA_VERSION:
+            dropped_t = len(d.get("treatment") or {})
+            dropped_c = len(d.get("control") or {})
+            if (dropped_t or dropped_c) and not _legacy_arms_warned:
+                _legacy_arms_warned = True
+                logger.warning(
+                    "output-savings ledger predates the shaper-active tag "
+                    "(schema %d); dropping %d treatment and %d control strata "
+                    "and re-accumulating from live traffic (baseline kept)",
+                    version,
+                    dropped_t,
+                    dropped_c,
+                )
+            return ledger
         for k, a in (d.get("treatment") or {}).items():
             ledger.treatment[k] = _Accum.from_dict(a)
         for k, a in (d.get("control") or {}).items():
             ledger.control[k] = _Accum.from_dict(a)
+        for k, a in (d.get("inactive_treatment") or {}).items():
+            ledger.inactive_treatment[k] = _Accum.from_dict(a)
+        for k, a in (d.get("inactive_control") or {}).items():
+            ledger.inactive_control[k] = _Accum.from_dict(a)
         return ledger
 
     def save(self, path: Any) -> None:
@@ -495,14 +611,23 @@ class SavingsRecorder:
 
     def record_from_labels(self, labels: Any, output_tokens: int) -> bool:
         """Record one outcome given its transforms_applied labels. Returns True
-        if a shaping label was found and recorded."""
+        if a shaping label was found and recorded.
+
+        The label carries the verbosity level the shaper resolved for this
+        request (see ``output_savings_policy.stratum_label``). Level 0, or a
+        label with no level at all, means no steering was applied to anyone on
+        this request — the observation is real, but it is not evidence about
+        shaping, so it is filed in the inactive arms and no estimator sees it.
+        """
         for label in labels or ():
             parsed = parse_stratum_label(str(label))
             if parsed is None:
                 continue
-            arm, key = parsed
+            arm, key, level = parsed
             with self._lock:
-                self._ledger.record(arm, key, output_tokens)
+                self._ledger.record(
+                    arm, key, output_tokens, shaper_active=level is not None and level > 0
+                )
                 self._since_flush += 1
                 if self._since_flush >= self._flush_every:
                     self._flush_locked()
@@ -535,8 +660,15 @@ class SavingsRecorder:
             parsed = parse_stratum_label(str(label))
             if parsed is None:
                 continue
-            arm, key = parsed
+            arm, key, level = parsed
             if arm != "treatment":
+                return 0
+            if level is None or level <= 0:
+                # Shaper inert on this request: the gap to the baseline is
+                # drift, not a saving. Same rule the ledger applies, applied
+                # here too — this number is priced in USD downstream, so
+                # letting it through would put the claim the ledger refuses to
+                # make onto the savings rollup and Prometheus instead (#3395).
                 return 0
             with self._lock:
                 mean, _var, n = self._ledger.baseline.lookup(key)

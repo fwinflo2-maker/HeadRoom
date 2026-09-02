@@ -26,7 +26,7 @@ def test_output_savings_reports_estimate(tmp_path, monkeypatch):
     for _ in range(50):
         ledger.baseline.observe("opus|new_user_ask|s|tools", 1000)
     for _ in range(30):
-        ledger.record("treatment", "opus|new_user_ask|s|tools", 700)
+        ledger.record("treatment", "opus|new_user_ask|s|tools", 700, shaper_active=True)
     ledger.save(tmp_path / "output_savings.json")
 
     result = CliRunner().invoke(main, ["output-savings"])
@@ -41,7 +41,10 @@ def test_recorder_round_trips_via_labels(tmp_path):
     rec = SavingsRecorder(path, flush_every=1)
     # Baseline so the estimate has something to compare against.
     rec._ledger.baseline.observe("opus|new_user_ask|s|tools", 1000)
-    labels = ["compress:smartcrush", stratum_label("treatment", "opus|new_user_ask|s|tools")]
+    labels = [
+        "compress:smartcrush",
+        stratum_label("treatment", "opus|new_user_ask|s|tools", verbosity_level=3),
+    ]
     assert rec.record_from_labels(labels, output_tokens=600) is True
     assert rec.record_from_labels(["no-shaper-label"], output_tokens=999) is False
     est = rec.estimate()

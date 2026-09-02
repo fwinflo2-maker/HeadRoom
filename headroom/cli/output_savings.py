@@ -40,8 +40,19 @@ def output_savings() -> None:
     click.echo(f"\n{'=' * 56}")
     click.echo("Output-token reduction")
     click.echo(f"{'=' * 56}")
+    # Requests recorded while the shaper was inert (level 0 — cache mode, or a
+    # learned/env level of 0). They are real traffic but carry no shaping
+    # signal, so no estimate counts them. Saying so beats leaving an operator to
+    # wonder why a busy proxy reports nothing.
+    inactive = ledger.inactive_requests
+
     if est.n_requests == 0:
         click.echo("  No shaped requests recorded yet.")
+        if inactive:
+            click.echo(
+                f"  {inactive:,} request(s) were recorded while the shaper was inactive (level 0);"
+            )
+            click.echo("  they are excluded — an unshaped request measures nothing about shaping.")
         click.echo(
             f"  Baseline: {ledger.baseline.total_samples} samples, "
             f"{len(ledger.baseline.strata)} strata."
@@ -56,6 +67,8 @@ def output_savings() -> None:
     click.echo(
         f"  Reduction: {est.pct:.1f}%   (95% CI {est.ci_low_pct:.1f}% … {est.ci_high_pct:.1f}%)"
     )
+    if inactive:
+        click.echo(f"  Excluded:  {inactive:,} request(s) recorded while the shaper was inactive")
     if est.kind == "estimated":
         click.echo(
             "\n  Note: estimated vs the learned baseline. For a measured number,"

@@ -70,7 +70,7 @@ def test_estimate_request_savings_treatment_uses_baseline(tmp_path):
         rec._ledger.baseline.observe(key, 1000)  # baseline mean ~1000
 
     # Treatment request that emitted 600 -> saved ~400 vs the baseline.
-    saved = rec.estimate_request_savings([stratum_label("treatment", key)], 600)
+    saved = rec.estimate_request_savings([stratum_label("treatment", key, verbosity_level=3)], 600)
     assert saved == 400
 
 
@@ -81,8 +81,13 @@ def test_estimate_request_savings_zero_for_control_and_unknown(tmp_path):
         rec._ledger.baseline.observe(key, 1000)
 
     # Control arm is unshaped -> no attributable saving.
-    assert rec.estimate_request_savings([stratum_label("control", key)], 600) == 0
+    assert (
+        rec.estimate_request_savings([stratum_label("control", key, verbosity_level=3)], 600) == 0
+    )
     # No shaping label at all.
     assert rec.estimate_request_savings(["something-else"], 600) == 0
     # Treatment but output exceeded the baseline -> clamped to 0, never negative.
-    assert rec.estimate_request_savings([stratum_label("treatment", key)], 5000) == 0
+    assert (
+        rec.estimate_request_savings([stratum_label("treatment", key, verbosity_level=3)], 5000)
+        == 0
+    )

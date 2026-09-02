@@ -476,7 +476,7 @@ logging.basicConfig(
 logger = logging.getLogger("headroom.proxy")
 
 
-def _output_reduction_payload(shaper_active: bool, est: Any) -> dict[str, Any]:
+def _output_reduction_payload(shaper_active: bool, est: Any = None) -> dict[str, Any]:
     """/stats payload for the output-shaping layer.
 
     A deployment whose shaper is off (rollout-blocked channel, kill switch,
@@ -486,33 +486,46 @@ def _output_reduction_payload(shaper_active: bool, est: Any) -> dict[str, Any]:
     accumulated unshaped traffic — which is how a rollout-blocked stable
     install came to advertise a "measured" -147.9% output reduction it never
     performed. The ledger itself stays untouched; only the claim is gated.
+
+    Every branch emits the SAME key set, nulls where a value does not exist,
+    so a consumer reading ``ci_low_percent`` or ``band_is_ci`` cannot KeyError
+    on the inactive or no-data paths. Numeric totals stay 0 rather than null:
+    callers already sum them.
     """
-    if not shaper_active:
-        return {
-            "available": True,
-            "active": False,
-            "method": "inactive",
-            "tokens_saved": 0,
-            "baseline_tokens": 0,
-            "reduction_percent": 0.0,
-            "requests": 0,
-        }
-    if getattr(est, "n_requests", 0) <= 0:
-        return {"available": False, "active": True}
-    return {
-        "available": True,
-        "active": True,
-        "method": est.kind,  # "measured" | "estimated" | "modelled"
-        # A modelled band is the spread between the two benchmarked
-        # models, not a sampling CI. The UI must not call it one.
-        "band_is_ci": est.kind != "modelled",
-        "tokens_saved": round(est.tokens_saved),
-        "baseline_tokens": round(est.baseline_tokens),
-        "reduction_percent": round(est.pct, 1),
-        "ci_low_percent": round(est.ci_low_pct, 1),
-        "ci_high_percent": round(est.ci_high_pct, 1),
-        "requests": est.n_requests,
+    payload: dict[str, Any] = {
+        "available": False,
+        "active": bool(shaper_active),
+        "method": None,
+        "band_is_ci": None,
+        "tokens_saved": 0,
+        "baseline_tokens": 0,
+        "reduction_percent": 0.0,
+        "ci_low_percent": None,
+        "ci_high_percent": None,
+        "requests": 0,
     }
+    if not shaper_active:
+        payload["available"] = True
+        payload["method"] = "inactive"
+        return payload
+    if getattr(est, "n_requests", 0) <= 0:
+        return payload
+    payload.update(
+        {
+            "available": True,
+            "method": est.kind,  # "measured" | "estimated" | "modelled"
+            # A modelled band is the spread between the two benchmarked
+            # models, not a sampling CI. The UI must not call it one.
+            "band_is_ci": est.kind != "modelled",
+            "tokens_saved": round(est.tokens_saved),
+            "baseline_tokens": round(est.baseline_tokens),
+            "reduction_percent": round(est.pct, 1),
+            "ci_low_percent": round(est.ci_low_pct, 1),
+            "ci_high_percent": round(est.ci_high_pct, 1),
+            "requests": est.n_requests,
+        }
+    )
+    return payload
 
 
 class _SuppressCancelledErrorFilter(logging.Filter):
@@ -4331,7 +4344,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # tokens the model didn't emit because we steered verbosity / routed
         # effort down. Always labelled estimated-vs-measured + a CI so it's
         # never mistaken for an exact count. Best-effort — never break /stats.
-        output_reduction: dict[str, Any] = {"available": False}
+        # Same key set as every other branch: a consumer must not have to
+        # discriminate on which failure produced the payload.
+        output_reduction: dict[str, Any] = _output_reduction_payload(False)
+        output_reduction["available"] = False
+        output_reduction["method"] = None
         try:
             from headroom.proxy.output_savings import get_recorder
             from headroom.proxy.output_shaper import (

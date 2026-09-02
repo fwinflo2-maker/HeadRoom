@@ -243,8 +243,47 @@ def _resolve_litellm_model(model: str) -> str:
     return model
 
 
-def _estimate_compression_savings_usd(model: str, tokens_saved: int) -> float:
-    """Estimate compression savings in USD from saved input tokens."""
+def _estimate_compression_savings_usd(
+    model: str,
+    tokens_saved: int,
+    *,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    uncached_input_tokens: int = 0,
+) -> float:
+    """Estimate compression savings in USD from saved input tokens.
+
+    When the caller supplies the request's cache read/write/uncached breakdown,
+    saved tokens price at that request's realized blended input rate — the same
+    split ``_estimate_input_cost_usd`` prices real spend with. Removed bytes
+    would have travelled in this request's mix: a removal on a cold request
+    would have billed near list (or the cache-write premium), while a removal
+    re-applied on a warm-prefix turn would have billed at the provider's
+    cache-read discount. Flat list pricing values every re-applied removal at
+    full rate every turn, which overstates cache-heavy traffic roughly 7x
+    (a 94%-cache-read mix bills near 10% of list). Lifetime twin of
+    ``cost.py``'s session-scoped ``cache_aware_savings_usd``.
+
+    Without a breakdown (legacy checkpoints, callers that never learned the
+    split) the historical flat-list behavior is unchanged.
+    """
+    saved = _coerce_int(tokens_saved)
+    if saved <= 0:
+        return 0.0
+    breakdown_tokens = (
+        max(_coerce_int(cache_read_tokens), 0)
+        + max(_coerce_int(cache_write_tokens), 0)
+        + max(_coerce_int(uncached_input_tokens), 0)
+    )
+    if breakdown_tokens > 0:
+        realized_input_cost = _estimate_input_cost_usd(
+            model,
+            0,
+            cache_read_tokens=max(_coerce_int(cache_read_tokens), 0),
+            cache_write_tokens=max(_coerce_int(cache_write_tokens), 0),
+            uncached_input_tokens=max(_coerce_int(uncached_input_tokens), 0),
+        )
+        return float(saved) * (realized_input_cost / float(breakdown_tokens))
     litellm = _get_litellm_module()
     if tokens_saved <= 0:
         return 0.0
@@ -336,6 +375,8 @@ def estimate_request_savings_usd(
     tool_schema_tokens_saved: int = 0,
     output_tokens_saved: int = 0,
     cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    uncached_input_tokens: int = 0,
 ) -> dict[str, float]:
     """Price one request's distinct savings layers for external telemetry.
 
@@ -346,7 +387,11 @@ def estimate_request_savings_usd(
 
     return {
         "compression": _estimate_compression_savings_usd(
-            model, max(_coerce_int(compression_tokens_saved), 0)
+            model,
+            max(_coerce_int(compression_tokens_saved), 0),
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            uncached_input_tokens=uncached_input_tokens,
         ),
         "tool_schema": _estimate_compression_savings_usd(
             model, max(_coerce_int(tool_schema_tokens_saved), 0)
@@ -702,6 +747,8 @@ class SavingsTracker:
         if timestamp_dt is None:
             timestamp_dt = _utc_now()
 
+        # Checkpoint callers have no cache breakdown, so this path keeps the
+        # historical flat-list pricing (see _estimate_compression_savings_usd).
         delta_usd = _estimate_compression_savings_usd(model, delta_tokens)
 
         with self._lock:
@@ -810,7 +857,13 @@ class SavingsTracker:
         else:
             # No priced breakdown available: only message savings are known here,
             # so this path stays message-only exactly as before.
-            delta_savings_usd = _estimate_compression_savings_usd(model, delta_tokens_saved)
+            delta_savings_usd = _estimate_compression_savings_usd(
+                model,
+                delta_tokens_saved,
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
+                uncached_input_tokens=uncached_input_tokens,
+            )
         delta_output_savings_usd = (
             max(_coerce_float(priced.get("output_shaping")), 0.0)
             if priced is not None
@@ -987,7 +1040,13 @@ class SavingsTracker:
         )
         metrics.setdefault(
             "compression_savings_usd",
-            _estimate_compression_savings_usd(model, _coerce_int(metrics.get("tokens_saved"))),
+            _estimate_compression_savings_usd(
+                model,
+                _coerce_int(metrics.get("tokens_saved")),
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
+                uncached_input_tokens=uncached_input_tokens,
+            ),
         )
         metrics.setdefault(
             "cache_savings_usd", _estimate_cache_savings_usd(model, cache_read_tokens)

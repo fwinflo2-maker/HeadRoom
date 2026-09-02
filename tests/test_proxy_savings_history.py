@@ -186,7 +186,7 @@ def test_record_compression_savings_skips_empty_updates_and_normalizes_timestamp
     monkeypatch.setattr(
         savings_tracker_module,
         "_estimate_compression_savings_usd",
-        lambda model, tokens_saved: tokens_saved / 1000.0,
+        lambda model, tokens_saved, **_split: tokens_saved / 1000.0,
     )
 
     assert tracker.record_compression_savings(model="gpt-4o", tokens_saved=0) is False
@@ -603,7 +603,7 @@ def test_display_session_rolls_after_inactivity_and_counts_zero_savings_requests
     monkeypatch.setattr(
         savings_tracker_module,
         "_estimate_compression_savings_usd",
-        lambda model, tokens_saved: tokens_saved / 1000.0,
+        lambda model, tokens_saved, **_split: tokens_saved / 1000.0,
     )
     monkeypatch.setattr(
         savings_tracker_module,
@@ -687,7 +687,7 @@ def test_savings_tracker_rollups_preserve_spend_and_input_history(tmp_path, monk
     )
     monkeypatch.setattr(
         "headroom.proxy.savings_tracker._estimate_compression_savings_usd",
-        lambda model, tokens_saved: tokens_saved / 1000.0,
+        lambda model, tokens_saved, **_split: tokens_saved / 1000.0,
     )
 
     tracker.record_compression_savings(
@@ -830,7 +830,7 @@ def test_savings_tracker_rollup_attributes_savings_per_provider(tmp_path, monkey
     )
     monkeypatch.setattr(
         "headroom.proxy.savings_tracker._estimate_compression_savings_usd",
-        lambda model, tokens_saved: tokens_saved / 1000.0,
+        lambda model, tokens_saved, **_split: tokens_saved / 1000.0,
     )
 
     # Two providers active in the same hour bucket.
@@ -908,7 +908,7 @@ def test_savings_tracker_rollup_attributes_savings_per_model(tmp_path, monkeypat
 
     monkeypatch.setattr(
         "headroom.proxy.savings_tracker._estimate_compression_savings_usd",
-        lambda model, tokens_saved: tokens_saved / 1000.0,
+        lambda model, tokens_saved, **_split: tokens_saved / 1000.0,
     )
 
     # Two models from the same provider land in the same bucket.
@@ -1023,7 +1023,7 @@ def test_stats_history_defaults_to_compact_history_but_can_return_full_history(
     )
     monkeypatch.setattr(
         "headroom.proxy.savings_tracker._estimate_compression_savings_usd",
-        lambda model, tokens_saved: tokens_saved / 1000.0,
+        lambda model, tokens_saved, **_split: tokens_saved / 1000.0,
     )
 
     for i in range(8):

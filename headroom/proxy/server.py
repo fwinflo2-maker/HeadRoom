@@ -476,6 +476,45 @@ logging.basicConfig(
 logger = logging.getLogger("headroom.proxy")
 
 
+def _output_reduction_payload(shaper_active: bool, est: Any) -> dict[str, Any]:
+    """/stats payload for the output-shaping layer.
+
+    A deployment whose shaper is off (rollout-blocked channel, kill switch,
+    disabled config) is shaping nothing, so /stats must not publish the
+    persisted ledger's estimate as this deployment's live layer: the ledger
+    survives restarts and can span periods or key schemas where arms
+    accumulated unshaped traffic — which is how a rollout-blocked stable
+    install came to advertise a "measured" -147.9% output reduction it never
+    performed. The ledger itself stays untouched; only the claim is gated.
+    """
+    if not shaper_active:
+        return {
+            "available": True,
+            "active": False,
+            "method": "inactive",
+            "tokens_saved": 0,
+            "baseline_tokens": 0,
+            "reduction_percent": 0.0,
+            "requests": 0,
+        }
+    if getattr(est, "n_requests", 0) <= 0:
+        return {"available": False, "active": True}
+    return {
+        "available": True,
+        "active": True,
+        "method": est.kind,  # "measured" | "estimated" | "modelled"
+        # A modelled band is the spread between the two benchmarked
+        # models, not a sampling CI. The UI must not call it one.
+        "band_is_ci": est.kind != "modelled",
+        "tokens_saved": round(est.tokens_saved),
+        "baseline_tokens": round(est.baseline_tokens),
+        "reduction_percent": round(est.pct, 1),
+        "ci_low_percent": round(est.ci_low_pct, 1),
+        "ci_high_percent": round(est.ci_high_pct, 1),
+        "requests": est.n_requests,
+    }
+
+
 class _SuppressCancelledErrorFilter(logging.Filter):
     """Hide expected uvicorn CancelledError tracebacks during shutdown."""
 
@@ -4305,31 +4344,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             # what a deployment with no holdout and no learned baseline has --
             # i.e. every fresh install, since `learn --verbosity` needs history
             # that predates the shaper.
+            _shaper_active = False
             _olevel: int | None = None
             try:
                 _osettings = OutputShaperSettings.from_env(
                     enabled=shaper_enabled_for(getattr(proxy, "config", None))
                 )
                 if _osettings.enabled:
+                    _shaper_active = True
                     _olevel = resolve_verbosity_level(_osettings)[0]
             except Exception:  # pragma: no cover - defensive
+                _shaper_active = False
                 _olevel = None
 
             _oest = get_recorder().estimate(_olevel)
-            if _oest.n_requests > 0:
-                output_reduction = {
-                    "available": True,
-                    "method": _oest.kind,  # "measured" | "estimated" | "modelled"
-                    # A modelled band is the spread between the two benchmarked
-                    # models, not a sampling CI. The UI must not call it one.
-                    "band_is_ci": _oest.kind != "modelled",
-                    "tokens_saved": round(_oest.tokens_saved),
-                    "baseline_tokens": round(_oest.baseline_tokens),
-                    "reduction_percent": round(_oest.pct, 1),
-                    "ci_low_percent": round(_oest.ci_low_pct, 1),
-                    "ci_high_percent": round(_oest.ci_high_pct, 1),
-                    "requests": _oest.n_requests,
-                }
+            output_reduction = _output_reduction_payload(_shaper_active, _oest)
         except Exception:  # pragma: no cover - defensive
             pass
 

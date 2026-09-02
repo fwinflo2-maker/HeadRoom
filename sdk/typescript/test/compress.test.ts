@@ -119,21 +119,19 @@ describe("compress()", () => {
 
   it("forwards a per-call config, overriding a provided client's config", async () => {
     mockFetch.mockResolvedValueOnce(okResponse());
-    // A provided client with its own client-level config; the per-call config
-    // must win. Pre-fix, `config` fell into clientOptions and was dropped when
-    // a `client` was supplied — so the provided client's "cache" was sent.
     const client = new HeadroomClient({
       baseUrl: "http://localhost:8787",
-      config: { defaultMode: "cache" },
+      config: { mode: "lossy_inline" },
     });
 
     await compress([{ role: "user", content: "hello" }], {
       client,
-      config: { defaultMode: "token" },
+      config: { mode: "ccr", targetRatio: 0.25 },
     });
 
     const [, opts] = mockFetch.mock.calls[0];
     const body = JSON.parse(opts.body);
-    expect(body.config.default_mode).toBe("token");
+    expect(body.config.mode).toBe("ccr");
+    expect(body.config.target_ratio).toBe(0.25);
   });
 });

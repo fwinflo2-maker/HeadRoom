@@ -19,7 +19,7 @@ import type {
 import { mapProxyError, HeadroomConnectionError, HeadroomAuthError, HeadroomCompressError } from "./errors.js";
 import { deepCamelCase, deepSnakeCase } from "./utils/case.js";
 import { parseSSE } from "./utils/stream.js";
-import type { HeadroomConfig, HeadroomMode } from "./types/config.js";
+import type { CompressRequestConfig, HeadroomMode } from "./types/config.js";
 import type {
   SimulationResult,
   RequestMetrics,
@@ -191,7 +191,7 @@ class Messages {
 export interface ExtendedClientOptions extends HeadroomClientOptions {
   providerApiKey?: string;
   defaultMode?: HeadroomMode;
-  config?: HeadroomConfig;
+  config?: CompressRequestConfig;
 }
 
 export class HeadroomClient implements HeadroomClientInterface {
@@ -200,7 +200,7 @@ export class HeadroomClient implements HeadroomClientInterface {
   private timeout: number;
   private fallback: boolean;
   private retries: number;
-  private config: HeadroomConfig | undefined;
+  private config: CompressRequestConfig | undefined;
   private stack: string | undefined;
 
   /** @internal */ providerApiKey: string | undefined;
@@ -234,7 +234,7 @@ export class HeadroomClient implements HeadroomClientInterface {
 
   async compress(
     messages: OpenAIMessage[],
-    options: { model?: string; tokenBudget?: number; config?: HeadroomConfig } = {},
+    options: { model?: string; tokenBudget?: number; config?: CompressRequestConfig } = {},
   ): Promise<CompressResult> {
     const model = options.model ?? "gpt-4o";
 
@@ -602,7 +602,7 @@ export class HeadroomClient implements HeadroomClientInterface {
     messages: OpenAIMessage[],
     model: string,
     tokenBudget?: number,
-    config?: HeadroomConfig,
+    config?: CompressRequestConfig,
   ): Promise<CompressResult> {
     const body: Record<string, unknown> = { messages, model };
     if (tokenBudget) {

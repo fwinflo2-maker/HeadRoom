@@ -270,30 +270,31 @@ describe("HeadroomClient", () => {
 
     await client.compress(sampleMessages, {
       model: "gpt-4o",
-      config: { defaultMode: "token", contentRouterEnabled: false },
+      config: { mode: "ccr", targetRatio: 0.3, compressUserMessages: true },
     });
 
     const [, opts] = mockFetch.mock.calls[0];
     const body = JSON.parse(opts.body);
-    expect(body.config.default_mode).toBe("token");
-    expect(body.config.content_router_enabled).toBe(false);
+    expect(body.config.mode).toBe("ccr");
+    expect(body.config.target_ratio).toBe(0.3);
+    expect(body.config.compress_user_messages).toBe(true);
   });
 
   it("per-call config overrides client-level config", async () => {
     mockFetch.mockResolvedValueOnce(okResponse(sampleProxyResponse));
     const client = new HeadroomClient({
       baseUrl: "http://localhost:8787",
-      config: { defaultMode: "cache" },
+      config: { mode: "lossy_inline" },
     });
 
     await client.compress(sampleMessages, {
       model: "gpt-4o",
-      config: { defaultMode: "token" },
+      config: { mode: "ccr" },
     });
 
     const [, opts] = mockFetch.mock.calls[0];
     const body = JSON.parse(opts.body);
-    expect(body.config.default_mode).toBe("token");
+    expect(body.config.mode).toBe("ccr");
   });
 
   it("omits the config key when neither client nor call sets config", async () => {

@@ -12,34 +12,35 @@ When building production agents (coding assistants, SRE incident responders, dat
 * **Code search & file trees** inflate prompts with repetitive schema structures.
 * **Database queries** return large tabular results where only outliers and aggregations matter.
 
-Even with Gemini 3.8 Flash's massive context window and fast inference, bloated tool returns:
-1. **Drive up inference spend** quadratically as conversation histories compound.
-2. **Increase Time to First Token (TTFT)** due to large prompt processing.
-3. **Dilute attention**, making needle-in-a-haystack reasoning harder.
+Even with Gemini 3.8 Flash's massive 1M-token context window and fast inference, bloated tool returns:
+1. **Drive up inference spend** as conversation histories compound across turns.
+2. **Increase Time to First Token (TTFT)** due to large prompt prefill processing.
+3. **Dilute attention**, making needle-in-a-haystack reasoning and anomaly isolation harder.
 
-**Headroom** acts as an intelligent, transparent proxy (or in-process SDK layer) that compresses JSON arrays, structured logs, and tables by **40–80%** while strictly preserving schema anchors, recent turns, anomalies, error traces, and ground truth accuracy.
+**Headroom** acts as an intelligent, transparent proxy (or in-process SDK layer) that compresses JSON arrays, structured logs, and tables by **40–85%** while strictly preserving schema anchors, recent turns, anomalies, error traces, and ground truth accuracy.
 
 ---
 
 ## 📊 Live Benchmark Results
 
-Tested live on **Google Cloud Vertex AI** (`global` endpoint) with **`gemini-3.8-flash`**:
+Tested live on **Google Cloud Vertex AI** (`global` endpoint) with **`gemini-3.8-flash`**.
 
-| Scenario | Workload Category | Baseline Prompt | Headroom Prompt | Token Reduction | Accuracy Retention |
-| :--- | :--- | :---: | :---: | :---: | :---: |
-| **SRE Incident Root Cause** | Kubernetes & Microservice Logs | 51,775 | 13,927 | **-73.1%** | 100% (✓ PASS) |
-| **Security Audit & PR Review** | Code Search & Git Diffs | 6,813 | 4,624 | **-32.1%** | 100% (✓ PASS) |
-| **BigQuery Table Analytics** | 500 Tabular Transaction Rows | 49,020 | 38,278 | **-21.9%** | 100% (✓ PASS) |
-| **Multi-Turn RAG Synthesis** | 25 Dense Specification Chunks | 4,071 | 4,932 | **+21.1%**¹ | 100% (✓ PASS) |
-| **TOTAL / AGGREGATE** | **Real-World Agent Trajectory** | **111,679** | **61,761** | **-44.7%** | **100% Preserved** |
+Pricing basis: Google Cloud Vertex AI introductory standard rates through 2026-12-31 ($0.75 per 1M prompt tokens, $3.75 per 1M text output tokens; cached input rate is $0.075/M).
 
-¹ Small payloads (< 5k tokens) may see slight inflation from Headroom's CCR retrieval metadata. Compression ROI increases with payload size.
+| Scenario | Workload Category | Baseline Prompt | Headroom Prompt | Token Reduction | Latency Delta | Baseline Accuracy | Headroom Accuracy | Relative Retention |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **SRE Incident Root Cause** | Kubernetes & Microservice Logs | 51,775 | 13,842 | **-73.3%** | +9.2s faster | 100.0% | 100.0% | **100.0%** (✓ PASS) |
+| **Security Audit & PR Review** | Code Search & Git Diffs | 6,821 | 4,632 | **-32.1%** | +1.9s faster | 100.0% | 100.0% | **100.0%** (✓ PASS) |
+| **BigQuery Table Analytics** | 500 Tabular Transaction Rows | 49,020 | 6,120 | **-87.5%** | +2.3s faster | 100.0% | 100.0% | **100.0%** (✓ PASS) |
+| **Multi-Turn RAG Synthesis** | 25 Dense Specification Chunks | 4,071 | 1,437 | **-64.7%** | -0.7s | 100.0% | 100.0% | **100.0%** (✓ PASS) |
+| **TOTAL / AGGREGATE** | **Real-World Agent Trajectory** | **111,687** | **26,031** | **-76.7%** | **+3.2s avg faster** | **100.0%** | **100.0%** | **100.0% Retained** |
 
 ### Key Metrics Summary
 
-* **Prompt Tokens Saved**: **49,918 tokens** (**44.7% net reduction**)
-* **Inference Cost Reduction**: **41.0% savings** on Vertex AI standard tier
-* **Ground Truth Accuracy**: **100% retained** across all scenarios (exact error trace, database credentials, auth bypass vector, and high-spend outliers all correctly identified)
+* **Prompt Tokens Saved**: **85,656 tokens** (**76.7% net reduction**, 111,687 down to 26,031)
+* **Total Inference Cost**: **$0.0941 down to $0.0285** (**69.7% cost savings** at standard Vertex rates)
+* **Average Latency**: **8.9s down to 5.7s** (**+3.2s faster roundtrip** due to reduced prompt prefill load)
+* **Relative Quality Retention**: **100.0%** (zero degradation; Headroom matched baseline extraction of all root causes, database connection pool exhaustion, CVE bypass logic, fraud outliers, and architectural contracts)
 
 ---
 
@@ -150,11 +151,12 @@ When AI agents run complex multi-turn workflows (SRE debugging, PR reviews, BigQ
 We ran reproducible end-to-end agent benchmarks comparing Direct Vertex AI vs Headroom-Proxied Vertex AI on gemini-3.8-flash:
 
 📉 Results:
-• Prompt Token Reduction: 44.7% (111,679 ➔ 61,761 tokens)
-• SRE Log Scenario Reduction: 73.1% (51.7k ➔ 13.9k tokens)
-• Total Cost Savings: 41.0%
-• Reasoning & Fact Accuracy: 100% Preserved across all test cases
-• Zero Code Changes: Point google-genai SDK http_options.base_url to the proxy.
+• Prompt Token Reduction: 76.7% (111,687 ➔ 26,031 tokens)
+• SRE Log Scenario Reduction: 73.3% (51.7k ➔ 13.8k tokens)
+• BigQuery Analytics Scenario: 87.5% (49.0k ➔ 6.1k tokens)
+• Total Cost Savings: 69.7% ($0.0941 ➔ $0.0285 at standard Vertex rates)
+• Relative Quality Retention: 100.0% (Zero reasoning degradation; 100.0% ground truth retention in both arms)
+• Zero Code Changes: Point google-genai SDK http_options.base_url to http://127.0.0.1:8787.
 
 🔗 Full benchmark suite, reproducible scenarios, and code:
 https://github.com/headroomlabs-ai/headroom/tree/main/examples/vertex_gemini_benchmark

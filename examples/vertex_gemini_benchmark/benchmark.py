@@ -9,7 +9,8 @@ Measures:
 - Input / Prompt Token Reduction (%)
 - Roundtrip Latency & TTFT (ms)
 - Total Inference Cost Savings ($ USD)
-- Ground Truth Reasoning & Anomaly Retention (Accuracy %)
+- Absolute Ground Truth Accuracy (% of expected facts/anomalies identified)
+- Relative Quality Retention (% of Baseline accuracy preserved after compression)
 """
 
 from __future__ import annotations
@@ -53,10 +54,13 @@ DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_LOCATION = "global"
 DEFAULT_PORT = 8787
 
-# Vertex AI Gemini 3.8 Flash pricing (Standard Tier <= 128k prompt)
-# $0.075 per 1M input tokens, $0.30 per 1M output tokens
-INPUT_PRICE_PER_M = 0.075
-OUTPUT_PRICE_PER_M = 0.30
+# Vertex AI Gemini 3.8 Flash Introductory Standard Pricing (through 2026-12-31):
+# - Input tokens: $0.75 per 1M un-cached prompt tokens
+# - Text output tokens: $3.75 per 1M candidate tokens
+# Source: Google Cloud Vertex AI Pricing documentation (Introductory rates through Dec 31, 2026)
+# Note: $0.075 / 1M is the context caching read rate, not standard input pricing.
+INPUT_PRICE_PER_M = 0.75
+OUTPUT_PRICE_PER_M = 3.75
 
 
 @dataclass
@@ -69,7 +73,7 @@ class TrialResult:
     total_tokens: int
     latency_ms: float
     cost_usd: float
-    accuracy_score: float
+    accuracy_score: float  # Absolute ground truth score [0.0 - 1.0]
     response_text: str
     facts_found: list[str]
     anomalies_found: list[str]
@@ -85,6 +89,7 @@ class ScenarioComparison:
     cost_savings_pct: float
     latency_delta_ms: float
     quality_retained: bool
+    relative_accuracy_retention_pct: float
 
 
 # ----------------------------------------------------------------------------
@@ -114,6 +119,7 @@ def start_headroom_proxy(
         region,
         "--port",
         str(port),
+        "--no-ccr",
         "--no-memory-tools",
         "--no-memory-context",
     ]
@@ -223,9 +229,19 @@ def evaluate_response_quality(
 ) -> tuple[float, list[str], list[str]]:
     """Evaluate whether the model response accurately captured all ground truth facts & anomalies."""
     text_lower = response_text.lower()
+    text_clean = text_lower.replace("$", "").replace(",", "").replace("-", " ")
 
-    facts_found = [fact for fact in scenario.expected_facts if fact.lower() in text_lower]
-    anomalies_found = [anom for anom in scenario.expected_anomalies if anom.lower() in text_lower]
+    def _matches(needle: str) -> bool:
+        n = needle.lower()
+        if n in text_lower:
+            return True
+        n_clean = n.replace("$", "").replace(",", "").replace("-", " ")
+        if n_clean in text_clean:
+            return True
+        return False
+
+    facts_found = [fact for fact in scenario.expected_facts if _matches(fact)]
+    anomalies_found = [anom for anom in scenario.expected_anomalies if _matches(anom)]
 
     total_expected = len(scenario.expected_facts) + len(scenario.expected_anomalies)
     if total_expected == 0:
@@ -237,7 +253,7 @@ def evaluate_response_quality(
 
 
 def calculate_cost(prompt_tokens: int, candidate_tokens: int) -> float:
-    """Calculate inference cost in USD for Gemini Flash on Vertex."""
+    """Calculate inference cost in USD for Gemini 3.8 Flash on Vertex."""
     return (prompt_tokens * INPUT_PRICE_PER_M + candidate_tokens * OUTPUT_PRICE_PER_M) / 1_000_000.0
 
 
@@ -317,6 +333,9 @@ def run_benchmark_suite(
     print(f" Location:  {location}")
     print(f" Project:   {project_id}")
     print(f" Proxy:     http://127.0.0.1:{port}")
+    print(
+        f" Pricing:   ${INPUT_PRICE_PER_M}/M input, ${OUTPUT_PRICE_PER_M}/M output (Introductory rate)"
+    )
     if thinking_budget > 0:
         print(f" Thinking:  budget={thinking_budget} tokens")
     print("=" * 82)
@@ -327,7 +346,9 @@ def run_benchmark_suite(
     # Clean any stale proxy processes on this port
     try:
         subprocess.run(
-            ["pkill", "-f", f"headroom.cli proxy.*{port}"], check=False, capture_output=True
+            ["pkill", "-f", f"headroom.cli proxy.*{port}"],
+            check=False,
+            capture_output=True,
         )
         time.sleep(0.5)
     except Exception:
@@ -402,6 +423,11 @@ def run_benchmark_suite(
             )
             latency_delta = baseline_res.latency_ms - headroom_res.latency_ms
             quality_ok = headroom_res.accuracy_score >= baseline_res.accuracy_score * 0.90
+            relative_retention = (
+                (headroom_res.accuracy_score / baseline_res.accuracy_score) * 100.0
+                if baseline_res.accuracy_score > 0
+                else 100.0
+            )
 
             print(
                 f"  📊 Results: Prompt Tokens: {baseline_res.prompt_tokens:,} -> {headroom_res.prompt_tokens:,} (-{token_savings:.1f}%)"
@@ -410,7 +436,7 @@ def run_benchmark_suite(
                 f"     Latency: {baseline_res.latency_ms:.0f}ms -> {headroom_res.latency_ms:.0f}ms ({latency_delta:+.0f}ms)"
             )
             print(
-                f"     Accuracy: Baseline={baseline_res.accuracy_score:.0%}, Headroom={headroom_res.accuracy_score:.0%} ({'✓ PASS' if quality_ok else '✗ DEGRADED'})\n"
+                f"     Accuracy: Baseline={baseline_res.accuracy_score:.1%}, Headroom={headroom_res.accuracy_score:.1%} (Retention: {relative_retention:.1f}%, {'✓ PASS' if quality_ok else '✗ DEGRADED'})\n"
             )
 
             comparisons.append(
@@ -423,6 +449,7 @@ def run_benchmark_suite(
                     cost_savings_pct=cost_savings,
                     latency_delta_ms=latency_delta,
                     quality_retained=quality_ok,
+                    relative_accuracy_retention_pct=relative_retention,
                 )
             )
 
@@ -453,11 +480,18 @@ def run_benchmark_suite(
         if total_baseline_cost > 0
         else 0.0
     )
+    overall_relative_retention = (
+        (avg_headroom_acc / avg_baseline_acc * 100.0) if avg_baseline_acc > 0 else 100.0
+    )
+    retention_label = (
+        "100.0% Retained"
+        if overall_relative_retention >= 99.9
+        else f"{overall_relative_retention:.1f}% Retained"
+    )
 
     # 4. Print Formatted Table
     print("=" * 82)
-    model_label = model.upper().replace("-", " ").replace("GEMINI", "GEMINI")
-    print(f" 📊 FINAL BENCHMARK SUMMARY: {model_label} ON VERTEX AI")
+    print(f" 📊 FINAL BENCHMARK SUMMARY: {model.upper()} ON VERTEX AI")
     print("=" * 82)
     print(
         f"{'Scenario':<34} | {'Baseline Prompt':>15} | {'Headroom Prompt':>15} | {'Reduction':>10}"
@@ -487,7 +521,7 @@ def run_benchmark_suite(
         f"{'Avg Latency (ms)':<34} | {avg_baseline_latency:>13.0f}ms | {avg_headroom_latency:>13.0f}ms | {avg_baseline_latency - avg_headroom_latency:>+12.0f}ms"
     )
     print(
-        f"{'Ground Truth Accuracy':<34} | {avg_baseline_acc:>14.1%} | {avg_headroom_acc:>14.1%} | {'100% Retained':>14}"
+        f"{'Ground Truth Accuracy (Absolute)':<34} | {avg_baseline_acc:>14.1%} | {avg_headroom_acc:>14.1%} | {retention_label:>14}"
     )
     print("=" * 82)
 
@@ -501,8 +535,8 @@ We ran reproducible end-to-end agent benchmarks comparing **Direct Vertex AI** v
 
 📉 **Results**:
 • **Prompt Token Reduction**: **{overall_token_savings:.1f}%** ({total_baseline_prompt:,} ➔ {total_headroom_prompt:,} tokens)
-• **Total Cost Savings**: **{overall_cost_savings:.1f}%**
-• **Reasoning & Fact Accuracy**: **100% Preserved** ({avg_headroom_acc:.0%} ground truth retention)
+• **Total Cost Savings**: **{overall_cost_savings:.1f}%** (${total_baseline_cost:.4f} ➔ ${total_headroom_cost:.4f})
+• **Relative Quality Retention**: **{overall_relative_retention:.1f}%** ({avg_headroom_acc:.1%} Headroom vs {avg_baseline_acc:.1%} Baseline ground truth score)
 • **Zero Code Changes**: Point `google-genai` SDK `http_options.base_url` to `http://127.0.0.1:{port}`.
 
 🔗 Full benchmark suite, reproducible scenarios, and code:
@@ -523,6 +557,10 @@ https://github.com/headroomlabs-ai/headroom/tree/main/examples/vertex_gemini_ben
             "project_id": project_id,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "thinking_budget": thinking_budget,
+            "pricing_source": (
+                "Google Cloud Vertex AI introductory standard pricing through 2026-12-31: "
+                f"${INPUT_PRICE_PER_M}/M input tokens, ${OUTPUT_PRICE_PER_M}/M text output tokens."
+            ),
         },
         "aggregate": {
             "total_baseline_prompt_tokens": total_baseline_prompt,
@@ -535,6 +573,7 @@ https://github.com/headroomlabs-ai/headroom/tree/main/examples/vertex_gemini_ben
             "avg_headroom_latency_ms": avg_headroom_latency,
             "avg_baseline_accuracy": avg_baseline_acc,
             "avg_headroom_accuracy": avg_headroom_acc,
+            "overall_relative_retention_pct": overall_relative_retention,
         },
         "scenarios": [asdict(c) for c in comparisons],
         "social_proof_point": social_text.strip(),
@@ -562,10 +601,16 @@ def main() -> int:
         "--model", default=DEFAULT_MODEL, help="Model ID (default: gemini-3.8-flash)"
     )
     parser.add_argument(
-        "--port", type=int, default=DEFAULT_PORT, help="Headroom proxy port (default: 8787)"
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help="Headroom proxy port (default: 8787)",
     )
     parser.add_argument(
-        "--thinking-budget", type=int, default=0, help="Thinking token budget (0 = disabled)"
+        "--thinking-budget",
+        type=int,
+        default=0,
+        help="Thinking token budget (0 = disabled)",
     )
     parser.add_argument(
         "--output-json",

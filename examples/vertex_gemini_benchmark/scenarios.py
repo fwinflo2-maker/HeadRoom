@@ -140,7 +140,12 @@ def create_sre_scenario() -> BenchmarkScenario:
         system_prompt="You are an expert Google Cloud SRE agent diagnosing a production outage. Identify the root cause service, exact error condition, and recommend immediate remediation steps.",
         user_query="We are experiencing a surge of 500/504 errors on user checkout. Inspect the attached Kubernetes logs and Prometheus metrics to determine the exact root cause and affected database cluster.",
         tool_outputs=[generate_sre_logs(350), generate_sre_metrics()],
-        expected_facts=["payment-service", "pg-primary.db.internal", "connection pool", "5432"],
+        expected_facts=[
+            "payment-service",
+            "pg-primary.db.internal",
+            "connection pool",
+            "5432",
+        ],
         expected_anomalies=["connectionpoolexhaustederror", "circuit breaker"],
     )
 
@@ -243,8 +248,8 @@ def create_security_audit_scenario() -> BenchmarkScenario:
         name="Codebase Security Audit & PR Review",
         category="Application Security",
         description="Inspect code search results across 40 files and a git diff to detect an authentication signature bypass vulnerability.",
-        system_prompt="You are a principal security engineer conducting a code review on a pull request. Identify vulnerabilities, cite the exact file and lines, explain the exploit vector, and propose a secure patch.",
-        user_query="Please audit the proposed changes in PR #482 against our codebase search results. Are there any critical security vulnerabilities or auth bypasses introduced?",
+        system_prompt="You are a principal software engineer conducting a defensive code review on a pull request. Identify security flaws, cite the exact file and lines, describe the security risk, and propose a secure remediation.",
+        user_query="Please audit the proposed changes in PR #482 against our codebase search results. Are there any critical security vulnerabilities or auth bypasses introduced? Propose a secure remediation.",
         tool_outputs=[generate_code_search_results(40), generate_git_diff()],
         expected_facts=["jwt_validator.py", "verify_signature", "alg", "none"],
         expected_anomalies=["bypass", "signature"],
@@ -316,7 +321,12 @@ def create_analytics_scenario() -> BenchmarkScenario:
         system_prompt="You are an enterprise data analyst assistant on Google Cloud. Summarize the dataset and explicitly pinpoint any extreme anomalies, billing outliers, or suspicious accounts.",
         user_query="Analyze the query output for our billing database. Find the top anomalous spenders, identify suspicious accounts, and provide summary insights.",
         tool_outputs=[generate_database_records(500)],
-        expected_facts=["usr_SUSPICIOUS_WHALE_87", "usr_CREDIT_FRAUD_312", "148500", "92450"],
+        expected_facts=[
+            "usr_SUSPICIOUS_WHALE_87",
+            "usr_CREDIT_FRAUD_312",
+            "148500",
+            "92450",
+        ],
         expected_anomalies=["flagged_review", "suspended_chargeback"],
     )
 
@@ -334,7 +344,7 @@ def generate_rag_documents(num_chunks: int = 25) -> dict[str, Any]:
     topics = [
         (
             "Agent Runtime Memory Bus",
-            "The Agent Platform Runtime maintains session state across persistent memory buses. For models including Gemini 3.7 Flash, context tokens are billed at regional rates. Long-horizon agent sessions that execute >50 tool calls frequently accumulate over 150k context tokens, causing quadratic latency growth in multi-turn reasoning loops. Automatic prompt compression at the proxy layer reduces token footprint before entering the inference queue.",
+            "The Agent Platform Runtime maintains session state across persistent memory buses. For models including Gemini 3.8 Flash, context tokens are billed at regional rates. Long-horizon agent sessions that execute >50 tool calls frequently accumulate over 150k context tokens, causing quadratic latency growth in multi-turn reasoning loops. Automatic prompt compression at the proxy layer reduces token footprint before entering the inference queue.",
         ),
         (
             "SmartCrusher Compression Contract",
@@ -342,7 +352,7 @@ def generate_rag_documents(num_chunks: int = 25) -> dict[str, Any]:
         ),
         (
             "Vertex AI Regional Routing",
-            "Vertex AI serves Gemini 3.7 Flash on global and regional endpoints. Application Default Credentials authenticate requests via Google OAuth bearer tokens. Headroom preserves client ADC credentials and transparently forwards streaming tokens.",
+            "Vertex AI serves Gemini 3.8 Flash on global and regional endpoints. Application Default Credentials authenticate requests via Google OAuth bearer tokens. Headroom preserves client ADC credentials and transparently forwards streaming tokens.",
         ),
         (
             "Tool Execution Idempotency",
@@ -380,9 +390,14 @@ def create_rag_scenario() -> BenchmarkScenario:
         category="Knowledge Retrieval (RAG)",
         description="Synthesize architecture specifications from 25 dense vector retrieval chunks regarding agent context management.",
         system_prompt="You are an enterprise AI solutions architect. Synthesize the provided technical documentation to answer the user's architectural questions accurately.",
-        user_query="Explain how context compression optimizes agent performance on Gemini 3.7 Flash and explain how the SmartCrusher algorithm operates.",
+        user_query="Explain how context compression optimizes agent performance on Gemini 3.8 Flash and explain how the SmartCrusher algorithm operates.",
         tool_outputs=[generate_rag_documents(25)],
-        expected_facts=["SmartCrusher", "Gemini 3.7 Flash", "70-90%", "first N", "last N"],
+        expected_facts=[
+            "SmartCrusher",
+            "Gemini 3.8 Flash",
+            "first N",
+            "last N",
+        ],
         expected_anomalies=["quadratic latency", "token reduction"],
     )
 

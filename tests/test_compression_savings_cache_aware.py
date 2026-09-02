@@ -13,6 +13,7 @@ breakdown is available; behavior without a breakdown is unchanged.
 
 from __future__ import annotations
 
+import json
 import types
 
 import pytest
@@ -110,3 +111,127 @@ def test_record_request_fallback_uses_realized_rate(tmp_path):
     blended_rate = (940_000 * CACHE_READ + 40_000 * CACHE_WRITE + 20_000 * LIST) / 1_000_000
     got = tracker.snapshot()["lifetime"]["compression_savings_usd"]
     assert got == pytest.approx(100_000 * blended_rate, rel=1e-4)
+
+
+def _legacy_ledger(path, *, list_priced: float = 10.0) -> None:
+    """A ledger written before the pricing fix: dollars at list, no marker."""
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 5,
+                "lifetime": {
+                    "requests": 100,
+                    "tokens_saved": 1_000_000,
+                    "compression_savings_usd": list_priced,
+                    "cache_read_tokens": 900_000,
+                    "cache_savings_usd": 0.5,
+                    # Realized input spend: $1/M, i.e. a tenth of the $10/M list
+                    # rate the saved tokens were priced at.
+                    "total_input_tokens": 1_000_000,
+                    "total_input_cost_usd": 1.0,
+                },
+                "history": [
+                    {
+                        "timestamp": "2026-01-01T00:00:00+00:00",
+                        "total_tokens_saved": 400_000,
+                        "compression_savings_usd": 4.0,
+                        "total_input_tokens": 400_000,
+                        "total_input_cost_usd": 0.4,
+                    },
+                    {
+                        "timestamp": "2026-01-02T00:00:00+00:00",
+                        "total_tokens_saved": 1_000_000,
+                        "compression_savings_usd": list_priced,
+                        "total_input_tokens": 1_000_000,
+                        "total_input_cost_usd": 1.0,
+                    },
+                ],
+                "by_model": {
+                    "m": {
+                        "requests": 100,
+                        "tokens_saved": 1_000_000,
+                        "compression_savings_usd": list_priced,
+                        "total_input_tokens": 1_000_000,
+                        "total_input_cost_usd": 1.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_legacy_ledger_is_restated_on_the_realized_basis_at_load(tmp_path):
+    """Without this the lifetime headline mixes list-priced and realized-rate
+    dollars with no way to tell them apart, and only converges as old entries
+    age out — i.e. the reported bug stays substantially unfixed on upgrade."""
+    path = tmp_path / "proxy_savings.json"
+    _legacy_ledger(path)
+
+    tracker = st.SavingsTracker(path=str(path))
+    snapshot = tracker.snapshot()
+
+    assert snapshot["pricing_basis"] == "realized"
+    # 1M saved tokens at the realized $1/M, not the $10/M list rate.
+    assert snapshot["lifetime"]["compression_savings_usd"] == pytest.approx(1.0)
+    assert snapshot["by_model"]["m"]["compression_savings_usd"] == pytest.approx(1.0)
+    # Each history point restates at its own realized rate, so the cumulative
+    # series stays monotonic and the derived deltas stay non-negative.
+    assert [p["compression_savings_usd"] for p in snapshot["history"]] == [
+        pytest.approx(0.4),
+        pytest.approx(1.0),
+    ]
+    daily = tracker.history_response()["series"]["daily"]
+    assert [d["compression_savings_usd_delta"] for d in daily] == [
+        pytest.approx(0.4),
+        pytest.approx(0.6),
+    ]
+
+
+def test_restatement_is_stamped_and_not_repeated(tmp_path):
+    """The marker rides out with the next save (same deferral as the schema
+    migrations beside it), so an install is restated once — and because the
+    restatement recomputes from tokens it is idempotent even if it ran twice."""
+    path = tmp_path / "proxy_savings.json"
+    _legacy_ledger(path)
+
+    tracker = st.SavingsTracker(path=str(path))
+    tracker.record_request(model="m", input_tokens=10, tokens_saved=0)
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted["pricing_basis"] == "realized"
+    assert persisted["lifetime"]["compression_savings_usd"] == pytest.approx(1.0)
+
+    again = st.SavingsTracker(path=str(path)).snapshot()
+    assert again["lifetime"]["compression_savings_usd"] == pytest.approx(1.0)
+
+
+def test_unpriced_legacy_ledger_waits_instead_of_freezing_list_prices(tmp_path):
+    """No realized rate yet (state predates input-cost tracking): leave the
+    dollars alone and retry next load rather than stamping list prices as
+    'realized' forever."""
+    path = tmp_path / "proxy_savings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 5,
+                "lifetime": {
+                    "requests": 10,
+                    "tokens_saved": 1_000_000,
+                    "compression_savings_usd": 10.0,
+                    "total_input_tokens": 0,
+                    "total_input_cost_usd": 0.0,
+                },
+                "history": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = st.SavingsTracker(path=str(path)).snapshot()
+    assert snapshot["pricing_basis"] == "legacy"
+    assert snapshot["lifetime"]["compression_savings_usd"] == pytest.approx(10.0)
+
+
+def test_fresh_install_is_marked_realized(tmp_path):
+    snapshot = st.SavingsTracker(path=str(tmp_path / "proxy_savings.json")).snapshot()
+    assert snapshot["pricing_basis"] == "realized"

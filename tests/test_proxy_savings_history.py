@@ -1770,8 +1770,10 @@ def test_non_finite_state_values_coerce_to_defaults(tmp_path):
     lifetime = tracker.snapshot()["lifetime"]
     assert lifetime["cache_read_tokens"] == 0
     assert lifetime["cache_savings_usd"] == 0.0
-    assert lifetime["compression_savings_usd"] == 0.0
     assert lifetime["tokens_saved"] == 2
+    # NaN coerces to 0.0, then the legacy ledger is restated on the realized
+    # basis: 2 saved tokens at the persisted $0.5/100-token realized rate.
+    assert lifetime["compression_savings_usd"] == pytest.approx(2 * (0.5 / 100))
 
     tracker.record_request(
         model="unknown-model",

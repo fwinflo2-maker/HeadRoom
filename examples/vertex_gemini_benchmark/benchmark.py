@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Vertex AI (Gemini Enterprise Agent Platform) + Headroom Context Compression Benchmark.
 
-Evaluates Gemini 3.7 Flash on Vertex AI across realistic multi-turn agent workloads:
+Evaluates Gemini 3.8 Flash on Vertex AI across realistic multi-turn agent workloads:
 1. Baseline: Direct Vertex AI API calls with raw, uncompressed tool outputs.
 2. Headroom: Transparently proxied Vertex AI API calls with intelligent context compression.
 
@@ -49,11 +49,11 @@ from examples.vertex_gemini_benchmark.scenarios import (  # noqa: E402
 # Constants & Pricing
 # ----------------------------------------------------------------------------
 
-DEFAULT_MODEL = "gemini-3.7-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_LOCATION = "global"
 DEFAULT_PORT = 8787
 
-# Vertex AI Gemini 3.7 Flash pricing (Standard Tier <= 128k prompt)
+# Vertex AI Gemini 3.8 Flash pricing (Standard Tier <= 128k prompt)
 # $0.075 per 1M input tokens, $0.30 per 1M output tokens
 INPUT_PRICE_PER_M = 0.075
 OUTPUT_PRICE_PER_M = 0.30
@@ -237,7 +237,7 @@ def evaluate_response_quality(
 
 
 def calculate_cost(prompt_tokens: int, candidate_tokens: int) -> float:
-    """Calculate inference cost in USD for Gemini 3.7 Flash on Vertex."""
+    """Calculate inference cost in USD for Gemini Flash on Vertex."""
     return (prompt_tokens * INPUT_PRICE_PER_M + candidate_tokens * OUTPUT_PRICE_PER_M) / 1_000_000.0
 
 
@@ -456,7 +456,8 @@ def run_benchmark_suite(
 
     # 4. Print Formatted Table
     print("=" * 82)
-    print(" 📊 FINAL BENCHMARK SUMMARY: GEMINI 3.7 FLASH ON VERTEX AI")
+    model_label = model.upper().replace("-", " ").replace("GEMINI", "GEMINI")
+    print(f" 📊 FINAL BENCHMARK SUMMARY: {model_label} ON VERTEX AI")
     print("=" * 82)
     print(
         f"{'Scenario':<34} | {'Baseline Prompt':>15} | {'Headroom Prompt':>15} | {'Reduction':>10}"
@@ -492,11 +493,11 @@ def run_benchmark_suite(
 
     # 5. Social Post Format
     social_text = f"""
-🚀 **Headroom + Gemini 3.7 Flash on Google Cloud Vertex AI Benchmark**
+🚀 **Headroom + {model} on Google Cloud Vertex AI Benchmark**
 
 When AI agents run complex multi-turn workflows (SRE debugging, PR reviews, BigQuery analytics), tool output bloat explodes prompt token costs and degrades TTFT.
 
-We ran reproducible end-to-end agent benchmarks comparing **Direct Vertex AI** vs **Headroom-Proxied Vertex AI** on `gemini-3.7-flash`:
+We ran reproducible end-to-end agent benchmarks comparing **Direct Vertex AI** vs **Headroom-Proxied Vertex AI** on `{model}`:
 
 📉 **Results**:
 • **Prompt Token Reduction**: **{overall_token_savings:.1f}%** ({total_baseline_prompt:,} ➔ {total_headroom_prompt:,} tokens)
@@ -549,7 +550,7 @@ https://github.com/headroomlabs-ai/headroom/tree/main/examples/vertex_gemini_ben
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Gemini 3.7 Flash on Vertex AI + Headroom Benchmark"
+        description="Gemini 3.8 Flash on Vertex AI + Headroom Benchmark"
     )
     parser.add_argument(
         "--project", default=os.environ.get("GCP_PROJECT_ID"), help="GCP Project ID"
@@ -558,7 +559,7 @@ def main() -> int:
         "--location", default=DEFAULT_LOCATION, help="Vertex location (default: global)"
     )
     parser.add_argument(
-        "--model", default=DEFAULT_MODEL, help="Model ID (default: gemini-3.7-flash)"
+        "--model", default=DEFAULT_MODEL, help="Model ID (default: gemini-3.8-flash)"
     )
     parser.add_argument(
         "--port", type=int, default=DEFAULT_PORT, help="Headroom proxy port (default: 8787)"

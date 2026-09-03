@@ -138,6 +138,15 @@ def test_unsupported_platform_raises(monkeypatch):
         binaries._asset_for_platform("difft", binaries.detect_platform())
 
 
+def test_codebase_memory_mcp_uses_platform_key_names():
+    for platform, asset_suffix in (
+        (binaries.PlatformKey("darwin", "aarch64", "n/a"), "darwin-arm64"),
+        (binaries.PlatformKey("linux", "aarch64", "gnu"), "linux-arm64"),
+    ):
+        asset = binaries._asset_for_platform("codebase-memory-mcp", platform)
+        assert asset["url"].endswith(f"codebase-memory-mcp-{asset_suffix}.tar.gz")
+
+
 def test_pypi_only_tool_raises_with_helpful_message(monkeypatch):
     _set_platform(monkeypatch, sys_plat="darwin", machine="arm64")
     with pytest.raises(binaries.PlatformNotSupported) as exc:
